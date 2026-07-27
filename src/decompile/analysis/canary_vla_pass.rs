@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, BTreeSet};
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
 use crate::run_pass;
-use crate::x86::mach::Mreg;
+use crate::mreg::Mreg;
 use crate::x86::types::*;
 use ascent::ascent_par;
 
@@ -27,11 +27,24 @@ ascent_par! {
     relation next(Address, Address);
     relation flags_and_jump_pair(Address, Address, &'static str);
     relation direct_call(Address, Address);
+    relation direct_jump(Address, Address);
     relation func_entry(Symbol, Address);
     relation plt_entry(Address, Symbol);
     relation plt_block(Address, Symbol);
+    relation block_in_function(Address, Address);
+    relation code_in_block(Address, Address);
 
     relation trim_instruction(Address);
+
+    // CANARY-3: structural function containment from the CFG-BFS block_in_function, recomputed here because consuming asm_pass's instr_in_function would cycle the schedule.
+    #[local] relation canary_instr_in_function(Address, Address);
+    canary_instr_in_function(addr, func) <--
+        block_in_function(blockaddr, func),
+        code_in_block(addr, blockaddr);
+
+    // Exported so the imperative VLA trimmer (detect_vla) resolves each alloc's function structurally instead of via the numeric find_func window.
+    relation instr_in_function_canary(Address, Address);
+    instr_in_function_canary(addr, func) <-- canary_instr_in_function(addr, func);
 
     #[local] relation prev(Address, Address);
     prev(b, a) <-- next(a, b);
@@ -50,7 +63,9 @@ ascent_par! {
         unrefinedinstruction(addr, _, _, _, _, op2, _, _, _, _),
         fs_segment_op(op2);
 
-    trim_instruction(addr) <-- fs_insn(addr);
+    // CANARY-1: trim only FS/GS accesses provably in the canary chain (the confirmed canary_store's load and the fs_check xor/sub); other FS reads are genuine TLS.
+    trim_instruction(fs_addr) <-- canary_store(fs_addr, _, _, _);
+    trim_instruction(chk) <-- fs_check(chk);
 
     #[local] relation stack_chk_fail_addr(Address);
     stack_chk_fail_addr(addr) <--
@@ -60,9 +75,6 @@ ascent_par! {
     stack_chk_fail_addr(addr) <--
         plt_block(addr, name), if name.contains("stack_chk_fail");
 
-    #[local] relation func_addr(Address);
-    func_addr(f) <-- func_entry(_, f);
-
     // FS MOV: canary load from TLS
     #[local] relation fs_mov(Address);
     fs_mov(addr) <--
@@ -70,35 +82,56 @@ ascent_par! {
         unrefinedinstruction(addr, _, _, mnem, _, _, _, _, _, _),
         if *mnem == "MOV";
 
-    #[local] relation fs_mov_fwd(Address, Address, usize);
-    fs_mov_fwd(a, a, 0usize) <-- fs_mov(a);
-    fs_mov_fwd(start, nxt, n + 1) <--
-        fs_mov_fwd(start, cur, n), next(cur, nxt), if *n < 4;
+    // ST-1: find the canary store by TRACKING the FS-loaded register forward to its first frame spill, killed by any redefinition, control flow, or a length backstop, instead of requiring fs+1.
+    #[local] relation fs_mov_dst(Address, Symbol);
+    fs_mov_dst(addr, reg) <--
+        fs_mov(addr),
+        unrefinedinstruction(addr, _, _, _, _, op2, _, _, _, _),
+        op_register(op2, reg);
 
-    // Canary store: MOV to [RBP+disp<0] immediately after FS MOV (n==1 only)
-    #[local] relation canary_store(Address, Address, i64);
-    canary_store(fs_addr, store_addr, disp) <--
-        fs_mov_fwd(fs_addr, store_addr, n), if *n == 1,
-        unrefinedinstruction(store_addr, _, _, mnem, _, op2, _, _, _, _),
+    #[local] relation insn_redefines(Address, Symbol);
+    insn_redefines(addr, reg) <--
+        unrefinedinstruction(addr, _, _, _, _, op2, _, _, _, _),
+        op_register(op2, reg);
+
+    #[local] relation insn_is_control(Address);
+    insn_is_control(addr) <--
+        unrefinedinstruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "JMP" | "CALL" | "RET" | "JE" | "JNE" | "JL" | "JLE" | "JG" | "JGE"
+            | "JB" | "JBE" | "JA" | "JAE" | "JS" | "JNS" | "JP" | "JNP" | "JO" | "JNO");
+
+    #[local] relation fs_track(Address, Address, Symbol, usize);
+    fs_track(a, nxt, reg, 1usize) <--
+        fs_mov_dst(a, reg),
+        next(a, nxt);
+    fs_track(start, nxt, reg, n + 1) <--
+        fs_track(start, cur, reg, n),
+        if *n < 16,
+        !insn_redefines(cur, reg),
+        !insn_is_control(cur),
+        next(cur, nxt);
+
+    // The slot carries its BASE register: an RSP-space displacement must never match an RBP-space reload (cross-base collision falsely trimmed real value reloads near epilogues).
+    #[local] relation canary_store(Address, Address, Symbol, i64);
+    canary_store(fs_addr, store_addr, base, disp) <--
+        fs_track(fs_addr, store_addr, reg, _),
+        unrefinedinstruction(store_addr, _, _, mnem, op1, op2, _, _, _, _),
         if *mnem == "MOV",
+        op_register(op1, src_reg),
+        if src_reg == reg,
         op_indirect(op2, _, base, _, _, disp, _),
-        if *base == "RBP" && *disp < 0;
+        if (*base == "RBP" && *disp < 0) || *base == "RSP";
 
-    trim_instruction(store_addr) <-- canary_store(_, store_addr, _);
+    trim_instruction(store_addr) <-- canary_store(_, store_addr, _, _);
 
-    // Determine which function contains each FS instruction
-    #[local] relation fs_func_le(Address, Address);
-    fs_func_le(fs_addr, f) <--
-        fs_insn(fs_addr), func_addr(f), if *f <= *fs_addr;
-
+    // Determine which function contains each FS instruction (STRUCTURAL CFG containment).
     #[local] relation fs_func(Address, Address);
-    fs_func(fs_addr, max_f) <--
-        fs_func_le(fs_addr, _),
-        agg max_f = ascent::aggregators::max(f) in fs_func_le(fs_addr, f);
+    fs_func(fs_addr, func) <--
+        fs_insn(fs_addr), canary_instr_in_function(fs_addr, func);
 
-    #[local] relation canary_slot(Address, i64);
-    canary_slot(func, disp) <--
-        canary_store(fs_addr, _, disp), fs_func(fs_addr, func);
+    #[local] relation canary_slot(Address, Symbol, i64);
+    canary_slot(func, base, disp) <--
+        canary_store(fs_addr, _, base, disp), fs_func(fs_addr, func);
 
     // Canary epilogue: FS SUB/XOR check instruction
     #[local] relation fs_check(Address);
@@ -115,6 +148,9 @@ ascent_par! {
         fs_check(cmp), flags_and_jump_pair(cmp, jcc, _);
     jcc_fwd(jcc, nxt, n + 1) <--
         jcc_fwd(jcc, cur, n), next(cur, nxt), if *n < 2;
+    // The __stack_chk_fail block is the canary JCC's TAKEN target, not the address-next instruction, so step along the branch edge too (same hop bound).
+    jcc_fwd(jcc, tgt, n + 1) <--
+        jcc_fwd(jcc, cur, n), direct_jump(cur, tgt), if *n < 2;
 
     // Suppress __stack_chk_fail calls after canary check JCC
     trim_instruction(call_addr) <--
@@ -136,17 +172,16 @@ ascent_par! {
     fs_check_bwd(chk, prv, n + 1) <--
         fs_check_bwd(chk, cur, n), prev(cur, prv), if *n < 4;
 
-    #[local] relation check_canary_ofs(Address, i64);
-    check_canary_ofs(chk, ofs) <--
-        fs_check(chk), fs_func(chk, func), canary_slot(func, ofs);
+    #[local] relation check_canary_ofs(Address, Symbol, i64);
+    check_canary_ofs(chk, base, ofs) <--
+        fs_check(chk), fs_func(chk, func), canary_slot(func, base, ofs);
 
     trim_instruction(reload_addr) <--
         fs_check_bwd(chk, reload_addr, n), if *n > 0,
         unrefinedinstruction(reload_addr, _, _, mnem, op1, _, _, _, _, _),
         if *mnem == "MOV",
         op_indirect(op1, _, base, _, _, disp, _),
-        if *base == "RBP",
-        check_canary_ofs(chk, disp);
+        check_canary_ofs(chk, base, disp);
 
     // === VLA Detection ===
 
@@ -163,14 +198,32 @@ ascent_par! {
         op_register(op1, size_reg),
         if *size_reg != "RSP" && *size_reg != "ESP";
 
-    // Suppress the alloc itself
-    trim_instruction(addr) <-- vla_dynamic_alloc(addr, _);
+    // ST-2: clang's canonical alloca updates RSP by MOV from a computed register rather than a direct SUB; RBP is excluded, and trims are gated on the FULL pattern matching.
+    #[local] relation vla_mov_alloc(Address, &'static str);
+    vla_mov_alloc(addr, size_reg) <--
+        unrefinedinstruction(addr, _, _, mnem, op1, op2, _, _, _, _),
+        if *mnem == "MOV",
+        rsp_op(op2),
+        op_register(op1, size_reg),
+        if *size_reg != "RSP" && *size_reg != "ESP" && *size_reg != "RBP" && *size_reg != "EBP";
 
-    // Forward walk from alloc (up to 30 steps)
+    vla_dynamic_alloc(addr, size_reg) <-- vla_mov_alloc(addr, size_reg);
+
+    // Suppress the alloc only when a capture confirmed the alloca pattern; VLA-1, an un-captured sub %reg,%rsp is a genuine dynamic stack adjustment that must survive.
+    trim_instruction(addr) <--
+        vla_dynamic_alloc(addr, _),
+        !vla_mov_alloc(addr, _),
+        vla_capture(addr, _, _, _);
+    trim_instruction(addr) <--
+        vla_mov_alloc(addr, _),
+        vla_capture(addr, _, _, _);
+
+    // Forward walk from alloc (up to 30 steps), straight-line only: the alloca sequence (sub/and/mov) contains no branches, and stopping at control flow keeps the walk from crossing a RET into the next function (the raw `next` chain is address order).
     #[local] relation vla_alloc_fwd(Address, Address, usize);
     vla_alloc_fwd(a, a, 0usize) <-- vla_dynamic_alloc(a, _);
     vla_alloc_fwd(start, nxt, n + 1) <--
-        vla_alloc_fwd(start, cur, n), next(cur, nxt), if *n < 30;
+        vla_alloc_fwd(start, cur, n), next(cur, nxt), if *n < 30,
+        !insn_is_control(cur);
 
     // Candidate captures: MOV RSP -> <non-RSP/RBP register>
     #[local] relation vla_capture_candidate(Address, Address, &'static str, usize);
@@ -209,15 +262,10 @@ ascent_par! {
         if *n <= *cap_n,
         flags_and_jump_pair(mid, jcc, _);
 
-    // Function containing each alloc (largest func_entry <= alloc addr)
-    #[local] relation vla_func_le(Address, Address);
-    vla_func_le(alloc, f) <--
-        vla_dynamic_alloc(alloc, _), func_addr(f), if *f <= *alloc;
-
+    // Function containing each alloc (STRUCTURAL CFG containment).
     #[local] relation vla_func(Address, Address);
-    vla_func(alloc, max_f) <--
-        vla_func_le(alloc, _),
-        agg max_f = ascent::aggregators::max(f) in vla_func_le(alloc, f);
+    vla_func(alloc, func) <--
+        vla_dynamic_alloc(alloc, _), canary_instr_in_function(alloc, func);
 
     // Forward walk from capture (up to 6 steps) for base var detection
     #[local] relation vla_cap_fwd(Address, Address, usize);
@@ -270,9 +318,13 @@ impl IRPass for CanaryVlaPass {
             "next",
             "flags_and_jump_pair",
             "direct_call",
+            "direct_jump",
             "func_entry",
             "plt_entry",
             "plt_block",
+            // CANARY-3: structural CFG containment inputs (CFG-BFS results set pre-pipeline), replacing the former func_entry<=addr windows.
+            "block_in_function",
+            "code_in_block",
         ]
     }
 
@@ -282,7 +334,14 @@ impl IRPass for CanaryVlaPass {
             "vla_alloca",
             "vla_base_var",
             "vla_capture",
+            // Structural per-instruction function membership, consumed imperatively by detect_vla in place of the old numeric find_func window.
+            "instr_in_function_canary",
         ]
+    }
+
+    // direct_jump is read imperatively in detect_vla, so declare it or the scheduler leaves it silently empty in parallel sub-DBs.
+    fn extra_reads(&self) -> &'static [&'static str] {
+        &["direct_jump"]
     }
 }
 
@@ -363,9 +422,21 @@ fn detect_vla(db: &mut DecompileDB) {
         .map(|&(_, addr)| addr)
         .collect();
 
+    // CANARY-3: structural per-instruction function membership from instr_in_function_canary, replacing the find_func window that misassigned across disjoint branches.
+    let instr_func: HashMap<Address, Address> = db
+        .rel_iter::<(Address, Address)>("instr_in_function_canary")
+        .map(|&(addr, func)| (addr, func))
+        .collect();
+
     let flags_pairs: HashMap<Address, Address> = db
         .rel_iter::<(Address, Address, &'static str)>("flags_and_jump_pair")
         .map(|&(cmp, jcc, _)| (cmp, jcc))
+        .collect();
+
+    // CANARY-2: resolved unconditional-jump targets; a probe-loop JMP is trimmed only when this map resolves it back into the recognized probe block.
+    let direct_jumps: HashMap<Address, Address> = db
+        .rel_iter::<(Address, Address)>("direct_jump")
+        .map(|&(src, tgt)| (src, tgt))
         .collect();
 
     let mut trimmed: BTreeSet<Address> = BTreeSet::new();
@@ -415,8 +486,9 @@ fn detect_vla(db: &mut DecompileDB) {
         op_immediates.get(op_id).copied()
     };
 
+    // Structural CFG containment lookup (replaces the address-order window).
     let find_func = |addr: Address| -> Option<Address> {
-        func_entries.iter().copied().filter(|&f| f <= addr).max()
+        instr_func.get(&addr).copied()
     };
 
     for &(alloc_addr, cap_addr, size_reg, result_reg) in &captures {
@@ -426,8 +498,8 @@ fn detect_vla(db: &mut DecompileDB) {
         };
 
         // Convert register names to Mreg for vla_alloca
-        let size_mreg = Mreg::from(size_reg);
-        let result_mreg = Mreg::from(result_reg);
+        let size_mreg = Mreg::x86(size_reg);
+        let result_mreg = Mreg::x86(result_reg);
         if size_mreg != Mreg::Unknown && result_mreg != Mreg::Unknown {
             vla_allocas.push((cap_addr, size_mreg, result_mreg));
         }
@@ -518,24 +590,32 @@ fn detect_vla(db: &mut DecompileDB) {
                 }
             }
 
+            // Trim the alignment prologue along the structural next chain from alignment_start to the alloc; a visited guard terminates it, and it stops if the chain leaves the function.
             let mut cur = alignment_start;
             trimmed.insert(cur);
-            while cur < alloc_addr {
-                if let Some(&nxt) = next_map.get(&cur) {
-                    trimmed.insert(nxt);
-                    cur = nxt;
-                } else {
-                    break;
+            let mut seen: HashSet<Address> = HashSet::new();
+            while cur != alloc_addr && seen.insert(cur) {
+                match next_map.get(&cur) {
+                    Some(&nxt) if find_func(nxt) == Some(func) => {
+                        trimmed.insert(nxt);
+                        cur = nxt;
+                    }
+                    _ => break,
                 }
             }
         }
 
-        // Stack probe loop: SUB rsp, PAGE_SIZE with CMP/JMP guard
+        // Stack probe loop (SUB rsp, PAGE_SIZE with CMP/JMP guard); CANARY-2 bounds every walk by structural function membership so it cannot bleed into a neighbour.
+        let in_func = |addr: Address| -> bool { find_func(addr) == Some(func) };
+
         let neighborhood: Vec<Address> = {
-            let mut n: Vec<Address> = walk_backward(alloc_addr, 20);
+            let mut n: Vec<Address> = walk_backward(alloc_addr, 20)
+                .into_iter()
+                .take_while(|&a| in_func(a))
+                .collect();
             n.reverse();
             n.push(alloc_addr);
-            n.extend(walk_forward(alloc_addr, 10));
+            n.extend(walk_forward(alloc_addr, 10).into_iter().take_while(|&a| in_func(a)));
             n
         };
 
@@ -543,18 +623,37 @@ fn detect_vla(db: &mut DecompileDB) {
             if let Some(&(_, _, _, mnem, op1, op2, _, _, _, _)) = insns.get(&probe_addr) {
                 if mnem == "SUB" && is_rsp_operand(op2) && get_immediate(op1) == Some(PAGE_SIZE) {
                     trimmed.insert(probe_addr);
-                    for &adj in walk_forward(probe_addr, 3).iter() {
+
+                    // Structural probe block: the straight-line region around the SUB confined to func; a JMP is trimmed only if it resolves back into this set, never by address range.
+                    let mut probe_block: HashSet<Address> = HashSet::new();
+                    probe_block.insert(probe_addr);
+                    for &b in walk_backward(probe_addr, 5).iter().take_while(|&&a| in_func(a)) {
+                        probe_block.insert(b);
+                    }
+                    let probe_fwd: Vec<Address> = walk_forward(probe_addr, 3)
+                        .into_iter()
+                        .take_while(|&a| in_func(a))
+                        .collect();
+                    for &f in &probe_fwd {
+                        probe_block.insert(f);
+                    }
+
+                    for &adj in &probe_fwd {
                         if let Some(&(_, _, _, nm, op1_adj, _, _, _, _, _)) = insns.get(&adj) {
                             match nm {
                                 "OR" if is_rsp_operand(op1_adj) || {
                                     op_indirects.get(op1_adj).map_or(false, |&(_, _, base, _, _, _, _)| base == "RSP")
-                                } => trimmed.insert(adj),
-                                "JMP" => trimmed.insert(adj),
-                                _ => false,
+                                } => { trimmed.insert(adj); }
+                                "JMP" => {
+                                    if direct_jumps.get(&adj).map_or(false, |t| probe_block.contains(t)) {
+                                        trimmed.insert(adj);
+                                    }
+                                }
+                                _ => {}
                             };
                         }
                     }
-                    for &adj in walk_backward(probe_addr, 5).iter() {
+                    for &adj in walk_backward(probe_addr, 5).iter().take_while(|&&a| in_func(a)) {
                         if let Some(&(_, _, _, nm, op1_adj, op2_adj, _, _, _, _)) = insns.get(&adj) {
                             match nm {
                                 "CMP" if is_rsp_operand(op1_adj) || is_rsp_operand(op2_adj) => {

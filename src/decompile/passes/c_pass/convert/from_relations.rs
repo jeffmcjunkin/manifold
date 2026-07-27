@@ -4,8 +4,8 @@ use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::c_pass::types::{
     AssignOp, BinaryOp, CBlockItem, CExpr, CStmt, CType, ExprTransform, FloatLiteral,
     FloatLiteralSuffix, FuncDef, FuncParam, IntLiteral, IntLiteralBase,
-    IntLiteralSuffix, Label, SourceLoc, StorageClass, StmtTransform, StringLiteral,
-    TypeQualifiers, UnaryOp, VarDecl,
+    IntLiteralSuffix, IntSize, Label, Signedness, SourceLoc, StorageClass, StmtTransform,
+    StringLiteral, TypeQualifiers, UnaryOp, VarDecl,
 };
 use crate::decompile::passes::c_pass::TranslationUnit;
 use crate::decompile::passes::clight_select::query::GlobalData;
@@ -77,6 +77,13 @@ fn convert_clight_type(ty: &crate::x86::types::ClightType) -> CType {
             };
             CType::Int(crate::decompile::passes::c_pass::types::IntSize::Long, c_sign)
         }
+        crate::x86::types::ClightType::Tint128(sign, _attr) => {
+            let c_sign = match sign {
+                ClightSignedness::Signed => crate::decompile::passes::c_pass::types::Signedness::Signed,
+                ClightSignedness::Unsigned => crate::decompile::passes::c_pass::types::Signedness::Unsigned,
+            };
+            CType::Int(crate::decompile::passes::c_pass::types::IntSize::Int128, c_sign)
+        }
         crate::x86::types::ClightType::Tfloat(size, _attr) => {
             let c_size = match size {
                 ClightFloatSize::F32 => crate::decompile::passes::c_pass::types::FloatSize::Float,
@@ -94,9 +101,15 @@ fn convert_clight_type(ty: &crate::x86::types::ClightType) -> CType {
         crate::x86::types::ClightType::Tarray(inner, size, _attr) => {
             CType::Array(Box::new(convert_clight_type(inner)), Some(*size as usize))
         }
-        crate::x86::types::ClightType::Tfunction(params, ret, _cc) => {
+        crate::x86::types::ClightType::Tfunction(params, ret, cc) => {
             let c_params: Vec<CType> = params.iter().map(convert_clight_type).collect();
-            CType::Function(Box::new(convert_clight_type(ret)), c_params, false)
+            // Carry the calling convention through: varargs gives variadic (T, ...), unproto gives true K&R () (unspecified args, distinct from (void)).
+            CType::Function(
+                Box::new(convert_clight_type(ret)),
+                c_params,
+                cc.varargs.is_some(),
+                cc.unproto,
+            )
         }
         crate::x86::types::ClightType::Tstruct(id, _attr) => {
             CType::Struct(format!("struct_{:x}", id))
@@ -127,7 +140,7 @@ fn clight_expr_to_ctype(expr: &clight::ClightExpr) -> CType {
     convert_clight_type(clight_ty)
 }
 
-// Well-known variadic libc/coreutils functions whose recovered prototypes carry only the fixed leading parameters, so calls passing the variadic tail fail to type-check unless the prototype is declared variadic (mirrors the printf/scanf families handled by narrow_varargs_args, plus common variadic libc entry points).
+// Well-known variadic libc/coreutils functions whose recovered prototypes carry only the fixed leading params, so calls passing the variadic tail need the prototype declared variadic.
 fn is_known_variadic_fn(name: &str) -> bool {
     matches!(
         name,
@@ -214,6 +227,7 @@ fn convert_xtype(xt: &XType) -> CType {
                 Box::new(CType::Void),
                 Vec::new(),
                 false,
+                false,
             )),
             TypeQualifiers::none(),
         ),
@@ -235,6 +249,63 @@ fn convert_xtype(xt: &XType) -> CType {
     }
 }
 
+/// Return type for a called-but-not-emitted callee's prototype, taken from the recovered signature rather than a hardcoded int, so a pointer/long-returning internal is not narrowed by insert_casts.
+fn recovered_ret_ctype(map: &HashMap<String, XType>, name: &str) -> CType {
+    map.get(name)
+        .and_then(|xt| match xt {
+            XType::Xvoid => None,
+            XType::XstructPtr(_) => Some(CType::Pointer(Box::new(CType::Void), TypeQualifiers::none())),
+            other => Some(convert_xtype(other)),
+        })
+        .unwrap_or(CType::Int(
+            crate::decompile::passes::c_pass::types::IntSize::Int,
+            Signedness::Signed,
+        ))
+}
+
+/// Policy for locally-DEFINED functions colliding with a header declaration: "filter" drops the body, otherwise (and by default) it is emitted renamed <name>_local.
+struct LocalDefPolicy {
+    renames: HashMap<String, String>,
+    filtered: HashSet<String>,
+}
+
+/// The canonical type spellings used by header_functions.json "globals" `type` fields (exposed as header_db().variables) -- a closed set kept tiny on purpose (header-declared globals are scalars/pointers, not aggregates).
+fn parse_canonical_var_type(spelling: &str) -> Option<CType> {
+    match spelling.trim() {
+        "char **" => Some(CType::ptr(CType::ptr(CType::char_signed()))),
+        "char *" => Some(CType::ptr(CType::char_signed())),
+        "void *" => Some(CType::ptr(CType::Void)),
+        "int" => Some(CType::int()),
+        "long" => Some(CType::long()),
+        _ => None,
+    }
+}
+
+fn header_collision_policy(selected_functions: &[SelectedFunction]) -> LocalDefPolicy {
+    let hdb = crate::decompile::passes::c_pass::header_db::header_db();
+    let is_provided =
+        |n: &str| hdb.functions.contains(n) || hdb.prefixes.iter().any(|p| n.starts_with(p));
+    let mut policy = LocalDefPolicy {
+        renames: HashMap::new(),
+        filtered: HashSet::new(),
+    };
+    for f in selected_functions {
+        if f.name.starts_with("FUN_") {
+            continue;
+        }
+        let name = sanitize_c_symbol_name(&f.name);
+        if !is_provided(&name) {
+            continue;
+        }
+        if hdb.local_def_filter.contains(name.as_str()) {
+            policy.filtered.insert(name);
+        } else {
+            policy.renames.insert(name.clone(), format!("{}_local", name));
+        }
+    }
+    policy
+}
+
 pub fn build_cast_from_relations(
     db: &DecompileDB,
     selected_functions: &[SelectedFunction],
@@ -243,6 +314,7 @@ pub fn build_cast_from_relations(
     edges: &[(crate::x86::types::Node, crate::x86::types::Node)],
 ) -> TranslationUnit {
     let mut ctx = ConversionContext::new(id_to_name.clone());
+    ctx.func_renames = header_collision_policy(selected_functions).renames;
     for global in globals {
         if global.is_string {
             ctx.string_globals.insert(global.id);
@@ -261,6 +333,11 @@ pub fn build_cast_from_relations(
             addr_name_map.insert(func.address as u64, sanitize_c_symbol_name(&func.name));
         }
         let mut sorted: Vec<(u64, String)> = addr_name_map.into_iter().collect();
+        for (_, name) in sorted.iter_mut() {
+            if let Some(renamed) = ctx.func_renames.get(name) {
+                *name = renamed.clone();
+            }
+        }
         sorted.sort_by_key(|(addr, _)| *addr);
         ctx.func_addrs_sorted = sorted;
     }
@@ -353,8 +430,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 chunk_list.retain(|c|
                     !matches!(c, MemoryChunk::MFloat32 | MemoryChunk::MFloat64));
             }
-            // Among remaining, prefer the largest integer type
-            let best = chunk_list.iter().max_by_key(|c| match c {
+            // Among remaining, prefer the largest integer type; use the chunk itself as a tiebreak so signed/unsigned pairs of the same width don't flip across parallel-Ascent runs.
+            let best = chunk_list.iter().max_by_key(|c| (match c {
                 MemoryChunk::MBool => 0,
                 MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => 1,
                 MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => 2,
@@ -365,9 +442,36 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 MemoryChunk::MAny32 => 7,
                 MemoryChunk::MAny64 => 8,
                 MemoryChunk::Unknown => 9,
-            }).copied().unwrap_or(MemoryChunk::Unknown);
+            }, **c)).copied().unwrap_or(MemoryChunk::Unknown);
             (id, best)
         }).collect()
+    };
+
+    // Rodata FP constants recovered from the binary (address, width, raw IEEE-754 bits), keyed by address so an unnamed .rodata slot emits a typed static const instead of a zeroed long.
+    let rodata_fp_consts: HashMap<u64, (usize, u64)> = db
+        .rel_iter::<(u64, usize, u64)>("rodata_fp_const")
+        .map(|(addr, width, bits)| (*addr, (*width, *bits)))
+        .collect();
+    // Build a static const double/float VarDecl for a recovered rodata FP constant, or None for a non-finite bit pattern, which is more likely a misclassified bitmask.
+    let make_rodata_fp_decl = |name: String, width: usize, bits: u64|
+        -> Option<crate::decompile::passes::c_pass::types::TopLevelDecl> {
+        use crate::decompile::passes::c_pass::types::{FloatLiteral, Initializer, TopLevelDecl};
+        let (ty, value, suffix) = if width == 4 {
+            (CType::float(), f32::from_bits(bits as u32) as f64, FloatLiteralSuffix::F)
+        } else {
+            (CType::double(), f64::from_bits(bits), FloatLiteralSuffix::None)
+        };
+        if !value.is_finite() {
+            return None;
+        }
+        Some(TopLevelDecl::VarDecl(VarDecl {
+            name,
+            ty,
+            storage_class: StorageClass::Static,
+            qualifiers: TypeQualifiers { is_const: true, ..TypeQualifiers::none() },
+            init: Some(Initializer::Expr(CExpr::FloatLit(FloatLiteral { value, suffix }))),
+            loc: SourceLoc::unknown(),
+        }))
     };
 
     // Build global pointer sets from rtl_pass analysis
@@ -378,13 +482,259 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         .map(|(id,)| *id)
         .collect();
 
+    // SR-1: type global declarations from recovered layouts so emit_global_struct_fields keeps the struct definition alive through clight_emit's referenced-filter; catalog guard prevents naming a struct that extract_struct_definitions won't emit (incomplete type at TU end).
+    let global_struct_decl_ids: HashMap<usize, usize> = {
+        let catalog_ids: HashSet<usize> = db
+            .rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog")
+            .map(|(_, id, _, _)| *id)
+            .collect();
+        let mut m: HashMap<usize, usize> = HashMap::new();
+        for (ident, sid, _fields) in
+            db.rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_global_struct_fields")
+        {
+            if !catalog_ids.contains(sid) {
+                continue;
+            }
+            // Min-sid per ident: relation is set-semantics and may carry several rows; arrival order must not pick the winner.
+            m.entry(*ident)
+                .and_modify(|e| {
+                    if *sid < *e {
+                        *e = *sid;
+                    }
+                })
+                .or_insert(*sid);
+        }
+        m
+    };
+    // Same for recovered global arrays: smallest (elem_size, count) per ident -- weakest claim, deterministic across the multi-valued relation.
+    let global_array_decl: HashMap<usize, (usize, usize)> = {
+        let mut m: HashMap<usize, (usize, usize)> = HashMap::new();
+        for (ident, elem_size, count) in db.rel_iter::<(Ident, usize, usize)>("is_global_array") {
+            if *elem_size == 0 || *count == 0 {
+                continue;
+            }
+            let cand = (*elem_size, *count);
+            m.entry(*ident)
+                .and_modify(|e| {
+                    if cand < *e {
+                        *e = cand;
+                    }
+                })
+                .or_insert(cand);
+        }
+        m
+    };
+    let ctype_of_chunk = |chunk: &MemoryChunk| -> CType {
+        match chunk {
+            // c26: MBool is a 1-byte store; emit _Bool rather than widening to a 4-byte int. _Bool is the true storage type and is consistent with the 1-byte chunk_byte_size used for array elements.
+            MemoryChunk::MBool => CType::Bool,
+            MemoryChunk::MInt32 | MemoryChunk::MAny32 => CType::Int(
+                crate::decompile::passes::c_pass::types::IntSize::Int,
+                crate::decompile::passes::c_pass::types::Signedness::Signed,
+            ),
+            MemoryChunk::MInt8Signed => CType::Int(
+                crate::decompile::passes::c_pass::types::IntSize::Char,
+                crate::decompile::passes::c_pass::types::Signedness::Signed,
+            ),
+            MemoryChunk::MInt8Unsigned => CType::Int(
+                crate::decompile::passes::c_pass::types::IntSize::Char,
+                crate::decompile::passes::c_pass::types::Signedness::Unsigned,
+            ),
+            MemoryChunk::MInt16Signed => CType::Int(
+                crate::decompile::passes::c_pass::types::IntSize::Short,
+                crate::decompile::passes::c_pass::types::Signedness::Signed,
+            ),
+            MemoryChunk::MInt16Unsigned => CType::Int(
+                crate::decompile::passes::c_pass::types::IntSize::Short,
+                crate::decompile::passes::c_pass::types::Signedness::Unsigned,
+            ),
+            MemoryChunk::MFloat32 => CType::Float(
+                crate::decompile::passes::c_pass::types::FloatSize::Float,
+            ),
+            MemoryChunk::MFloat64 => CType::Float(
+                crate::decompile::passes::c_pass::types::FloatSize::Double,
+            ),
+            _ => CType::long(),
+        }
+    };
+    let chunk_byte_size = |chunk: &MemoryChunk| -> usize {
+        match chunk {
+            MemoryChunk::MBool | MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => 1,
+            MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => 2,
+            MemoryChunk::MInt32 | MemoryChunk::MFloat32 | MemoryChunk::MAny32 => 4,
+            MemoryChunk::MInt64 | MemoryChunk::MFloat64 | MemoryChunk::MAny64 => 8,
+            MemoryChunk::Unknown => 0,
+        }
+    };
+
+    // c26: ELF symbol storage size per global, keyed by id since a global's id IS its address; multi-valued, so keep the smallest as the tightest deterministic upper bound.
+    let global_sym_size: HashMap<usize, usize> = {
+        let mut m: HashMap<usize, usize> = HashMap::new();
+        for (addr, size, _name) in db.rel_iter::<(Address, usize, Symbol)>("symbol_size") {
+            if *size == 0 {
+                continue;
+            }
+            m.entry(*addr as usize)
+                .and_modify(|e| {
+                    if *size < *e {
+                        *e = *size;
+                    }
+                })
+                .or_insert(*size);
+        }
+        m
+    };
+    // c26: smallest recorded load/store chunk per global, the narrowest width actually touched, preferred over global_chunks' LARGEST pick which promotes a 1-byte global to long.
+    let global_narrow_chunk: HashMap<usize, MemoryChunk> = {
+        let mut groups: HashMap<usize, Vec<MemoryChunk>> = HashMap::new();
+        for (id, chunk) in db.rel_iter::<(Ident, MemoryChunk)>("global_load_chunk") {
+            groups.entry(*id).or_default().push(*chunk);
+        }
+        groups
+            .into_iter()
+            .map(|(id, mut chunks)| {
+                let has_specific = chunks.iter().any(|c|
+                    !matches!(c, MemoryChunk::MAny32 | MemoryChunk::MAny64 | MemoryChunk::Unknown));
+                if has_specific {
+                    chunks.retain(|c|
+                        !matches!(c, MemoryChunk::MAny32 | MemoryChunk::MAny64 | MemoryChunk::Unknown));
+                }
+                chunks.sort();
+                (id, chunks[0])
+            })
+            .collect()
+    };
+    // c26: scalar global type, with st_size authoritative when it is a clean scalar size, else the narrowest recorded chunk and then long; recovers a 1-byte char global instead of widening.
+    let scalar_global_ctype = |id: usize| -> CType {
+        let narrow = global_narrow_chunk.get(&id).copied();
+        if let Some(&size) = global_sym_size.get(&id) {
+            if matches!(size, 1 | 2 | 4 | 8) {
+                if let Some(chunk) = narrow {
+                    if chunk_byte_size(&chunk) == size {
+                        return ctype_of_chunk(&chunk);
+                    }
+                }
+                return match size {
+                    1 => CType::char_unsigned(),
+                    2 => CType::Int(
+                        crate::decompile::passes::c_pass::types::IntSize::Short,
+                        crate::decompile::passes::c_pass::types::Signedness::Signed,
+                    ),
+                    4 => CType::int(),
+                    _ => CType::long(),
+                };
+            }
+        }
+        match narrow {
+            Some(chunk) => ctype_of_chunk(&chunk),
+            None => CType::long(),
+        }
+    };
+
+    // Names the emitted functions write or address-take, used to keep a data global defined rather than extern only when this TU owns its storage.
+    let mutated_globals: HashSet<String> = {
+        let mut m = HashSet::new();
+        for stmt in stmt_map.values() {
+            collect_mutated_names_in_stmt(stmt, &mut m);
+        }
+        m
+    };
+
     for global in globals {
-        if global.is_string || global.scalar_value.is_some() {
+        // String literals emit separately and read-only scalars are constant-folded, but a writable .data scalar keeps its storage and must be a real initialized declaration.
+        if global.is_string || (global.scalar_value.is_some() && !global.scalar_writable) {
             continue;
         }
+        // A recovered rodata FP constant reaches here with no scalar_value, so emit a typed static const with the real bits instead of a loader-zeroed long L_<addr>.
+        if let Some(addr) = global
+            .name
+            .strip_prefix("L_")
+            .and_then(|h| u64::from_str_radix(h, 16).ok())
+        {
+            if let Some(&(width, bits)) = rodata_fp_consts.get(&addr) {
+                if let Some(decl) = make_rodata_fp_decl(
+                    sanitize_c_symbol_name(&global.name),
+                    width,
+                    bits,
+                ) {
+                    tu.decls.push(decl);
+                    continue;
+                }
+            }
+        }
         let sanitized_name = sanitize_c_symbol_name(&global.name);
-        let (ty, init) = if let Some(known_ty) = known_global_types.get(&sanitized_name) {
+        // stdin/stdout/stderr are declared by <stdio.h>; emitting our own definition would conflict with the header and shadow libc's real FILE*.
+        if is_libc_stdio_global(&global.name) {
+            continue;
+        }
+        let (ty, init) = if !global.pointer_init.is_empty() {
+            // Relocated pointer-valued global from ELF ground truth: a single slot is a scalar void*, a run is a pointer table emitted as long name[N] = {...} so the runtime bytes are reconstructed.
+            use crate::decompile::passes::c_pass::types::{Initializer, InitItem};
+            if global.pointer_init.len() == 1 {
+                let e = global.pointer_init[0].clone();
+                let init_expr = CExpr::Cast(CType::ptr(CType::Void), Box::new(e));
+                (CType::ptr(CType::Void), Some(Initializer::Expr(init_expr)))
+            } else {
+                let items: Vec<InitItem> = global
+                    .pointer_init
+                    .iter()
+                    .map(|e| InitItem {
+                        designator: None,
+                        init: Initializer::Expr(CExpr::Cast(CType::long(), Box::new(e.clone()))),
+                    })
+                    .collect();
+                (
+                    CType::Array(Box::new(CType::long()), Some(global.pointer_init.len())),
+                    Some(Initializer::List(items)),
+                )
+            }
+        } else if let Some(scalar) = global
+            .scalar_value
+            .as_ref()
+            .filter(|_| global.scalar_writable)
+        {
+            // Writable initialized scalar global: width from the narrowest recorded chunk or ELF symbol size, initializer from the .data bytes, declared here so runtime stores are preserved.
+            (
+                scalar_global_ctype(global.id),
+                Some(crate::decompile::passes::c_pass::types::Initializer::Expr(scalar.to_cexpr())),
+            )
+        } else if let Some(known_ty) = known_global_types.get(&sanitized_name) {
             (known_ty.clone(), None)
+        } else if let Some(&sid) = global_struct_decl_ids.get(&global.id) {
+            // SR-1: naming the struct on the declaration keeps the definition alive through the referenced/needs_layout filter; use-site compatibility is handled by clight_emit's recovered-global rewrite.
+            (CType::Struct(format!("struct_{:x}", sid)), None)
+        } else if let Some(&(elem_size, count)) = global_array_decl.get(&global.id) {
+            // SR-1: non-scalar strides (e.g. 12-byte struct elements) have no honest scalar element type, so declare the full extent as a byte array rather than an undersized `int name[count]` that would let a recompile overlap the following symbol.
+            let (elem_ty, decl_count) = match elem_size {
+                1 | 2 | 4 | 8 => {
+                    let elem_ty = match global_chunks.get(&global.id) {
+                        Some(chunk) if chunk_byte_size(chunk) == elem_size => {
+                            ctype_of_chunk(chunk)
+                        }
+                        _ => match elem_size {
+                            1 => CType::Int(
+                                crate::decompile::passes::c_pass::types::IntSize::Char,
+                                crate::decompile::passes::c_pass::types::Signedness::Unsigned,
+                            ),
+                            2 => CType::Int(
+                                crate::decompile::passes::c_pass::types::IntSize::Short,
+                                crate::decompile::passes::c_pass::types::Signedness::Signed,
+                            ),
+                            8 => CType::long(),
+                            _ => CType::int(),
+                        },
+                    };
+                    (elem_ty, count)
+                }
+                _ => (
+                    CType::Int(
+                        crate::decompile::passes::c_pass::types::IntSize::Char,
+                        crate::decompile::passes::c_pass::types::Signedness::Unsigned,
+                    ),
+                    elem_size * count,
+                ),
+            };
+            (CType::Array(Box::new(elem_ty), Some(decl_count)), None)
         } else if global_char_ptr_ids.contains(&global.id) {
             (CType::Pointer(
                 Box::new(CType::Int(
@@ -395,45 +745,34 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             ), None)
         } else if global.is_pointer || global_ptr_ids.contains(&global.id) {
             (CType::ptr(CType::Void), None)
-        } else if let Some(chunk) = global_chunks.get(&global.id) {
-            let chunk_ty = match chunk {
-                MemoryChunk::MBool | MemoryChunk::MInt32 | MemoryChunk::MAny32 => CType::Int(
-                    crate::decompile::passes::c_pass::types::IntSize::Int,
-                    crate::decompile::passes::c_pass::types::Signedness::Signed,
-                ),
-                MemoryChunk::MInt8Signed => CType::Int(
-                    crate::decompile::passes::c_pass::types::IntSize::Char,
-                    crate::decompile::passes::c_pass::types::Signedness::Signed,
-                ),
-                MemoryChunk::MInt8Unsigned => CType::Int(
-                    crate::decompile::passes::c_pass::types::IntSize::Char,
-                    crate::decompile::passes::c_pass::types::Signedness::Unsigned,
-                ),
-                MemoryChunk::MInt16Signed => CType::Int(
-                    crate::decompile::passes::c_pass::types::IntSize::Short,
-                    crate::decompile::passes::c_pass::types::Signedness::Signed,
-                ),
-                MemoryChunk::MInt16Unsigned => CType::Int(
-                    crate::decompile::passes::c_pass::types::IntSize::Short,
-                    crate::decompile::passes::c_pass::types::Signedness::Unsigned,
-                ),
-                MemoryChunk::MFloat32 => CType::Float(
-                    crate::decompile::passes::c_pass::types::FloatSize::Float,
-                ),
-                MemoryChunk::MFloat64 => CType::Float(
-                    crate::decompile::passes::c_pass::types::FloatSize::Double,
-                ),
-                _ => CType::long(),
-            };
-            (chunk_ty, None)
         } else {
-            (CType::long(), None)
+            // c26: scalar global. Width comes from st_size / the narrowest recorded chunk (scalar_global_ctype), not the widened global_chunks pick, so a 1-byte global stays _Bool/char instead of becoming int/long.
+            (scalar_global_ctype(global.id), None)
         };
 
+        // A header-declared global VARIABLE must use the header's canonical type, since the declaration cannot be suppressed and any mismatch is a hard error; initialized data keeps the recovered type.
+        let ty = match crate::decompile::passes::c_pass::header_db::header_db()
+            .variables
+            .get(sanitized_name.as_str())
+        {
+            Some(spelling) if init.is_none() => {
+                parse_canonical_var_type(spelling).unwrap_or(ty)
+            }
+            _ => ty,
+        };
+
+        // A content-less scalar this TU only reads is emitted extern ONLY when a linked library actually defines it (curated gnulib/CRT globals or real-named libc globals); everything else keeps its own definition.
+        let is_lib = db.is_lib_global(&global.name)
+            || (uses_real_libc_name(&sanitized_name) && !is_libc_stdio_global(&sanitized_name));
+        let (storage_class, init) = if is_lib {
+            (StorageClass::Extern, None)
+        } else {
+            (StorageClass::default(), init)
+        };
         tu.add_global_var(VarDecl {
             name: sanitized_name,
             ty,
-            storage_class: StorageClass::default(),
+            storage_class,
             qualifiers: TypeQualifiers::none(),
             init,
             loc: SourceLoc::unknown(),
@@ -469,6 +808,49 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         )
         .collect();
 
+    let local_def_policy = header_collision_policy(selected_functions);
+    let func_renames = &local_def_policy.renames;
+
+    // Loop-structure facts for top-level ordering, keyed by synth-masked header to member addresses, keeping a rotated loop's body contiguous and ahead of its exit instead of address tie-breaking.
+    const ORDER_SYNTH_MASK: u64 = !((1u64 << 62) | (1u64 << 63));
+    // loop_members must be keyed through the SAME normalization order_nodes_dfs uses (sseq-head resolve then synth-mask), or a header folded into an sseq bundle reads as loop-free and its body orders after its exit.
+    let order_sseq_member_to_head: HashMap<crate::x86::types::Node, crate::x86::types::Node> = {
+        let mut m: HashMap<crate::x86::types::Node, crate::x86::types::Node> = HashMap::new();
+        for f in selected_functions {
+            for (&head, members) in &f.sseq_groups {
+                for &mem in members {
+                    if mem != head {
+                        m.entry(mem).and_modify(|h| { if head < *h { *h = head; } }).or_insert(head);
+                    }
+                }
+            }
+        }
+        m
+    };
+    let norm_order_id = |n: crate::x86::types::Node| -> crate::x86::types::Node {
+        order_sseq_member_to_head.get(&n).copied().unwrap_or(n) & ORDER_SYNTH_MASK
+    };
+    let loop_members: HashMap<crate::x86::types::Node, HashSet<crate::x86::types::Node>> = {
+        let mut m: HashMap<crate::x86::types::Node, HashSet<crate::x86::types::Node>> = HashMap::new();
+        for (_func, header, member) in db.rel_iter::<(Address, Node, Node)>("loop_body") {
+            let h = norm_order_id(*header);
+            let mem = norm_order_id(*member);
+            m.entry(h).or_default().insert(mem);
+        }
+        m
+    };
+    // Innermost natural loop per normalized node, memoized once from loop_members (smallest body, ties on header address), turning order_nodes_dfs's per-node rescan into an O(1) lookup.
+    let node_innermost_loop: HashMap<crate::x86::types::Node, crate::x86::types::Node> = {
+        let mut best: HashMap<crate::x86::types::Node, (usize, crate::x86::types::Node)> = HashMap::new();
+        for (header, members) in &loop_members {
+            let cand = (members.len(), *header);
+            for &node in members {
+                best.entry(node).and_modify(|cur| { if cand < *cur { *cur = cand; } }).or_insert(cand);
+            }
+        }
+        best.into_iter().map(|(node, (_, header))| (node, header)).collect()
+    };
+
     let mut emitted_func_names: HashSet<String> = HashSet::new();
     for func in selected_functions {
         let params: Vec<FuncParam> = func
@@ -496,12 +878,19 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             })
             .collect();
 
-        // sseq bundling drops bundle members but their clight_succ edges still point at them; narrowly remap member->synth edges to the head so synth nodes (e.g. SP-indexed-load assignments) stay reachable via DFS. Restricted to synth targets only: broader remap breaks loop structuring (smoke::for_loop).
+        // sseq bundling drops members whose clight_succ edges still point at them, so remap member->synth edges to the head; min-head-wins is order-independent, since a member can sit in two bundles.
         let mut sseq_member_to_head: HashMap<crate::x86::types::Node, crate::x86::types::Node> = HashMap::new();
         for (&head, members) in &func.sseq_groups {
             for &m in members {
                 if m != head {
-                    sseq_member_to_head.insert(m, head);
+                    sseq_member_to_head
+                        .entry(m)
+                        .and_modify(|h| {
+                            if head < *h {
+                                *h = head;
+                            }
+                        })
+                        .or_insert(head);
                 }
             }
         }
@@ -527,7 +916,19 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             .collect();
 
         let entry_node = func.address as crate::x86::types::Node;
-        let nodes = order_nodes_dfs(entry_node, &nodes_set, &remapped_edges);
+        // Normalize a top-level node id to the address loop_body is keyed by: resolve an sseq member to its bundle head, then mask both synthetic-address bits so synth nodes land on their base.
+        let order_normalize = |n: crate::x86::types::Node| -> crate::x86::types::Node {
+            let resolved = sseq_member_to_head.get(&n).copied().unwrap_or(n);
+            resolved & ORDER_SYNTH_MASK
+        };
+        let nodes = order_nodes_dfs(entry_node, &nodes_set, &remapped_edges, |n| {
+            stmt_map.get(&n).map_or(false, is_unconditional_exit)
+        }, &loop_members, &node_innermost_loop, order_normalize);
+        if let Ok(pat) = std::env::var("MANIFOLD_PR_DUMP") {
+            if !pat.is_empty() && func.name.contains(&pat) {
+                eprintln!("[PR-NODES] fn {} ({:#x}) n={}: {:x?}", func.name, func_addr, nodes.len(), nodes);
+            }
+        }
 
         let mut body_items = Vec::new();
         let mut body_terminated = false;
@@ -586,6 +987,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             let covered_nodes: HashSet<crate::x86::types::Node> = nodes.iter().copied().collect();
 
             let mut fb_ctx = ConversionContext::new(id_to_name.clone());
+            fb_ctx.func_renames = local_def_policy.renames.clone();
             {
                 let mut addr_name_map: HashMap<u64, String> = HashMap::new();
                 for (addr, name, _entry_node) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
@@ -595,6 +997,11 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                     addr_name_map.insert(f.address as u64, sanitize_c_symbol_name(&f.name));
                 }
                 let mut sorted: Vec<(u64, String)> = addr_name_map.into_iter().collect();
+                for (_, name) in sorted.iter_mut() {
+                    if let Some(renamed) = func_renames.get(name) {
+                        *name = renamed.clone();
+                    }
+                }
                 sorted.sort_by_key(|(addr, _)| *addr);
                 fb_ctx.func_addrs_sorted = sorted;
             }
@@ -608,7 +1015,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                     let cstmt = crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
                         crate::decompile::passes::c_pass::helpers::inline_string_literals(e, &string_map)
                     });
-                    let cstmt = strip_trivial_casts(&cstmt);
+                    let cstmt = strip_trivial_casts(&cstmt, &fb_ctx.var_types);
                     if !matches!(cstmt, CStmt::Empty) {
                         body_items.push(CBlockItem::Stmt(cstmt));
                     }
@@ -643,34 +1050,9 @@ pub fn build_translation_unit_from_stmt_map_with_types(
 
         simplify_xor_self_in_stmt(&mut body);
         strip_dead_expr_stmts(&mut body);
-        body = strip_trivial_casts(&body);
-        body = forward_return_value(&body);
 
-        let is_reconciled_void = db.rel_iter::<(Address,)>("emit_function_void").any(|&(addr,)| addr == func.address);
-
-        // Return type from signature_pass via emit_function_return_type_xtype
-        let return_type = if is_reconciled_void {
-            CType::Void
-        } else if let Some((_, xtype)) = db.rel_iter::<(Address, XType)>("emit_function_return_type_xtype").find(|(a, _)| *a == func.address) {
-            convert_xtype(xtype)
-        } else {
-            convert_clight_type(&func.return_type)
-        };
-
-        if is_reconciled_void {
-            strip_return_values_in_stmt(&mut body);
-        }
-        if !matches!(return_type, CType::Void) {
-            fix_bare_returns_in_stmt(&mut body);
-        }
-
-        if is_dead_expr_stmt(&body) {
-            continue;
-        }
-
+        // Per-function local variable types seeded from clight_select's refined candidates, built BEFORE strip_trivial_casts so a (long)float_var is not reduced to a bare float under a pointer cast.
         let mut local_var_types = func_var_types.clone();
-
-        // Seed with clang-refined types from clight_select (validated by clang compilation, takes precedence over re-inference).
         for (reg, candidates) in &func.var_type_candidates {
             let idx = func.var_decl_idx.get(reg).copied().unwrap_or(0);
             if let Some(type_str) = candidates.get(idx).or_else(|| func.var_types.get(reg)) {
@@ -680,11 +1062,112 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             }
         }
 
+        body = strip_trivial_casts(&body, &local_var_types);
+        body = forward_return_value(&body);
+
+        let is_reconciled_void = db.rel_iter::<(Address,)>("emit_function_void").any(|&(addr,)| addr == func.address);
+
+        // Return type from signature_pass; the relation is multi-valued, so reduce with the same .min() query.rs uses and every consumer selects the identical type.
+        let return_type = if is_reconciled_void {
+            CType::Void
+        } else if let Some(xtype) = db.rel_iter::<(Address, XType)>("emit_function_return_type_xtype")
+            .filter(|(a, _)| *a == func.address)
+            .map(|(_, t)| *t)
+            .min()
+        {
+            convert_xtype(&xtype)
+        } else {
+            convert_clight_type(&func.return_type)
+        };
+
+        if is_reconciled_void {
+            strip_return_values_in_stmt(&mut body);
+        }
+        if !matches!(return_type, CType::Void) {
+            fix_bare_returns_in_stmt(&mut body);
+            // Repair a shared-return-merge orphan: a value-returning function never legitimately ends in a fall-through, so append the body's own tail return to a trailing non-diverging block.
+            fix_falloff_return_orphan(&mut body);
+        }
+
+        if is_dead_expr_stmt(&body) {
+            continue;
+        }
+
+        // local_var_types was seeded from func.var_type_candidates above; continue refining with decl_solve overrides, usage inference, and stack buffers.
+
+        // Phase 5 decl authority (pointerness): a register the solve typed int_* but that is dereferenced or stored through is really a pointer, seeded void * BEFORE usage inference so the pointee refines.
+        if let Some(forced) = db.decl_solve_force_ptr_regs.get(&func.address) {
+            for reg in forced {
+                let var_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(*reg);
+                local_var_types.insert(var_name, CType::ptr(CType::Void));
+            }
+        }
+
         infer_var_types_from_usage(&body, &mut local_var_types, &extern_return_types);
+
+        // Phase 5 decl authority (force_long_registers): registers proven integer by an integer-only operator override the solver and usage inference, the register analogue of field force-long.
+        if let Some(forced) = db.decl_solve_force_long_regs.get(&func.address) {
+            for reg in forced {
+                let var_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(*reg);
+                local_var_types.insert(var_name, CType::long());
+            }
+        }
+
+        // Address-taken stack regions sized as a byte buffer are declared unsigned char[N], so raw byte-offset stores stay in-bounds and (long)var / &var stay valid via array decay.
+        if let Some(buffers) = db.stack_struct_buffers.get(&func.address) {
+            for (reg, size) in buffers {
+                let var_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(*reg);
+                local_var_types.insert(
+                    var_name,
+                    CType::Array(Box::new(CType::char_unsigned()), Some(*size as usize)),
+                );
+            }
+        }
+
+        // Runtime-indexed stack arrays declare with the element type so arr + i strides by element width; a stack_struct_buffers byte-buffer entry is more specific and wins.
+        if let Some(arrays) = db.stack_array_buffers.get(&func.address) {
+            for (reg, (chunk, count)) in arrays {
+                let var_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(*reg);
+                if matches!(local_var_types.get(&var_name), Some(CType::Array(..))) {
+                    continue;
+                }
+                let elem = ctype_from_memchunk(chunk);
+                local_var_types.insert(
+                    var_name,
+                    CType::Array(Box::new(elem), Some(*count)),
+                );
+            }
+        }
+
+        // A scalar-promoted store to an array local's base is illegal C, so reconcile it into the matching element store var[0] = val; keyed on the array-typed local with a bare-Var LHS.
+        let array_locals: HashSet<String> = local_var_types
+            .iter()
+            .filter_map(|(n, t)| matches!(t, CType::Array(..)).then(|| n.clone()))
+            .collect();
+        if !array_locals.is_empty() {
+            body = crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&body, &|e| {
+                if let CExpr::Assign(op, lhs, rhs) = e {
+                    if let CExpr::Var(name) = lhs.as_ref() {
+                        if array_locals.contains(name) {
+                            let elem_lhs = CExpr::Index(
+                                Box::new(CExpr::Var(name.clone())),
+                                Box::new(CExpr::int(0)),
+                            );
+                            return Some(CExpr::Assign(
+                                *op,
+                                Box::new(elem_lhs),
+                                rhs.clone(),
+                            ));
+                        }
+                    }
+                }
+                None
+            });
+        }
 
         let bool_vars = detect_bool_variables(&body);
 
-        let params: Vec<FuncParam> = params.into_iter().map(|mut p| {
+        let mut params: Vec<FuncParam> = params.into_iter().map(|mut p| {
             if let Some(name) = &p.name {
                 if p.ty == CType::long() {
                     if let Some(inferred_ty) = local_var_types.get(name) {
@@ -696,6 +1179,32 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             }
             p
         }).collect();
+
+        // const-qualify a read-only char * parameter whose name is never a write target in the emitted body, sound because the mutated-name set comes from the same body that will be compiled.
+        {
+            let mut mutated_names: HashSet<String> = HashSet::new();
+            collect_mutated_names_in_stmt(&body, &mut mutated_names);
+            let const_char_ptr = CType::Pointer(
+                Box::new(CType::Qualified(
+                    Box::new(CType::char_signed()),
+                    crate::decompile::passes::c_pass::types::TypeQualifiers {
+                        is_const: true,
+                        is_volatile: false,
+                        is_restrict: false,
+                    },
+                )),
+                crate::decompile::passes::c_pass::types::TypeQualifiers::none(),
+            );
+            for p in &mut params {
+                if let Some(name) = &p.name {
+                    if p.ty == CType::ptr(CType::char_signed())
+                        && !mutated_names.contains(name)
+                    {
+                        p.ty = const_char_ptr.clone();
+                    }
+                }
+            }
+        }
 
         // Compilability: now that var/param C types are final, cast to long the pointer operands of any arithmetic C forbids (ptr*int, ptr+ptr, ...); runs before VarRenamer so type map keys still match the variable names used in `body`.
         let body = {
@@ -710,7 +1219,10 @@ pub fn build_translation_unit_from_stmt_map_with_types(
 
         let mut local_names = HashSet::new();
         collect_var_names_from_stmt(&body, &mut local_names);
-        local_names.retain(|n| !param_name_set.contains(n) && !global_names.contains(n));
+        // __builtin_* markers are never locals: synthesizing one as a zero-init local lets the optimizer fold the guard it protects into if (0), so they are declared at file scope instead.
+        local_names.retain(|n| {
+            !param_name_set.contains(n) && !global_names.contains(n) && !n.starts_with("__builtin_")
+        });
 
         let mut local_vars: Vec<VarDecl> = local_names
             .into_iter()
@@ -728,6 +1240,25 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             .collect();
         local_vars.sort_by(|a, b| a.name.cmp(&b.name));
 
+        if std::env::var("DET_FP").is_ok() {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let body_str = crate::decompile::passes::c_pass::print::print_stmt(&body);
+            let mut lv: Vec<String> = local_vars.iter().map(|v| format!("{:?}", v)).collect();
+            lv.sort();
+            let mut h = DefaultHasher::new();
+            body_str.hash(&mut h);
+            lv.join(",").hash(&mut h);
+            eprintln!("[FP-PR] {:016x} {} {:016x}", func_addr, func.name, h.finish());
+        }
+        if let Ok(pat) = std::env::var("MANIFOLD_PR_DUMP") {
+            if !pat.is_empty() && func.name.contains(&pat) {
+                let body_str = crate::decompile::passes::c_pass::print::print_stmt(&body);
+                let mut lv: Vec<String> = local_vars.iter().map(|v| format!("{:?}", v)).collect();
+                lv.sort();
+                eprintln!("[PR-DUMP] fn {} ({:#x}) locals:\n{}\n[PR-DUMP] body:\n{}", func.name, func_addr, lv.join("\n"), body_str);
+            }
+        }
         let mut renamer = VarRenamer::new();
         for (i, p) in params.iter().enumerate() {
             if let Some(name) = &p.name {
@@ -752,7 +1283,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             v
         }).collect();
 
-        // Use-before-def guard: a local read but never the plain-variable assignment target, address-taken, or inc/dec'd in the final body has no producer and "comes from nowhere" (a residual use-before-def upstream recovery could not resolve), so zero-initialize its declaration to avoid reading an undefined value. Defensive last resort; the real fixes are upstream (reaching-def / return-value recovery).
+        // Use-before-def guard: a local that is read but never assigned, address-taken or inc/dec'd has no producer, so zero-initialize it; a defensive last resort, with the real fixes upstream.
         let mut local_origin_names: HashSet<String> = HashSet::new();
         for p in &params {
             if let Some(n) = &p.name { local_origin_names.insert(n.clone()); }
@@ -774,6 +1305,11 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             func.name.clone()
         };
         let func_name = sanitize_c_symbol_name(&func_name);
+        // Header-collision policy: a filtered definition is dropped entirely and its call sites bind to the system header, while a kept one is renamed <name>_local to match its converted call sites.
+        if local_def_policy.filtered.contains(&func_name) {
+            continue;
+        }
+        let func_name = func_renames.get(&func_name).cloned().unwrap_or(func_name);
 
         if !emitted_func_names.insert(func_name.clone()) {
             continue;
@@ -808,37 +1344,13 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         tu.add_function(func_def);
     }
 
-    // Functions declared by standard #include headers -- skip forward declarations to avoid conflicting with header prototypes.
-    let header_declared: HashSet<&str> = [
-        "printf", "fprintf", "sprintf", "snprintf", "puts", "putchar", "getchar",
-        "fopen", "fclose", "fread", "fwrite", "fgets", "fputs", "fflush", "fseek",
-        "ftell", "rewind", "sscanf", "fscanf", "perror", "remove", "rename", "tmpfile",
-        "setbuf", "setvbuf", "fileno", "clearerr", "feof", "ferror", "fdopen",
-        "fwrite_unlocked", "fread_unlocked", "fputs_unlocked", "fgets_unlocked",
-        "clearerr_unlocked", "feof_unlocked", "ferror_unlocked", "fileno_unlocked",
-        "fputc_unlocked", "fgetc_unlocked", "getc_unlocked", "putc_unlocked",
-        "malloc", "calloc", "realloc", "free", "exit", "abort", "atoi", "atol", "atof",
-        "strtol", "strtoul", "strtod", "strtoll", "strtoull", "qsort", "bsearch",
-        "abs", "labs", "getenv", "system", "rand", "srand", "atexit", "realpath",
-        "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat", "strncat",
-        "memcpy", "memmove", "memset", "memcmp", "strstr", "strchr", "strrchr",
-        "strtok", "strerror", "strdup", "strndup", "stpcpy", "stpncpy", "strcoll",
-        "strspn", "strcspn", "strnlen", "strpbrk", "strerror_r",
-        "open", "close", "read", "write", "lseek", "access", "unlink", "getpid",
-        "getcwd", "chdir", "isatty", "dup", "dup2", "pipe", "fork", "execve",
-        "ftruncate", "truncate", "link", "symlink", "readlink", "rmdir",
-        "stat", "fstat", "lstat", "mkdir", "chmod", "fchmod", "chown", "fchown",
-        "time", "clock", "difftime", "mktime", "localtime", "gmtime", "strftime",
-        "assert", "__assert_fail",
-        "signal", "raise", "sigaction",
-        "mmap", "munmap", "mprotect",
-        "setlocale", "bindtextdomain", "textdomain",
-        "pthread_create", "pthread_join", "pthread_mutex_lock", "pthread_mutex_unlock",
-        "pthread_mutex_init", "pthread_mutex_destroy",
-        "fcntl",
-    ].iter().copied().collect();
+    // A function whose declaration the compiler already provides (header prototype or builtin); our own decl only yields "conflicting types". Name/prefix lists live in header_functions.json (parsed once in c_pass::header_db, shared with print.rs's include selection), so this is data, not hardcoded.
+    let is_compiler_provided = |n: &str| {
+        let hdb = crate::decompile::passes::c_pass::header_db::header_db();
+        hdb.functions.contains(n) || hdb.prefixes.iter().any(|p| n.starts_with(p))
+    };
 
-    // resolved_extern_signature comes from Ascent (set-semantics, non-deterministic order) and may carry multiple rows for the same function name (one per call-site signature). Group by sanitized name, pick a single signature deterministically, then emit in sorted name order so the C file is byte-stable across runs.
+    // resolved_extern_signature has set semantics and may carry several rows per name, so group by sanitized name, pick one deterministically, and emit in sorted order for a byte-stable file.
     let mut extern_by_name: BTreeMap<String, Vec<(usize, XType, Arc<Vec<XType>>)>> = BTreeMap::new();
     for (name, param_count, ret_type, param_types) in db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature") {
         let sanitized = sanitize_c_symbol_name(name);
@@ -848,11 +1360,12 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             .push((*param_count, *ret_type, param_types.clone()));
     }
     for (sanitized_name, mut sigs) in extern_by_name {
-        if emitted_func_names.contains(&sanitized_name) || header_declared.contains(sanitized_name.as_str()) {
+        if emitted_func_names.contains(&sanitized_name) || is_compiler_provided(&sanitized_name) {
             continue;
         }
         // Deterministic pick: prefer the row whose XType vector compares smallest.
         sigs.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)).then_with(|| a.0.cmp(&b.0)));
+        // RB-1: each Vec holds >= 1 row by construction (.or_default().push(...)); no input shape produces an empty group.
         let (_param_count, ret_type, param_types) = sigs.into_iter().next().unwrap();
         let ret_ctype = convert_xtype(&ret_type);
         let params: Vec<FuncParam> = param_types
@@ -867,13 +1380,113 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         tu.add_func_decl(decl);
     }
 
-    // Per-callee argument types from observed call sites in the emitted bodies, used below to give called-but-not-emitted functions a prototype matching their calls instead of a bare (void).
-    let mut call_sigs: HashMap<String, Vec<CType>> = HashMap::new();
-    for decl in tu.decls.iter() {
-        if let crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDef(fdef) = decl {
-            collect_call_sigs_in_stmt(&fdef.body, &mut call_sigs);
+    // IL-1: join per-call-site argument type evidence (width+class lattice, see ArgEvidence) to produce typed prototypes for called-but-not-emitted functions when every call site agrees; K&R fallback covers the rest.
+    let joined_call_sigs: HashMap<String, Vec<CType>> = {
+        // Callee return types and global variable types visible to the compiler (definitions first, then resolved externs/globals already in the TU).
+        let mut callee_ret: HashMap<String, CType> = HashMap::new();
+        let mut global_types: HashMap<String, CType> = HashMap::new();
+        for decl in tu.decls.iter() {
+            match decl {
+                crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDef(f) => {
+                    callee_ret.insert(f.name.clone(), f.return_type.clone());
+                }
+                crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(d) => {
+                    callee_ret.entry(d.name.clone()).or_insert_with(|| d.return_type.clone());
+                }
+                crate::decompile::passes::c_pass::types::TopLevelDecl::VarDecl(v) => {
+                    global_types.insert(v.name.clone(), v.ty.clone());
+                }
+                _ => {}
+            }
         }
-    }
+        let mut call_evidence: HashMap<String, Vec<Vec<ArgEvidence>>> = HashMap::new();
+        for decl in tu.decls.iter() {
+            if let crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDef(fdef) = decl {
+                let mut local_types: HashMap<String, CType> = HashMap::new();
+                for p in &fdef.params {
+                    if let Some(n) = &p.name {
+                        local_types.insert(n.clone(), p.ty.clone());
+                    }
+                }
+                for v in &fdef.local_vars {
+                    local_types.insert(v.name.clone(), v.ty.clone());
+                }
+                let env = ArgEvidenceEnv {
+                    local_types,
+                    global_types: &global_types,
+                    callee_ret: &callee_ret,
+                };
+                collect_call_arg_evidence_in_stmt(&fdef.body, &env, &mut call_evidence);
+            }
+        }
+        join_call_site_evidence(&call_evidence)
+    };
+    // Recovered return type per callee name, most-refined candidate winning to match clight_select's pick, so a skip-listed internal declares its true return width instead of int.
+    let recovered_ret_by_name: HashMap<String, XType> = {
+        let prio = |t: &XType| (crate::decompile::passes::clight_pass::xtype_refine_priority(t), *t);
+        let mut by_addr: HashMap<Address, XType> = HashMap::new();
+        for (addr, xt) in db.rel_iter::<(Address, XType)>("emit_function_return_type_xtype") {
+            by_addr
+                .entry(*addr)
+                .and_modify(|cur| {
+                    if prio(xt) > prio(cur) {
+                        *cur = *xt;
+                    }
+                })
+                .or_insert(*xt);
+        }
+        let mut by_name: HashMap<String, XType> = HashMap::new();
+        for (addr, name, _node) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
+            if let Some(xt) = by_addr.get(addr) {
+                by_name.insert(sanitize_c_symbol_name(name), *xt);
+            }
+        }
+        by_name
+    };
+
+    // Curated signatures keyed by sanitized name, authoritative for skip-listed library functions but used only AFTER call-site evidence, so they never override a call-site-validated prototype.
+    let known_variadic_names: HashSet<String> = db
+        .rel_iter::<(Symbol, usize)>("known_varargs_function")
+        .map(|(n, _)| sanitize_c_symbol_name(n))
+        .collect();
+    let known_sig_by_name: HashMap<String, (XType, Arc<Vec<XType>>)> = db
+        .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
+        .map(|(n, _, ret, params)| (sanitize_c_symbol_name(n), (*ret, params.clone())))
+        .collect();
+    let known_decl = |name: &str| -> Option<crate::decompile::passes::c_pass::types::FuncDecl> {
+        let (ret, param_tys) = known_sig_by_name.get(name)?;
+        let params: Vec<FuncParam> = param_tys
+            .iter()
+            .enumerate()
+            .map(|(i, t)| FuncParam::named(format!("arg{}", i), convert_xtype(t)))
+            .collect();
+        let mut decl = crate::decompile::passes::c_pass::types::FuncDecl::new(
+            name.to_string(),
+            convert_xtype(ret),
+            params,
+        );
+        decl.is_variadic = known_variadic_names.contains(name);
+        Some(decl)
+    };
+
+    // Typed prototype from joined call-site evidence; None when evidence is missing, arity disagrees, any position is Poison, or the callee is a known variadic.
+    let evidence_decl = |name: &str| -> Option<crate::decompile::passes::c_pass::types::FuncDecl> {
+        if is_known_variadic_fn(name) {
+            return None;
+        }
+        let param_tys = joined_call_sigs.get(name)?;
+        let params: Vec<FuncParam> = param_tys
+            .iter()
+            .enumerate()
+            .map(|(i, t)| FuncParam::named(format!("arg{}", i), t.clone()))
+            .collect();
+        // Return type from the recovered signature (see recovered_ret_ctype); `int` only when unknown.
+        Some(crate::decompile::passes::c_pass::types::FuncDecl::new(
+            name.to_string(),
+            recovered_ret_ctype(&recovered_ret_by_name, name),
+            params,
+        ))
+    };
 
     let resolved_extern_names: HashSet<String> = db
         .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature")
@@ -886,23 +1499,30 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     unknown_extern_names.sort();
     unknown_extern_names.dedup();
     for sanitized_name in unknown_extern_names {
-        if emitted_func_names.contains(&sanitized_name) || header_declared.contains(sanitized_name.as_str()) {
+        if emitted_func_names.contains(&sanitized_name) || is_compiler_provided(&sanitized_name) {
             continue;
         }
         if resolved_extern_names.contains(&sanitized_name) {
             continue;
         }
 
-        // Derive the prototype from observed call sites (S1): an unknown-signature extern called with arguments gets a matching parameter list instead of the bare `int f(void)`.
-        let params: Vec<FuncParam> = call_sigs
-            .get(&sanitized_name)
-            .map(|tys| tys.iter().map(|t| FuncParam::new(None, t.clone())).collect())
-            .unwrap_or_default();
-        let decl = crate::decompile::passes::c_pass::types::FuncDecl::new(
-            sanitized_name,
-            CType::Int(crate::decompile::passes::c_pass::types::IntSize::Int, crate::decompile::passes::c_pass::types::Signedness::Signed),
-            params,
-        );
+        // A curated extern gets its authoritative typed prototype, while a genuinely unknown extern gets a K&R T name() that cannot clash with the real definition in another TU.
+        let ret_ctype = recovered_ret_ctype(&recovered_ret_by_name, &sanitized_name);
+        let decl = if known_sig_by_name.contains_key(&sanitized_name) {
+            evidence_decl(&sanitized_name)
+                .or_else(|| known_decl(&sanitized_name))
+                .unwrap_or_else(|| {
+                    crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
+                        sanitized_name.clone(),
+                        ret_ctype.clone(),
+                    )
+                })
+        } else {
+            crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
+                sanitized_name.clone(),
+                ret_ctype.clone(),
+            )
+        };
         tu.add_func_decl(decl);
     }
 
@@ -922,19 +1542,25 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         for name in sorted_called_funcs {
             let is_label = name.starts_with("L_")
                 || (name.starts_with('L') && name.len() > 1 && name[1..].chars().all(|c| c.is_ascii_hexdigit()));
-            if !declared.contains(name) && !is_label && !header_declared.contains(name.as_str()) {
-                // Derive the prototype from the function's observed call sites so calls that pass arguments type-check, instead of the bare `int f(void)` that rejects them (S1).
-                let params: Vec<crate::decompile::passes::c_pass::types::FuncParam> = call_sigs
-                    .get(name)
-                    .map(|tys| tys.iter()
-                        .map(|t| crate::decompile::passes::c_pass::types::FuncParam::new(None, t.clone()))
-                        .collect())
-                    .unwrap_or_default();
-                let decl = crate::decompile::passes::c_pass::types::FuncDecl::new(
-                    name.clone(),
-                    CType::Int(crate::decompile::passes::c_pass::types::IntSize::Int, crate::decompile::passes::c_pass::types::Signedness::Signed),
-                    params,
-                );
+            if !declared.contains(name) && !is_label && !is_compiler_provided(name)
+                && !emitted_func_names.contains(name) {
+                // Called-but-undeclared external: a curated one keeps its typed prototype, an unknown one gets a K&R name(); guarded to externals, with the return type from the recovered signature.
+                let ret_ctype = recovered_ret_ctype(&recovered_ret_by_name, name);
+                let decl = if known_sig_by_name.contains_key(name) {
+                    evidence_decl(name)
+                        .or_else(|| known_decl(name))
+                        .unwrap_or_else(|| {
+                            crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
+                                name.clone(),
+                                ret_ctype.clone(),
+                            )
+                        })
+                } else {
+                    crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
+                        name.clone(),
+                        ret_ctype.clone(),
+                    )
+                };
                 forward_decls.push(crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(decl));
             }
         }
@@ -945,7 +1571,286 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         }
     }
 
+    // Forward declarations for internal functions, so a call preceding the definition does not get a conflicting implicit int name(); pushed directly to preserve the symbol->definition mapping.
+    {
+        let mut internal_decls = Vec::new();
+        for decl in tu.decls.iter() {
+            if let crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDef(fdef) = decl {
+                if fdef.name == "main" {
+                    continue;
+                }
+                let mut fd = crate::decompile::passes::c_pass::types::FuncDecl::new(
+                    fdef.name.clone(),
+                    fdef.return_type.clone(),
+                    fdef.params.clone(),
+                );
+                fd.is_variadic = fdef.is_variadic;
+                internal_decls.push(fd);
+            }
+        }
+        for fd in internal_decls {
+            tu.decls.push(crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(fd));
+        }
+    }
+
+    // Normalize call-site argument counts to each callee's declared fixed arity so calls agree with their (now forward-declared) prototypes/definitions; only fixed-arity callees are collected, variadic and unspecified-prototype (K&R) callees are left as-is.
+    {
+        use crate::decompile::passes::c_pass::types::TopLevelDecl;
+        let mut arity_counts: HashMap<String, usize> = HashMap::new();
+        for decl in tu.decls.iter() {
+            match decl {
+                TopLevelDecl::FuncDef(f) if !f.is_variadic => {
+                    arity_counts.insert(f.name.clone(), f.params.len());
+                }
+                TopLevelDecl::FuncDecl(d) if !d.is_variadic && !d.unspecified_params => {
+                    arity_counts.entry(d.name.clone()).or_insert(d.params.len());
+                }
+                _ => {}
+            }
+        }
+        // Seed the curated arity for header-suppressed non-variadic libc functions, whose fixed arity never reaches arity_counts, so an over-recovered call cannot clash with the header prototype.
+        let known_variadic: HashSet<Symbol> = db
+            .rel_iter::<(Symbol, usize)>("known_varargs_function")
+            .map(|(n, _)| *n)
+            .collect();
+        for (name, arity, _ret, _params) in
+            db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
+        {
+            let sanitized = sanitize_c_symbol_name(name);
+            if known_variadic.contains(name) || is_known_variadic_fn(&sanitized) {
+                continue;
+            }
+            arity_counts.entry(sanitized).or_insert(*arity);
+        }
+        for decl in tu.decls.iter_mut() {
+            if let TopLevelDecl::FuncDef(f) = decl {
+                f.body = normalize_call_arity_stmt(&f.body, &arity_counts);
+            }
+        }
+    }
+
+    // Compilability: insert explicit casts at int<->pointer assignment/argument/return mismatches, after arity normalization so padded arguments are coerced too.
+    {
+        use crate::decompile::passes::c_pass::types::TopLevelDecl;
+        let mut callee_params: CalleeParams = HashMap::new();
+        let mut callee_ret: HashMap<String, CType> = HashMap::new();
+        let mut global_types: HashMap<String, CType> = HashMap::new();
+        for decl in tu.decls.iter() {
+            match decl {
+                TopLevelDecl::FuncDef(f) => {
+                    callee_params.insert(
+                        f.name.clone(),
+                        (f.params.iter().map(|p| p.ty.clone()).collect(), f.is_variadic, false),
+                    );
+                    callee_ret.insert(f.name.clone(), f.return_type.clone());
+                }
+                TopLevelDecl::FuncDecl(d) => {
+                    callee_params.entry(d.name.clone()).or_insert_with(|| {
+                        (d.params.iter().map(|p| p.ty.clone()).collect(), d.is_variadic, d.unspecified_params)
+                    });
+                    callee_ret.entry(d.name.clone()).or_insert_with(|| d.return_type.clone());
+                }
+                TopLevelDecl::VarDecl(v) => {
+                    global_types.insert(v.name.clone(), v.ty.clone());
+                }
+                _ => {}
+            }
+        }
+        for decl in tu.decls.iter_mut() {
+            if let TopLevelDecl::FuncDef(f) = decl {
+                let mut types = global_types.clone();
+                for p in &f.params {
+                    if let Some(n) = &p.name {
+                        types.insert(n.clone(), p.ty.clone());
+                    }
+                }
+                for v in &f.local_vars {
+                    types.insert(v.name.clone(), v.ty.clone());
+                }
+                let ret = f.return_type.clone();
+                f.body = insert_casts_stmt(&f.body, &types, &callee_params, &callee_ret, &ret);
+            }
+        }
+    }
+
+    // Compilability: declare any referenced-but-undeclared file-scope identifier as a tentative long; synthesized locals are excluded, since an undeclared one is a recovery gap to fix upstream.
+    {
+        use crate::decompile::passes::c_pass::types::TopLevelDecl;
+        let mut declared: HashSet<String> = HashSet::new();
+        let mut locals: HashSet<String> = HashSet::new();
+        for decl in tu.decls.iter() {
+            match decl {
+                TopLevelDecl::FuncDef(f) => {
+                    declared.insert(f.name.clone());
+                    for p in &f.params {
+                        if let Some(n) = &p.name {
+                            locals.insert(n.clone());
+                        }
+                    }
+                    for v in &f.local_vars {
+                        locals.insert(v.name.clone());
+                    }
+                }
+                TopLevelDecl::FuncDecl(d) => {
+                    declared.insert(d.name.clone());
+                }
+                TopLevelDecl::VarDecl(v) => {
+                    declared.insert(v.name.clone());
+                }
+                _ => {}
+            }
+        }
+        let mut referenced: HashSet<String> = HashSet::new();
+        for decl in tu.decls.iter() {
+            if let TopLevelDecl::FuncDef(f) = decl {
+                collect_var_names_from_stmt(&f.body, &mut referenced);
+            }
+        }
+        // __builtin_overflow, the opaque marker for the x86 OF flag, is declared once on use as a static volatile object so it recompiles and the optimizer cannot collapse the guarded branch.
+        let uses_overflow_marker = referenced.contains("__builtin_overflow");
+        let mut undeclared: Vec<String> = referenced
+            .into_iter()
+            .filter(|n| !declared.contains(n) && !locals.contains(n) && is_global_like_name(n)
+                && !is_libc_stdio_global(n))
+            .collect();
+        undeclared.sort();
+        undeclared.dedup();
+        for name in undeclared {
+            // An undeclared L_<addr> label holding a recovered .rodata FP constant emits a typed read-only definition, so uses read the real constant rather than a zero-initialized long.
+            if let Some(addr) = name
+                .strip_prefix("L_")
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+            {
+                if let Some(&(width, bits)) = rodata_fp_consts.get(&addr) {
+                    if let Some(decl) = make_rodata_fp_decl(name.clone(), width, bits) {
+                        tu.decls.push(decl);
+                        continue;
+                    }
+                }
+            }
+            // A skip-listed library function that is only ADDRESS-TAKEN gets an extern function declaration, or a tentative long object makes &name point at a fresh .bss slot instead of the function.
+            if db.should_skip_function(&name) {
+                // Prefer the curated signature (void close_stdout(void), ...) over a K&R `int name()`.
+                let decl = known_decl(&name).unwrap_or_else(|| {
+                    crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
+                        name.clone(),
+                        CType::Int(crate::decompile::passes::c_pass::types::IntSize::Int, Signedness::Signed),
+                    )
+                });
+                tu.add_func_decl(decl);
+                continue;
+            }
+            // A header-declared global reaching the undeclared path must use the header's canonical type, since a long tentative definition against an extern int is a hard conflicting-types error.
+            let var_ty = crate::decompile::passes::c_pass::header_db::header_db()
+                .variables
+                .get(name.as_str())
+                .and_then(|spelling| parse_canonical_var_type(spelling))
+                .unwrap_or_else(CType::long);
+            // A library/CRT-provided global reaching the undeclared path must be extern, or a local tentative definition is a multiple-definition error at link.
+            let storage_class = if db.is_lib_global(&name)
+                || (uses_real_libc_name(&name) && !is_libc_stdio_global(&name))
+            {
+                StorageClass::Extern
+            } else {
+                StorageClass::default()
+            };
+            tu.decls.push(TopLevelDecl::VarDecl(VarDecl {
+                name,
+                ty: var_ty,
+                storage_class,
+                qualifiers: TypeQualifiers::none(),
+                init: None,
+                loc: SourceLoc::unknown(),
+            }));
+        }
+
+        if uses_overflow_marker {
+            tu.decls.push(TopLevelDecl::VarDecl(VarDecl {
+                name: "__builtin_overflow".to_string(),
+                ty: CType::Int(
+                    crate::decompile::passes::c_pass::types::IntSize::Char,
+                    Signedness::Unsigned,
+                ),
+                storage_class: StorageClass::Static,
+                qualifiers: TypeQualifiers {
+                    is_volatile: true,
+                    ..TypeQualifiers::none()
+                },
+                init: None,
+                loc: SourceLoc::unknown(),
+            }));
+        }
+    }
+
+    // Drop captures of void-returning calls: lhs = free(p) is a frontend error, so emit the call as a bare statement; only direct assignment-of-call statements are rewritten.
+    let void_fns: HashSet<String> = known_sig_by_name
+        .iter()
+        .filter(|(_, (ret, _))| matches!(ret, XType::Xvoid))
+        .map(|(n, _)| n.clone())
+        .collect();
+    if !void_fns.is_empty() {
+        for decl in tu.decls.iter_mut() {
+            if let crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDef(f) = decl {
+                drop_void_captures_stmt(&mut f.body, &void_fns);
+            }
+        }
+    }
+
     tu
+}
+
+// The innermost Call(Var(name), ...) of a possibly cast-wrapped call expression, returning the callee name, or None when it is not such a call.
+fn call_name_through_casts(e: &CExpr) -> Option<&str> {
+    match e {
+        CExpr::Call(callee, _) => match callee.as_ref() {
+            CExpr::Var(n) => Some(n.as_str()),
+            _ => None,
+        },
+        CExpr::Cast(_, inner) | CExpr::Paren(inner) => call_name_through_casts(inner),
+        _ => None,
+    }
+}
+
+// The bare `Call(...)` node inside a cast/paren-wrapped call expression.
+fn unwrap_to_call(e: CExpr) -> CExpr {
+    match e {
+        CExpr::Cast(_, inner) | CExpr::Paren(inner) => unwrap_to_call(*inner),
+        other => other,
+    }
+}
+
+fn drop_void_captures_stmt(stmt: &mut CStmt, void_fns: &HashSet<String>) {
+    match stmt {
+        CStmt::Expr(CExpr::Assign(_, _, rhs)) => {
+            if call_name_through_casts(rhs).is_some_and(|n| void_fns.contains(n)) {
+                let call = unwrap_to_call((**rhs).clone());
+                *stmt = CStmt::Expr(call);
+            }
+        }
+        CStmt::If(_, then_s, else_s) => {
+            drop_void_captures_stmt(then_s, void_fns);
+            if let Some(e) = else_s {
+                drop_void_captures_stmt(e, void_fns);
+            }
+        }
+        CStmt::Switch(_, body) => drop_void_captures_stmt(body, void_fns),
+        CStmt::While(_, body) | CStmt::DoWhile(body, _) => drop_void_captures_stmt(body, void_fns),
+        CStmt::For(_, _, _, body) => drop_void_captures_stmt(body, void_fns),
+        CStmt::Labeled(_, inner) => drop_void_captures_stmt(inner, void_fns),
+        CStmt::Block(items) => {
+            for item in items.iter_mut() {
+                if let CBlockItem::Stmt(s) = item {
+                    drop_void_captures_stmt(s, void_fns);
+                }
+            }
+        }
+        CStmt::Sequence(stmts) => {
+            for s in stmts.iter_mut() {
+                drop_void_captures_stmt(s, void_fns);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn param_name_for_reg(reg: RTLReg) -> String {
@@ -965,7 +1870,7 @@ pub(crate) fn convert_param_type_from_param(param: &ParamType) -> CType {
     }
 }
 
-// Collect locals with an origin in the body for the use-before-def guard: the plain-variable LHS of an assignment, an address-taken variable (&v -- a callee may fill it), or an inc/dec target; a referenced local with none of these "comes from nowhere". Mirrors the use-before-def metric's notion of "written" (assign / ++,-- / address-taken).
+// Collect locals with an origin in the body (assignment LHS, address-taken, or inc/dec target) for the use-before-def guard; a referenced local with none of these comes from nowhere.
 fn collect_var_origins_expr(expr: &CExpr, out: &mut HashSet<String>) {
     match expr {
         CExpr::Assign(_, lhs, rhs) => {
@@ -1125,6 +2030,114 @@ fn collect_var_names_from_stmt(stmt: &CStmt, vars: &mut HashSet<String>) {
     }
 }
 
+/// The base symbol(s) an lvalue ultimately names (`x`, `*x`, `x.f`, `x[i]`, `(T)x` all base on `x`).
+fn collect_lvalue_base_names(expr: &CExpr, out: &mut HashSet<String>) {
+    match expr {
+        CExpr::Var(n) => {
+            out.insert(n.clone());
+        }
+        CExpr::Unary(_, e)
+        | CExpr::Cast(_, e)
+        | CExpr::Paren(e)
+        | CExpr::Member(e, _)
+        | CExpr::MemberPtr(e, _) => collect_lvalue_base_names(e, out),
+        CExpr::Index(a, _) => collect_lvalue_base_names(a, out),
+        _ => {}
+    }
+}
+
+/// Collect names appearing in a MUTATION context (assignment LHS, & operand, inc/dec target), distinguishing a library-provided global from one this TU owns; over-collecting only keeps a global defined.
+fn collect_mutated_names_in_expr(expr: &CExpr, out: &mut HashSet<String>) {
+    match expr {
+        CExpr::Assign(_, lhs, rhs) => {
+            collect_lvalue_base_names(lhs, out);
+            collect_mutated_names_in_expr(lhs, out);
+            collect_mutated_names_in_expr(rhs, out);
+        }
+        CExpr::Unary(op, inner) => {
+            if matches!(
+                op,
+                UnaryOp::AddrOf
+                    | UnaryOp::PreInc
+                    | UnaryOp::PreDec
+                    | UnaryOp::PostInc
+                    | UnaryOp::PostDec
+            ) {
+                collect_lvalue_base_names(inner, out);
+            }
+            collect_mutated_names_in_expr(inner, out);
+        }
+        CExpr::Binary(_, a, b) | CExpr::Index(a, b) => {
+            collect_mutated_names_in_expr(a, out);
+            collect_mutated_names_in_expr(b, out);
+        }
+        CExpr::Cast(_, e)
+        | CExpr::Paren(e)
+        | CExpr::SizeofExpr(e)
+        | CExpr::Member(e, _)
+        | CExpr::MemberPtr(e, _) => collect_mutated_names_in_expr(e, out),
+        CExpr::Ternary(c, t, e) => {
+            collect_mutated_names_in_expr(c, out);
+            collect_mutated_names_in_expr(t, out);
+            collect_mutated_names_in_expr(e, out);
+        }
+        CExpr::Call(f, args) => {
+            collect_mutated_names_in_expr(f, out);
+            for a in args {
+                collect_mutated_names_in_expr(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_mutated_names_in_stmt(stmt: &CStmt, out: &mut HashSet<String>) {
+    match stmt {
+        CStmt::Expr(e) | CStmt::Return(Some(e)) => collect_mutated_names_in_expr(e, out),
+        CStmt::If(cond, then_s, else_s) => {
+            collect_mutated_names_in_expr(cond, out);
+            collect_mutated_names_in_stmt(then_s, out);
+            if let Some(e) = else_s {
+                collect_mutated_names_in_stmt(e, out);
+            }
+        }
+        CStmt::Switch(expr, body) => {
+            collect_mutated_names_in_expr(expr, out);
+            collect_mutated_names_in_stmt(body, out);
+        }
+        CStmt::While(cond, body) | CStmt::DoWhile(body, cond) => {
+            collect_mutated_names_in_stmt(body, out);
+            collect_mutated_names_in_expr(cond, out);
+        }
+        CStmt::For(init, cond, update, body) => {
+            if let Some(crate::decompile::passes::c_pass::types::ForInit::Expr(e)) = init {
+                collect_mutated_names_in_expr(e, out);
+            }
+            if let Some(cond) = cond {
+                collect_mutated_names_in_expr(cond, out);
+            }
+            if let Some(update) = update {
+                collect_mutated_names_in_expr(update, out);
+            }
+            collect_mutated_names_in_stmt(body, out);
+        }
+        CStmt::Labeled(_, inner) => collect_mutated_names_in_stmt(inner, out),
+        CStmt::Block(items) => {
+            for item in items {
+                if let CBlockItem::Stmt(s) = item {
+                    collect_mutated_names_in_stmt(s, out);
+                }
+            }
+        }
+        CStmt::Sequence(stmts) => {
+            for s in stmts {
+                collect_mutated_names_in_stmt(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn infer_var_types_from_usage(
     stmt: &CStmt,
     var_types: &mut HashMap<String, CType>,
@@ -1180,9 +2193,7 @@ fn insert_or_refine(var_types: &mut HashMap<String, CType>, name: String, new_ty
             if *existing == CType::ptr(CType::Void) && new_ty != CType::ptr(CType::Void) && new_ty.is_pointer() {
                 var_types.insert(name, new_ty);
             }
-            else if (*existing == CType::int() || *existing == CType::long()) && new_ty.is_pointer() {
-                var_types.insert(name, new_ty);
-            }
+            // NOTE (plan 5.4): the int/long -> pointer FLIP is retired. Pointerness is decided by the solver and force_ptr_regs; usage inference defers on that axis and only refines the pointee or width.
             else if *existing == CType::long() && !new_ty.is_pointer() && new_ty != CType::long() {
                 var_types.insert(name, new_ty);
             }
@@ -1199,6 +2210,12 @@ fn extract_var_name(expr: &CExpr) -> Option<&str> {
         CExpr::Cast(_, inner) | CExpr::Paren(inner) => extract_var_name(inner),
         _ => None,
     }
+}
+
+// A 32/64-bit int/long, the default scalar the seeding hands an untyped result reg; sub-int, float and pointer types are excluded so the pointer-return override never downgrades them.
+fn is_default_int_scalar_ty(t: Option<&CType>) -> bool {
+    use crate::decompile::passes::c_pass::types::IntSize;
+    matches!(t, Some(CType::Int(IntSize::Int | IntSize::Long, _)))
 }
 
 fn infer_types_from_expr(
@@ -1250,7 +2267,12 @@ fn infer_types_from_expr(
                 if let CExpr::Call(callee, _) = rhs.as_ref() {
                     if let CExpr::Var(func_name) = callee.as_ref() {
                         if let Some(ret_ty) = extern_return_types.get(func_name.as_str()) {
-                            var_types.entry(name.clone()).or_insert(ret_ty.clone());
+                            // The result of a known POINTER-returning call is that pointer (a declared return type, not a cast inference); overrides only a default int/long scalar that would truncate it.
+                            if ret_ty.is_pointer() && is_default_int_scalar_ty(var_types.get(name)) {
+                                var_types.insert(name.clone(), ret_ty.clone());
+                            } else {
+                                var_types.entry(name.clone()).or_insert(ret_ty.clone());
+                            }
                         }
                     }
                 }
@@ -1514,49 +2536,54 @@ fn collect_bool_evidence_expr<'a>(expr: &'a CExpr, evidence: &mut HashMap<&'a st
     }
 }
 
-fn strip_trivial_casts(stmt: &CStmt) -> CStmt {
+fn strip_trivial_casts(stmt: &CStmt, var_types: &HashMap<String, CType>) -> CStmt {
     match stmt {
-        CStmt::Expr(e) => CStmt::Expr(strip_trivial_casts_expr(e)),
+        CStmt::Expr(e) => CStmt::Expr(strip_trivial_casts_expr(e, var_types)),
         CStmt::Block(items) => CStmt::Block(
             items
                 .iter()
                 .map(|item| match item {
-                    CBlockItem::Stmt(s) => CBlockItem::Stmt(strip_trivial_casts(s)),
+                    CBlockItem::Stmt(s) => CBlockItem::Stmt(strip_trivial_casts(s, var_types)),
                     other => other.clone(),
                 })
                 .collect(),
         ),
         CStmt::If(cond, then_s, else_s) => CStmt::If(
-            strip_trivial_casts_expr(cond),
-            Box::new(strip_trivial_casts(then_s)),
-            else_s.as_ref().map(|e| Box::new(strip_trivial_casts(e))),
+            strip_trivial_casts_expr(cond, var_types),
+            Box::new(strip_trivial_casts(then_s, var_types)),
+            else_s.as_ref().map(|e| Box::new(strip_trivial_casts(e, var_types))),
         ),
         CStmt::While(cond, body) => CStmt::While(
-            strip_trivial_casts_expr(cond),
-            Box::new(strip_trivial_casts(body)),
+            strip_trivial_casts_expr(cond, var_types),
+            Box::new(strip_trivial_casts(body, var_types)),
         ),
         CStmt::DoWhile(body, cond) => CStmt::DoWhile(
-            Box::new(strip_trivial_casts(body)),
-            strip_trivial_casts_expr(cond),
+            Box::new(strip_trivial_casts(body, var_types)),
+            strip_trivial_casts_expr(cond, var_types),
         ),
         CStmt::For(init, cond, update, body) => CStmt::For(
             init.clone(),
-            cond.as_ref().map(strip_trivial_casts_expr),
-            update.as_ref().map(strip_trivial_casts_expr),
-            Box::new(strip_trivial_casts(body)),
+            cond.as_ref().map(|e| strip_trivial_casts_expr(e, var_types)),
+            update.as_ref().map(|e| strip_trivial_casts_expr(e, var_types)),
+            Box::new(strip_trivial_casts(body, var_types)),
         ),
-        CStmt::Return(Some(e)) => CStmt::Return(Some(strip_trivial_casts_expr(e))),
+        CStmt::Return(Some(e)) => CStmt::Return(Some(strip_trivial_casts_expr(e, var_types))),
         CStmt::Switch(e, body) => CStmt::Switch(
-            strip_trivial_casts_expr(e),
-            Box::new(strip_trivial_casts(body)),
+            strip_trivial_casts_expr(e, var_types),
+            Box::new(strip_trivial_casts(body, var_types)),
         ),
-        CStmt::Labeled(lbl, inner) => CStmt::Labeled(lbl.clone(), Box::new(strip_trivial_casts(inner))),
-        CStmt::Sequence(stmts) => CStmt::Sequence(stmts.iter().map(strip_trivial_casts).collect()),
+        CStmt::Labeled(lbl, inner) => CStmt::Labeled(lbl.clone(), Box::new(strip_trivial_casts(inner, var_types))),
+        CStmt::Sequence(stmts) => CStmt::Sequence(stmts.iter().map(|s| strip_trivial_casts(s, var_types)).collect()),
         other => other.clone(),
     }
 }
 
-fn strip_trivial_casts_expr(expr: &CExpr) -> CExpr {
+// True for a floating-point local: a (long)float_var is the load-bearing float->integer truncation, and stripping it under an outer pointer cast makes an illegal float->pointer conversion.
+fn var_is_float_typed(var_types: &HashMap<String, CType>, name: &str) -> bool {
+    matches!(var_types.get(name), Some(CType::Float(_)))
+}
+
+fn strip_trivial_casts_expr(expr: &CExpr, var_types: &HashMap<String, CType>) -> CExpr {
     fn unwrap_parens(expr: &CExpr) -> &CExpr {
         match expr {
             CExpr::Paren(inner) => unwrap_parens(inner),
@@ -1566,15 +2593,19 @@ fn strip_trivial_casts_expr(expr: &CExpr) -> CExpr {
 
     match expr {
         CExpr::Cast(ty, inner) => {
-            let inner_stripped = strip_trivial_casts_expr(inner);
+            let inner_stripped = strip_trivial_casts_expr(inner, var_types);
 
             if is_long_type(ty) {
                 let unwrapped_inner = unwrap_parens(&inner_stripped);
                 match unwrapped_inner {
+                    // Keep (long)var when var is float/double: dropping it leaves a bare float under any outer pointer cast, and the (long) is what makes the subsequent int->pointer cast legal.
+                    CExpr::Var(name) if var_is_float_typed(var_types, name) => {}
                     CExpr::Var(_) => return inner_stripped,
                     CExpr::IntLit(_) => return inner_stripped,
                     CExpr::StringLit(_) => return inner_stripped,
                     CExpr::Cast(inner_ty, _) if is_long_type(inner_ty) => return inner_stripped,
+                    // Likewise keep (long)(float)x: the inner float-cast is the float->int step, so stripping the (long) would put a float directly under an outer pointer cast.
+                    CExpr::Cast(inner_ty, _) if inner_ty.is_float() => {}
                     // Strip (long) wrapping pointer-typed expressions from coerce_ptr_to_long in clight_pass to avoid int/ptr conversion errors.
                     CExpr::Cast(inner_ty, _) if inner_ty.is_pointer() => return inner_stripped,
                     _ => {}
@@ -1593,33 +2624,93 @@ fn strip_trivial_casts_expr(expr: &CExpr) -> CExpr {
         }
         CExpr::Assign(op, lhs, rhs) => CExpr::Assign(
             *op,
-            Box::new(strip_trivial_casts_expr(lhs)),
-            Box::new(strip_trivial_casts_expr(rhs)),
+            Box::new(strip_trivial_casts_expr(lhs, var_types)),
+            Box::new(strip_trivial_casts_expr(rhs, var_types)),
         ),
         CExpr::Binary(op, lhs, rhs) => CExpr::Binary(
             *op,
-            Box::new(strip_trivial_casts_expr(lhs)),
-            Box::new(strip_trivial_casts_expr(rhs)),
+            Box::new(strip_trivial_casts_expr(lhs, var_types)),
+            Box::new(strip_trivial_casts_expr(rhs, var_types)),
         ),
-        CExpr::Unary(op, inner) => CExpr::Unary(*op, Box::new(strip_trivial_casts_expr(inner))),
+        CExpr::Unary(op, inner) => CExpr::Unary(*op, Box::new(strip_trivial_casts_expr(inner, var_types))),
         CExpr::Call(func, args) => CExpr::Call(
-            Box::new(strip_trivial_casts_expr(func)),
-            args.iter().map(strip_trivial_casts_expr).collect(),
+            Box::new(strip_trivial_casts_expr(func, var_types)),
+            args.iter().map(|a| strip_trivial_casts_expr(a, var_types)).collect(),
         ),
-        CExpr::Paren(inner) => CExpr::Paren(Box::new(strip_trivial_casts_expr(inner))),
+        CExpr::Paren(inner) => CExpr::Paren(Box::new(strip_trivial_casts_expr(inner, var_types))),
         CExpr::Index(arr, idx) => CExpr::Index(
-            Box::new(strip_trivial_casts_expr(arr)),
-            Box::new(strip_trivial_casts_expr(idx)),
+            Box::new(strip_trivial_casts_expr(arr, var_types)),
+            Box::new(strip_trivial_casts_expr(idx, var_types)),
         ),
-        CExpr::Member(inner, field) => CExpr::Member(Box::new(strip_trivial_casts_expr(inner)), field.clone()),
-        CExpr::MemberPtr(inner, field) => CExpr::MemberPtr(Box::new(strip_trivial_casts_expr(inner)), field.clone()),
+        CExpr::Member(inner, field) => CExpr::Member(Box::new(strip_trivial_casts_expr(inner, var_types)), field.clone()),
+        CExpr::MemberPtr(inner, field) => CExpr::MemberPtr(Box::new(strip_trivial_casts_expr(inner, var_types)), field.clone()),
         CExpr::Ternary(cond, then_e, else_e) => CExpr::Ternary(
-            Box::new(strip_trivial_casts_expr(cond)),
-            Box::new(strip_trivial_casts_expr(then_e)),
-            Box::new(strip_trivial_casts_expr(else_e)),
+            Box::new(strip_trivial_casts_expr(cond, var_types)),
+            Box::new(strip_trivial_casts_expr(then_e, var_types)),
+            Box::new(strip_trivial_casts_expr(else_e, var_types)),
         ),
         other => other.clone(),
     }
+}
+
+// Last top-level return <expr> in a body block (the function's tail return), scanning only the immediate item list so it picks the function-level exit, not an early in-cascade return.
+fn last_toplevel_return_expr(body: &CStmt) -> Option<CExpr> {
+    let items = match body {
+        CStmt::Block(items) => items,
+        _ => return None,
+    };
+    let mut found: Option<CExpr> = None;
+    for it in items {
+        if let CBlockItem::Stmt(s) = it {
+            match s {
+                CStmt::Return(Some(e)) => found = Some(e.clone()),
+                // A labeled block whose inner directly returns also exposes a tail return.
+                CStmt::Labeled(_, inner) => {
+                    if let CStmt::Return(Some(e)) = &**inner {
+                        found = Some(e.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+// Repair the shared-return-merge orphan: append the tail return inside a final labeled block that does not end in an unconditional exit, always a defect in a value-returning function.
+fn fix_falloff_return_orphan(body: &mut CStmt) {
+    let ret_expr = match last_toplevel_return_expr(body) {
+        Some(e) => e,
+        None => return,
+    };
+    let items = match body {
+        CStmt::Block(items) => items,
+        _ => return,
+    };
+    let Some(CBlockItem::Stmt(last)) = items.last_mut() else {
+        return;
+    };
+    let CStmt::Labeled(_, inner) = last else {
+        return;
+    };
+    if is_unconditional_exit(inner) {
+        return;
+    }
+    // Append `return <tail expr>` to the labeled block's body, preserving its existing statements.
+    let appended = CStmt::Return(Some(ret_expr));
+    let new_inner = match &**inner {
+        CStmt::Block(inner_items) => {
+            let mut v = inner_items.clone();
+            v.push(CBlockItem::Stmt(appended));
+            CStmt::Block(v)
+        }
+        CStmt::Empty => appended,
+        other => CStmt::Block(vec![
+            CBlockItem::Stmt(other.clone()),
+            CBlockItem::Stmt(appended),
+        ]),
+    };
+    **inner = new_inner;
 }
 
 fn fix_bare_returns_in_stmt(stmt: &mut CStmt) {
@@ -1699,30 +2790,38 @@ pub(crate) fn sanitize_c_ident(name: &str) -> String {
     out
 }
 
+/// libc stdio FILE* globals keep their REAL name and are left UNDEFINED so <stdio.h>'s extern binds them to libc; renaming them silently disconnects them and any fputs on them segfaults.
+pub(crate) fn is_libc_stdio_global(name: &str) -> bool {
+    let base = name.split('@').next().unwrap_or(name);
+    crate::decompile::passes::c_pass::header_db::header_db()
+        .stdio_globals
+        .contains(base)
+}
+
+/// libc globals that must keep their REAL name (the stdio FILE*s plus the getopt globals and environ) so they bind to libc; the getopt/environ ones are emitted as a plain extern.
+fn uses_real_libc_name(name: &str) -> bool {
+    let base = name.split('@').next().unwrap_or(name);
+    crate::decompile::passes::c_pass::header_db::header_db()
+        .real_libc_globals
+        .contains(base)
+}
+
 pub(crate) fn sanitize_c_symbol_name(name: &str) -> String {
-    const RESERVED_GLOBALS: &[&str] = &[
-        "stdin",
-        "stdout",
-        "stderr",
-        "optind",
-        "optarg",
-        "opterr",
-        "optopt",
-        "errno",
-        "environ",
-        "program_invocation_name",
-        "program_invocation_short_name",
-    ];
+    if uses_real_libc_name(name) {
+        return name.split('@').next().unwrap_or(name).to_string();
+    }
+    // Globals colliding with a libc symbol but holding a PROGRAM copy are renamed <name>_sym so the recovered definition neither binds to nor shadows the libc one.
+    let reserved = &crate::decompile::passes::c_pass::header_db::header_db().reserved_globals;
 
     let base_name = name.split('@').next().unwrap_or(name);
-    if RESERVED_GLOBALS.contains(&base_name) {
+    if reserved.contains(base_name) {
         let mut out = sanitize_c_ident(base_name);
         out.push_str("_sym");
         return out;
     }
 
     let mut out = sanitize_c_ident(name);
-    if RESERVED_GLOBALS.contains(&out.as_str()) {
+    if reserved.contains(out.as_str()) {
         out.push_str("_sym");
     }
     out
@@ -1844,6 +2943,7 @@ fn is_long_type(ty: &CType) -> bool {
 fn collect_var_names_from_expr(expr: &CExpr, vars: &mut HashSet<String>) {
     match expr {
         CExpr::Var(name) => {
+            // Collect ALL referenced names; a __builtin_* identifier is a compiler builtin, filtered out at the locals call-site but kept at the undeclared-globals one so the marker is declared.
             vars.insert(name.clone());
         }
         CExpr::Unary(_, inner)
@@ -1863,11 +2963,21 @@ fn collect_var_names_from_expr(expr: &CExpr, vars: &mut HashSet<String>) {
             collect_var_names_from_expr(e, vars);
         }
         CExpr::Call(func, args) => {
-            // Skip direct callee names (functions, not local variables) but recurse into non-trivial callee expressions.
-            match func.as_ref() {
-                CExpr::Var(_) => {}
-                CExpr::Cast(_, inner) if matches!(inner.as_ref(), CExpr::Var(_)) => {}
-                _ => collect_var_names_from_expr(func, vars),
+            // A bare-name callee is usually a direct call needing no VarDecl, but an indirect call's target is a var_* local that DOES need declaring; collect that, skip symbols, and recurse into complex callees.
+            let callee_var = match func.as_ref() {
+                CExpr::Var(n) => Some(n),
+                CExpr::Cast(_, inner) => match inner.as_ref() {
+                    CExpr::Var(n) => Some(n),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match callee_var {
+                Some(n) if n.starts_with("var_") => {
+                    vars.insert(n.clone());
+                }
+                Some(_) => {}
+                None => collect_var_names_from_expr(func, vars),
             }
             for a in args {
                 collect_var_names_from_expr(a, vars);
@@ -1926,11 +3036,16 @@ pub struct ConversionContext {
     pub string_label_to_content: HashMap<String, String>,
     pub suppress_string_literals: bool,
     pub func_addrs_sorted: Vec<(u64, String)>,
+    /// Locally-DEFINED functions colliding with a header declaration, mapped to their emitted name (atexit -> atexit_local), applied to every symbol reference so call sites track the rename.
+    pub func_renames: HashMap<String, String>,
+    /// CAST-2: label id -> final injective C identifier, computed once so Slabel(id) and Sgoto(id) always resolve to the SAME name while distinct ids never share one.
+    label_disambig: HashMap<usize, String>,
 }
 
 impl ConversionContext {
     pub fn new(id_to_name: HashMap<usize, String>) -> Self {
         let global_names = id_to_name.values().cloned().collect();
+        let label_disambig = Self::build_label_disambig(&id_to_name);
         Self {
             id_to_name,
             global_names,
@@ -1941,7 +3056,37 @@ impl ConversionContext {
             string_label_to_content: HashMap::new(),
             suppress_string_literals: false,
             func_addrs_sorted: Vec::new(),
+            func_renames: HashMap::new(),
+            label_disambig,
         }
+    }
+
+    // CAST-2: the un-disambiguated label spelling for a raw id_to_name entry. label_name resolves through this, then through label_disambig for colliding ids.
+    fn label_name_base(raw: &str) -> String {
+        if raw.chars().all(|c| c.is_ascii_digit()) {
+            format!("L{}", raw)
+        } else {
+            sanitize_c_ident(raw)
+        }
+    }
+
+    // CAST-2: resolve label ids that sanitize to the same identifier; the smallest id in a colliding group keeps the plain name and the rest get <base>_<id>, sorted so the choice is order-independent.
+    fn build_label_disambig(id_to_name: &HashMap<usize, String>) -> HashMap<usize, String> {
+        let mut by_base: HashMap<String, Vec<usize>> = HashMap::new();
+        for (id, raw) in id_to_name {
+            by_base.entry(Self::label_name_base(raw)).or_default().push(*id);
+        }
+        let mut out: HashMap<usize, String> = HashMap::new();
+        for (base, mut ids) in by_base {
+            if ids.len() <= 1 {
+                continue;
+            }
+            ids.sort();
+            for &id in ids.iter().skip(1) {
+                out.insert(id, format!("{}_{}", base, id));
+            }
+        }
+        out
     }
 
     pub fn record_var_type(&mut self, var_name: &str, ty: CType) {
@@ -1965,16 +3110,13 @@ impl ConversionContext {
     }
 
     pub fn label_name(&self, id: usize) -> String {
-        let raw = self
-            .id_to_name
-            .get(&id)
-            .cloned()
-            .unwrap_or_else(|| format!("L{}", id));
-
-        if raw.chars().all(|c| c.is_ascii_digit()) {
-            format!("L{}", raw)
-        } else {
-            sanitize_c_ident(&raw)
+        // CAST-2: a colliding id resolves through the per-context disambiguation map (built once in new); Slabel(id) and Sgoto(id) hit the same entry, so a goto and its target always agree.
+        if let Some(name) = self.label_disambig.get(&id) {
+            return name.clone();
+        }
+        match self.id_to_name.get(&id) {
+            Some(raw) => Self::label_name_base(raw),
+            None => format!("L{}", id),
         }
     }
 
@@ -2030,7 +3172,7 @@ fn cexpr_is_pointer(e: &CExpr, types: &HashMap<String, CType>) -> bool {
     }
 }
 
-// Machine address arithmetic is computed in integer registers, but type recovery can type those operands as pointers, and C rejects `ptr*int`, `ptr&int`, `ptr+ptr`, mixed `ptr-ptr`, etc. Cast the offending pointer operands to `long` so the arithmetic is valid integer arithmetic; the result is converted back by the surrounding cast (if any). Genuine `ptr+int` / `ptr-int` are left intact.
+// Cast pointer operands of machine address arithmetic to long so the arithmetic is valid C; MEASURED non-subsumable (bypassing it regressed +3010 invalid-binop) and disjoint from decl-level force_long.
 fn repair_pointer_arith(
     op: BinaryOp,
     lhs: CExpr,
@@ -2051,17 +3193,256 @@ fn repair_pointer_arith(
             if lhs_ptr { to_long(lhs) } else { lhs },
             if rhs_ptr { to_long(rhs) } else { rhs },
         ),
+        // ptr + ptr is invalid; ptr - ptr we normalize to an integer (byte) difference.
         BinaryOp::Add | BinaryOp::Sub if lhs_ptr && rhs_ptr => (to_long(lhs), to_long(rhs)),
+        // int - ptr is invalid C (a pointer may only be subtracted from a pointer); cast the pointer operand to long so it becomes integer subtraction (ptr - int and ptr + int are kept).
+        BinaryOp::Sub if rhs_ptr && !lhs_ptr => (lhs, to_long(rhs)),
         _ => (lhs, rhs),
     }
 }
 
-// Walk an expression bottom-up, repairing invalid pointer arithmetic at every Binary node.
+// Walk an expression bottom-up, repairing invalid pointer arithmetic at every Binary node. The Clight type annotation carried by an expression node (every variant's last field).
+fn clight_expr_ctype(e: &clight::ClightExpr) -> &clight::ClightType {
+    use clight::ClightExpr::*;
+    match e {
+        EconstInt(_, t) | EconstFloat(_, t) | EconstSingle(_, t) | EconstLong(_, t)
+        | Evar(_, t) | EvarSymbol(_, t) | Etempvar(_, t) | Ederef(_, t) | Eaddrof(_, t)
+        | Eunop(_, _, t) | Ebinop(_, _, _, t) | Ecast(_, t) | Efield(_, _, t)
+        | Esizeof(_, t) | Ealignof(_, t) | Econdition(_, _, _, t) => t,
+    }
+}
+
+/// Strip a materialized annotation cast on a bare variable when the final decl renders it redundant: `(T *)v` with v declared exactly `T *` is just `v`.
+fn strip_matching_var_cast(e: CExpr, types: &HashMap<String, CType>) -> CExpr {
+    if let CExpr::Cast(cty, inner) = &e {
+        if let CExpr::Var(name) = inner.as_ref() {
+            if types.get(name) == Some(cty) {
+                return (**inner).clone();
+            }
+        }
+    }
+    e
+}
+
+/// A string literal is a char * base that code indexes into, never the integer offset; paren/cast-transparent, targeting the case cexpr_is_pointer does not classify as a pointer at all.
+fn is_string_base(e: &CExpr) -> bool {
+    match e {
+        CExpr::StringLit(_) => true,
+        CExpr::Paren(inner) | CExpr::Cast(_, inner) => is_string_base(inner),
+        _ => false,
+    }
+}
+
+/// An "indexable base" of pointer arithmetic that must stay a pointer: a string literal, &x, or an array-declared Var; the caller integerizes the OTHER operand instead of scalarizing both.
+fn is_indexable_base(e: &CExpr, types: &HashMap<String, CType>) -> bool {
+    match e {
+        CExpr::Unary(UnaryOp::AddrOf, _) => true,
+        CExpr::Var(name) => matches!(types.get(name), Some(CType::Array(..))),
+        // A cast whose TARGET is a pointer type is itself a pointer base, even when an outer integer cast later scalarizes it (`(long)(T *)p`): recursing lets the inner `(T *)` cast still register as the base.
+        CExpr::Cast(ty, inner) => ty.is_pointer() || is_indexable_base(inner, types),
+        CExpr::Paren(inner) => is_indexable_base(inner, types),
+        _ => is_string_base(e),
+    }
+}
+
+/// Undo a scalarizing integer cast wrapping a pointer base -- `(long)(T *)p` -> `(T *)p` -- so an address base survives as a pointer through additive arithmetic. Strips only when the outer cast is integer and the inner is itself an indexable (pointer) base; otherwise returns `e` unchanged.
+fn strip_scalarizing_cast(e: CExpr, types: &HashMap<String, CType>) -> CExpr {
+    if let CExpr::Cast(ty, inner) = &e {
+        if ty.is_integer() && is_indexable_base(inner, types) {
+            return (**inner).clone();
+        }
+    }
+    e
+}
+
+/// Peel leading casts/parens to the underlying value, so a mis-typed pointer index `(long)(void *)v` can be re-expressed cleanly as `(long)v`.
+fn peel_casts(e: &CExpr) -> &CExpr {
+    match e {
+        CExpr::Cast(_, inner) | CExpr::Paren(inner) => peel_casts(inner),
+        _ => e,
+    }
+}
+
+/// True when the innermost pointer cast of `e` is `void *` -- the degenerate pointer type a mis-typed integer index usually carries.
+fn inner_ptr_is_void(e: &CExpr) -> bool {
+    match e {
+        CExpr::Cast(CType::Pointer(inner, _), _) if matches!(**inner, CType::Void) => true,
+        CExpr::Cast(_, inner) | CExpr::Paren(inner) => inner_ptr_is_void(inner),
+        _ => false,
+    }
+}
+
+/// True when a pointee type SCALES under C pointer arithmetic (stride > 1): anything but char (stride 1) and void (GNU stride 1) and an array pointee. A scaling pointee is what makes a raw byte offset get re-multiplied.
+fn pointee_scales_ctype(pointee: &CType) -> bool {
+    !matches!(
+        pointee,
+        CType::Void | CType::Int(IntSize::Char, _) | CType::Array(..)
+    )
+}
+
+/// True when e is the char*-rebased byte-address shape this fix materializes, returning the inner char* expression and T *, so a further byte offset FOLDS in instead of re-scaling.
+fn peel_char_byte_rebase(e: &CExpr) -> Option<(CType, CExpr)> {
+    let (ptr_ty, inner) = match e {
+        CExpr::Cast(CType::Pointer(pointee, q), inner) if pointee_scales_ctype(pointee) => {
+            (CType::Pointer(pointee.clone(), *q), inner.as_ref())
+        }
+        _ => return None,
+    };
+    let byte_expr = match inner {
+        CExpr::Paren(p) => p.as_ref(),
+        other => other,
+    };
+    // The byte expression must itself be additive arithmetic whose left operand is a `(char *)` base, i.e. already byte-addressed.
+    if let CExpr::Binary(BinaryOp::Add | BinaryOp::Sub, l, _) = byte_expr {
+        let l_is_char_ptr = matches!(
+            l.as_ref(),
+            CExpr::Cast(CType::Pointer(p, _), _) if matches!(p.as_ref(), CType::Int(IntSize::Char, _))
+        );
+        if l_is_char_ptr {
+            return Some((ptr_ty, byte_expr.clone()));
+        }
+    }
+    None
+}
+
+/// A pointer base whose sibling integral operand is a raw BYTE offset that must not be re-scaled: a bare T * Var whose B2 rebase did not fire, or the char*-rebased shape this fix produces.
+fn scaling_ptr_byte_base(e: &CExpr, types: &HashMap<String, CType>) -> Option<(CType, Option<CExpr>)> {
+    match e {
+        CExpr::Paren(inner) => scaling_ptr_byte_base(inner, types),
+        CExpr::Var(name) => match types.get(name) {
+            Some(CType::Pointer(pointee, _)) if pointee_scales_ctype(pointee) => {
+                Some((types.get(name).cloned().unwrap(), None))
+            }
+            _ => None,
+        },
+        _ => peel_char_byte_rebase(e).map(|(ty, inner)| (ty, Some(inner))),
+    }
+}
+
+/// Apply a raw BYTE offset to a scaling pointer base exactly once through char*, folding into an already-rebased inner expression; byte-correct under any pointee size since char* has stride 1.
+fn rebase_byte_add_through_char(
+    op: BinaryOp,
+    base: CExpr,
+    inner_byte_expr: Option<CExpr>,
+    offset: CExpr,
+    ptr_ty: CType,
+) -> CExpr {
+    let off = CExpr::Cast(CType::long(), Box::new(offset));
+    let byte_addr = match inner_byte_expr {
+        Some(inner) => CExpr::Binary(op, Box::new(inner), Box::new(off)),
+        None => {
+            let base_char = CExpr::Cast(CType::ptr(CType::char_signed()), Box::new(base));
+            CExpr::Binary(op, Box::new(base_char), Box::new(off))
+        }
+    };
+    CExpr::Cast(ptr_ty, Box::new(CExpr::Paren(Box::new(byte_addr))))
+}
+
+/// CType for a memory chunk (element type of a runtime-indexed stack array).
+fn ctype_from_memchunk(chunk: &MemoryChunk) -> CType {
+    use crate::decompile::passes::c_pass::types::{IntSize, Signedness, FloatSize};
+    match chunk {
+        MemoryChunk::MBool => CType::Bool,
+        MemoryChunk::MInt8Signed => CType::Int(IntSize::Char, Signedness::Signed),
+        MemoryChunk::MInt8Unsigned => CType::Int(IntSize::Char, Signedness::Unsigned),
+        MemoryChunk::MInt16Signed => CType::Int(IntSize::Short, Signedness::Signed),
+        MemoryChunk::MInt16Unsigned => CType::Int(IntSize::Short, Signedness::Unsigned),
+        MemoryChunk::MInt32 | MemoryChunk::MAny32 => CType::Int(IntSize::Int, Signedness::Signed),
+        MemoryChunk::MFloat32 => CType::Float(FloatSize::Float),
+        MemoryChunk::MFloat64 => CType::Float(FloatSize::Double),
+        _ => CType::long(),
+    }
+}
+
 fn repair_arith_expr(e: &CExpr, types: &HashMap<String, CType>) -> CExpr {
+    // &arr on an array-typed local is pointer-to-array, so &arr + i strides by whole arrays; rewrite it to the bare name, which decays to an element pointer.
+    if let CExpr::Unary(UnaryOp::AddrOf, inner) = e {
+        if let CExpr::Var(name) = inner.as_ref() {
+            if matches!(types.get(name), Some(CType::Array(..))) {
+                return CExpr::Var(name.clone());
+            }
+        }
+    }
     match e {
         CExpr::Binary(op, l, r) => {
-            let l = repair_arith_expr(l, types);
-            let r = repair_arith_expr(r, types);
+            let l_raw = repair_arith_expr(l, types);
+            let r_raw = repair_arith_expr(r, types);
+            // Byte-offset re-scaling fix on the UN-stripped children: re-express a scaling base plus a raw byte offset through char*, since stripping would forge a bare Var and hide a genuine element index.
+            if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+                let l_byte_base = scaling_ptr_byte_base(&l_raw, types);
+                let r_byte_base = scaling_ptr_byte_base(&r_raw, types);
+                match (l_byte_base, r_byte_base) {
+                    (Some((lty, inner)), None) if !cexpr_is_pointer(&r_raw, types) => {
+                        return rebase_byte_add_through_char(*op, l_raw, inner, r_raw, lty);
+                    }
+                    // offset + base (Add is commutative; Sub of int - ptr is not a base subtraction).
+                    (None, Some((rty, inner)))
+                        if matches!(op, BinaryOp::Add) && !cexpr_is_pointer(&l_raw, types) =>
+                    {
+                        return rebase_byte_add_through_char(*op, r_raw, inner, l_raw, rty);
+                    }
+                    _ => {}
+                }
+            }
+            let l = strip_matching_var_cast(l_raw, types);
+            let r = r_raw;
+            // An indexable base added to a pointer-TYPED operand means that operand is really the integer offset, so keep the base and cast the offset to long rather than scalarizing both.
+            if matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+                let l_base = is_indexable_base(&l, types);
+                let r_base = is_indexable_base(&r, types);
+                let to_long = |e: CExpr| CExpr::Cast(CType::long(), Box::new(e));
+                if l_base ^ r_base {
+                    match op {
+                        // base +/- offset / offset + base: keep the base, integerize the pointer offset.
+                        BinaryOp::Add if l_base && cexpr_is_pointer(&r, types) => {
+                            return CExpr::Binary(*op, Box::new(l), Box::new(to_long(r)));
+                        }
+                        BinaryOp::Add if r_base && cexpr_is_pointer(&l, types) => {
+                            return CExpr::Binary(*op, Box::new(to_long(l)), Box::new(r));
+                        }
+                        BinaryOp::Sub if l_base && cexpr_is_pointer(&r, types) => {
+                            return CExpr::Binary(*op, Box::new(l), Box::new(to_long(r)));
+                        }
+                        // ptr - base: a pointer minus a base is a mismatched difference; normalize to an integer one.
+                        BinaryOp::Sub if r_base && cexpr_is_pointer(&l, types) => {
+                            return CExpr::Binary(*op, Box::new(to_long(l)), Box::new(to_long(r)));
+                        }
+                        // A scalarized pointer base plus a plain integer offset: the outer (long) hid the pointer from the arms above, so strip the base's scalarizing cast to keep base + off a T * + long.
+                        BinaryOp::Add if l_base && !cexpr_is_pointer(&r, types) => {
+                            return CExpr::Binary(*op, Box::new(strip_scalarizing_cast(l, types)), Box::new(r));
+                        }
+                        BinaryOp::Add if r_base && !cexpr_is_pointer(&l, types) => {
+                            return CExpr::Binary(*op, Box::new(l), Box::new(strip_scalarizing_cast(r, types)));
+                        }
+                        BinaryOp::Sub if l_base && !cexpr_is_pointer(&r, types) => {
+                            return CExpr::Binary(*op, Box::new(strip_scalarizing_cast(l, types)), Box::new(r));
+                        }
+                        _ => {}
+                    }
+                }
+                // Both operands carry pointer casts, and ptr + ptr is never valid C, so keep the typed pointer as the base and integerize the void*-cast operand.
+                if matches!(op, BinaryOp::Add)
+                    && is_indexable_base(&l, types)
+                    && is_indexable_base(&r, types)
+                {
+                    let l_void = inner_ptr_is_void(&l);
+                    let r_void = inner_ptr_is_void(&r);
+                    if r_void && !l_void {
+                        return CExpr::Binary(
+                            *op,
+                            Box::new(strip_scalarizing_cast(l, types)),
+                            Box::new(to_long(peel_casts(&r).clone())),
+                        );
+                    }
+                    if l_void && !r_void {
+                        return CExpr::Binary(
+                            *op,
+                            Box::new(to_long(peel_casts(&l).clone())),
+                            Box::new(strip_scalarizing_cast(r, types)),
+                        );
+                    }
+                }
+            }
             let lp = cexpr_is_pointer(&l, types);
             let rp = cexpr_is_pointer(&r, types);
             let (l, r) = repair_pointer_arith(*op, l, lp, r, rp);
@@ -2072,6 +3453,12 @@ fn repair_arith_expr(e: &CExpr, types: &HashMap<String, CType>) -> CExpr {
             // `-ptr` and `~ptr` are invalid C; cast the pointer operand to long (Deref/AddrOf/Not are valid on pointers and left alone).
             let inner = if matches!(op, UnaryOp::Neg | UnaryOp::BitNot) && cexpr_is_pointer(&inner, types) {
                 CExpr::Cast(CType::long(), Box::new(inner))
+            } else {
+                inner
+            };
+            // Strip the materialized access cast (Ederef conversion) when the final decl makes it redundant: `*(T *)v` with v declared exactly `T *` prints `*v`.
+            let inner = if matches!(op, UnaryOp::Deref) {
+                strip_matching_var_cast(inner, types)
             } else {
                 inner
             };
@@ -2165,6 +3552,299 @@ fn repair_arith_stmt(stmt: &CStmt, types: &HashMap<String, CType>) -> CStmt {
     }
 }
 
+// Pad or truncate each call's argument list to the callee's declared fixed arity, padding with 0; counts holds only fixed-arity callees, so variadic and K&R calls are untouched.
+fn normalize_call_arity_expr(e: &CExpr, counts: &HashMap<String, usize>) -> CExpr {
+    match e {
+        CExpr::Call(func, args) => {
+            let nf = normalize_call_arity_expr(func, counts);
+            let mut nargs: Vec<CExpr> = args.iter().map(|a| normalize_call_arity_expr(a, counts)).collect();
+            if let CExpr::Var(name) = &nf {
+                if let Some(&pc) = counts.get(name) {
+                    if nargs.len() > pc {
+                        nargs.truncate(pc);
+                    } else {
+                        while nargs.len() < pc {
+                            nargs.push(CExpr::int(0));
+                        }
+                    }
+                }
+            }
+            CExpr::Call(Box::new(nf), nargs)
+        }
+        CExpr::Unary(op, i) => CExpr::Unary(*op, Box::new(normalize_call_arity_expr(i, counts))),
+        CExpr::Binary(op, l, r) => CExpr::Binary(*op, Box::new(normalize_call_arity_expr(l, counts)), Box::new(normalize_call_arity_expr(r, counts))),
+        CExpr::Assign(op, l, r) => CExpr::Assign(*op, Box::new(normalize_call_arity_expr(l, counts)), Box::new(normalize_call_arity_expr(r, counts))),
+        CExpr::Ternary(c, t, f) => CExpr::Ternary(Box::new(normalize_call_arity_expr(c, counts)), Box::new(normalize_call_arity_expr(t, counts)), Box::new(normalize_call_arity_expr(f, counts))),
+        CExpr::Cast(ty, i) => CExpr::Cast(ty.clone(), Box::new(normalize_call_arity_expr(i, counts))),
+        CExpr::Member(i, f) => CExpr::Member(Box::new(normalize_call_arity_expr(i, counts)), f.clone()),
+        CExpr::MemberPtr(i, f) => CExpr::MemberPtr(Box::new(normalize_call_arity_expr(i, counts)), f.clone()),
+        CExpr::Index(a, i) => CExpr::Index(Box::new(normalize_call_arity_expr(a, counts)), Box::new(normalize_call_arity_expr(i, counts))),
+        CExpr::SizeofExpr(i) => CExpr::SizeofExpr(Box::new(normalize_call_arity_expr(i, counts))),
+        CExpr::Paren(i) => CExpr::Paren(Box::new(normalize_call_arity_expr(i, counts))),
+        CExpr::StmtExpr(stmts, i) => CExpr::StmtExpr(
+            stmts.iter().map(|s| normalize_call_arity_stmt(s, counts)).collect(),
+            Box::new(normalize_call_arity_expr(i, counts)),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn normalize_call_arity_stmt(stmt: &CStmt, counts: &HashMap<String, usize>) -> CStmt {
+    match stmt {
+        CStmt::Expr(e) => CStmt::Expr(normalize_call_arity_expr(e, counts)),
+        CStmt::Block(items) => CStmt::Block(items.iter().map(|item| match item {
+            CBlockItem::Stmt(s) => CBlockItem::Stmt(normalize_call_arity_stmt(s, counts)),
+            other => other.clone(),
+        }).collect()),
+        CStmt::If(c, t, e) => CStmt::If(
+            normalize_call_arity_expr(c, counts),
+            Box::new(normalize_call_arity_stmt(t, counts)),
+            e.as_ref().map(|x| Box::new(normalize_call_arity_stmt(x, counts))),
+        ),
+        CStmt::While(c, b) => CStmt::While(normalize_call_arity_expr(c, counts), Box::new(normalize_call_arity_stmt(b, counts))),
+        CStmt::DoWhile(b, c) => CStmt::DoWhile(Box::new(normalize_call_arity_stmt(b, counts)), normalize_call_arity_expr(c, counts)),
+        CStmt::For(init, c, u, b) => CStmt::For(
+            init.clone(),
+            c.as_ref().map(|x| normalize_call_arity_expr(x, counts)),
+            u.as_ref().map(|x| normalize_call_arity_expr(x, counts)),
+            Box::new(normalize_call_arity_stmt(b, counts)),
+        ),
+        CStmt::Return(Some(e)) => CStmt::Return(Some(normalize_call_arity_expr(e, counts))),
+        CStmt::Switch(e, b) => CStmt::Switch(normalize_call_arity_expr(e, counts), Box::new(normalize_call_arity_stmt(b, counts))),
+        CStmt::Labeled(lbl, inner) => CStmt::Labeled(lbl.clone(), Box::new(normalize_call_arity_stmt(inner, counts))),
+        CStmt::Sequence(stmts) => CStmt::Sequence(stmts.iter().map(|s| normalize_call_arity_stmt(s, counts)).collect()),
+        other => other.clone(),
+    }
+}
+
+// Compilability: insert explicit casts at int<->pointer mismatches, which modern clang and gcc reject as hard errors even under -w; float<->pointer and unknown-class operands are left alone.
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum ScalarClass {
+    Ptr,
+    Int,
+    Float,
+    Other,
+}
+
+fn ctype_scalar_class(t: &CType) -> ScalarClass {
+    match t {
+        CType::Pointer(..) | CType::Array(..) => ScalarClass::Ptr,
+        CType::Int(..) | CType::Bool | CType::Enum(..) => ScalarClass::Int,
+        CType::Float(..) => ScalarClass::Float,
+        _ => ScalarClass::Other,
+    }
+}
+
+// Best-effort static class of an expression's value; Other == unknown (left untouched).
+fn cexpr_scalar_class(
+    e: &CExpr,
+    types: &HashMap<String, CType>,
+    callee_ret: &HashMap<String, CType>,
+) -> ScalarClass {
+    match e {
+        CExpr::Cast(ty, _) => ctype_scalar_class(ty),
+        CExpr::Var(name) => types.get(name).map(ctype_scalar_class).unwrap_or(ScalarClass::Other),
+        CExpr::Paren(inner) => cexpr_scalar_class(inner, types, callee_ret),
+        CExpr::IntLit(_) => ScalarClass::Int,
+        CExpr::FloatLit(_) => ScalarClass::Float,
+        CExpr::StringLit(_) => ScalarClass::Ptr,
+        CExpr::Unary(UnaryOp::AddrOf, _) => ScalarClass::Ptr,
+        CExpr::Unary(UnaryOp::Neg | UnaryOp::BitNot | UnaryOp::Not | UnaryOp::Plus, _) => ScalarClass::Int,
+        CExpr::Binary(BinaryOp::Add | BinaryOp::Sub, l, r) => {
+            if cexpr_scalar_class(l, types, callee_ret) == ScalarClass::Ptr
+                || cexpr_scalar_class(r, types, callee_ret) == ScalarClass::Ptr
+            {
+                ScalarClass::Ptr
+            } else {
+                ScalarClass::Int
+            }
+        }
+        CExpr::Binary(..) => ScalarClass::Int,
+        CExpr::Call(f, _) => match f.as_ref() {
+            CExpr::Var(n) => callee_ret.get(n).map(ctype_scalar_class).unwrap_or(ScalarClass::Other),
+            _ => ScalarClass::Other,
+        },
+        _ => ScalarClass::Other,
+    }
+}
+
+// Wrap `e` in a cast to `target` only at a genuine pointer<->integer mismatch (the hard-error pair).
+fn coerce_scalar(
+    target: &CType,
+    e: CExpr,
+    types: &HashMap<String, CType>,
+    callee_ret: &HashMap<String, CType>,
+) -> CExpr {
+    let mismatch = matches!(
+        (ctype_scalar_class(target), cexpr_scalar_class(&e, types, callee_ret)),
+        (ScalarClass::Ptr, ScalarClass::Int) | (ScalarClass::Int, ScalarClass::Ptr)
+    );
+    if !mismatch {
+        return e;
+    }
+    // 0 is a valid null-pointer constant and a valid integer; it never needs a cast.
+    if let CExpr::IntLit(l) = &e {
+        if l.value == 0 {
+            return e;
+        }
+    }
+    CExpr::Cast(target.clone(), Box::new(e))
+}
+
+// Type of an lvalue, for casting an assignment's RHS to it; handles a plain variable and a deref of a pointer variable, other lvalue forms (field, index) return None and are left untouched.
+fn lvalue_ctype(e: &CExpr, types: &HashMap<String, CType>) -> Option<CType> {
+    match e {
+        CExpr::Var(n) => types.get(n).cloned(),
+        CExpr::Paren(inner) => lvalue_ctype(inner, types),
+        CExpr::Unary(UnaryOp::Deref, inner) => match lvalue_ctype(inner, types) {
+            Some(CType::Pointer(t, _)) => Some(*t),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// name -> (param types, is_variadic, is_unspecified_K&R)
+type CalleeParams = HashMap<String, (Vec<CType>, bool, bool)>;
+
+fn insert_casts_expr(
+    e: &CExpr,
+    types: &HashMap<String, CType>,
+    callee_params: &CalleeParams,
+    callee_ret: &HashMap<String, CType>,
+) -> CExpr {
+    match e {
+        CExpr::Call(f, args) => {
+            let nf = insert_casts_expr(f, types, callee_params, callee_ret);
+            let mut nargs: Vec<CExpr> = args
+                .iter()
+                .map(|a| insert_casts_expr(a, types, callee_params, callee_ret))
+                .collect();
+            if let CExpr::Var(fname) = &nf {
+                if let Some((ptypes, _variadic, unspecified)) = callee_params.get(fname) {
+                    // K&R `f()` is unchecked; for variadics, ptypes covers only the fixed leading parameters, so `ptypes.get(i)` naturally leaves the variadic tail untouched.
+                    if !unspecified {
+                        for (i, a) in nargs.iter_mut().enumerate() {
+                            if let Some(pt) = ptypes.get(i) {
+                                let arg = std::mem::replace(a, CExpr::int(0));
+                                *a = coerce_scalar(pt, arg, types, callee_ret);
+                            }
+                        }
+                    }
+                }
+            }
+            CExpr::Call(Box::new(nf), nargs)
+        }
+        CExpr::Assign(op, lhs, rhs) => {
+            let nlhs = insert_casts_expr(lhs, types, callee_params, callee_ret);
+            let nrhs = insert_casts_expr(rhs, types, callee_params, callee_ret);
+            if *op == AssignOp::Assign {
+                if let Some(lty) = lvalue_ctype(&nlhs, types) {
+                    let nrhs = coerce_scalar(&lty, nrhs, types, callee_ret);
+                    return CExpr::Assign(*op, Box::new(nlhs), Box::new(nrhs));
+                }
+            }
+            CExpr::Assign(*op, Box::new(nlhs), Box::new(nrhs))
+        }
+        CExpr::Unary(op, i) => CExpr::Unary(*op, Box::new(insert_casts_expr(i, types, callee_params, callee_ret))),
+        CExpr::Binary(op, l, r) => CExpr::Binary(
+            *op,
+            Box::new(insert_casts_expr(l, types, callee_params, callee_ret)),
+            Box::new(insert_casts_expr(r, types, callee_params, callee_ret)),
+        ),
+        CExpr::Ternary(c, t, f) => CExpr::Ternary(
+            Box::new(insert_casts_expr(c, types, callee_params, callee_ret)),
+            Box::new(insert_casts_expr(t, types, callee_params, callee_ret)),
+            Box::new(insert_casts_expr(f, types, callee_params, callee_ret)),
+        ),
+        CExpr::Cast(ty, i) => CExpr::Cast(ty.clone(), Box::new(insert_casts_expr(i, types, callee_params, callee_ret))),
+        CExpr::Member(i, fld) => CExpr::Member(Box::new(insert_casts_expr(i, types, callee_params, callee_ret)), fld.clone()),
+        CExpr::MemberPtr(i, fld) => CExpr::MemberPtr(Box::new(insert_casts_expr(i, types, callee_params, callee_ret)), fld.clone()),
+        CExpr::Index(a, i) => CExpr::Index(
+            Box::new(insert_casts_expr(a, types, callee_params, callee_ret)),
+            Box::new(insert_casts_expr(i, types, callee_params, callee_ret)),
+        ),
+        CExpr::SizeofExpr(i) => CExpr::SizeofExpr(Box::new(insert_casts_expr(i, types, callee_params, callee_ret))),
+        CExpr::Paren(i) => CExpr::Paren(Box::new(insert_casts_expr(i, types, callee_params, callee_ret))),
+        CExpr::StmtExpr(stmts, i) => CExpr::StmtExpr(
+            stmts.iter().map(|s| insert_casts_stmt(s, types, callee_params, callee_ret, &CType::Void)).collect(),
+            Box::new(insert_casts_expr(i, types, callee_params, callee_ret)),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn insert_casts_stmt(
+    stmt: &CStmt,
+    types: &HashMap<String, CType>,
+    callee_params: &CalleeParams,
+    callee_ret: &HashMap<String, CType>,
+    ret_type: &CType,
+) -> CStmt {
+    match stmt {
+        CStmt::Expr(e) => CStmt::Expr(insert_casts_expr(e, types, callee_params, callee_ret)),
+        CStmt::Block(items) => CStmt::Block(
+            items
+                .iter()
+                .map(|item| match item {
+                    CBlockItem::Stmt(s) => CBlockItem::Stmt(insert_casts_stmt(s, types, callee_params, callee_ret, ret_type)),
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
+        CStmt::If(c, t, e) => CStmt::If(
+            insert_casts_expr(c, types, callee_params, callee_ret),
+            Box::new(insert_casts_stmt(t, types, callee_params, callee_ret, ret_type)),
+            e.as_ref().map(|x| Box::new(insert_casts_stmt(x, types, callee_params, callee_ret, ret_type))),
+        ),
+        CStmt::While(c, b) => CStmt::While(
+            insert_casts_expr(c, types, callee_params, callee_ret),
+            Box::new(insert_casts_stmt(b, types, callee_params, callee_ret, ret_type)),
+        ),
+        CStmt::DoWhile(b, c) => CStmt::DoWhile(
+            Box::new(insert_casts_stmt(b, types, callee_params, callee_ret, ret_type)),
+            insert_casts_expr(c, types, callee_params, callee_ret),
+        ),
+        CStmt::For(init, c, u, b) => CStmt::For(
+            init.clone(),
+            c.as_ref().map(|x| insert_casts_expr(x, types, callee_params, callee_ret)),
+            u.as_ref().map(|x| insert_casts_expr(x, types, callee_params, callee_ret)),
+            Box::new(insert_casts_stmt(b, types, callee_params, callee_ret, ret_type)),
+        ),
+        CStmt::Switch(e, b) => CStmt::Switch(
+            insert_casts_expr(e, types, callee_params, callee_ret),
+            Box::new(insert_casts_stmt(b, types, callee_params, callee_ret, ret_type)),
+        ),
+        CStmt::Labeled(lbl, inner) => CStmt::Labeled(lbl.clone(), Box::new(insert_casts_stmt(inner, types, callee_params, callee_ret, ret_type))),
+        CStmt::Sequence(ss) => CStmt::Sequence(ss.iter().map(|s| insert_casts_stmt(s, types, callee_params, callee_ret, ret_type)).collect()),
+        CStmt::Return(Some(e)) => {
+            let ne = insert_casts_expr(e, types, callee_params, callee_ret);
+            let ne = if matches!(ret_type, CType::Void) { ne } else { coerce_scalar(ret_type, ne, types, callee_ret) };
+            CStmt::Return(Some(ne))
+        }
+        other => other.clone(),
+    }
+}
+
+// Whether a referenced-but-undeclared identifier should become a file-scope object; synthesized local names are excluded, since masking one with a global would hide the real recovery gap.
+fn is_global_like_name(n: &str) -> bool {
+    if n.is_empty() {
+        return false;
+    }
+    if n.starts_with("var_") || n.starts_with("tmp") {
+        return false;
+    }
+    // Compiler builtins (the opaque markers for un-encodable ops) are neither file-scope objects nor locals, and declaring one as a tentative long would let the optimizer constant-fold it.
+    if n.starts_with("__builtin_") {
+        return false;
+    }
+    if n.starts_with('p') && n.len() >= 2 && n[1..].chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    true
+}
+
 fn convert_binary_op(op: &clight::ClightBinaryOp) -> BinaryOp {
     match op {
         clight::ClightBinaryOp::Oadd => BinaryOp::Add,
@@ -2235,10 +3915,39 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
                     });
                 }
             }
-            CExpr::Var(sanitize_c_symbol_name(name))
+            let sanitized = sanitize_c_symbol_name(name);
+            // Track header-collision renames (local `atexit` definition -> `atexit_local`) so calls and address-of references target the renamed local definition.
+            match ctx.func_renames.get(&sanitized) {
+                Some(renamed) => CExpr::Var(renamed.clone()),
+                None => CExpr::Var(sanitized),
+            }
         }
         clight::ClightExpr::Etempvar(id, _ty) => CExpr::Var(ctx.temp_name(*id)),
-        clight::ClightExpr::Ederef(inner, _ty) => {
+        clight::ClightExpr::Ederef(inner, ty) => {
+            // Materialize the node's ACCESS type as *(T *)base: always for a bare variable, whose decl may lawfully diverge, and for a composite base unless its annotation already points to the access type.
+            let access_castable = matches!(
+                ty,
+                clight::ClightType::Tint(..)
+                    | clight::ClightType::Tlong(..)
+                    | clight::ClightType::Tfloat(..)
+                    | clight::ClightType::Tpointer(..)
+            );
+            if access_castable {
+                let need_cast = match inner.as_ref() {
+                    clight::ClightExpr::Etempvar(..) | clight::ClightExpr::Evar(..) => true,
+                    other => !matches!(
+                        clight_expr_ctype(other),
+                        clight::ClightType::Tpointer(p, _) if p.as_ref() == ty
+                    ),
+                };
+                if need_cast {
+                    let cty = CType::ptr(convert_clight_type(ty));
+                    return CExpr::Unary(
+                        UnaryOp::Deref,
+                        Box::new(CExpr::Cast(cty, Box::new(convert_expr(inner, ctx)))),
+                    );
+                }
+            }
             CExpr::Unary(UnaryOp::Deref, Box::new(convert_expr(inner, ctx)))
         }
         clight::ClightExpr::Eaddrof(inner, _ty) => {
@@ -2279,6 +3988,58 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
             }
         }
         clight::ClightExpr::Ebinop(op, lhs, rhs, _ty) => {
+            // B2 mis-scaling fix: byte-addressed candidates annotate their base void * without a cast node, so materialize (RT)((char *)v + k) and the C stays byte-correct under any final declaration.
+            if matches!(
+                op,
+                clight::ClightBinaryOp::Oadd | clight::ClightBinaryOp::Osub
+            ) {
+                let (bare, vt) = match lhs.as_ref() {
+                    clight::ClightExpr::Etempvar(_, vt) | clight::ClightExpr::Evar(_, vt) => {
+                        (true, vt)
+                    }
+                    other => (false, clight_expr_ctype(other)),
+                };
+                if let clight::ClightType::Tpointer(p, _) = vt {
+                    // A void pointee means byte-add, so scale through char *; a composite base realizes its own annotation faithfully except void *, which C cannot scale or deref through.
+                    let is_void = matches!(p.as_ref(), clight::ClightType::Tvoid);
+                    // The OFFSET operand of pointer arithmetic must print as an integer, since a pointer-annotated rhs is a byte count wearing the wrong type; Osub keeps a pointer rhs as legal pointer difference.
+                    let rhs_is_ptr = matches!(
+                        clight_expr_ctype(rhs),
+                        clight::ClightType::Tpointer(..)
+                    ) && matches!(op, clight::ClightBinaryOp::Oadd);
+                    let rhs_field_int = matches!(rhs.as_ref(), clight::ClightExpr::Efield(..))
+                        && matches!(
+                            clight_expr_ctype(rhs),
+                            clight::ClightType::Tint(..) | clight::ClightType::Tlong(..)
+                        );
+                    let rhs_is_ptr = rhs_is_ptr || rhs_field_int;
+                    if bare || is_void || rhs_is_ptr {
+                        let base_cty = if is_void {
+                            CType::ptr(CType::char_signed())
+                        } else {
+                            convert_clight_type(vt)
+                        };
+                        let base = CExpr::Cast(base_cty.clone(), Box::new(convert_expr(lhs, ctx)));
+                        let offset = if rhs_is_ptr {
+                            CExpr::Cast(CType::long(), Box::new(convert_expr(rhs, ctx)))
+                        } else {
+                            convert_expr(rhs, ctx)
+                        };
+                        let sum = CExpr::Binary(
+                            convert_binary_op(op),
+                            Box::new(base),
+                            Box::new(offset),
+                        );
+                        // In C the sum already has the base cast's type; an outer cast only adds information when the annotated result type differs.
+                        let result_cty = convert_clight_type(_ty);
+                        return if result_cty == base_cty {
+                            sum
+                        } else {
+                            CExpr::Cast(result_cty, Box::new(CExpr::Paren(Box::new(sum))))
+                        };
+                    }
+                }
+            }
             let is_comparison = matches!(
                 op,
                 clight::ClightBinaryOp::Oeq
@@ -2316,7 +4077,7 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
                                 field_name,
                             )
                         }
-                        // The base derefs to a non-aggregate (no struct/union identity recovered for it), so `->ofs_N` would be a member access through a void/scalar pointer and cannot compile. The field ident encodes the byte offset N (see field_ident_to_name); lower to a typed byte-offset deref `*(FieldTy *)((char *)base + N)`, matching Ghidra's `*(int *)(param + 0x10)` form. FieldTy comes from the Efield's own type, which is always a concrete scalar/pointer here.
+                        // The base derefs to a non-aggregate, so lower ->ofs_N to a typed byte-offset deref *(FieldTy *)((char *)base + N); the field ident encodes N and FieldTy is always a concrete scalar.
                         _ => {
                             let offset = *field_id as i64;
                             let field_ctype = convert_clight_type(field_ty);
@@ -2706,9 +4467,10 @@ pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> C
                 }
             }
             if converted.len() == 1 {
+                // RB-1: len()==1 guard makes next() infallible; both arms push CBlockItem::Stmt so the non-Stmt arm is unreachable.
                 match converted.into_iter().next().unwrap() {
                     CBlockItem::Stmt(s) => s,
-                    _ => unreachable!(),
+                    _ => unreachable!("Ssequence conversion pushes only CBlockItem::Stmt"),
                 }
             } else {
                 CStmt::Block(converted)
@@ -2821,6 +4583,7 @@ fn extract_loop_condition(body: &CStmt) -> Option<(CExpr, CStmt, bool)> {
         return Some((cond, rest_stmt, true));
     }
 
+    // RB-1: last() is infallible -- is_empty() and len()==1 returns above guarantee >= 2 elements here.
     if let Some(cond) = extract_condition_break(stmts.last().unwrap()) {
         let rest: Vec<CStmt> = stmts[..stmts.len() - 1].iter().map(|s| (*s).clone()).collect();
         let rest_stmt = if rest.len() == 1 {
@@ -2886,6 +4649,7 @@ fn extract_loop_update(stmt: &CStmt) -> Option<CExpr> {
                     exprs
                         .into_iter()
                         .reduce(|acc, e| CExpr::Binary(BinaryOp::Comma, Box::new(acc), Box::new(e)))
+                        // RB-1: reduce(None) only on empty iterator; excluded by the !exprs.is_empty() guard above.
                         .unwrap(),
                 )
             } else {
@@ -2912,14 +4676,7 @@ fn convert_switch_cases(
         })
         .collect();
 
-    // Collapse maximal runs of consecutive cases that share an identical, non-fall-through body
-    // into one stacked-label arm (`case a: case b: <body>`), the way switch arms are written by
-    // hand. A chain lowered from a jump table or comparison ladder produces one `case k: goto L;`
-    // per value, so distinct values reaching the same target would otherwise emit one goto each.
-    // Only bodies ending in an unconditional control transfer are merged, so stacking them cannot
-    // change C fall-through accumulation semantics. Labels are nested (Labeled wrapping Labeled)
-    // rather than emitted as separate empty-bodied block items, so later block-level cleanup
-    // passes treat each arm as a single unit and cannot drop an intermediate label.
+    // Collapse maximal runs of consecutive cases sharing an identical non-fall-through body into one stacked-label arm; labels are nested so later cleanup treats each arm as a single unit.
     let mut block_items = Vec::new();
     let mut i = 0;
     while i < converted.len() {
@@ -2940,9 +4697,7 @@ fn convert_switch_cases(
     CStmt::Block(block_items)
 }
 
-/// True if `stmt` ends in an unconditional control transfer, so control never falls off its end.
-/// Stacking consecutive same-bodied switch cases under shared labels is sound only when the shared
-/// body cannot fall through into the following case.
+/// True if `stmt` ends in an unconditional control transfer, so control never falls off its end. Stacking consecutive same-bodied switch cases under shared labels is sound only when the shared body cannot fall through into the following case.
 fn switch_body_exits(stmt: &CStmt) -> bool {
     match stmt {
         CStmt::Goto(_) | CStmt::Break | CStmt::Continue | CStmt::Return(_) => true,
@@ -2960,25 +4715,10 @@ fn switch_body_exits(stmt: &CStmt) -> bool {
     }
 }
 
-/// Number of disjoint value ranges above which a single-target switch is left as a switch rather
-/// than expanded into an `||` chain of range tests (keeps a genuinely sparse set readable as a switch).
+/// Number of disjoint value ranges above which a single-target switch is left as a switch rather than expanded into an `||` chain of range tests (keeps a genuinely sparse set readable as a switch).
 const MAX_RANGE_IF_RUNS: usize = 8;
 
-/// A switch whose explicit cases all branch to one identical, non-fall-through body is semantically a
-/// membership test: `switch(e){case lo: ... case hi: goto L;}` == `if (e>=lo && e<=hi) goto L;`. Jump
-/// tables and equality-comparison ladders lower to exactly this shape -- one `case k: goto L;` per
-/// value -- which a human writes as a range / `ctype`-style `if`. Recover that form when it is
-/// provably equivalent and return None (leaving the switch intact) otherwise.
-///
-/// Equivalence conditions, all required:
-/// - the scrutinee is duplicable (no memory read), since it is evaluated once per range test;
-/// - every explicit case shares one body that cannot fall through (so arm order is irrelevant and
-///   unmatched values still fall past the `if`, matching switch semantics with no `default`);
-/// - an optional `default` body (also non-fall-through) becomes the trailing `else`;
-/// - all case values are non-negative, so the `>=`/`<=` range tests agree with the switch's integer
-///   match regardless of the scrutinee's signedness (equality on the exact case constants is always
-///   sound; only the relational range form is signedness-sensitive). Each emitted range covers a
-///   maximal run of contiguous case labels, so every integer it admits is a real case value.
+/// Converts a single-target switch (all cases share one non-fall-through body) into a range `if` test. Requires: duplicable scrutinee (evaluated multiple times), non-negative case values (so `>=`/`<=` matches the switch's signedness semantics), and every emitted range covers only real case values.
 fn try_switch_to_range_if(
     expr: &clight::ClightExpr,
     cases: &clight::ClightLabeledStatements,
@@ -3043,8 +4783,7 @@ fn try_switch_to_range_if(
         let part = if lo == hi {
             CExpr::Binary(BinaryOp::Eq, Box::new(scrutinee.clone()), Box::new(CExpr::int(lo)))
         } else {
-            // Wrap each `e>=lo && e<=hi` group in parens so a multi-range condition reads as
-            // `(e>=lo && e<=hi) || (e>=lo2 && e<=hi2)` rather than relying on C's &&-over-|| precedence.
+            // Wrap each `e>=lo && e<=hi` group in parens so a multi-range condition reads as `(e>=lo && e<=hi) || (e>=lo2 && e<=hi2)` rather than relying on C's &&-over-|| precedence.
             CExpr::Paren(Box::new(CExpr::Binary(
                 BinaryOp::And,
                 Box::new(CExpr::Binary(BinaryOp::Ge, Box::new(scrutinee.clone()), Box::new(CExpr::int(lo)))),
@@ -3062,10 +4801,7 @@ fn try_switch_to_range_if(
     Some(CStmt::If(condition?, Box::new(then_branch), else_branch))
 }
 
-/// True if `expr` can be evaluated more than once without changing program behavior: a constant or
-/// variable read, or arithmetic over such. Excludes memory reads (`Efield`, address-of) so a range
-/// `if` never duplicates a load that could alias or be volatile. The Clight expression language has
-/// no call or assignment forms, so these are the only impurity concerns.
+/// True if expr can be evaluated more than once without changing behavior; excludes memory reads so a range if never duplicates a load that could alias or be volatile.
 fn clight_scrutinee_dupable(expr: &clight::ClightExpr) -> bool {
     match expr {
         clight::ClightExpr::EconstInt(_, _)
@@ -3085,8 +4821,7 @@ fn clight_scrutinee_dupable(expr: &clight::ClightExpr) -> bool {
     }
 }
 
-/// True if a Clight statement ends in an unconditional control transfer (mirrors `switch_body_exits`
-/// at the Clight level, before conversion to the C AST).
+/// True if a Clight statement ends in an unconditional control transfer (mirrors `switch_body_exits` at the Clight level, before conversion to the C AST).
 fn clight_stmt_exits(stmt: &clight::ClightStmt) -> bool {
     match stmt {
         clight::ClightStmt::Sgoto(_)
@@ -3115,20 +4850,41 @@ fn external_func_name(ef: &ExternalFunction) -> String {
     }
 }
 
+/// RPO over statement-bearing nodes walking the FULL clight_succ edge set, with loop-structure-aware successor ordering that places a loop body contiguously ahead of its exit.
 fn order_nodes_dfs(
     entry: crate::x86::types::Node,
     nodes: &HashSet<crate::x86::types::Node>,
     edges: &[(crate::x86::types::Node, crate::x86::types::Node)],
+    is_exit: impl Fn(crate::x86::types::Node) -> bool,
+    loop_members: &HashMap<crate::x86::types::Node, HashSet<crate::x86::types::Node>>,
+    node_innermost_loop: &HashMap<crate::x86::types::Node, crate::x86::types::Node>,
+    normalize: impl Fn(crate::x86::types::Node) -> crate::x86::types::Node,
 ) -> Vec<crate::x86::types::Node> {
     let mut adjacency: HashMap<crate::x86::types::Node, Vec<crate::x86::types::Node>> = HashMap::new();
     for (src, dst) in edges {
-        if nodes.contains(src) && nodes.contains(dst) {
+        if src != dst {
             adjacency.entry(*src).or_default().push(*dst);
         }
     }
 
-    for succs in adjacency.values_mut() {
-        succs.sort();
+    // Loop-structure-aware successor ordering, inverted because the DFS reverses twice: the body successor must be ordered LAST to emit first. Address ascending remains the tiebreak.
+    for (src, succs) in adjacency.iter_mut() {
+        let src_norm = normalize(*src);
+        // Innermost natural loop containing src (smallest body, ties on header address); None degrades the comparator to pure address order, and it is precomputed for O(1) lookup.
+        let inner_body: Option<&HashSet<crate::x86::types::Node>> = node_innermost_loop
+            .get(&src_norm)
+            .and_then(|header| loop_members.get(header));
+        succs.sort_by(|a, b| {
+            // 0 = leaves the innermost loop (exit, ordered first); 1 = stays inside it (body, ordered last). Both 0 (loop-free node) preserves the prior ascending-address order.
+            let key = |n: &crate::x86::types::Node| -> u8 {
+                match inner_body {
+                    Some(body) if body.contains(&normalize(*n)) => 1,
+                    _ => 0,
+                }
+            };
+            key(a).cmp(&key(b)).then_with(|| a.cmp(b))
+        });
+        succs.dedup();
     }
 
     let mut visited = HashSet::new();
@@ -3140,15 +4896,8 @@ fn order_nodes_dfs(
         PostVisit(crate::x86::types::Node),
     }
 
-    let start_node = if nodes.contains(&entry) {
-        entry
-    } else {
-        *nodes.iter().min().unwrap_or(&entry)
-    };
-
-    if nodes.contains(&start_node) {
-        stack.push(Action::Visit(start_node));
-    }
+    // Always start at the true entry so its successor chain orders every reachable member, even when the entry itself carries no statement.
+    stack.push(Action::Visit(entry));
 
     while let Some(action) = stack.pop() {
         match action {
@@ -3166,18 +4915,75 @@ fn order_nodes_dfs(
                 }
             }
             Action::PostVisit(u) => {
-                post_order.push(u);
+                if nodes.contains(&u) {
+                    post_order.push(u);
+                }
             }
         }
     }
 
     let mut result: Vec<_> = post_order.into_iter().rev().collect();
 
+    // Disconnected members (edges lost to bundling or genuinely dead) are inserted BEFORE the trailing exit run, not after it -- placing them after would let the consumer's dead-statement trim silently drop them. exec_order_key is a last-resort presentation tiebreak, not a reachability decision.
     let result_set: HashSet<_> = result.iter().copied().collect();
-    let mut remaining: Vec<_> = nodes.difference(&result_set).copied().collect();
-    if !remaining.is_empty() {
-        remaining.sort_by_key(|&n| crate::util::exec_order_key(n));
-        result.extend(remaining);
+    let all_remaining: Vec<_> = nodes.difference(&result_set).copied().collect();
+    // A disconnected node that is itself a LOOP HEADER is placed right after the reachable node edging into its body, or its Sloop floats to the wrong place and becomes unreachable.
+    let mut targeted: Vec<(usize, crate::x86::types::Node)> = Vec::new();
+    let mut general_remaining: Vec<crate::x86::types::Node> = Vec::new();
+    for &r in &all_remaining {
+        let rk = normalize(r);
+        let anchor = loop_members.get(&rk).and_then(|body| {
+            result.iter().position(|&e| {
+                adjacency.get(&e).map_or(false, |succs| {
+                    succs.iter().any(|s| body.contains(&normalize(*s)))
+                })
+            })
+        }).or_else(|| {
+            // Threaded-entry fallback: anchor to the LAST result node whose forward edge-walk reaches a body member first, the loop's immediate preheader, so preheader init is not emitted after the loop.
+            loop_members.get(&rk).and_then(|body| {
+                let result_set: HashSet<crate::x86::types::Node> = result.iter().copied().collect();
+                result.iter().rposition(|&e| {
+                    let mut stack: Vec<crate::x86::types::Node> = adjacency
+                        .get(&e)
+                        .map(|s| s.clone())
+                        .unwrap_or_default();
+                    let mut seen: HashSet<crate::x86::types::Node> = HashSet::new();
+                    while let Some(n) = stack.pop() {
+                        if !seen.insert(n) {
+                            continue;
+                        }
+                        if body.contains(&normalize(n)) {
+                            return true;
+                        }
+                        // Stop at any other emitted node: control reached a different top-level statement first, so e is not the loop's entry edge.
+                        if result_set.contains(&n) {
+                            continue;
+                        }
+                        if let Some(succs) = adjacency.get(&n) {
+                            stack.extend(succs.iter().copied());
+                        }
+                    }
+                    false
+                })
+            })
+        });
+        match anchor {
+            Some(pos) => targeted.push((pos, r)),
+            None => general_remaining.push(r),
+        }
+    }
+    // Apply targeted insertions descending so earlier positions stay valid.
+    targeted.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    for (pos, r) in targeted {
+        result.insert(pos + 1, r);
+    }
+    if !general_remaining.is_empty() {
+        general_remaining.sort_by_key(|&n| crate::util::exec_order_key(n));
+        let mut insert_at = result.len();
+        while insert_at > 0 && is_exit(result[insert_at - 1]) {
+            insert_at -= 1;
+        }
+        result.splice(insert_at..insert_at, general_remaining);
     }
 
     result
@@ -3291,6 +5097,24 @@ fn simplify_stmt_fallthrough(stmt: &CStmt, next_label: Option<&str>, count: &mut
                 result.push(simplify_stmt_fallthrough(s, next.as_deref(), count));
             }
             CStmt::Sequence(result)
+        }
+
+        // Recurse into loop/switch bodies with next_label = None, since a goto at a loop body's end falls to the back-edge and a fall-through past a case label is meaningful.
+        CStmt::While(cond, body) => {
+            CStmt::While(cond.clone(), Box::new(simplify_stmt_fallthrough(body, None, count)))
+        }
+
+        CStmt::DoWhile(body, cond) => {
+            CStmt::DoWhile(Box::new(simplify_stmt_fallthrough(body, None, count)), cond.clone())
+        }
+
+        CStmt::For(init, cond, update, body) => {
+            CStmt::For(init.clone(), cond.clone(), update.clone(),
+                       Box::new(simplify_stmt_fallthrough(body, None, count)))
+        }
+
+        CStmt::Switch(disc, body) => {
+            CStmt::Switch(disc.clone(), Box::new(simplify_stmt_fallthrough(body, None, count)))
         }
 
         other => other.clone(),
@@ -3687,6 +5511,7 @@ pub(crate) fn is_valid_c_identifier(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
+    // RB-1: infallible -- the is_empty() return above guarantees a first char.
     let first = s.chars().next().unwrap();
     if !first.is_ascii_alphabetic() && first != '_' {
         return false;
@@ -3870,77 +5695,367 @@ fn collect_called_names_in_expr(expr: &CExpr, names: &mut HashSet<String>) {
     }
 }
 
-/// Infer a forward-declaration parameter type from a call-site argument expression, giving a called-but-not-emitted function (e.g. statically-linked gnulib helpers like version_etc, error) a usable prototype derived from how it is actually called instead of the bare `int f(void)` fallback that rejects every argument; casts (the common decompiler form) give the exact type, otherwise fall back to a width accepting both pointers and integers without truncation.
-fn infer_arg_ctype(expr: &CExpr) -> CType {
-    use crate::decompile::passes::c_pass::types::UnaryOp;
-    match expr {
-        CExpr::Cast(ty, _) => ty.clone(),
-        CExpr::StringLit(_) => CType::ptr(CType::Void),
-        CExpr::Unary(UnaryOp::AddrOf, _) => CType::ptr(CType::Void),
-        _ => CType::long(),
+// IL-1: forward-declaration parameter types from a JOIN over call-site evidence; every site must agree on arity and yield classifiable evidence, else the K&R int f() fallback stands.
+
+/// Per-position evidence as a join-semilattice over (class, width): Int|Int takes max width, Int|Float widens to Float(64), Ptr|Ptr unifies to void* except poisoning fn-ptr mismatches.
+#[derive(Debug, Clone, PartialEq)]
+enum ArgEvidence {
+    Bottom,
+    Int(u8, Signedness),
+    Float(u8),
+    /// Pointer class; `Some(T)` = exact pointer type evidenced, `None` = unknown pointee (emitted `void *`).
+    Ptr(Option<CType>),
+    TopIntPtr,
+    Poison,
+}
+
+impl ArgEvidence {
+    /// Lattice join: commutative, associative, idempotent -- result is independent of call-site arrival order.
+    fn join(self, other: ArgEvidence) -> ArgEvidence {
+        use ArgEvidence::*;
+        match (self, other) {
+            (Poison, _) | (_, Poison) => Poison,
+            (Bottom, x) | (x, Bottom) => x,
+            (Int(w1, s1), Int(w2, s2)) => {
+                if w1 == w2 {
+                    let s = if s1 == s2 { s1 } else { Signedness::Signed };
+                    Int(w1, s)
+                } else if w1 > w2 {
+                    Int(w1, s1)
+                } else {
+                    Int(w2, s2)
+                }
+            }
+            (Float(w1), Float(w2)) => Float(w1.max(w2)),
+            // Documented: int | float widens to double (see type-level docs).
+            (Int(_, _), Float(_)) | (Float(_), Int(_, _)) => Float(64),
+            (Ptr(a), Ptr(b)) => {
+                if a == b {
+                    Ptr(a)
+                } else if ctype_opt_involves_function(&a) || ctype_opt_involves_function(&b) {
+                    // Differing function-pointer types must not unify to void* (not implicit in strict C).
+                    Poison
+                } else {
+                    Ptr(None)
+                }
+            }
+            // Mixed scalar/pointer classes meet at the int/ptr-safe top.
+            (TopIntPtr, _) | (_, TopIntPtr) => TopIntPtr,
+            (Int(_, _), Ptr(_)) | (Ptr(_), Int(_, _)) => TopIntPtr,
+            (Float(_), Ptr(_)) | (Ptr(_), Float(_)) => TopIntPtr,
+        }
+    }
+
+    /// The C type to emit for a fully-joined position; `None` only for `Poison`, which forces the whole declaration to the K&R fallback.
+    fn to_ctype(&self) -> Option<CType> {
+        use crate::decompile::passes::c_pass::types::{FloatSize, IntSize};
+        match self {
+            // Bottom = no evidence: conservative default (long accepts both ints and pointers untruncated).
+            ArgEvidence::Bottom => Some(CType::long()),
+            ArgEvidence::Int(w, s) => {
+                let sz = match *w {
+                    0..=8 => IntSize::Char,
+                    9..=16 => IntSize::Short,
+                    17..=32 => IntSize::Int,
+                    _ => IntSize::Long,
+                };
+                Some(CType::Int(sz, *s))
+            }
+            ArgEvidence::Float(w) => Some(CType::Float(if *w <= 32 {
+                FloatSize::Float
+            } else {
+                FloatSize::Double
+            })),
+            ArgEvidence::Ptr(Some(ty)) => Some(ty.clone()),
+            ArgEvidence::Ptr(None) => Some(CType::ptr(CType::Void)),
+            ArgEvidence::TopIntPtr => Some(CType::long()),
+            ArgEvidence::Poison => None,
+        }
     }
 }
 
-/// Collect, per called function name, the argument types of its highest-arity call site (so a variadic callee gets a prototype covering all observed arguments); mirrors the traversal of collect_called_names_in_stmt.
-fn collect_call_sigs_in_stmt(stmt: &CStmt, sigs: &mut HashMap<String, Vec<CType>>) {
-    match stmt {
-        CStmt::Expr(expr) => collect_call_sigs_in_expr(expr, sigs),
-        CStmt::Return(Some(expr)) => collect_call_sigs_in_expr(expr, sigs),
-        CStmt::If(cond, then_s, else_s) => {
-            collect_call_sigs_in_expr(cond, sigs);
-            collect_call_sigs_in_stmt(then_s, sigs);
-            if let Some(e) = else_s { collect_call_sigs_in_stmt(e, sigs); }
+fn ctype_involves_function(ty: &CType) -> bool {
+    match ty {
+        CType::Function(_, _, _, _) => true,
+        CType::Pointer(inner, _) | CType::Array(inner, _) | CType::Qualified(inner, _) => {
+            ctype_involves_function(inner)
         }
-        CStmt::While(cond, body) | CStmt::DoWhile(body, cond) => {
-            collect_call_sigs_in_expr(cond, sigs);
-            collect_call_sigs_in_stmt(body, sigs);
+        _ => false,
+    }
+}
+
+fn ctype_opt_involves_function(ty: &Option<CType>) -> bool {
+    ty.as_ref().map_or(false, ctype_involves_function)
+}
+
+/// Classify a declared C type as argument evidence.
+fn arg_evidence_of_ctype(ty: &CType) -> ArgEvidence {
+    use crate::decompile::passes::c_pass::types::{FloatSize, IntSize};
+    match ty {
+        CType::Int(sz, s) => {
+            let w = match sz {
+                IntSize::Char => 8,
+                IntSize::Short => 16,
+                IntSize::Int => 32,
+                IntSize::Long | IntSize::LongLong => 64,
+                IntSize::Int128 => 128,
+            };
+            ArgEvidence::Int(w, *s)
         }
-        CStmt::For(_, cond, update, body) => {
-            if let Some(c) = cond { collect_call_sigs_in_expr(c, sigs); }
-            if let Some(u) = update { collect_call_sigs_in_expr(u, sigs); }
-            collect_call_sigs_in_stmt(body, sigs);
+        CType::Bool => ArgEvidence::Int(8, Signedness::Unsigned),
+        CType::Enum(_) => ArgEvidence::Int(32, Signedness::Signed),
+        CType::Float(FloatSize::Float) => ArgEvidence::Float(32),
+        CType::Float(_) => ArgEvidence::Float(64),
+        CType::Pointer(_, _) => ArgEvidence::Ptr(Some(ty.clone())),
+        // Arrays and function designators decay to pointers in argument position.
+        CType::Array(inner, _) => {
+            ArgEvidence::Ptr(Some(CType::ptr(inner.as_ref().clone())))
         }
-        CStmt::Switch(expr, body) => {
-            collect_call_sigs_in_expr(expr, sigs);
-            collect_call_sigs_in_stmt(body, sigs);
+        CType::Function(_, _, _, _) => ArgEvidence::Ptr(Some(CType::ptr(ty.clone()))),
+        CType::Qualified(inner, _) => arg_evidence_of_ctype(inner),
+        // void/struct/union/typedef: not a scalar class we can safely type a parameter from.
+        _ => ArgEvidence::Poison,
+    }
+}
+
+/// Type environment for classifying call arguments: exactly the declarations the C compiler sees; locals shadow globals.
+struct ArgEvidenceEnv<'a> {
+    local_types: HashMap<String, CType>,
+    global_types: &'a HashMap<String, CType>,
+    callee_ret: &'a HashMap<String, CType>,
+}
+
+impl ArgEvidenceEnv<'_> {
+    fn var_type(&self, name: &str) -> Option<&CType> {
+        self.local_types.get(name).or_else(|| self.global_types.get(name))
+    }
+}
+
+/// Classify one call-site argument expression; returns `Poison` when the declared type cannot be determined.
+fn arg_evidence_of_expr(expr: &CExpr, env: &ArgEvidenceEnv) -> ArgEvidence {
+    use crate::decompile::passes::c_pass::types::UnaryOp;
+    match expr {
+        CExpr::Cast(ty, _) => arg_evidence_of_ctype(ty),
+        CExpr::StringLit(_) => {
+            ArgEvidence::Ptr(Some(CType::ptr(CType::char_signed())))
         }
-        CStmt::Sequence(stmts) => { for s in stmts { collect_call_sigs_in_stmt(s, sigs); } }
-        CStmt::Block(items) => {
-            for item in items {
-                if let CBlockItem::Stmt(s) = item { collect_call_sigs_in_stmt(s, sigs); }
+        // A literal 0 is a valid int, float, and null pointer constant.
+        CExpr::IntLit(l) if l.value == 0 => ArgEvidence::Bottom,
+        CExpr::IntLit(l) => {
+            use crate::decompile::passes::c_pass::types::IntLiteralSuffix as S;
+            let (suffix_wide, unsigned) = match l.suffix {
+                S::None => (false, false),
+                S::U => (false, true),
+                S::L | S::LL => (true, false),
+                _ => (true, true),
+            };
+            let fits32 = l.value >= i32::MIN as i128 && l.value <= u32::MAX as i128;
+            let w = if suffix_wide || !fits32 { 64 } else { 32 };
+            let s = if unsigned { Signedness::Unsigned } else { Signedness::Signed };
+            ArgEvidence::Int(w, s)
+        }
+        CExpr::FloatLit(l) => {
+            use crate::decompile::passes::c_pass::types::FloatLiteralSuffix as F;
+            ArgEvidence::Float(if matches!(l.suffix, F::F) { 32 } else { 64 })
+        }
+        // A C character literal has type int.
+        CExpr::CharLit(_) => ArgEvidence::Int(32, Signedness::Signed),
+        CExpr::Var(name) => env
+            .var_type(name)
+            .map(arg_evidence_of_ctype)
+            .unwrap_or(ArgEvidence::Poison),
+        CExpr::Paren(inner) => arg_evidence_of_expr(inner, env),
+        CExpr::Unary(UnaryOp::AddrOf, _) => ArgEvidence::Ptr(None),
+        CExpr::Unary(UnaryOp::Deref, inner) => match arg_evidence_of_expr(inner, env) {
+            ArgEvidence::Ptr(Some(CType::Pointer(p, _))) => arg_evidence_of_ctype(&p),
+            _ => ArgEvidence::Poison,
+        },
+        CExpr::Unary(UnaryOp::Not, _) => ArgEvidence::Int(32, Signedness::Signed),
+        CExpr::Unary(UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot, inner) => {
+            match arg_evidence_of_expr(inner, env) {
+                ev @ (ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom) => ev,
+                _ => ArgEvidence::Poison,
             }
         }
-        CStmt::Labeled(_, inner) => collect_call_sigs_in_stmt(inner, sigs),
+        CExpr::Unary(_, _) => ArgEvidence::Poison,
+        CExpr::Binary(op, l, r) => {
+            use crate::decompile::passes::c_pass::types::BinaryOp as B;
+            match op {
+                // Comparisons and logical connectives have type int.
+                B::Eq | B::Ne | B::Lt | B::Le | B::Gt | B::Ge | B::And | B::Or => {
+                    ArgEvidence::Int(32, Signedness::Signed)
+                }
+                B::Shl | B::Shr => match arg_evidence_of_expr(l, env) {
+                    ev @ (ArgEvidence::Int(_, _) | ArgEvidence::Bottom) => ev,
+                    _ => ArgEvidence::Poison,
+                },
+                B::Add | B::Sub => {
+                    let le = arg_evidence_of_expr(l, env);
+                    let re = arg_evidence_of_expr(r, env);
+                    match (le, re) {
+                        // ptr - ptr is ptrdiff_t; ptr +/- int keeps the pointer type.
+                        (ArgEvidence::Ptr(_), ArgEvidence::Ptr(_)) if matches!(op, B::Sub) => {
+                            ArgEvidence::Int(64, Signedness::Signed)
+                        }
+                        (p @ ArgEvidence::Ptr(_), ArgEvidence::Int(_, _) | ArgEvidence::Bottom)
+                        | (ArgEvidence::Int(_, _) | ArgEvidence::Bottom, p @ ArgEvidence::Ptr(_)) => p,
+                        (
+                            le @ (ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom),
+                            re @ (ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom),
+                        ) => le.join(re),
+                        _ => ArgEvidence::Poison,
+                    }
+                }
+                B::Mul | B::Div | B::Mod | B::BitAnd | B::BitOr | B::BitXor => {
+                    let le = arg_evidence_of_expr(l, env);
+                    let re = arg_evidence_of_expr(r, env);
+                    match (&le, &re) {
+                        (
+                            ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom,
+                            ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom,
+                        ) => le.join(re),
+                        _ => ArgEvidence::Poison,
+                    }
+                }
+                _ => ArgEvidence::Poison,
+            }
+        }
+        CExpr::Ternary(_, t, e) => {
+            let te = arg_evidence_of_expr(t, env);
+            let ee = arg_evidence_of_expr(e, env);
+            match (&te, &ee) {
+                // int/ptr-mixed ternary is not valid C; poison so the callee keeps the K&R decl rather than laundering it through TopIntPtr.
+                (ArgEvidence::Ptr(_), ArgEvidence::Int(_, _))
+                | (ArgEvidence::Int(_, _), ArgEvidence::Ptr(_)) => ArgEvidence::Poison,
+                _ => te.join(ee),
+            }
+        }
+        CExpr::Call(callee, _) => match callee.as_ref() {
+            CExpr::Var(name) => env
+                .callee_ret
+                .get(name)
+                .map(arg_evidence_of_ctype)
+                .unwrap_or(ArgEvidence::Poison),
+            _ => ArgEvidence::Poison,
+        },
+        CExpr::SizeofType(_) | CExpr::SizeofExpr(_) | CExpr::AlignofType(_) => {
+            // size_t.
+            ArgEvidence::Int(64, Signedness::Unsigned)
+        }
+        _ => ArgEvidence::Poison,
+    }
+}
+
+/// Collect per-call-site argument evidence vectors keyed by callee name (deterministic TU walk order).
+fn collect_call_arg_evidence_in_stmt(
+    stmt: &CStmt,
+    env: &ArgEvidenceEnv,
+    sites: &mut HashMap<String, Vec<Vec<ArgEvidence>>>,
+) {
+    match stmt {
+        CStmt::Expr(expr) => collect_call_arg_evidence_in_expr(expr, env, sites),
+        CStmt::Return(Some(expr)) => collect_call_arg_evidence_in_expr(expr, env, sites),
+        CStmt::If(cond, then_s, else_s) => {
+            collect_call_arg_evidence_in_expr(cond, env, sites);
+            collect_call_arg_evidence_in_stmt(then_s, env, sites);
+            if let Some(e) = else_s { collect_call_arg_evidence_in_stmt(e, env, sites); }
+        }
+        CStmt::While(cond, body) | CStmt::DoWhile(body, cond) => {
+            collect_call_arg_evidence_in_expr(cond, env, sites);
+            collect_call_arg_evidence_in_stmt(body, env, sites);
+        }
+        CStmt::For(_, cond, update, body) => {
+            if let Some(c) = cond { collect_call_arg_evidence_in_expr(c, env, sites); }
+            if let Some(u) = update { collect_call_arg_evidence_in_expr(u, env, sites); }
+            collect_call_arg_evidence_in_stmt(body, env, sites);
+        }
+        CStmt::Switch(expr, body) => {
+            collect_call_arg_evidence_in_expr(expr, env, sites);
+            collect_call_arg_evidence_in_stmt(body, env, sites);
+        }
+        CStmt::Sequence(stmts) => {
+            for s in stmts { collect_call_arg_evidence_in_stmt(s, env, sites); }
+        }
+        CStmt::Block(items) => {
+            for item in items {
+                if let CBlockItem::Stmt(s) = item { collect_call_arg_evidence_in_stmt(s, env, sites); }
+            }
+        }
+        CStmt::Labeled(_, inner) => collect_call_arg_evidence_in_stmt(inner, env, sites),
         _ => {}
     }
 }
 
-fn collect_call_sigs_in_expr(expr: &CExpr, sigs: &mut HashMap<String, Vec<CType>>) {
+fn collect_call_arg_evidence_in_expr(
+    expr: &CExpr,
+    env: &ArgEvidenceEnv,
+    sites: &mut HashMap<String, Vec<Vec<ArgEvidence>>>,
+) {
     match expr {
         CExpr::Call(callee, args) => {
             if let CExpr::Var(name) = callee.as_ref() {
-                let keep = sigs.get(name).map_or(true, |existing| args.len() > existing.len());
-                if keep {
-                    sigs.insert(name.clone(), args.iter().map(infer_arg_ctype).collect());
-                }
+                let evidence: Vec<ArgEvidence> =
+                    args.iter().map(|a| arg_evidence_of_expr(a, env)).collect();
+                sites.entry(name.clone()).or_default().push(evidence);
             }
-            collect_call_sigs_in_expr(callee, sigs);
-            for arg in args { collect_call_sigs_in_expr(arg, sigs); }
+            collect_call_arg_evidence_in_expr(callee, env, sites);
+            for arg in args { collect_call_arg_evidence_in_expr(arg, env, sites); }
         }
         CExpr::Assign(_, lhs, rhs) | CExpr::Binary(_, lhs, rhs) => {
-            collect_call_sigs_in_expr(lhs, sigs);
-            collect_call_sigs_in_expr(rhs, sigs);
+            collect_call_arg_evidence_in_expr(lhs, env, sites);
+            collect_call_arg_evidence_in_expr(rhs, env, sites);
         }
-        CExpr::Unary(_, inner) | CExpr::Cast(_, inner) | CExpr::Member(inner, _) | CExpr::MemberPtr(inner, _) => {
-            collect_call_sigs_in_expr(inner, sigs);
+        CExpr::Unary(_, inner)
+        | CExpr::Cast(_, inner)
+        | CExpr::Member(inner, _)
+        | CExpr::MemberPtr(inner, _)
+        | CExpr::Paren(inner)
+        | CExpr::SizeofExpr(inner) => {
+            collect_call_arg_evidence_in_expr(inner, env, sites);
+        }
+        CExpr::Index(arr, idx) => {
+            collect_call_arg_evidence_in_expr(arr, env, sites);
+            collect_call_arg_evidence_in_expr(idx, env, sites);
         }
         CExpr::Ternary(a, b, c) => {
-            collect_call_sigs_in_expr(a, sigs);
-            collect_call_sigs_in_expr(b, sigs);
-            collect_call_sigs_in_expr(c, sigs);
+            collect_call_arg_evidence_in_expr(a, env, sites);
+            collect_call_arg_evidence_in_expr(b, env, sites);
+            collect_call_arg_evidence_in_expr(c, env, sites);
         }
         _ => {}
     }
+}
+
+/// Join per-site evidence into a parameter type vector per callee; a callee gets a typed prototype only when arity agrees across all sites and no position joins to Poison.
+fn join_call_site_evidence(
+    sites_by_callee: &HashMap<String, Vec<Vec<ArgEvidence>>>,
+) -> HashMap<String, Vec<CType>> {
+    let mut joined: HashMap<String, Vec<CType>> = HashMap::new();
+    for (name, sites) in sites_by_callee {
+        let Some(first) = sites.first() else { continue };
+        let arity = first.len();
+        if sites.iter().any(|s| s.len() != arity) {
+            continue; // arity disagreement: variadic-or-noise, keep K&R
+        }
+        let mut acc: Vec<ArgEvidence> = vec![ArgEvidence::Bottom; arity];
+        for site in sites {
+            for (slot, ev) in acc.iter_mut().zip(site.iter()) {
+                *slot = std::mem::replace(slot, ArgEvidence::Bottom).join(ev.clone());
+            }
+        }
+        let mut param_types = Vec::with_capacity(arity);
+        let mut ok = true;
+        for ev in &acc {
+            match ev.to_ctype() {
+                Some(t) => param_types.push(t),
+                None => { ok = false; break; }
+            }
+        }
+        if ok {
+            joined.insert(name.clone(), param_types);
+        }
+    }
+    joined
 }
 
 /// Rename duplicate labels within a function body so each is unique: first occurrence keeps its name, subsequent get `_2`, `_3`, etc.
@@ -4236,5 +6351,130 @@ fn replace_last_assign_with_return(stmt: &CStmt, var: &str) -> CStmt {
             CStmt::Sequence(new_stmts)
         }
         other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod arg_evidence_tests {
+    use super::*;
+    use crate::decompile::passes::c_pass::types::{FloatSize, IntSize};
+
+    fn i32_() -> ArgEvidence { ArgEvidence::Int(32, Signedness::Signed) }
+    fn i64_() -> ArgEvidence { ArgEvidence::Int(64, Signedness::Signed) }
+    fn u32_() -> ArgEvidence { ArgEvidence::Int(32, Signedness::Unsigned) }
+    fn f64_() -> ArgEvidence { ArgEvidence::Float(64) }
+    fn ptr_char() -> ArgEvidence { ArgEvidence::Ptr(Some(CType::ptr(CType::char_signed()))) }
+    fn ptr_int() -> ArgEvidence { ArgEvidence::Ptr(Some(CType::ptr(CType::int()))) }
+
+    #[test]
+    fn join_int_widths() {
+        // int32 | int64 -> int64 (the FIXPLAN 5.5 example).
+        assert_eq!(i32_().join(i64_()), i64_());
+        // equal width, sign disagreement -> signed.
+        assert_eq!(u32_().join(i32_()), i32_());
+        assert_eq!(
+            i32_().join(i64_()).to_ctype(),
+            Some(CType::Int(IntSize::Long, Signedness::Signed))
+        );
+    }
+
+    #[test]
+    fn join_int_ptr_is_compilable_top() {
+        // int | ptr -> conservative top emitted as long (cast-inserter-safe).
+        assert_eq!(i64_().join(ptr_char()), ArgEvidence::TopIntPtr);
+        assert_eq!(ArgEvidence::TopIntPtr.to_ctype(), Some(CType::long()));
+        // float | ptr must never produce a float param; inserter cannot coerce float<->ptr, so it lands at the int/ptr top.
+        assert_eq!(f64_().join(ptr_char()), ArgEvidence::TopIntPtr);
+    }
+
+    #[test]
+    fn join_float_int_documented_choice() {
+        // float | int -> double (documented in the ArgEvidence docs).
+        assert_eq!(i64_().join(ArgEvidence::Float(32)), ArgEvidence::Float(64));
+        assert_eq!(
+            f64_().join(i32_()).to_ctype(),
+            Some(CType::Float(FloatSize::Double))
+        );
+    }
+
+    #[test]
+    fn join_pointers() {
+        // identical pointer types stay exact; differing ones unify to void*.
+        assert_eq!(ptr_char().join(ptr_char()), ptr_char());
+        assert_eq!(ptr_char().join(ptr_int()), ArgEvidence::Ptr(None));
+        assert_eq!(
+            ArgEvidence::Ptr(None).to_ctype(),
+            Some(CType::ptr(CType::Void))
+        );
+        // differing function-pointer types poison (no implicit conversion).
+        let fp = ArgEvidence::Ptr(Some(CType::ptr(CType::Function(
+            Box::new(CType::Void),
+            vec![],
+            false,
+            false,
+        ))));
+        assert_eq!(fp.clone().join(ptr_char()), ArgEvidence::Poison);
+        assert_eq!(fp.clone().join(fp.clone()), fp);
+    }
+
+    #[test]
+    fn join_bottom_and_poison() {
+        // literal 0 (Bottom) constrains nothing; Poison absorbs everything.
+        assert_eq!(ArgEvidence::Bottom.join(ptr_char()), ptr_char());
+        assert_eq!(ArgEvidence::Bottom.join(i32_()), i32_());
+        assert_eq!(ArgEvidence::Bottom.to_ctype(), Some(CType::long()));
+        assert_eq!(ArgEvidence::Poison.join(i64_()), ArgEvidence::Poison);
+        assert_eq!(ArgEvidence::Poison.to_ctype(), None);
+    }
+
+    #[test]
+    fn join_is_commutative_associative_idempotent() {
+        let samples = [
+            ArgEvidence::Bottom,
+            i32_(),
+            i64_(),
+            u32_(),
+            ArgEvidence::Float(32),
+            f64_(),
+            ptr_char(),
+            ptr_int(),
+            ArgEvidence::Ptr(None),
+            ArgEvidence::TopIntPtr,
+            ArgEvidence::Poison,
+        ];
+        for a in &samples {
+            assert_eq!(a.clone().join(a.clone()), *a, "idempotence {:?}", a);
+            for b in &samples {
+                assert_eq!(
+                    a.clone().join(b.clone()),
+                    b.clone().join(a.clone()),
+                    "commutativity {:?} {:?}",
+                    a,
+                    b
+                );
+                for c in &samples {
+                    let ab_c = a.clone().join(b.clone()).join(c.clone());
+                    let a_bc = a.clone().join(b.clone().join(c.clone()));
+                    assert_eq!(ab_c, a_bc, "associativity {:?} {:?} {:?}", a, b, c);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn join_sites_requires_arity_agreement() {
+        let mut sites: HashMap<String, Vec<Vec<ArgEvidence>>> = HashMap::new();
+        sites.insert("f".to_string(), vec![vec![i32_()], vec![i64_()]]);
+        sites.insert("g".to_string(), vec![vec![i32_()], vec![i32_(), i32_()]]);
+        sites.insert("h".to_string(), vec![vec![ArgEvidence::Poison]]);
+        sites.insert("z".to_string(), vec![vec![], vec![]]);
+        let joined = join_call_site_evidence(&sites);
+        assert_eq!(
+            joined.get("f"),
+            Some(&vec![CType::Int(IntSize::Long, Signedness::Signed)])
+        );
+        assert!(!joined.contains_key("g"), "arity mismatch must fall back to K&R");
+        assert!(!joined.contains_key("h"), "poison must fall back to K&R");
+        assert_eq!(joined.get("z"), Some(&vec![]), "consistent zero-arity -> (void)");
     }
 }

@@ -3,7 +3,7 @@ pub type Address = u64;
 pub type Size = usize;
 pub type Symbol = &'static str;
 use crate::x86::asm::{Ireg, TestCond};
-use crate::x86::mach::Mreg;
+use crate::mreg::Mreg;
 use crate::x86::op::{Addressing, Comparison, Condition, Operation, Ptrofs, F32, F64};
 use either::Either;
 use std::hash::{Hash, Hasher};
@@ -336,6 +336,9 @@ pub fn condition_for_testcond_sized(test: TestCond, is_64bit: bool) -> Condition
         }
         TestCond::CondNp => Condition::Cmasknotzero(0),
         TestCond::CondP => Condition::Cmaskzero(0),
+        // OF is a single flag bit, not a comparison: lift to the opaque overflow conditions, width-agnostic.
+        TestCond::CondO => Condition::Coverflow,
+        TestCond::CondNo => Condition::Cnotoverflow,
         TestCond::Unknown => Condition::Ccomp(Comparison::Unknown),
     }
 }
@@ -354,6 +357,8 @@ pub fn negate_testcond(c: TestCond) -> TestCond {
         TestCond::CondG  => TestCond::CondLe,
         TestCond::CondP  => TestCond::CondNp,
         TestCond::CondNp => TestCond::CondP,
+        TestCond::CondO  => TestCond::CondNo,
+        TestCond::CondNo => TestCond::CondO,
         TestCond::Unknown => TestCond::Unknown,
     }
 }
@@ -654,6 +659,8 @@ pub enum ClightType {
     Tvoid,
     Tint(ClightIntSize, ClightSignedness, ClightAttr),
     Tlong(ClightSignedness, ClightAttr),
+    // __int128, used ONLY for the 64x64->128 high multiply; never a selected register/variable type.
+    Tint128(ClightSignedness, ClightAttr),
     Tfloat(ClightFloatSize, ClightAttr),
     Tpointer(Arc<ClightType>, ClightAttr),
     #[allow(dead_code)]

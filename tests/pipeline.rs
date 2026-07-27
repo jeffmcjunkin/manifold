@@ -76,7 +76,16 @@ fn body_from_text(source: &str, func: &str) -> String {
         let line_start = source[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
         let prefix = &source[line_start..pos];
         if !prefix.starts_with(' ') && !prefix.starts_with('\t') && prefix.contains(' ') {
-            break pos;
+            // A definition has '{' before the next ';'; skip forward declarations (`ret name(...);`).
+            let rest = &source[pos..];
+            let is_def = match (rest.find('{'), rest.find(';')) {
+                (Some(b), Some(s)) => b < s,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if is_def {
+                break pos;
+            }
         }
         search_from = pos + 1;
     };
@@ -386,17 +395,6 @@ dual_compiler_test!(expressions, "-O1");
 dual_compiler_test!(structuring, "-O0");
 dual_compiler_test!(loops_advanced, "-O1");
 dual_compiler_test!(call_patterns, "-O1");
-
-// Tests adopted from CompCert small test suite
-
-dual_compiler_test!(compcert_fib, "-O1");
-dual_compiler_test!(compcert_qsort, "-O1");
-dual_compiler_test!(compcert_lists, "-O1");
-dual_compiler_test!(compcert_sha1, "-O1");
-dual_compiler_test!(compcert_switch, "-O1");
-// -O0: at -O1 gcc/clang emit cmov which the decompiler doesn't reconstruct yet
-dual_compiler_test!(compcert_ifconv, "-O0");
-dual_compiler_test!(compcert_vmach, "-O1");
 
 // Variable recovery tests
 

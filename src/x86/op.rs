@@ -20,6 +20,9 @@ pub enum Condition {
     Cnotcompfs(Comparison),
     Cmaskzero(i64),
     Cmasknotzero(i64),
+    // OF tests (JO/JNO) have no faithful CompCert encoding; these opaque variants exist to keep both Jcc edges.
+    Coverflow,
+    Cnotoverflow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -1,7 +1,11 @@
 
 
+pub mod ctyping;
+pub mod decl_solve;
 pub mod query;
 pub mod select;
+pub mod solve;
+pub mod wt_audit;
 
 
 pub fn derive_canonical_path(path_str: &str) -> String {

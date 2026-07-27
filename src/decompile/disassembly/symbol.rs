@@ -1,5 +1,5 @@
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use object::{Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, SectionKind, SymbolKind};
 use crate::decompile::elevator::DecompileDB;
 use crate::x86::types::*;
@@ -79,11 +79,11 @@ fn parse_eh_frame_hdr_starts(obj: &object::File) -> Vec<u64> {
     starts
 }
 
-// Push eh_frame_func_range(start, next_start) bracket ranges from the FDE starts so function inference treats a no-predecessor block strictly inside a range as a mid-body block (landing pad/tail), not a spurious entry; real functions sit ON a boundary so the strict-inequality guard preserves them.
+// Push generic known_function_range(start, next_start) brackets from the FDE starts; PE contributes exact ranges to the same relation.
 pub fn load_eh_frame_ranges(db: &mut DecompileDB, obj: &object::File) {
     let starts = parse_eh_frame_hdr_starts(obj);
     for w in starts.windows(2) {
-        db.rel_push("eh_frame_func_range", (w[0] as Address, w[1] as Address));
+        db.rel_push("known_function_range", (w[0] as Address, w[1] as Address));
     }
     if starts.len() >= 2 {
         log::debug!("eh_frame_hdr: {} FDE starts -> {} bracket ranges", starts.len(), starts.len() - 1);
@@ -165,9 +165,185 @@ pub fn load_symbols(db: &mut DecompileDB, obj: &object::File) {
     load_data_pointers(db, obj);
 
     load_data_section_ranges(db, obj);
+
+    load_fp_sign_clear_masks(db, obj);
+
+    load_rodata_fp_consts(db, obj);
 }
 
-// Push [start, end) ranges for allocated non-code data sections; a no-base absolute or scaled-index displacement is a genuine data/table address only when it lands in one, else a scaled-index lea displacement (e.g. `lea 0x8(,%rsi,8)`) is mistaken for a table base and synthesized into a bogus global.
+// Record .rodata addresses holding the IEEE-754 sign-clear masks (0x7FFFFFFF / 0x7FFFFFFFFFFFFFFF), the positive evidence needed to recover fabs in its reg-reg form.
+fn load_fp_sign_clear_masks(db: &mut DecompileDB, obj: &object::File) {
+    const MASK32: u32 = 0x7FFF_FFFF;
+    const MASK64: u64 = 0x7FFF_FFFF_FFFF_FFFF;
+    for section in obj.sections() {
+        if !section_is_allocated_elf(&section) {
+            continue;
+        }
+        match section.kind() {
+            // Sign masks live in read-only constant pools; never in code or writable data.
+            SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => {}
+            _ => continue,
+        }
+        let base = section.address();
+        if base == 0 {
+            continue;
+        }
+        let data = match section.data() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let n = data.len();
+        // 4-byte single-precision mask at every aligned offset.
+        let mut off = 0usize;
+        while off + 4 <= n {
+            let v = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+            if v == MASK32 {
+                db.rel_push("fp_sign_clear_mask", (base + off as u64, 4usize));
+            }
+            off += 4;
+        }
+        // 8-byte double-precision mask at every aligned offset.
+        let mut off = 0usize;
+        while off + 8 <= n {
+            let v = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+            if v == MASK64 {
+                db.rel_push("fp_sign_clear_mask", (base + off as u64, 8usize));
+            }
+            off += 8;
+        }
+    }
+}
+
+// Record (addr, width, bits) for rip-relative .rodata operands read by scalar-SSE ops, so a symbol-less FP constant is emitted typed instead of as an uninitialized long.
+fn load_rodata_fp_consts(db: &mut DecompileDB, obj: &object::File) {
+    use capstone::prelude::*;
+
+    // .rodata-style read-only constant pools, keyed by [start,end) with their bytes.
+    let mut rodata: Vec<(u64, u64, &[u8])> = Vec::new();
+    for section in obj.sections() {
+        if !section_is_allocated_elf(&section) {
+            continue;
+        }
+        match section.kind() {
+            SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => {}
+            _ => continue,
+        }
+        let base = section.address();
+        if base == 0 {
+            continue;
+        }
+        if let Ok(data) = section.data() {
+            rodata.push((base, base + data.len() as u64, data));
+        }
+    }
+    if rodata.is_empty() {
+        return;
+    }
+
+    let cs = match capstone::Capstone::new()
+        .x86()
+        .mode(arch::x86::ArchMode::Mode64)
+        .syntax(arch::x86::ArchSyntax::Intel)
+        .detail(true)
+        .build()
+    {
+        Ok(cs) => cs,
+        Err(_) => return,
+    };
+
+    // Recorded once per (addr,width) so duplicate loads of the same constant do not spam the relation.
+    let mut seen: HashSet<(u64, usize)> = HashSet::new();
+
+    for section in obj.sections() {
+        if section.kind() != SectionKind::Text {
+            continue;
+        }
+        let base = section.address();
+        let data = match section.data() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let insns = match cs.disasm_all(data, base) {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        for insn in insns.as_ref() {
+            let mnem = insn.mnemonic().unwrap_or("");
+            // Scalar SSE width: an *sd op reads 8 bytes, an *ss op 4; packed (*ps/*pd) and vector moves are excluded as bulk copies.
+            let width = scalar_fp_op_width(mnem);
+            let width = match width {
+                Some(w) => w,
+                None => continue,
+            };
+            let detail = match cs.insn_detail(insn) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let arch = detail.arch_detail();
+            let x86 = match arch.x86() {
+                Some(x) => x,
+                None => continue,
+            };
+            for op in x86.operands() {
+                if let capstone::arch::x86::X86OperandType::Mem(mem) = op.op_type {
+                    let base_name = cs
+                        .reg_name(mem.base())
+                        .unwrap_or_default()
+                        .to_ascii_uppercase();
+                    if base_name != "RIP" {
+                        continue;
+                    }
+                    if mem.index().0 != 0 {
+                        continue;
+                    }
+                    let target = (insn.address() + insn.len() as u64)
+                        .wrapping_add(mem.disp() as u64);
+                    let slot = match rodata
+                        .iter()
+                        .find(|(s, e, _)| target >= *s && target + width as u64 <= *e)
+                    {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    if !seen.insert((target, width)) {
+                        continue;
+                    }
+                    let off = (target - slot.0) as usize;
+                    let bits: u64 = match width {
+                        4 => u32::from_le_bytes(slot.2[off..off + 4].try_into().unwrap()) as u64,
+                        8 => u64::from_le_bytes(slot.2[off..off + 8].try_into().unwrap()),
+                        _ => continue,
+                    };
+                    db.rel_push("rodata_fp_const", (target, width, bits));
+                }
+            }
+        }
+    }
+}
+
+// Scalar-FP access width for an SSE mnemonic: 8 for *sd, 4 for *ss, None otherwise; conversions match by suffix at their SOURCE width.
+fn scalar_fp_op_width(mnem: &str) -> Option<usize> {
+    // Strip an AVX `v` prefix so vmovsd/vaddss etc. are handled identically.
+    let m = mnem.strip_prefix('v').unwrap_or(mnem);
+    // Only genuine scalar-FP ops: the packed bitwise logicals implement fabs/fneg with a sign mask (handled by fp_sign_clear_mask), and cvtsi2sd/ss read an integer source.
+    const DOUBLE: &[&str] = &[
+        "movsd", "comisd", "ucomisd", "addsd", "subsd", "mulsd", "divsd", "minsd", "maxsd",
+        "sqrtsd", "cvtsd2ss", "cvtsd2si", "cvttsd2si",
+    ];
+    const SINGLE: &[&str] = &[
+        "movss", "comiss", "ucomiss", "addss", "subss", "mulss", "divss", "minss", "maxss",
+        "sqrtss", "cvtss2sd", "cvtss2si", "cvttss2si",
+    ];
+    if DOUBLE.contains(&m) {
+        Some(8)
+    } else if SINGLE.contains(&m) {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+// Push [start, end) ranges for allocated non-code data sections, so an absolute or scaled-index displacement counts as a table address only when it lands in one.
 fn load_data_section_ranges(db: &mut DecompileDB, obj: &object::File) {
     for section in obj.sections() {
         if !section_is_allocated_elf(&section) {
@@ -368,7 +544,7 @@ fn load_plt(db: &mut DecompileDB, obj: &object::File) {
     }
 }
 
-// Detect the main function address from symbols, falling back to ELF entry point.
+// Detect main from symbols, falling back to the entry point only for ELF; a PE AddressOfEntryPoint names the CRT entry, not main.
 fn detect_main(db: &mut DecompileDB, obj: &object::File) {
     for sym in obj.symbols().chain(obj.dynamic_symbols()) {
         if sym.name().unwrap_or("") == "main" && sym.address() > 0 {
@@ -377,9 +553,16 @@ fn detect_main(db: &mut DecompileDB, obj: &object::File) {
         }
     }
 
-    let entry = obj.entry();
-    if entry > 0 {
-        db.rel_set("main_function", vec![(entry,)].into_iter().collect::<ascent::boxcar::Vec<_>>());
+    if db.abi().format == crate::abi::BinaryFormat::Elf {
+        let entry = obj.entry();
+        if entry > 0 {
+            db.rel_set(
+                "main_function",
+                vec![(entry,)]
+                    .into_iter()
+                    .collect::<ascent::boxcar::Vec<_>>(),
+            );
+        }
     }
 }
 
@@ -397,6 +580,24 @@ fn load_data_pointers(db: &mut DecompileDB, obj: &object::File) {
 
     let is_code_addr = |addr: u64| -> bool {
         code_ranges.iter().any(|(start, end)| addr >= *start && addr < *end)
+    };
+
+    // Allocated data-bearing section ranges: a pointer target landing here is a DATA pointer; .got/.got.plt and code are excluded as linker bookkeeping.
+    let data_ranges: Vec<(u64, u64)> = obj.sections()
+        .filter(|s| match s.kind() {
+            SectionKind::Data | SectionKind::ReadOnlyData | SectionKind::ReadOnlyDataWithRel
+                | SectionKind::ReadOnlyString | SectionKind::UninitializedData => true,
+            _ => false,
+        })
+        .filter(|s| {
+            let n = s.name().unwrap_or("");
+            n != ".got" && n != ".got.plt"
+        })
+        .filter(|s| s.address() != 0 && s.size() != 0)
+        .map(|s| (s.address(), s.address() + s.size()))
+        .collect();
+    let is_data_addr = |addr: u64| -> bool {
+        addr != 0 && data_ranges.iter().any(|(start, end)| addr >= *start && addr < *end)
     };
 
     // Scan data/rodata for 8-byte values pointing into code; skip GOT sections (.got, .got.plt) since their dynamic-linker pointers (e.g. lazy PLT resolver fallbacks) are not function entries.
@@ -420,11 +621,14 @@ fn load_data_pointers(db: &mut DecompileDB, obj: &object::File) {
             let val = u64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
             if is_code_addr(val) {
                 db.rel_push("code_pointer_in_data", (base + offset as u64, val));
+            } else if is_data_addr(val) {
+                // Non-PIE: the target is written directly in the section bytes, so a nonzero value pointing into a data section is a pointer-valued slot.
+                db.rel_push("pointer_in_data", (base + offset as u64, val));
             }
         }
     }
 
-    // In PIE binaries data code pointers are zero in section bytes (real target is the R_X86_64_RELATIVE addend applied at load), so recover them from the relocation addend here.
+    // In PIE binaries data pointers are zero in section bytes, so recover them from the relocation addend; a discarded data-target addend mis-recovered the global.
     if let Some(dyn_relocs) = obj.dynamic_relocations() {
         for (offset, reloc) in dyn_relocs {
             let is_relative = matches!(
@@ -439,6 +643,34 @@ fn load_data_pointers(db: &mut DecompileDB, obj: &object::File) {
             let target = reloc.addend() as u64;
             if is_code_addr(target) {
                 db.rel_push("code_pointer_in_data", (offset, target));
+            } else if is_data_addr(target) {
+                db.rel_push("pointer_in_data", (offset, target));
+            }
+        }
+    }
+
+    // Absolute 64-bit data relocations (non-PIE form): symbol value plus addend is the pointer target, recorded like RELATIVE addends; code targets go to code_pointer_in_data.
+    if let Some(dyn_symtab) = obj.dynamic_symbol_table() {
+        if let Some(dyn_relocs) = obj.dynamic_relocations() {
+            for (offset, reloc) in dyn_relocs {
+                let is_abs64 = matches!(
+                    reloc.flags(),
+                    object::RelocationFlags::Elf { r_type } if r_type == object::elf::R_X86_64_64
+                );
+                if !is_abs64 {
+                    continue;
+                }
+                let sym_val = match reloc.target() {
+                    object::RelocationTarget::Symbol(idx) => dyn_symtab
+                        .symbol_by_index(idx)
+                        .map(|s| s.address())
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                let target = sym_val.wrapping_add(reloc.addend() as u64);
+                if is_data_addr(target) && !is_code_addr(target) {
+                    db.rel_push("pointer_in_data", (offset, target));
+                }
             }
         }
     }
@@ -481,6 +713,13 @@ pub fn load_strings(db: &mut DecompileDB, obj: &object::File) {
             SectionKind::ReadOnlyData | SectionKind::ReadOnlyString => {}
             _ => continue,
         }
+        // PE metadata directories are byte tables, not string pools; .rdata is retained because MSVC/LLD place literals and import metadata together there.
+        if matches!(
+            section.name().unwrap_or(""),
+            ".pdata" | ".xdata" | ".rsrc" | ".reloc" | ".idata" | ".edata"
+        ) {
+            continue;
+        }
         let data = match section.data() {
             Ok(d) => d,
             Err(_) => continue,
@@ -507,6 +746,9 @@ pub fn load_strings(db: &mut DecompileDB, obj: &object::File) {
                     let size = str_bytes.len();
                     db.rel_push("string_data", (label, content, size));
                 }
+                // Record a zero-length string at each terminating NUL, so a deduplicated "" folded onto a trailing NUL lowers to "" instead of an opaque long global.
+                let nul_label = format!("L_{:x}", base + i as u64);
+                db.rel_push("string_data", (nul_label, String::new(), 0usize));
                 i += 1;
             }
         }

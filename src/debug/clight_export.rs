@@ -6,23 +6,18 @@ use crate::decompile::passes::clight_select::select::{select_clight_stmts, Selec
 use crate::x86::types::*;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 
 /// Export the selected Clight IR from the decompile DB to a JSON file.
 pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), String> {
     // Diagnostics
     let csharp_count = db.rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt").count();
-    let clight_wf_count = db.rel_iter::<(Node, ClightStmt)>("clight_stmt_without_field").count();
     let clight_count = db.rel_iter::<(Node, ClightStmt)>("clight_stmt").count();
-    let emit_wf_count = db.rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt_without_field").count();
     let emit_count = db.rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt").count();
     let var_type_count = db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate").count();
     eprintln!("=== Clight Pipeline Diagnostics ===");
     eprintln!("  csharp_stmt:                    {}", csharp_count);
-    eprintln!("  clight_stmt_without_field:      {}", clight_wf_count);
     eprintln!("  clight_stmt:                    {}", clight_count);
-    eprintln!("  emit_clight_stmt_without_field: {}", emit_wf_count);
     eprintln!("  emit_clight_stmt:               {}", emit_count);
     eprintln!("  emit_var_type:                  {}", var_type_count);
     eprintln!("=== End Diagnostics ===\n");
@@ -529,6 +524,15 @@ fn serialize_clight_type(ty: &ClightType) -> Value {
             "attr": serialize_attr(attr),
         }),
 
+        ClightType::Tint128(sign, attr) => json!({
+            "tag": "Tint128",
+            "sign": match sign {
+                ClightSignedness::Signed => "Signed",
+                ClightSignedness::Unsigned => "Unsigned",
+            },
+            "attr": serialize_attr(attr),
+        }),
+
         ClightType::Tfloat(size, attr) => json!({
             "tag": "Tfloat",
             "size": match size {
@@ -800,6 +804,11 @@ fn serialize_ctype_from_field(ty: &crate::decompile::passes::c_pass::types::CTyp
                     "sign": match sign { Signedness::Signed => "Signed", Signedness::Unsigned => "Unsigned" },
                     "attr": null,
                 }),
+                IntSize::Int128 => return json!({
+                    "tag": "Tint128",
+                    "sign": match sign { Signedness::Signed => "Signed", Signedness::Unsigned => "Unsigned" },
+                    "attr": null,
+                }),
             };
             json!({
                 "tag": "Tint",
@@ -834,11 +843,17 @@ fn serialize_ctype_from_field(ty: &crate::decompile::passes::c_pass::types::CTyp
             "name": name,
             "attr": null,
         }),
-        CType::Function(ret, params, variadic) => json!({
+        CType::Function(ret, params, variadic, unprototyped) => json!({
             "tag": "Tfunction",
             "return": serialize_ctype_from_field(ret),
             "params": params.iter().map(serialize_ctype_from_field).collect::<Vec<_>>(),
-            "cc": if *variadic { json!({"varargs": 0}) } else { json!("cc_default") },
+            "cc": if *unprototyped {
+                json!("cc_unproto")
+            } else if *variadic {
+                json!({"varargs": 0})
+            } else {
+                json!("cc_default")
+            },
         }),
         CType::Enum(name) => json!({"tag": "Tint", "size": "I32", "sign": "Signed", "attr": null, "enum": name}),
         CType::TypedefName(name) => json!({"tag": "Tint", "size": "I32", "sign": "Signed", "attr": null, "typedef": name}),

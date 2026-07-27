@@ -5,7 +5,7 @@ use capstone::arch::x86::X86OperandType;
 use object::{Object, ObjectSection, SectionFlags, SectionKind};
 use crate::decompile::disassembly::operand::*;
 use crate::decompile::elevator::DecompileDB;
-use crate::x86::mach::Mreg;
+use crate::mreg::Mreg;
 
 const SHF_EXECINSTR: u64 = 0x4;
 
@@ -17,7 +17,7 @@ fn is_rsp_reg(cs: &Capstone, op_type: &X86OperandType) -> bool {
     })
 }
 
-fn is_executable_section(section: &object::Section) -> bool {
+pub fn is_executable_section(section: &object::Section) -> bool {
     match section.flags() {
         SectionFlags::Elf { sh_flags } => sh_flags & SHF_EXECINSTR != 0,
         _ => section.kind() == SectionKind::Text,
@@ -33,13 +33,25 @@ pub struct DecodedInsn {
     pub op_str: &'static str,
 }
 
-// Disassemble all executable sections and populate instruction/operand/register DB relations.
+// Disassemble executable sections into the instruction/operand/register relations, dispatching on target arch.
 pub fn disassemble_sections(
     db: &mut DecompileDB,
     obj: &object::File,
 ) -> Vec<DecodedInsn> {
+    match db.abi().arch {
+        crate::abi::Arch::Aarch64 => {
+            crate::decompile::disassembly::aarch64::disassemble_sections(db, obj)
+        }
+        _ => disassemble_x86_sections(db, obj),
+    }
+}
+
+fn disassemble_x86_sections(
+    db: &mut DecompileDB,
+    obj: &object::File,
+) -> Vec<DecodedInsn> {
     let cs = {
-        let mode = if crate::x86::abi::abi_config().is_64bit() {
+        let mode = if db.abi().is_64bit() {
             arch::x86::ArchMode::Mode64
         } else {
             arch::x86::ArchMode::Mode32
@@ -146,7 +158,7 @@ pub fn disassemble_sections(
                         op_registers.push((id, name));
                         op_ids[i] = id;
 
-                        let mreg = Mreg::from(name);
+                        let mreg = Mreg::x86(name);
                         if mreg != Mreg::Unknown && !is_nop {
                             if op.access.map_or(false, |a| a.is_writable()) {
                                 reg_defs.push((addr, mreg));
@@ -187,13 +199,13 @@ pub fn disassemble_sections(
                         // Memory operand base/index registers count as reg_use
                         if !is_nop {
                             if base != "NONE" && base != "RIP" {
-                                let mreg = Mreg::from(base);
+                                let mreg = Mreg::x86(base);
                                 if mreg != Mreg::Unknown {
                                     reg_uses.push((addr, mreg));
                                 }
                             }
                             if index != "NONE" {
-                                let mreg = Mreg::from(index);
+                                let mreg = Mreg::x86(index);
                                 if mreg != Mreg::Unknown {
                                     reg_uses.push((addr, mreg));
                                 }
@@ -319,14 +331,14 @@ pub fn disassemble_sections(
             if !is_nop {
                 for &reg_id in detail.regs_write() {
                     let name = cs.reg_name(reg_id).unwrap_or_default().to_ascii_uppercase();
-                    let mreg = Mreg::from(name.as_str());
+                    let mreg = Mreg::x86(name.as_str());
                     if mreg != Mreg::Unknown {
                         reg_defs.push((addr, mreg));
                     }
                 }
                 for &reg_id in detail.regs_read() {
                     let name = cs.reg_name(reg_id).unwrap_or_default().to_ascii_uppercase();
-                    let mreg = Mreg::from(name.as_str());
+                    let mreg = Mreg::x86(name.as_str());
                     if mreg != Mreg::Unknown {
                         reg_uses.push((addr, mreg));
                     }

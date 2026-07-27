@@ -18,17 +18,22 @@ impl IRPass for AbiPass {
         populate_known_func_returns(db);
         populate_hardcoded_signatures(db);
         populate_known_global_types(db);
+        populate_known_func_param_pointee_size(db);
     }
 
     fn outputs(&self) -> &'static [&'static str] {
         &[
-            "is_arg_reg", "is_ret_reg", "is_xmm_arg_reg", "is_float_arg_reg",
-            "is_caller_saved", "is_known_noreturn_function",
+            "is_arg_reg", "is_xmm_arg_reg", "is_float_arg_reg",
+            "is_caller_saved", "is_callee_saved",
+            "abi_int_arg_position", "abi_float_arg_position",
+            "abi_shared_arg_slots", "abi_first_stack_arg_position",
+            "abi_outgoing_stack_base", "abi_incoming_sp_stack_base",
+            "abi_incoming_bp_stack_base", "abi_stack_slot_size",
+            "is_known_noreturn_function",
             "known_func_param_is_ptr", "known_func_returns_ptr",
-            "known_func_returns_long", "known_func_returns_int",
-            "known_func_returns_float", "known_func_returns_single",
+            "known_func_returns_long",
             "known_extern_signature", "known_global_type",
-            "known_varargs_function",
+            "known_varargs_function", "known_func_param_pointee_size",
         ]
     }
 }
@@ -36,35 +41,37 @@ impl IRPass for AbiPass {
 
 // Populate argument, return, and caller-saved register facts from the ABI config.
 fn populate_arg_ret_regs(db: &mut DecompileDB) {
-    let cfg = crate::x86::abi::abi_config();
-    for reg in &cfg.int_arg_regs {
+    let cfg = db.abi().clone();
+    for (pos, reg) in cfg.int_arg_regs.iter().enumerate() {
         db.rel_push("is_arg_reg", (*reg,));
+        db.rel_push("abi_int_arg_position", (*reg, pos));
     }
-    for reg in &cfg.float_arg_regs {
+    for (pos, reg) in cfg.float_arg_regs.iter().enumerate() {
         db.rel_push("is_xmm_arg_reg", (*reg,));
         db.rel_push("is_float_arg_reg", (*reg,));
+        db.rel_push("abi_float_arg_position", (*reg, pos));
     }
-    db.rel_push("is_ret_reg", (cfg.ret_int_reg,));
     for reg in &cfg.caller_saved {
         db.rel_push("is_caller_saved", (*reg,));
     }
+    for reg in &cfg.callee_saved {
+        db.rel_push("is_callee_saved", (*reg,));
+    }
+    if cfg.uses_shared_arg_slots() {
+        db.rel_push("abi_shared_arg_slots", (true,));
+    }
+    db.rel_push("abi_first_stack_arg_position", (cfg.first_stack_arg_position(),));
+    db.rel_push("abi_outgoing_stack_base", (cfg.outgoing_stack_arg_base(),));
+    db.rel_push("abi_incoming_sp_stack_base", (cfg.incoming_sp_stack_arg_base(),));
+    db.rel_push("abi_incoming_bp_stack_base", (cfg.incoming_bp_stack_arg_base(),));
+    db.rel_push("abi_stack_slot_size", (cfg.pointer_size as i64,));
 }
 
 
-// Register functions that never return (exit, abort, longjmp, etc.).
+// Register the always-noreturn functions from abi's single ALWAYS_NORETURN_FUNCS list; status-dependent error-family functions are decided at the call site instead.
 fn populate_known_noreturn(db: &mut DecompileDB) {
-    let noreturn_funcs: &[Symbol] = &[
-        "exit", "_exit", "_Exit",
-        "abort",
-        "__assert_fail", "__assert_perror_fail",
-        "__stack_chk_fail",
-        "pthread_exit",
-        "longjmp", "_longjmp", "siglongjmp",
-        "__cxa_throw", "__cxa_rethrow",
-        "quick_exit", "thrd_exit",
-    ];
-    for name in noreturn_funcs {
-        db.rel_push("is_known_noreturn_function", (*name,));
+    for name in crate::abi::ALWAYS_NORETURN_FUNCS {
+        db.rel_push("is_known_noreturn_function", (*name as Symbol,));
     }
 }
 
@@ -84,8 +91,7 @@ fn populate_known_func_param_is_ptr(db: &mut DecompileDB) {
         ("strstr", 0), ("strstr", 1),
         ("strtol", 0), ("strtol", 1),
         ("strtoul", 0), ("strtoul", 1),
-        ("strerror", 0),
-        ("malloc", 0),
+        // ABI-1: strerror(int) and malloc(size_t) take a SCALAR param 0; forcing it to pointer contradicted the signatures below and wrongly drove must_be_ptr/is_ptr/Xptr.
         ("free", 0),
         ("realloc", 0),
         ("reallocarray", 0),
@@ -140,8 +146,7 @@ fn populate_known_func_param_is_ptr(db: &mut DecompileDB) {
         ("quotearg_style", 1),
         ("quotearg_buffer", 0), ("quotearg_buffer", 2),
         ("quote", 0),
-        ("getpwuid", 0),
-        ("getgrgid", 0),
+        // ABI-1: getpwuid(uid_t) and getgrgid(gid_t) take a SCALAR ID param 0; forcing it to pointer wrongly drove must_be_ptr/is_ptr/Xptr.
         ("error", 2),
         ("__errno_location", 0),
         ("dcgettext", 0), ("dcgettext", 1),
@@ -192,6 +197,8 @@ fn populate_known_func_returns(db: &mut DecompileDB) {
         "uinttostr", "timetostr",
         "localtime_rz", "human_readable",
         "quotearg_style", "quote",
+        // gnulib author-name helpers return const char *; without the returns-ptr fact the result defaults to int and gets read-cast (int), truncating the pointer.
+        "proper_name", "proper_name_lite", "proper_name_utf8",
     ];
     for name in returns_ptr {
         db.rel_push("known_func_returns_ptr", (*name,));
@@ -208,39 +215,6 @@ fn populate_known_func_returns(db: &mut DecompileDB) {
     ];
     for name in returns_long {
         db.rel_push("known_func_returns_long", (*name,));
-    }
-
-    let returns_int: &[Symbol] = &[
-        "printf", "fprintf", "snprintf", "sprintf",
-        "__sprintf_chk", "__snprintf_chk", "__fprintf_chk", "__printf_chk",
-        "strcmp", "strncmp", "memcmp",
-        "fclose", "feof", "ferror", "fileno",
-        "atoi",
-        "fgetc", "getc", "getchar",
-        "fputc", "putc", "putchar",
-        "isalpha", "isdigit", "isspace",
-        "tolower", "toupper",
-        "close", "open", "access", "chmod", "chown",
-        "isatty", "atexit", "raise", "fflush",
-        "getopt_long",
-        "fstatat", "stat", "fstat", "lstat",
-        "fcntl", "ioctl", "openat", "dup2", "fchdir",
-        "faccessat", "unlink", "unlinkat", "mkdir",
-        "renameat", "fchown", "fchownat",
-        "sigaction", "sigprocmask", "sigemptyset", "sigaddset", "sigismember",
-        "kill", "fork", "execvp", "waitpid",
-        "unsetenv", "clock_gettime", "gettimeofday",
-        "uname", "getpagesize", "umask",
-        "fputs_unlocked", "fputc_unlocked", "fflush_unlocked",
-        "fseeko", "setvbuf",
-        "mbsinit", "iswprint", "iswcntrl", "wcwidth",
-        "strcoll", "fnmatch", "rpmatch",
-        "__cxa_atexit", "__fpending", "__freading",
-        "qsort", "posix_fadvise", "ftruncate",
-        "dirfd",
-    ];
-    for name in returns_int {
-        db.rel_push("known_func_returns_int", (*name,));
     }
 }
 
@@ -324,8 +298,9 @@ fn populate_hardcoded_signatures(db: &mut DecompileDB) {
         ("closedir", 1, Xint,   &[Xptr]),
         ("readdir",  1, Xptr,   &[Xptr]),
         ("access",   2, Xint,   &[Xcharptr, Xint]),
-        ("chmod",    2, Xint,   &[Xcharptr, Xint]),
-        ("chown",    3, Xint,   &[Xcharptr, Xint, Xint]),
+        // mode_t/uid_t/gid_t are unsigned 32-bit in the libc prototypes.
+        ("chmod",    2, Xint,   &[Xcharptr, Xintunsigned]),
+        ("chown",    3, Xint,   &[Xcharptr, Xintunsigned, Xintunsigned]),
         ("isatty",   1, Xint,   &[Xint]),
         ("time",       1, Xlong, &[Xptr]),
         ("localtime",  1, Xptr,  &[Xptr]),
@@ -342,8 +317,9 @@ fn populate_hardcoded_signatures(db: &mut DecompileDB) {
         ("quotearg_style", 2, Xcharptr, &[Xint, Xcharptr]),
         ("quotearg_buffer", 5, Xany64, &[Xcharptr, Xany64, Xcharptr, Xany64, Xptr]),
         ("quote",      1, Xcharptr, &[Xcharptr]),
-        ("getpwuid",   1, Xptr, &[Xint]),
-        ("getgrgid",   1, Xptr, &[Xint]),
+        // uid_t/gid_t are unsigned 32-bit; signed Xint here mis-signed comparisons and %u formatting.
+        ("getpwuid",   1, Xptr, &[Xintunsigned]),
+        ("getgrgid",   1, Xptr, &[Xintunsigned]),
         ("getuid",     0, Xint, &[]),
         ("getgid",     0, Xint, &[]),
         ("geteuid",    0, Xint, &[]),
@@ -412,11 +388,12 @@ fn populate_hardcoded_signatures(db: &mut DecompileDB) {
         ("faccessat",         4, Xint,   &[Xint, Xcharptr, Xint, Xint]),
         ("unlink",            1, Xint,   &[Xcharptr]),
         ("unlinkat",          3, Xint,   &[Xint, Xcharptr, Xint]),
-        ("mkdir",             2, Xint,   &[Xcharptr, Xint]),
+        ("mkdir",             2, Xint,   &[Xcharptr, Xintunsigned]),
         ("renameat",          4, Xint,   &[Xint, Xcharptr, Xint, Xcharptr]),
         ("renameat2",         5, Xint,   &[Xint, Xcharptr, Xint, Xcharptr, Xintunsigned]),
-        ("fchown",            3, Xint,   &[Xint, Xint, Xint]),
-        ("fchownat",          5, Xint,   &[Xint, Xcharptr, Xint, Xint, Xint]),
+        ("linkat",            5, Xint,   &[Xint, Xcharptr, Xint, Xcharptr, Xint]),
+        ("fchown",            3, Xint,   &[Xint, Xintunsigned, Xintunsigned]),
+        ("fchownat",          5, Xint,   &[Xint, Xcharptr, Xintunsigned, Xintunsigned, Xint]),
         ("pathconf",          2, Xlong,  &[Xcharptr, Xint]),
         ("canonicalize_file_name", 1, Xcharptr, &[Xcharptr]),
         ("sigaction",         3, Xint,   &[Xint, Xptr, Xptr]),
@@ -436,7 +413,7 @@ fn populate_hardcoded_signatures(db: &mut DecompileDB) {
         ("clock",             0, Xlong,  &[]),
         ("uname",             1, Xint,   &[Xptr]),
         ("getpagesize",       0, Xint,   &[]),
-        ("umask",             1, Xint,   &[Xint]),
+        ("umask",             1, Xint,   &[Xintunsigned]),
         ("getpwnam",          1, Xptr,   &[Xcharptr]),
         ("getgrnam",          1, Xptr,   &[Xcharptr]),
         ("endpwent",          0, Xvoid,  &[]),
@@ -477,6 +454,69 @@ fn populate_hardcoded_signatures(db: &mut DecompileDB) {
         ("sysconf",           1, Xlong,  &[Xint]),
         ("munmap",            2, Xint,   &[Xptr, Xany64]),
         ("sscanf",            2, Xint,   &[Xcharptr, Xcharptr]),
+        // <math.h> (mirrors header_functions.json); Xfloat == C double, and the true fixed arity clamps call sites whose argument count was over-recovered.
+        ("pow",               2, Xfloat, &[Xfloat, Xfloat]),
+        ("fmod",              2, Xfloat, &[Xfloat, Xfloat]),
+        ("atan2",             2, Xfloat, &[Xfloat, Xfloat]),
+        ("sqrt",              1, Xfloat, &[Xfloat]),
+        ("sin",               1, Xfloat, &[Xfloat]),
+        ("cos",               1, Xfloat, &[Xfloat]),
+        ("tan",               1, Xfloat, &[Xfloat]),
+        ("asin",              1, Xfloat, &[Xfloat]),
+        ("acos",              1, Xfloat, &[Xfloat]),
+        ("atan",              1, Xfloat, &[Xfloat]),
+        ("sinh",              1, Xfloat, &[Xfloat]),
+        ("cosh",              1, Xfloat, &[Xfloat]),
+        ("tanh",              1, Xfloat, &[Xfloat]),
+        ("exp",               1, Xfloat, &[Xfloat]),
+        ("log",               1, Xfloat, &[Xfloat]),
+        ("log10",             1, Xfloat, &[Xfloat]),
+        ("fabs",              1, Xfloat, &[Xfloat]),
+        ("ceil",              1, Xfloat, &[Xfloat]),
+        ("floor",             1, Xfloat, &[Xfloat]),
+        ("round",             1, Xfloat, &[Xfloat]),
+        // `f` (float) variants -- Xsingle == C float for ret/args.
+        ("powf",              2, Xsingle, &[Xsingle, Xsingle]),
+        ("fmodf",             2, Xsingle, &[Xsingle, Xsingle]),
+        ("atan2f",            2, Xsingle, &[Xsingle, Xsingle]),
+        ("sqrtf",             1, Xsingle, &[Xsingle]),
+        ("sinf",              1, Xsingle, &[Xsingle]),
+        ("cosf",              1, Xsingle, &[Xsingle]),
+        ("tanf",              1, Xsingle, &[Xsingle]),
+        ("asinf",             1, Xsingle, &[Xsingle]),
+        ("acosf",             1, Xsingle, &[Xsingle]),
+        ("atanf",             1, Xsingle, &[Xsingle]),
+        ("sinhf",             1, Xsingle, &[Xsingle]),
+        ("coshf",             1, Xsingle, &[Xsingle]),
+        ("tanhf",             1, Xsingle, &[Xsingle]),
+        ("expf",              1, Xsingle, &[Xsingle]),
+        ("logf",              1, Xsingle, &[Xsingle]),
+        ("log10f",            1, Xsingle, &[Xsingle]),
+        ("fabsf",             1, Xsingle, &[Xsingle]),
+        ("ceilf",             1, Xsingle, &[Xsingle]),
+        ("floorf",            1, Xsingle, &[Xsingle]),
+        ("roundf",            1, Xsingle, &[Xsingle]),
+        // Long-double (l) variants; the prototype is header-suppressed, so the Xfloat shape only feeds arity normalization and float-typed args.
+        ("powl",              2, Xfloat, &[Xfloat, Xfloat]),
+        ("fmodl",             2, Xfloat, &[Xfloat, Xfloat]),
+        ("atan2l",            2, Xfloat, &[Xfloat, Xfloat]),
+        ("sqrtl",             1, Xfloat, &[Xfloat]),
+        ("sinl",              1, Xfloat, &[Xfloat]),
+        ("cosl",              1, Xfloat, &[Xfloat]),
+        ("tanl",              1, Xfloat, &[Xfloat]),
+        ("asinl",             1, Xfloat, &[Xfloat]),
+        ("acosl",             1, Xfloat, &[Xfloat]),
+        ("atanl",             1, Xfloat, &[Xfloat]),
+        ("sinhl",             1, Xfloat, &[Xfloat]),
+        ("coshl",             1, Xfloat, &[Xfloat]),
+        ("tanhl",             1, Xfloat, &[Xfloat]),
+        ("expl",              1, Xfloat, &[Xfloat]),
+        ("logl",              1, Xfloat, &[Xfloat]),
+        ("log10l",            1, Xfloat, &[Xfloat]),
+        ("fabsl",             1, Xfloat, &[Xfloat]),
+        ("ceill",             1, Xfloat, &[Xfloat]),
+        ("floorl",            1, Xfloat, &[Xfloat]),
+        ("roundl",            1, Xfloat, &[Xfloat]),
     ];
 
     for &(name, param_count, ret_type, param_types) in signatures {
@@ -505,11 +545,33 @@ fn populate_hardcoded_signatures(db: &mut DecompileDB) {
 }
 
 
+// Required pointee size of struct-writing extern out-params (name, param_index, bytes); propagation into stack_struct_buffers is still TODO in struct_recovery_pass.
+fn populate_known_func_param_pointee_size(db: &mut DecompileDB) {
+    // (name, out-param index, struct size in bytes on x86-64 Linux / glibc)
+    const STAT_SIZE: usize = 144;     // struct stat
+    const TM_SIZE: usize = 56;        // struct tm
+    const UTSNAME_SIZE: usize = 390;  // struct utsname (6 * _UTSNAME_LENGTH=65)
+    let entries: &[(Symbol, usize, usize)] = &[
+        ("stat", 1, STAT_SIZE),
+        ("lstat", 1, STAT_SIZE),
+        ("fstat", 1, STAT_SIZE),
+        ("fstatat", 2, STAT_SIZE),
+        ("localtime_r", 1, TM_SIZE),   // localtime_r(const time_t*, struct tm*)
+        ("localtime_rz", 2, TM_SIZE),  // localtime_rz(timezone_t, const time_t*, struct tm*)
+        ("gmtime_r", 1, TM_SIZE),      // gmtime_r(const time_t*, struct tm*)
+        ("uname", 0, UTSNAME_SIZE),
+    ];
+    for &(name, idx, size) in entries {
+        db.rel_push("known_func_param_pointee_size", (name, idx, size));
+    }
+}
+
+
 // Register known types for well-known global variables (stdout, optarg, etc.).
 fn populate_known_global_types(db: &mut DecompileDB) {
     use XType::*;
 
-    // REMOVED only `Version`: it is a GENERIC identifier (the audit's top global-type overfit) that force-typed any program's unrelated `int`/`struct Version` to char*; it now takes the binary's own recovered evidence (void* on unstripped gnulib -- an acceptable pointer). program_name and exit_failure are KEPT: they are specific/low-collision gnulib names AND empirically (gcc -fsyntax-only on unstripped `[`) their recovered evidence is too weak -- dropping program_name regressed char*->long -- so the table type is the better default. NB: on STRIPPED binaries none of these internal symbol names survive, so the table only ever matches genuine dynamic imports there; this change is a no-op on the stripped eval corpus and only affects unstripped collisions.
+    // REMOVED only Version, a GENERIC identifier that force-typed unrelated program types to char*; program_name and exit_failure are KEPT as specific gnulib names whose recovered evidence is too weak.
     let known_globals: &[(&str, XType)] = &[
         ("stdout", Xptr),
         ("stderr", Xptr),

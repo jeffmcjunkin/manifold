@@ -4,7 +4,7 @@ use capstone::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use crate::x86::types::*;
-use crate::x86::mach::Mreg;
+use crate::mreg::Mreg;
 
 #[derive(Serialize)]
 struct DataflowOutput {

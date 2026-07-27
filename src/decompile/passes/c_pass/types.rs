@@ -30,6 +30,8 @@ pub enum IntSize {
     Long,
     #[allow(dead_code)]
     LongLong,
+    // __int128 (gcc/clang extension), emitted only for the 64x64->128 high-multiply lowering; never selected.
+    Int128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -74,7 +76,8 @@ pub enum CType {
     Float(FloatSize),
     Pointer(Box<CType>, TypeQualifiers),
     Array(Box<CType>, Option<usize>),
-    Function(Box<CType>, Vec<CType>, bool),
+    /// Function type (ret, params, variadic, unprototyped); unprototyped is K&R ret (*name)(): unspecified args, not (void), and the only type admitting both 0-arg and N-arg calls.
+    Function(Box<CType>, Vec<CType>, bool, bool),
     Struct(String),
     Union(String),
     #[allow(dead_code)]
@@ -122,6 +125,11 @@ impl CType {
 
     pub fn ptr(inner: CType) -> Self {
         CType::Pointer(Box::new(inner), TypeQualifiers::none())
+    }
+
+    /// A true unprototyped K&R function type ret (): use when arity could not be recovered but call sites differ in arity.
+    pub fn func_unprototyped(ret: CType) -> Self {
+        CType::Function(Box::new(ret), Vec::new(), false, true)
     }
 
     #[allow(dead_code)]
@@ -647,6 +655,8 @@ pub struct FuncDecl {
     pub return_type: CType,
     pub params: Vec<FuncParam>,
     pub is_variadic: bool,
+    /// When true, emit `()` (an unspecified, unchecked K&R argument list) instead of `(void)`.
+    pub unspecified_params: bool,
     pub loc: SourceLoc,
 }
 
@@ -657,6 +667,19 @@ impl FuncDecl {
             return_type,
             params,
             is_variadic: false,
+            unspecified_params: false,
+            loc: SourceLoc::unknown(),
+        }
+    }
+
+    // Declaration with an unspecified (K&R) parameter list `RET name();`: the compiler does no argument-count/type checking at call sites. Used for external functions of unknown signature.
+    pub fn new_unspecified(name: impl Into<String>, return_type: CType) -> Self {
+        Self {
+            name: name.into(),
+            return_type,
+            params: Vec::new(),
+            is_variadic: false,
+            unspecified_params: true,
             loc: SourceLoc::unknown(),
         }
     }
@@ -771,8 +794,7 @@ impl TranslationUnit {
         self.symbols.insert(name, idx);
     }
 
-    /// Rebuild `symbols` from actual `decls` positions.
-    /// Must be called after any operation that reorders or prepends to `decls`.
+    /// Rebuild `symbols` from actual `decls` positions. Must be called after any operation that reorders or prepends to `decls`.
     pub fn rebuild_symbols(&mut self) {
         self.symbols.clear();
         for (i, decl) in self.decls.iter().enumerate() {

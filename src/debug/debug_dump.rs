@@ -7,7 +7,7 @@ use crate::x86::types::*;
 use capstone::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use crate::x86::mach::Mreg;
+use crate::mreg::Mreg;
 use std::sync::Arc;
 
 #[derive(Debug, Serialize, Deserialize)]

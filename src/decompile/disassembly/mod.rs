@@ -1,13 +1,16 @@
-
-pub mod instruction;
-pub mod operand;
-pub mod symbol;
+pub mod aarch64;
 pub mod block;
+pub mod branch;
 pub mod cfg;
 pub mod function;
+pub mod instruction;
+pub mod operand;
+pub mod pe;
+pub mod symbol;
 
 use std::collections::HashMap;
 use std::path::Path;
+
 use crate::decompile::elevator::DecompileDB;
 use crate::x86::types::*;
 
@@ -28,17 +31,21 @@ pub fn load_from_binary(db: &mut DecompileDB, binary_path: &Path) {
         .unwrap_or_else(|e| panic!("Failed to parse binary {:?}: {}", binary_path, e));
 
     // Detect ABI from binary headers
-    let abi = crate::x86::abi::detect_abi(&obj);
+    let abi = crate::abi::detect_abi(&obj)
+        .unwrap_or_else(|e| panic!("Unsupported binary {:?}: {}", binary_path, e));
     log::info!("Detected ABI: {:?} / {:?} ({}bit, ptr={}B)",
               abi.format, abi.arch,
               if abi.is_64bit() { 64 } else { 32 },
               abi.pointer_size);
-    if !crate::x86::abi::abi_config_initialized() {
-        crate::x86::abi::init_abi_config(abi);
-    }
+    db.target_abi = Some(abi);
+
+    pe::validate_native_pe(&obj)
+        .unwrap_or_else(|e| panic!("Unsupported PE binary {:?}: {}", binary_path, e));
 
     symbol::load_symbols(db, &obj);
     symbol::load_eh_frame_ranges(db, &obj);
+    let pe_function_leaders = pe::load_metadata(db, &obj)
+        .unwrap_or_else(|e| panic!("Failed to load PE metadata from {:?}: {}", binary_path, e));
 
     let insns = instruction::disassemble_sections(db, &obj);
 
@@ -47,6 +54,7 @@ pub fn load_from_binary(db: &mut DecompileDB, binary_path: &Path) {
     let mut extra_leaders: Vec<u64> = jump_table_targets.values()
         .flat_map(|info| info.ordered_targets.iter().copied())
         .collect();
+    extra_leaders.extend(pe_function_leaders);
 
     let prologue_entries = function::detect_prologue_entries(&insns);
     extra_leaders.extend(prologue_entries.iter());
@@ -63,11 +71,13 @@ pub fn load_from_binary(db: &mut DecompileDB, binary_path: &Path) {
     extra_leaders.extend(code_pointer_targets.iter());
 
     // Recover main from __libc_start_main pattern for stripped binaries; must precede build_blocks so main becomes a block leader.
-    if let Some(main_addr) = function::detect_main_via_libc_start_main(db, &insns) {
-        extra_leaders.push(main_addr);
-        db.rel_push("main_function", (main_addr,));
-        db.rel_push("symbols", (main_addr, "main", "Beg"));
-        log::debug!("Recovered main from __libc_start_main pattern: {:x}", main_addr);
+    if db.abi().format == crate::abi::BinaryFormat::Elf {
+        if let Some(main_addr) = function::detect_main_via_libc_start_main(db, &insns) {
+            extra_leaders.push(main_addr);
+            db.rel_push("main_function", (main_addr,));
+            db.rel_push("symbols", (main_addr, "main", "Beg"));
+            log::debug!("Recovered main from __libc_start_main pattern: {:x}", main_addr);
+        }
     }
 
     log::debug!("Extra block leaders: {} jump table targets + {} prologue entries",
@@ -112,7 +122,7 @@ pub fn load_from_binary(db: &mut DecompileDB, binary_path: &Path) {
 
     db.compute_mach_func_from_function_inference();
 
-    let bits = if crate::x86::abi::abi_config().is_64bit() { 64 } else { 32 };
+    let bits = if db.abi().is_64bit() { 64 } else { 32 };
     db.rel_set("arch_bit", vec![(bits,)].into_iter().collect::<ascent::boxcar::Vec<_>>());
 
 }
@@ -124,25 +134,7 @@ pub fn load_preset(db: &mut DecompileDB) {
 
 // Load project-local static CSV data (registers, jump instructions, builtins, mnemonics), embedded at compile time via include_str!.
 fn load_static_csv(db: &mut DecompileDB) {
-    use crate::util::{leak, parse_csv_str};
-
-    db.rel_set("reg_x64", parse_csv_str::<String>(
-        include_str!("../../data/csv/reg_x64.csv"), b'\t')
-        .into_iter()
-        .map(|reg| (Box::leak(reg.into_boxed_str()) as &'static str,))
-        .collect::<ascent::boxcar::Vec<_>>());
-
-    db.rel_set("jump_instr", parse_csv_str::<String>(
-        include_str!("../../data/csv/jump_instr.csv"), b'\t')
-        .into_iter()
-        .map(|s| (Box::leak(s.into_boxed_str()) as &'static str,))
-        .collect::<ascent::boxcar::Vec<_>>());
-
-    db.rel_set("printasm_mnemonic", parse_csv_str::<(String, String)>(
-        include_str!("../../data/csv/bindmnemonic.csv"), b',')
-        .into_iter()
-        .map(|(x, y)| (leak::<String, str>(x), leak::<String, str>(y)))
-        .collect::<ascent::boxcar::Vec<_>>());
+    use crate::util::parse_csv_str;
 
     db.rel_set("builtins", parse_csv_str::<String>(
         include_str!("../../data/csv/builtins.csv"), b'\t')

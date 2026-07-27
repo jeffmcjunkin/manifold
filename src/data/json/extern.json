@@ -1,5 +1,18 @@
 {
   "functions": [
+    { "name": "dlopen", "sig_args": ["Xcharptr", "Xint"], "sig_res": "Xptr", "ptr_params": [0] },
+    { "name": "dlsym", "sig_args": ["Xptr", "Xcharptr"], "sig_res": "Xptr", "ptr_params": [0, 1] },
+    { "name": "dlclose", "sig_args": ["Xptr"], "sig_res": "Xint", "ptr_params": [0] },
+    { "name": "dlerror", "sig_args": [], "sig_res": "Xcharptr" },
+    { "name": "_Unwind_Resume", "sig_args": ["Xptr"], "sig_res": "Xvoid", "ptr_params": [0] },
+    { "name": "GC_malloc", "sig_args": ["Xlong"], "sig_res": "Xptr" },
+    { "name": "GC_malloc_atomic", "sig_args": ["Xlong"], "sig_res": "Xptr" },
+    { "name": "GC_free", "sig_args": ["Xptr"], "sig_res": "Xvoid", "ptr_params": [0] },
+    { "name": "GC_realloc", "sig_args": ["Xptr", "Xlong"], "sig_res": "Xptr", "ptr_params": [0] },
+    { "name": "GC_strdup", "sig_args": ["Xcharptr"], "sig_res": "Xcharptr", "ptr_params": [0] },
+    { "name": "XInternAtom", "sig_args": ["Xptr", "Xcharptr", "Xint"], "sig_res": "Xlong", "ptr_params": [0, 1] },
+    { "name": "XFree", "sig_args": ["Xptr"], "sig_res": "Xint", "ptr_params": [0] },
+    { "name": "XFlush", "sig_args": ["Xptr"], "sig_res": "Xint", "ptr_params": [0] },
     {
       "name": "signal",
       "sig_args": [
@@ -152,6 +165,27 @@
         0
       ]
     },
+    { "name": "timegm",  "sig_args": ["Xptr"],                       "sig_res": "Xlong", "ptr_params": [0] },
+    { "name": "abs",     "sig_args": ["Xint"],                       "sig_res": "Xint"  },
+    { "name": "labs",    "sig_args": ["Xlong"],                      "sig_res": "Xlong" },
+    { "name": "llabs",   "sig_args": ["Xlong"],                      "sig_res": "Xlong" },
+    { "name": "system",  "sig_args": ["Xcharptr"],                   "sig_res": "Xint",  "ptr_params": [0] },
+    { "name": "sleep",   "sig_args": ["Xint"],                       "sig_res": "Xint"  },
+    { "name": "usleep",  "sig_args": ["Xint"],                       "sig_res": "Xint"  },
+    { "name": "rand",    "sig_args": [],                             "sig_res": "Xint"  },
+    { "name": "srand",   "sig_args": ["Xint"],                       "sig_res": "Xvoid" },
+    { "name": "random",  "sig_args": [],                             "sig_res": "Xlong" },
+    { "name": "srandom", "sig_args": ["Xint"],                       "sig_res": "Xvoid" },
+    { "name": "rewind",  "sig_args": ["Xptr"],                       "sig_res": "Xvoid", "ptr_params": [0] },
+    { "name": "fgets",   "sig_args": ["Xcharptr", "Xint", "Xptr"],   "sig_res": "Xcharptr", "ptr_params": [0, 2] },
+    { "name": "pause",                  "sig_args": [],                "sig_res": "Xint" },
+    { "name": "pthread_cond_signal",    "sig_args": ["Xptr"],          "sig_res": "Xint", "ptr_params": [0] },
+    { "name": "pthread_cond_broadcast", "sig_args": ["Xptr"],          "sig_res": "Xint", "ptr_params": [0] },
+    { "name": "pthread_cond_wait",      "sig_args": ["Xptr", "Xptr"],  "sig_res": "Xint", "ptr_params": [0, 1] },
+    { "name": "pthread_cond_destroy",   "sig_args": ["Xptr"],          "sig_res": "Xint", "ptr_params": [0] },
+    { "name": "pthread_cond_init",      "sig_args": ["Xptr", "Xptr"],  "sig_res": "Xint", "ptr_params": [0, 1] },
+    { "name": "pthread_mutex_destroy",  "sig_args": ["Xptr"],          "sig_res": "Xint", "ptr_params": [0] },
+    { "name": "pthread_mutex_trylock",  "sig_args": ["Xptr"],          "sig_res": "Xint", "ptr_params": [0] },
     {
       "name": "strftime",
       "sig_args": [
@@ -2767,6 +2801,150 @@
       "sig_args": ["Xptr", "Xlong"],
       "sig_res": "Xvoid",
       "ptr_params": [0]
+    },
+    {
+      "name": "chroot",
+      "sig_args": ["Xcharptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0]
+    },
+    {
+      "name": "setuid",
+      "sig_args": ["Xint"],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "strtok",
+      "sig_args": ["Xcharptr", "Xcharptr"],
+      "sig_res": "Xcharptr",
+      "ptr_params": [0, 1]
+    },
+    {
+      "name": "mkdirat",
+      "sig_args": ["Xint", "Xcharptr", "Xint"],
+      "sig_res": "Xint",
+      "ptr_params": [1]
+    },
+    {
+      "name": "fchmodat",
+      "sig_args": ["Xint", "Xcharptr", "Xint", "Xint"],
+      "sig_res": "Xint",
+      "ptr_params": [1]
+    },
+    {
+      "name": "utimensat",
+      "sig_args": ["Xint", "Xcharptr", "Xptr", "Xint"],
+      "sig_res": "Xint",
+      "ptr_params": [1, 2]
+    },
+    {
+      "name": "ungetc",
+      "sig_args": ["Xint", "Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [1]
+    },
+    {
+      "name": "lchmod",
+      "sig_args": ["Xcharptr", "Xint"],
+      "sig_res": "Xint",
+      "ptr_params": [0]
+    },
+    {
+      "name": "symlinkat",
+      "sig_args": ["Xcharptr", "Xint", "Xcharptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0, 2]
+    },
+    {
+      "name": "mknod",
+      "sig_args": ["Xcharptr", "Xint", "Xany64"],
+      "sig_res": "Xint",
+      "ptr_params": [0]
+    },
+    {
+      "name": "mkfifo",
+      "sig_args": ["Xcharptr", "Xint"],
+      "sig_res": "Xint",
+      "ptr_params": [0]
+    },
+    {
+      "name": "timespec_get",
+      "sig_args": ["Xptr", "Xint"],
+      "sig_res": "Xint",
+      "ptr_params": [0]
+    },
+    {
+      "name": "fsync",
+      "sig_args": ["Xint"],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "fdatasync",
+      "sig_args": ["Xint"],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "sync",
+      "sig_args": [],
+      "sig_res": "Xvoid",
+      "ptr_params": []
+    },
+    {
+      "name": "mkstemp",
+      "sig_args": ["Xcharptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0]
+    },
+    {
+      "name": "fileno_unlocked",
+      "sig_args": ["Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0]
+    },
+    {
+      "name": "pthread_mutex_init",
+      "sig_args": ["Xptr", "Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0, 1]
+    },
+    {
+      "name": "pthread_mutex_lock",
+      "sig_args": ["Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0]
+    },
+    {
+      "name": "pthread_mutex_unlock",
+      "sig_args": ["Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [0]
+    },
+    {
+      "name": "pthread_sigmask",
+      "sig_args": ["Xint", "Xptr", "Xptr"],
+      "sig_res": "Xint",
+      "ptr_params": [1, 2]
+    },
+    {
+      "name": "strtold",
+      "sig_args": ["Xcharptr", "Xptr"],
+      "sig_res": "Xany64",
+      "ptr_params": [0, 1]
+    },
+    {
+      "name": "alarm",
+      "sig_args": ["Xint"],
+      "sig_res": "Xint",
+      "ptr_params": []
+    },
+    {
+      "name": "__libc_current_sigrtmin",
+      "sig_args": [],
+      "sig_res": "Xint",
+      "ptr_params": []
     }
   ]
 }

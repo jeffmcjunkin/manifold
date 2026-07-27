@@ -5,7 +5,7 @@ use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
 use crate::decompile::passes::rtl_pass::fresh_xtl_reg;
 use crate::run_pass;
-use crate::x86::mach::Mreg;
+use crate::mreg::Mreg;
 use crate::x86::op::Addressing;
 use crate::x86::types::*;
 use ascent::ascent_par;
@@ -68,6 +68,7 @@ ascent_par! {
     relation emit_function_void_candidate(Address);
     relation emit_function_return_type_xtype_candidate(Address, XType);
     relation call_returns_value(Address, Mreg);
+    relation abi_int_arg_position(Mreg, usize);
 
     // Calls that have precise per-position arg_mapping.
     #[local] relation call_precise(Node);
@@ -118,9 +119,9 @@ ascent_par! {
     // (a) definition confirms
     int_pos_confirmed(f, p) <--
         def_int_pos(f, p),
-        if *p < 6;
+        abi_int_arg_position(_, p);
 
-    // A pure-float-param function reads float params (XMM args) but no integer arg register; at its call sites, int arg regs live across the call for unrelated reasons get back-attributed as args, so call_pos_support fabricates positions the callee never consumes (the spurious trailing `long` on float-only sigs like f(double,double,double)).
+    // A pure-float-param function reads XMM args but no integer arg register, so int regs live across its call sites get back-attributed and fabricate positions the callee never consumes.
     #[local] relation func_pure_float_params(Address);
     func_pure_float_params(f) <--
         emit_function_float_param_count(f, fc),
@@ -131,7 +132,7 @@ ascent_par! {
     int_pos_confirmed(f, p) <--
         call_pos_support(f, p, c),
         informative_call_count(f, total),
-        if *p < 6,
+        abi_int_arg_position(_, p),
         if *total > 0,
         if (*c as f64) / (*total as f64) >= CALL_SITE_CONFIRM_THRESHOLD,
         !func_pure_float_params(f);
@@ -226,16 +227,10 @@ ascent_par! {
         emit_function(addr, name, _),
         if *name == "main";
 
-    // C++ mangled-name detection: _ZN prefix implies "this" is a pointer.
-    relation is_cpp_method_fn(Address);
-    is_cpp_method_fn(addr) <--
-        emit_function(addr, name, _),
-        if name.starts_with("_ZN");
-
     // Return-type ladder. Case 7 (no info -> Xvoid) is implicit: no row emitted, caller reads Xvoid default.
     relation reconciled_return_type(Address, XType);
 
-    // Case 1: definition says void -- always wins
+    // Case 1: definition says void; always wins
     reconciled_return_type(f, XType::Xvoid) <--
         emit_function_void_candidate(f);
 
@@ -272,10 +267,6 @@ ascent_par! {
         !emit_function_void_candidate(f),
         !emit_function_has_return_candidate(f),
         !emit_function_return_type_xtype_candidate(f, _);
-}
-
-fn arg_regs() -> &'static [Mreg] {
-    &crate::x86::abi::abi_config().int_arg_regs
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +313,8 @@ impl IRPass for SignatureReconciliationPass {
             "emit_function_float_param_count", "emit_function_stack_param_count",
             "func_has_variadic_xmm_prologue",
             "rtl_inst",
+            "known_func_param_is_ptr",
+            "abi_int_arg_position",
         ]
     }
 
@@ -339,30 +332,29 @@ impl IRPass for SignatureReconciliationPass {
     }
 }
 
-// ABI parameter order: integer regs first (DI..R9), then float regs (X0..X7)
-pub(crate) fn param_mreg_sort_key(mreg: Mreg) -> usize {
-    match mreg {
-        Mreg::DI => 0,
-        Mreg::SI => 1,
-        Mreg::DX => 2,
-        Mreg::CX => 3,
-        Mreg::R8 => 4,
-        Mreg::R9 => 5,
-        Mreg::X0 => 6,
-        Mreg::X1 => 7,
-        Mreg::X2 => 8,
-        Mreg::X3 => 9,
-        Mreg::X4 => 10,
-        Mreg::X5 => 11,
-        Mreg::X6 => 12,
-        Mreg::X7 => 13,
-        _ => 100,
+// ABI parameter order; Windows uses shared GP/XMM ordinal slots, and a class bit keeps ties deterministic while class evidence chooses the real one.
+pub(crate) fn param_mreg_sort_key(
+    mreg: Mreg,
+    abi: &crate::abi::AbiConfig,
+) -> usize {
+    if let Some(pos) = abi.int_arg_regs.iter().position(|r| *r == mreg) {
+        return if abi.uses_shared_arg_slots() { pos * 2 } else { pos };
     }
+    if let Some(pos) = abi.float_arg_regs.iter().position(|r| *r == mreg) {
+        return if abi.uses_shared_arg_slots() {
+            pos * 2 + 1
+        } else {
+            abi.int_arg_regs.len() + pos
+        };
+    }
+    usize::MAX
 }
 
 // Per-position int arg confirmation is in Ascent (int_pos_confirmed / reconciled_int_count).
 
 fn reconcile_signatures(db: &mut DecompileDB) {
+
+    let target_abi = db.abi().clone();
 
     let functions: HashMap<Address, Symbol> = db.rel_iter::<(Address, Symbol, Node)>("emit_function")
         .map(|&(addr, name, _)| (addr, name))
@@ -411,14 +403,22 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         .rel_iter::<(Address,)>("is_main_fn")
         .map(|&(a,)| a)
         .collect();
-    let is_cpp_method_fn_set: HashSet<Address> = db
-        .rel_iter::<(Address,)>("is_cpp_method_fn")
-        .map(|&(a,)| a)
-        .collect();
-    let reconciled_return_type_map: HashMap<Address, XType> = db
-        .rel_iter::<(Address, XType)>("reconciled_return_type")
-        .map(|&(a, ref t)| (a, t.clone()))
-        .collect();
+    // reconciled_return_type can have multiple facts per address (cases 2/4 fire once per xtype candidate), so reduce with (refine-priority, ty) to stay deterministic across parallel runs.
+    let reconciled_return_type_map: HashMap<Address, XType> = {
+        let mut groups: HashMap<Address, Vec<XType>> = HashMap::new();
+        for &(a, ref t) in db.rel_iter::<(Address, XType)>("reconciled_return_type") {
+            groups.entry(a).or_default().push(t.clone());
+        }
+        groups
+            .into_iter()
+            .map(|(addr, mut tys)| {
+                tys.sort_by_key(|ty| {
+                    (crate::decompile::passes::clight_pass::xtype_refine_priority(ty), *ty)
+                });
+                (addr, *tys.last().unwrap())
+            })
+            .collect()
+    };
 
     let extern_sigs: HashMap<Symbol, (usize, XType, Arc<Vec<XType>>)> = db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
         .map(|&(name, count, ref ret, ref params)| (name, (count, ret.clone(), params.clone())))
@@ -430,10 +430,21 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         *entry = (*entry).max(count);
     }
 
-    let mut def_param_types: HashMap<Address, HashMap<RTLReg, XType>> = HashMap::new();
-    for &(addr, reg, ref xtype) in db.rel_iter::<(Address, RTLReg, XType)>("emit_function_param_type_candidate") {
-        def_param_types.entry(addr).or_default().insert(reg, xtype.clone());
-    }
+    // Multiple param-type candidates per (addr, reg) are possible; reduce with (refine-priority, ty) for determinism under parallel Ascent.
+    let def_param_types: HashMap<Address, HashMap<RTLReg, XType>> = {
+        let mut cands: HashMap<(Address, RTLReg), Vec<XType>> = HashMap::new();
+        for &(addr, reg, ref xtype) in db.rel_iter::<(Address, RTLReg, XType)>("emit_function_param_type_candidate") {
+            cands.entry((addr, reg)).or_default().push(xtype.clone());
+        }
+        let mut map: HashMap<Address, HashMap<RTLReg, XType>> = HashMap::new();
+        for ((addr, reg), mut tys) in cands {
+            tys.sort_by_key(|ty| {
+                (crate::decompile::passes::clight_pass::xtype_refine_priority(ty), *ty)
+            });
+            map.entry(addr).or_default().insert(reg, *tys.last().unwrap());
+        }
+        map
+    };
 
     let mut rtl_to_mreg: HashMap<(Address, RTLReg), Mreg> = HashMap::new();
     for &(node, ref mreg, rtl_reg) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl") {
@@ -448,11 +459,11 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         params.sort_by(|a, b| {
             let ka = rtl_to_mreg
                 .get(&(*addr, *a))
-                .map(|m| param_mreg_sort_key(*m))
+                .map(|m| param_mreg_sort_key(*m, &target_abi))
                 .unwrap_or(usize::MAX);
             let kb = rtl_to_mreg
                 .get(&(*addr, *b))
-                .map(|m| param_mreg_sort_key(*m))
+                .map(|m| param_mreg_sort_key(*m, &target_abi))
                 .unwrap_or(usize::MAX);
             ka.cmp(&kb).then_with(|| a.cmp(b))
         });
@@ -481,6 +492,29 @@ fn reconcile_signatures(db: &mut DecompileDB) {
             })
             .collect()
     };
+
+    // Diagnostic: trace the return-type ladder inputs for a target function (by name substring), to see why a void-bodied callee whose result is used stays void (X<-void errors).
+    if let Ok(target) = std::env::var("MANIFOLD_TRACE_RET") {
+        if !target.is_empty() {
+            let crv: std::collections::HashSet<Node> = db
+                .rel_iter::<(Node, Mreg)>("call_returns_value").map(|&(n, _)| n).collect();
+            let ctf: Vec<(Node, Address)> = db
+                .rel_iter::<(Node, Address)>("call_target_func").map(|&(n, a)| (n, a)).collect();
+            for &(addr, ref name, _) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
+                if !name.contains(target.as_str()) { continue; }
+                let sites: Vec<Node> = ctf.iter().filter(|(_, a)| *a == addr).map(|(n, _)| *n).collect();
+                let sites_used = sites.iter().filter(|n| crv.contains(n)).count();
+                eprintln!(
+                    "RET-TRACE {} @ {:#x}: void_cand={} has_ret={} xtype={:?} has_calls={} any_uses_ret={} reconciled={:?} | call_target_sites={} sites_with_used_result={}",
+                    name, addr,
+                    def_void.contains(&addr), def_has_return.contains(&addr), def_return_types.get(&addr),
+                    has_call_sites_set.contains(&addr), any_call_uses_return_set.contains(&addr),
+                    reconciled_return_type_map.get(&addr),
+                    sites.len(), sites_used,
+                );
+            }
+        }
+    }
 
     // call_targets is consumed by patch_db and the call-site arg-type lookup below.
     let call_targets: HashMap<Node, Address> = db.rel_iter::<(Node, Address)>("call_target_func")
@@ -545,7 +579,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         ("main", (2, XType::Xint, vec![XType::Xint, XType::Xcharptrptr])),
     ].into_iter().collect();
 
-    // Detect param registers used as load/store base addresses in RTL, catching pointers missed by Datalog type inference, and struct-like multi-offset access patterns.
+    // POINTER-PARAM-AS-SCALAR: mark a param a pointer when a deref base is value-derived from it through address-preserving Iops, since a base-only match misses params flowing through lea/add.
     let (param_is_ptr, param_struct_offsets): (HashSet<RTLReg>, HashMap<RTLReg, HashSet<i64>>) = {
         let mut ptr_set = HashSet::new();
         let mut offsets_map: HashMap<RTLReg, HashSet<i64>> = HashMap::new();
@@ -553,6 +587,62 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         for &(_addr, reg) in db.rel_iter::<(Address, RTLReg)>("emit_function_param_candidate") {
             param_regs.insert(reg);
         }
+
+        // Address-preserving Iops (pointer + offset, or a plain copy): pointerness propagates from any source operand, so union all source roots into the dst.
+        use crate::x86::op::Operation;
+        fn addr_preserving(op: &Operation) -> bool {
+            matches!(
+                op,
+                Operation::Omove
+                    | Operation::Olea(_)
+                    | Operation::Oleal(_)
+                    | Operation::Oadd
+                    | Operation::Oaddl
+                    | Operation::Oaddimm(_)
+                    | Operation::Oaddlimm(_)
+                    | Operation::Osub
+                    | Operation::Osubl
+            )
+        }
+
+        // root_of[reg] = the param regs reg's address value derives from; seed each param with itself and propagate to a fixpoint.
+        let mut root_of: HashMap<RTLReg, HashSet<RTLReg>> = HashMap::new();
+        for &p in &param_regs {
+            root_of.entry(p).or_default().insert(p);
+        }
+        // Pre-collect the address-preserving Iop edges (srcs -> dst) once.
+        let mut addr_edges: Vec<(Vec<RTLReg>, RTLReg)> = Vec::new();
+        for &(_node, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+            if let RTLInst::Iop(op, srcs, dst) = inst {
+                if addr_preserving(op) {
+                    addr_edges.push((srcs.iter().copied().collect(), *dst));
+                }
+            }
+        }
+        // Fixpoint: a dst inherits the union of its sources' roots. Bounded by the finite reg set.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (srcs, dst) in &addr_edges {
+                let mut incoming: HashSet<RTLReg> = HashSet::new();
+                // Pointerness propagates from the BASE operand (args[0]) only: the second operand of base + index*scale is the integer index, and unioning its roots over-promotes a scalar index param.
+                if let Some(s) = srcs.first() {
+                    if let Some(rs) = root_of.get(s) {
+                        incoming.extend(rs.iter().copied());
+                    }
+                }
+                if incoming.is_empty() {
+                    continue;
+                }
+                let entry = root_of.entry(*dst).or_default();
+                for r in incoming {
+                    if entry.insert(r) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+
         for &(_node, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
             let (addr_mode, args) = match inst {
                 RTLInst::Iload(_, addr, args, _) => (addr, args),
@@ -566,9 +656,66 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                 _ => continue,
             };
             if let Some(&base_rtl) = args.first() {
+                // Direct match (preserves prior behavior).
                 if param_regs.contains(&base_rtl) {
                     ptr_set.insert(base_rtl);
                     offsets_map.entry(base_rtl).or_default().insert(offset);
+                }
+                // Value-derived match: the deref base derives from one or more param regs through address arithmetic, so every such param is a pointer.
+                if let Some(roots) = root_of.get(&base_rtl) {
+                    for &p in roots {
+                        ptr_set.insert(p);
+                        offsets_map.entry(p).or_default().insert(offset);
+                    }
+                }
+            }
+        }
+
+        // POINTER-PARAM-AS-SCALAR, forwarded form: a param handed to a callee that takes a pointer at that position is a pointer; marks only the pointerness axis.
+        let mut callee_ptr_pos: HashMap<Symbol, HashSet<usize>> = HashMap::new();
+        for &(name, idx) in db.rel_iter::<(Symbol, usize)>("known_func_param_is_ptr") {
+            callee_ptr_pos.entry(name).or_default().insert(idx);
+        }
+        for &(name, _cnt, _ret, ref params) in
+            db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
+        {
+            for (i, t) in params.iter().enumerate() {
+                if matches!(t, XType::Xptr | XType::Xcharptr | XType::Xcharptrptr
+                    | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::XstructPtr(_)) {
+                    callee_ptr_pos.entry(name).or_default().insert(i);
+                }
+            }
+        }
+        if !callee_ptr_pos.is_empty() {
+            for &(_node, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+                let (callee, args) = match inst {
+                    RTLInst::Icall(_, callee, args, _, _) => (callee, args),
+                    RTLInst::Itailcall(_, callee, args) => (callee, args),
+                    _ => continue,
+                };
+                // Resolve the callee name (symbol form only; indirect calls have no known sig).
+                let name: Option<Symbol> = match callee {
+                    either::Either::Right(either::Either::Right(sym)) => Some(*sym),
+                    either::Either::Right(either::Either::Left(addr)) => {
+                        functions.get(addr).copied()
+                    }
+                    _ => None,
+                };
+                let Some(name) = name else { continue };
+                let Some(ptr_positions) = callee_ptr_pos.get(name) else { continue };
+                for (pos, &arg_reg) in args.iter().enumerate() {
+                    if !ptr_positions.contains(&pos) {
+                        continue;
+                    }
+                    // The arg reg, or any param it value-derives from, is a pointer.
+                    if param_regs.contains(&arg_reg) {
+                        ptr_set.insert(arg_reg);
+                    }
+                    if let Some(roots) = root_of.get(&arg_reg) {
+                        for &p in roots {
+                            ptr_set.insert(p);
+                        }
+                    }
                 }
             }
         }
@@ -597,14 +744,20 @@ fn reconcile_signatures(db: &mut DecompileDB) {
             // Varargs known but no extern sig: fall through, remember is_va so call sites keep extra args.
         }
 
-        // Hardcode int main(int argc, char **argv) when is_main_fn fires.
+        // main's signature: the classic `int main(int argc, char **argv)`, upgraded to the 3-arg `int main(int, char **argv, char **envp)` when the body's own recovered evidence shows a third register parameter (ABI-4: the hardcoded 2-arg form could not reconcile envp-using mains).
         if is_main_fn_set.contains(&func_addr) {
             if let Some((param_count, ret_type, param_types)) = known_internal_sigs.get(func_name) {
+                let detected_int = reconciled_int_count_map.get(&func_addr).copied().unwrap_or(0);
+                let (main_count, main_types) = if detected_int >= 3 {
+                    (3, vec![XType::Xint, XType::Xcharptrptr, XType::Xcharptrptr])
+                } else {
+                    (*param_count, param_types.clone())
+                };
                 prototypes.push(FunctionPrototype {
                     address: func_addr,
                     name: func_name,
-                    param_count: *param_count,
-                    param_types: param_types.clone(),
+                    param_count: main_count,
+                    param_types: main_types,
                     return_type: *ret_type,
                     confidence: SignatureConfidence::HighConfidence,
                     is_varargs: is_va,
@@ -630,7 +783,17 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         let reconciled_int = reconciled_int_count_map.get(&func_addr).copied().unwrap_or(0);
         let float_count = float_param_counts.get(&func_addr).copied().unwrap_or(0);
         let stack_count = stack_param_counts.get(&func_addr).copied().unwrap_or(0);
-        let position_based_count = reconciled_int + float_count + stack_count;
+        let position_based_count = if target_abi.uses_shared_arg_slots() {
+            // A Win64 stack argument starts at source position 4 even when register slots go unused; counting only observed register params would compact it.
+            let stack_end = if stack_count > 0 {
+                target_abi.first_stack_arg_position() + stack_count
+            } else {
+                0
+            };
+            reconciled_int.max(stack_end)
+        } else {
+            reconciled_int + float_count + stack_count
+        };
 
         // Use position-level result, but allow call-site override with strong consensus
         let reconciled_count = if !has_call_sites {
@@ -641,7 +804,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         } else if call_site_mode > position_based_count
             && consensus_ratio >= 0.6 && total_sites >= 2
         {
-            // Call sites strongly agree on more params -- trust them
+            // Call sites strongly agree on more params; trust them
             call_site_mode
         } else {
             position_based_count
@@ -667,17 +830,30 @@ fn reconcile_signatures(db: &mut DecompileDB) {
 
         let existing_types = def_param_types.get(&func_addr);
         let existing_params = def_params.get(&func_addr);
+        // TR-5: stack params are keyed by fresh_stack_param_reg, not by register webs, so positions >= stack_base must be looked up via fresh_stack_param_reg rather than existing_params.get(i).
+        let stack_base = if target_abi.uses_shared_arg_slots() {
+            target_abi.first_stack_arg_position()
+        } else {
+            reconciled_int + float_count
+        };
+        let pos_reg = |i: usize| -> Option<RTLReg> {
+            if i >= stack_base && i < stack_base + stack_count {
+                return Some(crate::decompile::passes::rtl_pass::fresh_stack_param_reg(
+                    func_addr,
+                    i - stack_base,
+                ));
+            }
+            existing_params.and_then(|params| params.get(i).copied())
+        };
         let mut param_types = Vec::with_capacity(reconciled_count);
         for i in 0..reconciled_count {
             let mut resolved_type: Option<XType> = None;
 
             // Priority 1: Definition type from emit_function_param_type
-            if let Some(params) = existing_params {
-                if let Some(&reg) = params.get(i) {
-                    if let Some(types) = existing_types {
-                        if let Some(xtype) = types.get(&reg) {
-                            resolved_type = Some(xtype.clone());
-                        }
+            if let Some(reg) = pos_reg(i) {
+                if let Some(types) = existing_types {
+                    if let Some(xtype) = types.get(&reg) {
+                        resolved_type = Some(xtype.clone());
                     }
                 }
             }
@@ -695,40 +871,65 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                         | XType::Xptr
                 )
             ) {
-                if let Some(params) = existing_params {
-                    if let Some(&reg) = params.get(i) {
-                        if let Some(xtypes) = emit_var_types.get(&reg) {
-                            // Pick the most specific type from candidates (prefer struct ptr > ptr > specific int > generic int)
-                            let best = xtypes.iter().max_by_key(|t| match t {
-                                XType::XstructPtr(_) => 5,
-                                XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr => 4,
-                                XType::Xptr => 3,
-                                XType::Xint8signed | XType::Xint8unsigned | XType::Xint16signed | XType::Xint16unsigned => 2,
-                                XType::Xfloat | XType::Xsingle => 2,
-                                _ => 1,
-                            });
-                            if let Some(best_type) = best {
-                                resolved_type = Some(best_type.clone());
-                            }
-                        } else if param_is_ptr.contains(&reg) {
-                            // Check if it's a struct pointer (multiple offsets)
-                            if let Some(offsets) = param_struct_offsets.get(&reg) {
-                                if offsets.len() > 1 {
-                                    // Look up struct ID from struct_recovery
-                                    let struct_id = db.rel_iter::<(Address, RTLReg, usize)>("emit_var_is_struct_candidate")
-                                        .find(|&&(_, r, _)| r == reg)
-                                        .map(|&(_, _, sid)| sid);
-                                    if let Some(sid) = struct_id {
-                                        resolved_type = Some(XType::XstructPtr(sid));
-                                    } else {
-                                        resolved_type = Some(XType::Xintptr);
-                                    }
+                if let Some(reg) = pos_reg(i) {
+                    if let Some(xtypes) = emit_var_types.get(&reg) {
+                        // Pick the most specific type from candidates (prefer struct ptr > ptr > specific int > generic int)
+                        let best = xtypes.iter().max_by_key(|t| match t {
+                            XType::XstructPtr(_) => 5,
+                            XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr => 4,
+                            XType::Xptr => 3,
+                            XType::Xint8signed | XType::Xint8unsigned | XType::Xint16signed | XType::Xint16unsigned => 2,
+                            XType::Xfloat | XType::Xsingle => 2,
+                            _ => 1,
+                        });
+                        if let Some(best_type) = best {
+                            resolved_type = Some(best_type.clone());
+                        }
+                    }
+                    // Consult the value-flow-accurate param_is_ptr lift even when emit_var_type candidates exist, but only to raise a still-scalar type, never to downgrade recovered ptr/struct/float.
+                    let is_scalar = matches!(
+                        resolved_type,
+                        None | Some(
+                            XType::Xint
+                                | XType::Xintunsigned
+                                | XType::Xlong
+                                | XType::Xlongunsigned
+                                | XType::Xany32
+                                | XType::Xany64
+                        )
+                    );
+                    if is_scalar && param_is_ptr.contains(&reg) {
+                        // Check if it's a struct pointer (multiple offsets)
+                        if let Some(offsets) = param_struct_offsets.get(&reg) {
+                            if offsets.len() > 1 {
+                                // Multiple emit_var_is_struct_candidate facts may match; take min sid for determinism under parallel Ascent.
+                                let struct_id = db.rel_iter::<(Address, RTLReg, usize)>("emit_var_is_struct_candidate")
+                                    .filter(|&&(_, r, _)| r == reg)
+                                    .map(|&(_, _, sid)| sid)
+                                    .min();
+                                if let Some(sid) = struct_id {
+                                    resolved_type = Some(XType::XstructPtr(sid));
                                 } else {
                                     resolved_type = Some(XType::Xintptr);
                                 }
                             } else {
-                                resolved_type = Some(XType::Xptr);
+                                resolved_type = Some(XType::Xintptr);
                             }
+                        } else {
+                            resolved_type = Some(XType::Xptr);
+                        }
+                    }
+                }
+            }
+
+            // Priority 1.6: refine float WIDTH from the value web (Xsingle present, Xfloat absent means 32-bit), since rtl's fallback hardcodes Xfloat for a register-resident single-precision param.
+            if matches!(resolved_type, Some(XType::Xfloat)) {
+                if let Some(reg) = pos_reg(i) {
+                    if let Some(xtypes) = emit_var_types.get(&reg) {
+                        let has_single = xtypes.contains(&XType::Xsingle);
+                        let has_double = xtypes.contains(&XType::Xfloat);
+                        if has_single && !has_double {
+                            resolved_type = Some(XType::Xsingle);
                         }
                     }
                 }
@@ -808,7 +1009,24 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                                             | XType::Xfuncptr
                                             | XType::Xptr
                                     ) {
-                                        resolved_type = Some(best_ptr.clone());
+                                        // Frequency-gate the pointer upgrade like the int vote: require a pointer-class majority across caller sites, counting every pointer class so a majority spread across Xptr+Xcharptr still upgrades.
+                                        let ptr_count = caller_types
+                                            .iter()
+                                            .filter(|t| matches!(
+                                                t,
+                                                XType::XstructPtr(_)
+                                                    | XType::Xcharptr
+                                                    | XType::Xcharptrptr
+                                                    | XType::Xintptr
+                                                    | XType::Xfloatptr
+                                                    | XType::Xsingleptr
+                                                    | XType::Xfuncptr
+                                                    | XType::Xptr
+                                            ))
+                                            .count();
+                                        if ptr_count * 2 > caller_types.len() {
+                                            resolved_type = Some(best_ptr.clone());
+                                        }
                                     }
                                 }
                             }
@@ -821,17 +1039,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
             param_types.push(resolved_type.unwrap_or(XType::Xany64));
         }
 
-        // C++ method: _ZN-mangled names upgrade param 0 (this) to Xptr.
-        if is_cpp_method_fn_set.contains(&func_addr) && !param_types.is_empty() {
-            let needs_upgrade = matches!(
-                param_types[0],
-                XType::Xint | XType::Xintunsigned | XType::Xlong | XType::Xlongunsigned |
-                XType::Xany32 | XType::Xany64 | XType::Xvoid
-            );
-            if needs_upgrade {
-                param_types[0] = XType::Xptr;
-            }
-        }
+        // No name-based 'this' upgrade: an _ZN prefix also covers namespaced free functions and static members; a genuine 'this' is already recovered structurally at Priority 1.5 via param_is_ptr.
 
         let def_ret_type = def_return_types.get(&func_addr);
 
@@ -885,6 +1093,20 @@ fn patch_db(
     db: &mut DecompileDB,
     prototypes: &[FunctionPrototype],
 ) {
+    let target_abi = db.abi().clone();
+    let first_stack_position = target_abi.first_stack_arg_position();
+    let register_for_position = |position: usize, xtype: &XType| -> Option<Mreg> {
+        if position >= first_stack_position {
+            return None;
+        }
+        if target_abi.uses_shared_arg_slots()
+            && matches!(xtype, XType::Xfloat | XType::Xsingle)
+        {
+            target_abi.float_arg_regs.get(position).copied()
+        } else {
+            target_abi.int_arg_regs.get(position).copied()
+        }
+    };
     let proto_map: HashMap<Address, &FunctionPrototype> = prototypes.iter()
         .map(|p| (p.address, p))
         .collect();
@@ -909,11 +1131,11 @@ fn patch_db(
             params.sort_by(|a, b| {
                 let ka = rtl_to_mreg
                     .get(&(*addr, *a))
-                    .map(|m| param_mreg_sort_key(*m))
+                    .map(|m| param_mreg_sort_key(*m, &target_abi))
                     .unwrap_or(usize::MAX);
                 let kb = rtl_to_mreg
                     .get(&(*addr, *b))
-                    .map(|m| param_mreg_sort_key(*m))
+                    .map(|m| param_mreg_sort_key(*m, &target_abi))
                     .unwrap_or(usize::MAX);
                 ka.cmp(&kb).then_with(|| a.cmp(b))
             });
@@ -939,17 +1161,17 @@ fn patch_db(
 
             if proto.param_count > current_count {
                 for i in current_count..proto.param_count {
-                    let synthetic_reg = if i < arg_regs().len() {
-                        fresh_xtl_reg(proto.address, arg_regs()[i])
+                    let xtype = proto.param_types.get(i).cloned().unwrap_or(XType::Xany64);
+                    let synthetic_reg = if let Some(mreg) = register_for_position(i, &xtype) {
+                        fresh_xtl_reg(proto.address, mreg)
                     } else {
                         crate::decompile::passes::rtl_pass::fresh_stack_param_reg(
                             proto.address,
-                            i - arg_regs().len(),
+                            i - first_stack_position,
                         )
                     };
                     new_params.push((proto.address, synthetic_reg));
 
-                    let xtype = proto.param_types.get(i).cloned().unwrap_or(XType::Xany64);
                     db.rel_push("emit_function_param_type_candidate", (proto.address, synthetic_reg, xtype));
                 }
             }
@@ -959,7 +1181,7 @@ fn patch_db(
     }
 
     {
-        // Read from emit_function_param (just written by block 1) so synthetic regs added when growing param_count beyond existing evidence get types pushed too; the former emit_function_param_candidate only had the original (pre-widening) reg set, dropping types for widened slots and leaving e.g. main's argv as Xany64/Xint.
+        // Read from emit_function_param, just written by block 1, so synthetic regs added when growing param_count get types too; the candidate relation only had the pre-widening reg set.
         let mut effective_params: HashMap<Address, Vec<RTLReg>> = HashMap::new();
         for &(addr, reg) in db.rel_iter::<(Address, RTLReg)>("emit_function_param") {
             let params = effective_params.entry(addr).or_default();
@@ -971,11 +1193,11 @@ fn patch_db(
             params.sort_by(|a, b| {
                 let ka = rtl_to_mreg
                     .get(&(*addr, *a))
-                    .map(|m| param_mreg_sort_key(*m))
+                    .map(|m| param_mreg_sort_key(*m, &target_abi))
                     .unwrap_or(usize::MAX);
                 let kb = rtl_to_mreg
                     .get(&(*addr, *b))
-                    .map(|m| param_mreg_sort_key(*m))
+                    .map(|m| param_mreg_sort_key(*m, &target_abi))
                     .unwrap_or(usize::MAX);
                 ka.cmp(&kb).then_with(|| a.cmp(b))
             });
@@ -1011,7 +1233,7 @@ fn patch_db(
                 for (addr, params) in m.iter_mut() {
                     params.sort_by_key(|reg| {
                         rtl_to_mreg.get(&(*addr, *reg))
-                            .map(|mreg| param_mreg_sort_key(*mreg))
+                            .map(|mreg| param_mreg_sort_key(*mreg, &target_abi))
                             .unwrap_or(usize::MAX)
                     });
                     params.dedup();
@@ -1118,35 +1340,28 @@ fn patch_db(
     }
 
     {
-        let mut new_has_ret: Vec<(Address,)> = db.rel_iter::<(Address,)>("emit_function_has_return_candidate")
-            .filter(|&&(addr,)| !proto_map.contains_key(&addr))
-            .cloned()
-            .collect();
         let mut new_void: Vec<(Address,)> = db.rel_iter::<(Address,)>("emit_function_void_candidate")
             .filter(|&&(addr,)| !proto_map.contains_key(&addr))
             .cloned()
             .collect();
         for proto in prototypes {
-            if proto.return_type != XType::Xvoid {
-                new_has_ret.push((proto.address,));
-            } else {
+            if proto.return_type == XType::Xvoid {
                 new_void.push((proto.address,));
             }
         }
-        db.rel_set("emit_function_has_return", new_has_ret.into_iter().collect::<ascent::boxcar::Vec<_>>());
         db.rel_set("emit_function_void", new_void.into_iter().collect::<ascent::boxcar::Vec<_>>());
     }
 
+    // reg->rtl and def-at-use maps, shared by the (dead) call_args_collected reconciliation and the Icall/Itailcall argument-arity reconciliation in the rtl_inst patch below.
+    let reg_rtl_map: HashMap<(Node, Mreg), RTLReg> = db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl")
+        .map(|&(addr, ref mreg, rtl)| ((addr, *mreg), rtl))
+        .collect();
+    let mut reg_def_at_use: HashMap<(Mreg, Address), Address> = HashMap::new();
+    for &(def_addr, ref mreg, use_addr) in db.rel_iter::<(Address, Mreg, Address)>("reg_def_used") {
+        reg_def_at_use.insert((*mreg, use_addr), def_addr);
+    }
+
     {
-        let reg_rtl_map: HashMap<(Node, Mreg), RTLReg> = db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl")
-            .map(|&(addr, ref mreg, rtl)| ((addr, *mreg), rtl))
-            .collect();
-
-        let mut reg_def_at_use: HashMap<(Mreg, Address), Address> = HashMap::new();
-        for &(def_addr, ref mreg, use_addr) in db.rel_iter::<(Address, Mreg, Address)>("reg_def_used") {
-            reg_def_at_use.insert((*mreg, use_addr), def_addr);
-        }
-
         let mut new_call_args: Vec<(Node, Arc<Vec<RTLReg>>)> = Vec::new();
         let mut patched_calls: std::collections::HashSet<Node> = std::collections::HashSet::new();
 
@@ -1182,10 +1397,10 @@ fn patch_db(
 
             let mut widened = args.as_ref().clone();
             for i in args.len()..proto.param_count {
-                if i >= arg_regs().len() {
+                let xtype = proto.param_types.get(i).unwrap_or(&XType::Xany64);
+                let Some(mreg) = register_for_position(i, xtype) else {
                     break;
-                }
-                let mreg = arg_regs()[i];
+                };
 
                 if let Some(&rtl) = reg_rtl_map.get(&(call_node, mreg)) {
                     widened.push(rtl);
@@ -1216,6 +1431,42 @@ fn patch_db(
     {
         let mut new_insts: Vec<(Node, RTLInst)> = Vec::new();
         let mut patched_insts: usize = 0;
+
+        // Reconcile a call's argument list to the callee's reconciled arity, since cminor builds Scall directly from Icall.args and clang checks it against the already-reconciled declaration.
+        let reconcile_args = |call_node: Node, args: &Args, param_types: &[XType]| -> Args {
+            let param_count = param_types.len();
+            if args.len() == param_count {
+                return args.clone();
+            }
+            if args.len() > param_count {
+                // Only fixed-arity signatures are modeled; drop the extra collected args.
+                return Arc::new(args.iter().take(param_count).cloned().collect());
+            }
+            let mut widened = args.as_ref().clone();
+            for i in args.len()..param_count {
+                if let Some(mreg) = register_for_position(i, &param_types[i]) {
+                    if let Some(&rtl) = reg_rtl_map.get(&(call_node, mreg)) {
+                        widened.push(rtl);
+                        continue;
+                    }
+                    if let Some(&def_addr) = reg_def_at_use.get(&(mreg, call_node)) {
+                        if let Some(&rtl) = reg_rtl_map.get(&(def_addr, mreg)) {
+                            widened.push(rtl);
+                            continue;
+                        }
+                    }
+                    widened.push(fresh_xtl_reg(call_node, mreg));
+                } else {
+                    // Stack-passed parameters (beyond the 6 GP arg registers).
+                    widened.push(crate::decompile::passes::rtl_pass::fresh_stack_param_reg(
+                        call_node,
+                        i - first_stack_position,
+                    ));
+                }
+            }
+            Arc::new(widened)
+        };
+
         for &(node, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
             match inst {
                 RTLInst::Icall(sig_opt, callee, args, dst, succ) => {
@@ -1225,20 +1476,34 @@ fn patch_db(
                     };
                     let proto = target.and_then(|t| proto_map.get(&t).copied());
                     if let Some(proto) = proto {
+                        // Variadic callees keep their full (tail-bearing) arg list; only fixed-arity calls are reconciled to the prototype count.
+                        let new_args = if proto.is_varargs {
+                            args.clone()
+                        } else {
+                            reconcile_args(node, args, &proto.param_types)
+                        };
+                        // Type the variadic tail at its natural 64-bit width; an untyped tail slot defaults to int and truncates a pointer vararg.
+                        let mut sig_args = proto.param_types.clone();
+                        if proto.is_varargs {
+                            while sig_args.len() < new_args.len() {
+                                sig_args.push(XType::Xany64);
+                            }
+                        }
                         let new_sig = Signature {
-                            sig_args: Arc::new(proto.param_types.clone()),
+                            sig_args: Arc::new(sig_args),
                             sig_res: proto.return_type,
                             sig_cc: sig_opt.as_ref().map(|s| s.sig_cc.clone()).unwrap_or_default(),
                         };
-                        let needs_patch = sig_opt.as_ref()
+                        let sig_changed = sig_opt.as_ref()
                             .map(|s| s.sig_res != new_sig.sig_res
                                   || s.sig_args.as_slice() != new_sig.sig_args.as_slice())
                             .unwrap_or(true);
-                        if needs_patch {
+                        let args_changed = new_args.as_slice() != args.as_slice();
+                        if sig_changed || args_changed {
                             let new_inst = RTLInst::Icall(
                                 Some(new_sig),
                                 callee.clone(),
-                                args.clone(),
+                                new_args,
                                 *dst,
                                 *succ,
                             );
@@ -1256,20 +1521,34 @@ fn patch_db(
                     };
                     let proto = target.and_then(|t| proto_map.get(&t).copied());
                     if let Some(proto) = proto {
+                        // Variadic callees keep their full (tail-bearing) arg list; only fixed-arity calls are reconciled to the prototype count.
+                        let new_args = if proto.is_varargs {
+                            args.clone()
+                        } else {
+                            reconcile_args(node, args, &proto.param_types)
+                        };
+                        // Type the variadic tail at its natural 64-bit width; an untyped tail slot defaults to int and truncates a pointer vararg.
+                        let mut sig_args = proto.param_types.clone();
+                        if proto.is_varargs {
+                            while sig_args.len() < new_args.len() {
+                                sig_args.push(XType::Xany64);
+                            }
+                        }
                         let new_sig = Signature {
-                            sig_args: Arc::new(proto.param_types.clone()),
+                            sig_args: Arc::new(sig_args),
                             sig_res: proto.return_type,
                             sig_cc: sig_opt.as_ref().map(|s| s.sig_cc.clone()).unwrap_or_default(),
                         };
-                        let needs_patch = sig_opt.as_ref()
+                        let sig_changed = sig_opt.as_ref()
                             .map(|s| s.sig_res != new_sig.sig_res
                                   || s.sig_args.as_slice() != new_sig.sig_args.as_slice())
                             .unwrap_or(true);
-                        if needs_patch {
+                        let args_changed = new_args.as_slice() != args.as_slice();
+                        if sig_changed || args_changed {
                             let new_inst = RTLInst::Itailcall(
                                 Some(new_sig),
                                 callee.clone(),
-                                args.clone(),
+                                new_args,
                             );
                             new_insts.push((node, new_inst));
                             patched_insts += 1;

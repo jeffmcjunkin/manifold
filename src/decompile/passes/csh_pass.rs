@@ -35,19 +35,12 @@ ascent_par! {
     relation plt_entry(Address, Symbol);
     relation plt_block(Address, Symbol);
     relation block_boundaries(Address, Address, Address);
-    relation msg(u64);
 
     relation addr_to_func_ident(Address, Ident);
     relation ident_to_symbol(Ident, Symbol);
-    relation block_span(Node, Node);
     relation base_ident_to_symbol(Ident, Symbol);
     relation base_addr_usage(Node, RTLReg, i64);
 
-
-    block_span(head, tail) <--
-        block_boundaries(func, head, tail),
-        instr_in_function(head, func),
-        instr_in_function(tail, func);
 
     addr_to_func_ident(addr, ident) <--
         emit_function(addr, _, _),
@@ -201,6 +194,14 @@ pub fn default_ulong_type() -> ClightType {
     ClightType::Tlong(ClightSignedness::Unsigned, default_attr())
 }
 
+pub fn default_int128_type() -> ClightType {
+    ClightType::Tint128(ClightSignedness::Signed, default_attr())
+}
+
+pub fn default_uint128_type() -> ClightType {
+    ClightType::Tint128(ClightSignedness::Unsigned, default_attr())
+}
+
 pub fn default_single_type() -> ClightType {
     ClightType::Tfloat(ClightFloatSize::F32, default_attr())
 }
@@ -339,7 +340,7 @@ pub fn clight_type_from_xtype(xtype: &XType) -> ClightType {
 
 pub fn clight_function_pointer_type(sig: &Signature) -> ClightType {
     let arg_types: Vec<ClightType> = sig.sig_args.iter().map(clight_type_from_xtype).collect();
-    // A call whose result is itself used as a code pointer carries sig_res = Xfuncptr, which would nest a function-pointer return inside this function-pointer type. C has no unparenthesized spelling for that, and it would print as the un-parseable doubled cast `void (*)(void) (*)(args)`. Collapse such a return to a generic data pointer (matching Ghidra's `code *` return convention); the indirect call site does not depend on the exact pointee.
+    // A call whose result is itself a code pointer carries sig_res = Xfuncptr, which has no unparenthesized C spelling, so collapse the return to a generic data pointer.
     let ret_type = if sig.sig_res == XType::Xfuncptr {
         pointer_to(ClightType::Tvoid)
     } else {
@@ -417,6 +418,9 @@ pub fn merge_clight_types(existing: &ClightType, candidate: &ClightType) -> Clig
             Tint(ClightIntSize::I32, ClightSignedness::Unsigned, _) => 14,
             Tint(ClightIntSize::I32, ClightSignedness::Signed, _) => 15,
             Tvoid => 16,
+            // 128-bit int is only the synthetic high-mul annotation, never a merge-able candidate; rank it least-specific.
+            Tint128(ClightSignedness::Unsigned, _) => 17,
+            Tint128(ClightSignedness::Signed, _) => 18,
         }
     }
 
@@ -624,6 +628,53 @@ pub fn cast_expr_to_type(expr: ClightExpr, target_ty: ClightType) -> ClightExpr 
     }
 }
 
+// Byte size of a Clight type, used only for pointer-arithmetic scaling; unknown/aggregate returns None.
+fn clight_type_byte_size(ty: &ClightType) -> Option<i64> {
+    match ty {
+        ClightType::Tint(ClightIntSize::I8, _, _) => Some(1),
+        ClightType::Tint(ClightIntSize::I16, _, _) => Some(2),
+        ClightType::Tint(ClightIntSize::I32, _, _) => Some(4),
+        ClightType::Tint(ClightIntSize::IBool, _, _) => Some(1),
+        ClightType::Tlong(_, _) => Some(8),
+        ClightType::Tfloat(ClightFloatSize::F32, _) => Some(4),
+        ClightType::Tfloat(ClightFloatSize::F64, _) => Some(8),
+        // detect_abi rejects non-64-bit inputs, so the pointer width is fixed.
+        ClightType::Tpointer(_, _) => Some(8),
+        _ => None,
+    }
+}
+
+fn const_i64(expr: &ClightExpr) -> Option<i64> {
+    match expr {
+        ClightExpr::EconstInt(v, _) => Some(*v as i64),
+        ClightExpr::EconstLong(v, _) => Some(*v),
+        _ => None,
+    }
+}
+
+// Structural test: is expr a BYTE offset already scaled by pointee_size? Deliberately does not match a bare index, which C scales itself.
+fn is_byte_offset_for_pointee(expr: &ClightExpr, pointee_size: i64) -> bool {
+    if pointee_size <= 1 {
+        return false;
+    }
+    match expr {
+        ClightExpr::Ebinop(ClightBinaryOp::Omul, l, r, _) => {
+            const_i64(l) == Some(pointee_size) || const_i64(r) == Some(pointee_size)
+        }
+        ClightExpr::Ebinop(ClightBinaryOp::Oshl, _l, r, _) => {
+            // idx << k  is a byte offset iff (1 << k) == pointee_size and size is a power of two.
+            match const_i64(r) {
+                Some(k) if (0..63).contains(&k) => (1i64 << k) == pointee_size,
+                _ => false,
+            }
+        }
+        _ => match const_i64(expr) {
+            Some(c) => c != 0 && c % pointee_size == 0,
+            None => false,
+        },
+    }
+}
+
 pub fn rewrite_expr_as_pointer(expr: ClightExpr, target_ptr_ty: ClightType) -> ClightExpr {
     if !is_pointer_type(&target_ptr_ty) {
         return expr;
@@ -644,14 +695,63 @@ pub fn rewrite_expr_as_pointer(expr: ClightExpr, target_ptr_ty: ClightType) -> C
             let lhs_ty = clight_expr_type(&lhs);
             let rhs_ty = clight_expr_type(&rhs);
 
+            // The integral operand is a raw byte offset, so apply it through a char* base (stride 1) and cast the whole address to target_ptr_ty, or C scales it by the wide pointee size.
             if is_integral_type(&rhs_ty) && !is_pointer_type(&lhs_ty) {
-                let new_lhs = rewrite_expr_as_pointer(*lhs, target_ptr_ty.clone());
-                ClightExpr::Ebinop(op, Box::new(new_lhs), rhs, target_ptr_ty)
+                let char_ptr_ty = pointer_to(ClightType::Tint(
+                    ClightIntSize::I8,
+                    ClightSignedness::Signed,
+                    default_attr(),
+                ));
+                let base_as_char_ptr = cast_expr_to_type(*lhs, char_ptr_ty.clone());
+                let byte_addr = ClightExpr::Ebinop(op, Box::new(base_as_char_ptr), rhs, char_ptr_ty);
+                cast_expr_to_type(byte_addr, target_ptr_ty)
             } else if is_integral_type(&lhs_ty) && !is_pointer_type(&rhs_ty) {
-                let new_rhs = rewrite_expr_as_pointer(*rhs, target_ptr_ty.clone());
-                ClightExpr::Ebinop(op, lhs, Box::new(new_rhs), target_ptr_ty)
+                let char_ptr_ty = pointer_to(ClightType::Tint(
+                    ClightIntSize::I8,
+                    ClightSignedness::Signed,
+                    default_attr(),
+                ));
+                let base_as_char_ptr = cast_expr_to_type(*rhs, char_ptr_ty.clone());
+                let byte_addr = ClightExpr::Ebinop(op, lhs, Box::new(base_as_char_ptr), char_ptr_ty);
+                cast_expr_to_type(byte_addr, target_ptr_ty)
             } else {
-                ClightExpr::Ebinop(op, lhs, rhs, target_ptr_ty)
+                // A typed pointer plus an already-byte-scaled offset would make C scale a second time; re-base through char* exactly once, then cast back.
+                let pointee_size = match &target_ptr_ty {
+                    ClightType::Tpointer(inner, _) => clight_type_byte_size(inner),
+                    _ => None,
+                };
+                let rebase_through_char =
+                    |off: Box<ClightExpr>, base: Box<ClightExpr>, off_first: bool| {
+                        let char_ptr_ty = pointer_to(ClightType::Tint(
+                            ClightIntSize::I8,
+                            ClightSignedness::Signed,
+                            default_attr(),
+                        ));
+                        let base_as_char_ptr = cast_expr_to_type(*base, char_ptr_ty.clone());
+                        let byte_addr = if off_first {
+                            ClightExpr::Ebinop(op, off, Box::new(base_as_char_ptr), char_ptr_ty)
+                        } else {
+                            ClightExpr::Ebinop(op, Box::new(base_as_char_ptr), off, char_ptr_ty)
+                        };
+                        cast_expr_to_type(byte_addr, target_ptr_ty.clone())
+                    };
+                match pointee_size {
+                    Some(sz)
+                        if is_pointer_type(&lhs_ty)
+                            && is_byte_offset_for_pointee(&rhs, sz) =>
+                    {
+                        rebase_through_char(rhs, lhs, false)
+                    }
+                    // For Oadd, integral + pointer is also valid; Osub of int - ptr is not.
+                    Some(sz)
+                        if matches!(op, ClightBinaryOp::Oadd)
+                            && is_pointer_type(&rhs_ty)
+                            && is_byte_offset_for_pointee(&lhs, sz) =>
+                    {
+                        rebase_through_char(lhs, rhs, true)
+                    }
+                    _ => ClightExpr::Ebinop(op, lhs, rhs, target_ptr_ty),
+                }
             }
         }
 
@@ -724,55 +824,6 @@ pub fn ident_from_node(node: Node) -> Ident {
     usize::try_from(node).unwrap_or(usize::MAX)
 }
 
-pub fn expr_has_bad_binop(expr: &ClightExpr) -> bool {
-    match expr {
-        ClightExpr::Ebinop(op, lhs, rhs, _result_ty) => {
-            let lhs_ty = clight_expr_type(lhs);
-            let rhs_ty = clight_expr_type(rhs);
-
-            let calls_make_binarith_strict = matches!(
-                op,
-                ClightBinaryOp::Omul
-                    | ClightBinaryOp::Odiv
-                    | ClightBinaryOp::Omod
-                    | ClightBinaryOp::Oand
-                    | ClightBinaryOp::Oor
-                    | ClightBinaryOp::Oxor
-                    | ClightBinaryOp::Oshl
-                    | ClightBinaryOp::Oshr
-                    | ClightBinaryOp::Oeq
-                    | ClightBinaryOp::One
-                    | ClightBinaryOp::Olt
-                    | ClightBinaryOp::Ogt
-                    | ClightBinaryOp::Ole
-                    | ClightBinaryOp::Oge
-            );
-
-            if calls_make_binarith_strict {
-                let lhs_is_int = matches!(lhs_ty, ClightType::Tint(_, _, _));
-                let lhs_is_ptr = is_pointer_type(&lhs_ty);
-                let rhs_is_int = matches!(rhs_ty, ClightType::Tint(_, _, _));
-                let rhs_is_ptr = is_pointer_type(&rhs_ty);
-
-                let has_int_ptr_mismatch = (lhs_is_int && rhs_is_ptr)
-                    || (lhs_is_ptr && rhs_is_int);
-
-                if has_int_ptr_mismatch {
-                    return true;
-                }
-            }
-
-            expr_has_bad_binop(lhs) || expr_has_bad_binop(rhs)
-        }
-        ClightExpr::Ecast(inner, _) => expr_has_bad_binop(inner),
-        ClightExpr::Eunop(_, inner, _) => expr_has_bad_binop(inner),
-        ClightExpr::Ederef(inner, _) => expr_has_bad_binop(inner),
-        ClightExpr::Eaddrof(inner, _) => expr_has_bad_binop(inner),
-        ClightExpr::Efield(inner, _, _) => expr_has_bad_binop(inner),
-        _ => false,
-    }
-}
-
 pub fn make_binarith_check(lhs_ty: &ClightType, rhs_ty: &ClightType) -> bool {
     use ClightType::*;
 
@@ -797,5 +848,4 @@ pub fn make_binarith_check(lhs_ty: &ClightType, rhs_ty: &ClightType) -> bool {
         _ => false,
     }
 }
-
 

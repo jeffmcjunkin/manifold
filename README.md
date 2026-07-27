@@ -1,6 +1,6 @@
 # Manifold
 
-An experimental x86-64 ELF binary decompiler using [Ascent](https://github.com/s-arash/ascent).
+An experimental x86-64 ELF and native AMD64 PE32+ binary decompiler using [Ascent](https://github.com/s-arash/ascent).
 
 ## Quick Start
 

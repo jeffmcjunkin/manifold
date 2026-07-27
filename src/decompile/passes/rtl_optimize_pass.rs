@@ -289,13 +289,6 @@ ascent_par! {
         inline_temp_reach_ok(func, reg);
 }
 
-// Flatten BuiltinArg uses recursively (helper for Ascent rule).
-pub(crate) fn flatten_ba_uses(arg: &BuiltinArg<RTLReg>) -> Vec<RTLReg> {
-    let mut out = Vec::new();
-    collect_ba_uses(arg, &mut out);
-    out
-}
-
 // Build and run RTLOptimizerProgram over a PassContext; returns the program for inspection.
 #[cfg(debug_assertions)]
 fn run_rtl_optimizer_program(ctx: &PassContext) -> RTLOptimizerProgram {
@@ -401,7 +394,7 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         .map(|&(addr, reg)| (addr, reg))
         .collect();
 
-    // RTLOptimizerProgram is the Ascent v2 of the imperative optimizer. Its outputs are only consumed by the debug-only RTL_V2_DIFF block below, so in release builds we skip it entirely (dominates the RTL pass -- ~57s on a 700KB binary).
+    // RTLOptimizerProgram is the Ascent v2 of the imperative optimizer. Its outputs are only consumed by the debug-only RTL_V2_DIFF block below, so in release builds we skip it entirely (dominates the RTL pass at ~57s on a 700KB binary).
     #[cfg(debug_assertions)]
     let ascent_v2: Option<AscentV2Snapshot> = if std::env::var("RTL_V2_DIFF").is_ok() {
         let ascent_opt = run_rtl_optimizer_program(&ctx);
@@ -624,7 +617,7 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
     Some(stats)
 }
 
-// Retype functions that lost their only return value (to static-eq branch folding) as void: emit_function_void_candidate wins the return-type ladder in signature reconciliation (Case 1) so the function renders `void`, and the stale has-return / return-type signals are dropped so they cannot reintroduce a bogus return type.
+// Retype functions that lost their only return value to void: emit_function_void_candidate wins the ladder, and stale has-return signals are dropped so they cannot reintroduce a bogus return type.
 fn mark_functions_void(db: &mut DecompileDB, void_funcs: &HashSet<Address>) {
     let mut void_cand: Vec<(Address,)> = db
         .rel_iter::<(Address,)>("emit_function_void_candidate")
@@ -667,7 +660,7 @@ fn mark_functions_void(db: &mut DecompileDB, void_funcs: &HashSet<Address>) {
 }
 
 pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
-    let callee_arity: HashMap<Address, usize> = db
+    let mut callee_arity: HashMap<Address, usize> = db
         .rel_iter::<(Address, Signature)>("emit_function_signature_candidate")
         .fold(HashMap::new(), |mut acc, (addr, sig)| {
             acc.entry(*addr)
@@ -676,18 +669,43 @@ pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
             acc
         });
 
+    // RTL's first signature candidate holds register params only; include the upstream stack-param count now, or this pass deletes recovered stack arguments before reconciliation widens the callee.
+    let shared_arg_slots = db.abi().uses_shared_arg_slots();
+    let first_stack_arg_position = db.abi().first_stack_arg_position();
+    for &(addr, stack_count) in
+        db.rel_iter::<(Address, usize)>("emit_function_stack_param_count")
+    {
+        let arity = callee_arity.entry(addr).or_insert(0);
+        if shared_arg_slots && stack_count > 0 {
+            // Win64's home space fixes the first stack parameter at ordinal 4, so preserve unobserved register-slot gaps instead of treating stack params as a dense suffix.
+            *arity = (*arity).max(first_stack_arg_position) + stack_count;
+        } else {
+            *arity += stack_count;
+        }
+    }
+
     let call_targets: HashMap<Node, Address> = db
         .rel_iter::<(Node, Address)>("call_target_func")
         .map(|(call_node, target)| (*call_node, *target))
+        .collect();
+
+    // Variadic callees receive more args than their fixed signature, so detect them structurally via the SysV variadic XMM register-save-area prologue rather than trimming their tail args.
+    let varargs_callees: HashSet<Address> = db
+        .rel_iter::<(Address,)>("func_has_variadic_xmm_prologue")
+        .map(|&(addr,)| addr)
         .collect();
 
     let filtered_mapping: Vec<(Node, usize, RTLReg)> = db
         .rel_iter::<(Node, usize, RTLReg)>("call_arg_mapping")
         .filter_map(|&(node, pos, reg)| {
             if let Some(&target) = call_targets.get(&node) {
-                if let Some(&arity) = callee_arity.get(&target) {
-                    if pos >= arity {
-                        return None;
+                // Root E: keep the whole argument tail for a detected-variadic callee; arg_setup_candidate already restricts each position to a def that structurally reaches the call.
+                let keep_varargs_tail = varargs_callees.contains(&target);
+                if !keep_varargs_tail {
+                    if let Some(&arity) = callee_arity.get(&target) {
+                        if pos >= arity {
+                            return None;
+                        }
                     }
                 }
             }
@@ -713,8 +731,11 @@ pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
     let mut normalized_mapping: HashMap<(Node, usize), RTLReg> = HashMap::new();
     for (node, pos, reg) in filtered_mapping {
         if let Some(&target) = call_targets.get(&node) {
-            if let Some(&arity) = callee_arity.get(&target) {
-                debug_assert!(pos < arity);
+            let keep_varargs_tail = varargs_callees.contains(&target);
+            if !keep_varargs_tail {
+                if let Some(&arity) = callee_arity.get(&target) {
+                    debug_assert!(pos < arity);
+                }
             }
         }
         normalized_mapping
@@ -730,7 +751,7 @@ pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
     let rebuild_args = |node: Node| -> Option<Arc<Vec<RTLReg>>> {
         let mut pairs = args_by_call.get(&node)?.clone();
         pairs.sort_by_key(|(pos, _)| *pos);
-        // Scatter by position into a dense vector padded with DEFAULT_VAR so a dropped leading arg leaves a sentinel hole rather than left-shifting later args into its slot (Args is purely positional); contiguous positions 0..N overwrite every slot.
+        // Scatter by position (sentinel DEFAULT_VAR for holes so dropped leading args don't left-shift later ones); len = max_pos+1 is safe because pos <= 5 (6-entry ARG_REGS, rtl_pass.rs).
         let len = pairs.last().map(|(pos, _)| *pos + 1).unwrap_or(0);
         let mut args: Vec<RTLReg> = vec![crate::util::DEFAULT_VAR as RTLReg; len];
         for (pos, reg) in pairs {
@@ -841,11 +862,13 @@ impl IRPass for RTLOptimizePass {
             "emit_function_param_candidate",
             "emit_var_type_candidate",
             "emit_function_signature_candidate",
+            "emit_function_stack_param_count",
             "emit_function_return",
             "call_target_func",
             "call_arg_mapping",
             "call_args_collected_candidate",
             "call_float_args_collected",
+            "func_has_variadic_xmm_prologue",
         ]
     }
 
@@ -869,8 +892,8 @@ impl IRPass for RTLOptimizePass {
     }
 
     fn extra_reads(&self) -> &'static [&'static str] {
-        // Read imperatively in PassContext::load to add a mem-indirect call's target-load address regs as uses of the call node (keeps the vtable Iload alive through DSE).
-        &["call_through_memory_load"]
+        // Read imperatively in PassContext::load: call_through_memory_load (keeps a vtable Iload alive), jump_table_* (protects an in-loop dispatch entry), slot_escaped_canonical (protects escaped-slot stores from DSE).
+        &["call_through_memory_load", "jump_table_impl", "jump_table_cmp", "jump_table_target", "slot_escaped_canonical"]
     }
 }
 
@@ -883,8 +906,12 @@ pub(crate) struct FunctionCFG {
     pub(crate) succs: HashMap<Node, Vec<Node>>,
     pub(crate) preds: HashMap<Node, Vec<Node>>,
     pub(crate) params: HashSet<RTLReg>,
-    // For a mem-indirect call (`call [base+idx*s+ofs]`), the address regs feeding the vtable/function-pointer load; rtl_pass threads these into call_through_memory_load (consumed only by cshminor for Eload rendering), so the optimizer's def/use model never saw them and DSE killed the producing Iload, collapsing the call target to an uninitialized var. Recorded here so they count as uses of the call node.
+    // The address regs feeding a mem-indirect call's function-pointer load; rtl_pass threads them only into call_through_memory_load, so record them here or DSE kills the producing Iload.
     pub(crate) mem_call_addr_uses: HashMap<Node, Vec<RTLReg>>,
+    // Jump-table dispatch entries of IN-LOOP tables: collapsing one threads the guard past the switch, so only these are protected from nop_collapse.
+    pub(crate) dispatch_entry_nodes: HashSet<Node>,
+    // Canonical SSA regs of address-escaped stack slots: the callee may write through the escaped pointer, a use reg liveness cannot see, so their stores are excluded from DSE.
+    pub(crate) escaped_slot_regs: HashSet<RTLReg>,
 }
 
 
@@ -916,6 +943,31 @@ impl PassContext {
             .rel_iter::<(Address, RTLReg)>("emit_function_param_candidate")
             .cloned()
             .collect();
+        // Per jump table: dispatch entry, bounds-check guard, and case targets; loop membership is tested as "a case body reaches the guard", since the dispatch JMP's edges are not yet in the CFG.
+        let mut dispatch_entry_by_table: HashMap<Node, Node> = HashMap::new();
+        for &(impl_addr, jmp_addr) in db.rel_iter::<(Node, Node)>("jump_table_impl") {
+            dispatch_entry_by_table
+                .entry(jmp_addr)
+                .and_modify(|e| { if impl_addr < *e { *e = impl_addr; } })
+                .or_insert(impl_addr);
+        }
+        let mut table_guard: HashMap<Node, Node> = HashMap::new();
+        for &(jmp_addr, cmp_addr) in db.rel_iter::<(Node, Node)>("jump_table_cmp") {
+            table_guard.entry(jmp_addr).or_insert(cmp_addr);
+        }
+        let mut table_cases: HashMap<Node, Vec<Node>> = HashMap::new();
+        for &(jmp_addr, _idx, target) in db.rel_iter::<(Node, usize, Node)>("jump_table_target") {
+            table_cases.entry(jmp_addr).or_default().push(target);
+        }
+        // (dispatch_entry, guard, case_targets) per table that has both an entry and a guard.
+        let dispatch_loop_probes: Vec<(Node, Node, Vec<Node>)> = dispatch_entry_by_table.iter()
+            .filter_map(|(&jmp, &entry)| {
+                let guard = *table_guard.get(&jmp)?;
+                let cases = table_cases.get(&jmp).cloned().unwrap_or_default();
+                Some((entry, guard, cases))
+            })
+            .collect();
+
         // Address regs feeding a mem-indirect call's target load, per call node (node -> [base, idx?]); see FunctionCFG::mem_call_addr_uses. Declared in extra_reads().
         let mut mem_call_addr_uses: HashMap<Node, Vec<RTLReg>> = HashMap::new();
         for (node, _temp, _chunk, _addr, args) in
@@ -928,16 +980,27 @@ impl PassContext {
                 }
             }
         }
+
+        // Per function, the canonical SSA regs of address-escaped stack slots, whose stores must not be dead-store-eliminated. Declared in extra_reads().
+        let mut escaped_slot_regs: HashMap<Address, HashSet<RTLReg>> = HashMap::new();
+        for &(func, _ofs, reg) in db.rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical") {
+            escaped_slot_regs.entry(func).or_default().insert(reg);
+        }
+        // Per reg, keep the max-(refine_priority, type) candidate via fold-during-insert (avoids intermediate Vec; key embeds type so equal-key ties are identical values, making the winner iteration-order-independent).
         let var_types: HashMap<RTLReg, XType> = {
-            let mut groups: HashMap<RTLReg, Vec<XType>> = HashMap::new();
+            let key = |ty: &XType| (crate::decompile::passes::clight_pass::xtype_refine_priority(ty), *ty);
+            let mut chosen: HashMap<RTLReg, XType> = HashMap::new();
             for (reg, xty) in db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate") {
-                groups.entry(*reg).or_default().push(*xty);
+                chosen
+                    .entry(*reg)
+                    .and_modify(|cur| {
+                        if key(xty) > key(cur) {
+                            *cur = *xty;
+                        }
+                    })
+                    .or_insert(*xty);
             }
-            groups.into_iter().map(|(reg, mut tys)| {
-                tys.sort_by_key(|ty| (crate::decompile::passes::clight_pass::xtype_refine_priority(ty), *ty));
-                let chosen = *tys.last().unwrap();
-                (reg, chosen)
-            }).collect()
+            chosen
         };
 
         let node_to_func: HashMap<Node, Address> = {
@@ -979,13 +1042,18 @@ impl PassContext {
         let mut func_insts: HashMap<Address, BTreeMap<Node, RTLInst>> = HashMap::new();
         for (func, node_candidates) in func_node_candidates {
             let insts = func_insts.entry(func).or_default();
+            // INVARIANT: entries in func_node_candidates are created only via push, so each Vec has >= 1 element; malformed input changes which candidates appear, never empties an existing list.
             for (node, candidates) in node_candidates {
                 if candidates.len() == 1 {
-                    insts.insert(node, candidates.into_iter().next().unwrap());
+                    let only = candidates
+                        .into_iter()
+                        .next()
+                        .expect("len()==1 guard: single candidate present");
+                    insts.insert(node, only);
                 } else {
                     let mut candidates = candidates;
                     candidates.sort_by_cached_key(|inst| format!("{:?}", inst));
-                    // Icond wins categorically when Icond and Iop collide on one node (fused flag-setter+jcc: cmp/test/sub/and+jcc; Iop is side-effect-only, Icond carries the CFG edge), so the branch is never dropped. The (is_cond, ..) tuple makes instruction kind the primary key; score+arg_bonus (reg_usage_count-based) only breaks ties among same-kind candidates (cmov shadow resolved upstream by lop_overwrite_use_id).
+                    // Icond wins categorically when Icond and Iop collide on one node, since Iop is side-effect-only while Icond carries the CFG edge; score only breaks ties among same-kind candidates.
                     let best = candidates.into_iter().max_by_key(|inst| {
                         let mut regs = HashSet::new();
                         collect_inst_regs(inst, &mut regs);
@@ -1000,7 +1068,7 @@ impl PassContext {
                         };
                         let is_cond = matches!(inst, RTLInst::Icond(..));
                         (is_cond, score + arg_bonus)
-                    }).unwrap();
+                    }).expect("non-empty by construction: func_node_candidates entries are created by push (see invariant above)");
                     insts.insert(node, best);
                 }
             }
@@ -1073,7 +1141,7 @@ impl PassContext {
                 .filter_map(|n| mem_call_addr_uses.get(n).map(|regs| (*n, regs.clone())))
                 .collect();
 
-            functions.insert(func_addr, FunctionCFG {
+            let mut func = FunctionCFG {
                 func_addr,
                 entry,
                 nodes,
@@ -1082,7 +1150,25 @@ impl PassContext {
                 preds,
                 params: func_params.remove(&func_addr).unwrap_or_default(),
                 mem_call_addr_uses: func_mem_call_uses,
-            });
+                dispatch_entry_nodes: HashSet::new(),
+                escaped_slot_regs: escaped_slot_regs.remove(&func_addr).unwrap_or_default(),
+            };
+            // A dispatch entry is protected only when some case body flows back to the bounds-check guard, i.e. the switch is inside a loop; structural CFG reachability, no address comparison.
+            let mut dispatch_entry_nodes: HashSet<Node> = HashSet::new();
+            for (entry, guard, cases) in &dispatch_loop_probes {
+                if !func.nodes.contains(entry) || dispatch_entry_nodes.contains(entry) {
+                    continue;
+                }
+                let in_loop = cases.iter().any(|c| {
+                    func.nodes.contains(c) && reachable_from(&func, *c).contains(guard)
+                });
+                if in_loop {
+                    dispatch_entry_nodes.insert(*entry);
+                }
+            }
+            func.dispatch_entry_nodes = dispatch_entry_nodes;
+
+            functions.insert(func_addr, func);
         }
 
         PassContext { functions, var_types, inline_temps: HashSet::new() }
@@ -1118,6 +1204,10 @@ impl PassContext {
             for (_, inst) in &func.inst {
                 if let RTLInst::Iop(op, args, dst) = inst {
                     if args.is_empty() {
+                        // A const store to an address-escaped slot is a real memory init, so excluding it from single_def_const stops inline_constants dropping the store and leaving the out-param uninitialized.
+                        if func.escaped_slot_regs.contains(dst) {
+                            continue;
+                        }
                         if let Some(cst) = crate::decompile::passes::cminor_pass::constant_from_operation(op) {
                             new_sdc.push((*dst, cst));
                         }
@@ -1434,14 +1524,18 @@ fn const_eq_branch_taken(cond: &Condition) -> Option<bool> {
     }
 }
 
-// Constant-fold a two-register conditional branch whose operands provably hold the SAME value, then drop the now-unreachable nodes: CRT stubs (deregister_tm_clones) compare two LEAs of the same global with `je`, so the statically-taken branch leaves the fall-through tail (and its undefined-return-value load) dead. Operands are equal only when the same register or both the identical 0-arg constant (`single_def_const`, e.g. same Oaddrsymbol), never firing for genuine runtime compares. Returns true if a branch was folded.
+// Constant-fold a two-register conditional branch whose operands provably hold the SAME value, then drop the unreachable nodes; equal only for the same register or an identical 0-arg constant.
 fn fold_static_eq_branches(func: &mut FunctionCFG) -> bool {
+    // single_def_const, enforced: a register counts as constant ONLY when that constant op is its sole def, or a multi-def register could fold a runtime branch through a non-reaching def.
+    let du = DefUseInfo::build(func);
     let mut const_of: HashMap<RTLReg, Constant> = HashMap::new();
     for inst in func.inst.values() {
         if let RTLInst::Iop(op, args, dst) = inst {
             if args.is_empty() {
                 if let Some(cst) = crate::decompile::passes::cminor_pass::constant_from_operation(op) {
-                    const_of.insert(*dst, cst);
+                    if du.defs.get(dst).is_some_and(|d| d.len() == 1) {
+                        const_of.insert(*dst, cst);
+                    }
                 }
             }
         }
@@ -1549,50 +1643,47 @@ pub(crate) fn copy_propagation(
     let mut subst: HashMap<RTLReg, RTLReg> = HashMap::new();
     let mut dead_nodes: HashSet<Node> = HashSet::new();
 
+    // Pass 1: classify each Omove candidate as propagatable or not, recording the dst of every unsafe copy (notably one whose source is clobbered before a use).
+    let mut unsafe_dsts: HashSet<RTLReg> = HashSet::new();
+    let mut safe_list: Vec<(Node, RTLReg, RTLReg)> = Vec::new();
     for (copy_node, src, dst) in &candidates {
         let src = *src;
         let dst = *dst;
-
-        if func.params.contains(&dst) {
-            continue;
-        }
-
-        let dst_defs = du.defs.get(&dst).map_or(0, |d| d.len());
-        if dst_defs != 1 {
-            continue;
-        }
-
-        let dst_uses = match du.uses.get(&dst) {
-            Some(u) => u,
-            None => {
-                continue;
-            }
-        };
-
-        let mut safe = true;
-        for &use_node in dst_uses {
-            if use_node == *copy_node {
-                safe = false;
-                break;
-            }
-        }
-        if !safe { continue; }
-
-        let reachable = reachable_from(func, *copy_node);
-        for &use_node in dst_uses {
-            if !reachable.contains(&use_node) {
-                safe = false;
-                break;
-            }
-        }
-        if !safe { continue; }
-
-        safe = src_not_redefined_on_paths_to_uses(func, du, *copy_node, src, dst_uses);
-
+        let mut safe = !func.params.contains(&dst)
+            && du.defs.get(&dst).map_or(0, |d| d.len()) == 1;
         if safe {
-            subst.insert(dst, src);
-            dead_nodes.insert(*copy_node);
+            match du.uses.get(&dst) {
+                None => safe = false,
+                Some(dst_uses) => {
+                    if dst_uses.iter().any(|&u| u == *copy_node) {
+                        safe = false;
+                    }
+                    if safe {
+                        let reachable = reachable_from(func, *copy_node);
+                        if dst_uses.iter().any(|&u| !reachable.contains(&u)) {
+                            safe = false;
+                        }
+                    }
+                    if safe {
+                        safe = src_not_redefined_on_paths_to_uses(func, du, *copy_node, src, dst_uses);
+                    }
+                }
+            }
         }
+        if safe {
+            safe_list.push((*copy_node, src, dst));
+        } else {
+            unsafe_dsts.insert(dst);
+        }
+    }
+
+    // Pass 2: a copy whose SOURCE is an unsafe copy's dst must not propagate either, or a later dead-store pass drops the producer and the use reads uninitialized memory.
+    for (copy_node, src, dst) in &safe_list {
+        if unsafe_dsts.contains(src) {
+            continue;
+        }
+        subst.insert(*dst, *src);
+        dead_nodes.insert(*copy_node);
     }
 
     if subst.is_empty() {
@@ -1702,7 +1793,6 @@ pub(crate) fn subst_ba(ba: &BuiltinArg<RTLReg>, map: &HashMap<RTLReg, RTLReg>) -
     }
 }
 
-
 pub(crate) fn dead_store_elimination(
     func: &mut FunctionCFG,
     du: &DefUseInfo,
@@ -1715,6 +1805,11 @@ pub(crate) fn dead_store_elimination(
             let def_reg = du.node_def.get(&node)?;
 
             if func.params.contains(def_reg) {
+                return None;
+            }
+
+            // A store to an address-escaped stack slot is never dead: the callee reads it through the escaped pointer, protecting every by-reference out-param's initialization.
+            if func.escaped_slot_regs.contains(def_reg) {
                 return None;
             }
 
@@ -1765,9 +1860,11 @@ pub(crate) fn dead_store_elimination(
 
 
 pub(crate) fn nop_collapse(func: &mut FunctionCFG) -> usize {
+    // An in-loop dispatch entry is DSE-nopped but not removable: keep it self-canonical, or threading the guard past the switch leaves a dead switch.
+    let dispatch_entry = &func.dispatch_entry_nodes;
     let nop_nodes: Vec<Node> = func.inst.iter()
         .filter(|(&node, inst)| {
-            matches!(inst, RTLInst::Inop) && node != func.entry
+            matches!(inst, RTLInst::Inop) && node != func.entry && !dispatch_entry.contains(&node)
         })
         .map(|(&node, _)| node)
         .collect();
@@ -1938,6 +2035,14 @@ pub(crate) fn find_inline_temps(
 
         let reachable = reachable_from(func, def_node);
         if !reachable.contains(&use_node) {
+            continue;
+        }
+
+        // Refuse to inline if any source operand is redefined on a CFG path from the temp's def to its use; liveness at the use does not preclude an intervening redefinition.
+        if !def_args
+            .iter()
+            .all(|&a| src_not_redefined_on_paths_to_uses(func, du, def_node, a, &[use_node]))
+        {
             continue;
         }
 

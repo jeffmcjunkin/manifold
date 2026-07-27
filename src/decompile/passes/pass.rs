@@ -1,5 +1,5 @@
 // IRPass trait, swap-run-swap macros, and dependency-based pass scheduler.
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use crate::decompile::elevator::DecompileDB;
 
 // A single stage of the decompilation pipeline with declared input/output relations.

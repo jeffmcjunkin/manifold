@@ -266,6 +266,25 @@ fn osel_condition_expr(cond: &Condition, args: &[RTLReg]) -> CsharpminorExpr {
             Box::new(CsharpminorExpr::Evar(args[2])),
             Box::new(CsharpminorExpr::Evar(args[3])),
         ),
+        // Mask test (from TEST/AND + CMOV): (reg & mask) == 0 / != 0, mirroring the Ocmp(Cmask*) lowering.
+        Condition::Cmaskzero(mask) if args.len() >= 3 => CsharpminorExpr::Ebinop(
+            CminorBinop::Ocmpu(Comparison::Ceq),
+            Box::new(CsharpminorExpr::Ebinop(
+                CminorBinop::Oand,
+                Box::new(CsharpminorExpr::Evar(args[2])),
+                Box::new(CsharpminorExpr::Econst(Constant::Ointconst(*mask))),
+            )),
+            Box::new(CsharpminorExpr::Econst(Constant::Ointconst(0))),
+        ),
+        Condition::Cmasknotzero(mask) if args.len() >= 3 => CsharpminorExpr::Ebinop(
+            CminorBinop::Ocmpu(Comparison::Cne),
+            Box::new(CsharpminorExpr::Ebinop(
+                CminorBinop::Oand,
+                Box::new(CsharpminorExpr::Evar(args[2])),
+                Box::new(CsharpminorExpr::Econst(Constant::Ointconst(*mask))),
+            )),
+            Box::new(CsharpminorExpr::Econst(Constant::Ointconst(0))),
+        ),
         _ => CsharpminorExpr::Econst(Constant::Ointconst(1)),
     }
 }
@@ -600,7 +619,13 @@ pub(crate) fn cast_call_args_to_signature_with_node(
     let mut result = Vec::with_capacity(args.len().max(expected_types.len()));
     for (i, arg) in args.into_iter().enumerate() {
         if i < expected_types.len() {
-            result.push(crate::x86::types::cast_expr_to_type(arg, expected_types[i].clone()));
+            let expected = expected_types[i].clone();
+            // &sym is intrinsically a pointer: never narrow to a sub-64-bit int param, which would truncate the address.
+            if matches!(&arg, ClightExpr::Eaddrof(_, _)) && matches!(&expected, ClightType::Tint(_, _, _)) {
+                result.push(arg);
+            } else {
+                result.push(crate::x86::types::cast_expr_to_type(arg, expected));
+            }
         } else {
             // Preserve extra args for varargs; narrowed at C AST emission
             result.push(arg);

@@ -5,7 +5,7 @@ use crate::decompile::passes::pass::IRPass;
 use crate::{declare_io_from, run_pass};
 
 use std::sync::Arc;
-use crate::x86::mach::Mreg;
+use crate::mreg::Mreg;
 use crate::x86::op::Condition;
 use crate::x86::types::*;
 use ascent::ascent_par;
@@ -23,7 +23,6 @@ ascent_par! {
     relation arg_constrained_as_ptr(Node, RTLReg);
     relation base_ident_to_symbol(Ident, Symbol);
     relation block_in_function(Node, Address);
-    relation call_arg_struct_ptr(Node, usize, usize);
     relation call_return_reg(Node, RTLReg);
     relation emit_clight_stmt(Address, Node, ClightStmt);
     relation emit_function_return_type_candidate(Address, ClightType);
@@ -32,7 +31,6 @@ ascent_par! {
     relation emit_loop_exit(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node);
     relation emit_switch_chain(Address, Node, RTLReg);
     relation func_param_struct_type_candidate(Address, usize, usize);
-    relation func_return_struct_type(Address, usize);
     relation func_span(Symbol, Address, Address);
     relation global_struct_catalog(u64, usize, usize, usize);
     relation ident_to_symbol(Ident, Symbol);
@@ -40,19 +38,17 @@ ascent_par! {
     relation is_external_function(Address);
     relation known_extern_signature(Symbol, usize, XType, Arc<Vec<XType>>);
     relation known_func_param_is_ptr(Symbol, usize);
-    relation known_func_returns_float(Symbol);
-    relation known_func_returns_int(Symbol);
     relation known_func_returns_long(Symbol);
     relation known_func_returns_ptr(Symbol);
-    relation known_func_returns_single(Symbol);
     relation mach_imm_stack_init(Address, i64, i64, Typ);
+    // The no-linear-op side-effect class (fused mem-arith RMW, immediate indirect/absolute stores, mem-source loads) surfaces as a bare label+Lbranch, so threading gotos past it would drop the update.
+    relation node_unlowered_side_effect(Address);
     relation main_function(Address);
     relation reg_def_used(Address, Mreg, Address);
     relation reg_rtl(Node, Mreg, RTLReg);
     relation reg_xtl(Node, Mreg, RTLReg);
     relation stack_var(Address, Address, i64, RTLReg);
     relation string_data(String, String, usize);
-    relation struct_field(u64, i64, String, MemoryChunk);
     relation struct_id_to_canonical(usize, usize);
     relation symbol_resolved_addr(Symbol, Address);
 
@@ -82,12 +78,11 @@ ascent_par! {
     relation emit_function_has_return_candidate(Address);
 
     relation is_local_block(Address);
-    relation intra_function_edge(Address, Address);
-    relation has_tailcall(Node);
     relation linear_has_executable_code(Node);
     relation ltl_branch_candidate(Node, Node);
-    relation label_classified(Node);
     relation lcond_real_fallthrough(Node, Node);
+    // Produced by asm_pass: this Lcond sits at a secondary jcc's own address (not at its compare), so its fall-through is next(addr) rather than skip-one-paired-jcc.
+    relation mcond_at_jcc(Address);
     relation ltl_fallthrough(Node, Node);
     relation ltl_branch_target(Node, Node);
     relation ltl_jumptable_index(Node, usize);
@@ -111,7 +106,6 @@ ascent_par! {
     relation function_noreturn(Address);
     relation is_known_noreturn_function(Symbol);
     relation return_may_reach(Node, Node);
-    relation ltl_intra_function_edge(Node, Node, Address);
 
 
     is_function_entry(addr) <--
@@ -121,21 +115,6 @@ ascent_par! {
         block_in_function(addr, func),
         !ddisasm_function_entry(*addr),
         if *addr != *func;
-
-    intra_function_edge(src, dst) <--
-        ddisasm_cfg_edge(src, dst, edge_type),
-        if *edge_type != "indirect" && *edge_type != "indirect_call",
-        block_in_function(src, func),
-        block_in_function(dst, func2),
-        if func == func2;
-
-
-    has_tailcall(n) <--
-        linear_inst(n, inst),
-        if match inst {
-            LinearInst::Ltailcall(_) => true,
-            _ => false,
-        };
 
     linear_has_executable_code(n) <--
         linear_inst(n, inst),
@@ -260,14 +239,6 @@ ascent_par! {
         let inst = LTLInst::Lbranch(Either::Right(*next_node));
 
 
-    label_classified(n) <--
-        linear_inst(n, linearinst),
-        if match linearinst {
-            LinearInst::Llabel(_) => true,
-            _ => false,
-        },
-        is_local_block(n);
-
     ltl_branch_candidate(n, *fallthrough) <--
         linear_inst(n, linearinst),
         if match linearinst {
@@ -290,15 +261,6 @@ ascent_par! {
         code_in_block(n, block),
         ddisasm_cfg_edge(block, fallthrough_blk, edge_type),
         if *edge_type == "fallthrough";
-
-    label_classified(n) <--
-        linear_inst(n, linearinst),
-        if match linearinst {
-            LinearInst::Llabel(_) => true,
-            _ => false,
-        },
-        !is_local_block(n),
-        is_function_entry(n);
 
     ltl_branch_candidate(n, *fallthrough) <--
         linear_inst(n, linearinst),
@@ -338,11 +300,13 @@ ascent_par! {
 
     lcond_real_fallthrough(cmp_addr, real_ft) <--
         linear_inst(cmp_addr, ?LinearInst::Lcond(_, _, _)),
+        !mcond_at_jcc(cmp_addr),
         next(cmp_addr, jcc_addr),
         next(jcc_addr, real_ft);
-    
+
     lcond_real_fallthrough(cmp_addr, real_ft) <--
         linear_inst(cmp_addr, ?LinearInst::Lcond(_, _, _)),
+        !mcond_at_jcc(cmp_addr),
         next(cmp_addr, jcc_addr),
         !next(jcc_addr, _),
         code_in_block(jcc_addr, block),
@@ -350,11 +314,13 @@ ascent_par! {
         if *edge_type == "fallthrough",
         let real_ft = *fallthrough_blk;
 
-    lcond_real_fallthrough(cmp_addr, real_ft) <--
-        linear_inst(cmp_addr, ?LinearInst::Lcond(_, _, _)),
-        next(cmp_addr, jcc_addr),
-        instruction(jcc_addr, size, _, _, _, _, _, _, _, _),
-        let real_ft = ((*jcc_addr as i64) + (*size as i64)) as Address;
+    // LINEAR-1: dropped the address-arithmetic fall-through rule, which fabricated a phantom edge at a section/block tail; rule 1 already covers every real next instruction.
+
+    // An Lcond placed AT a secondary jcc's own address (mcond_at_jcc, see asm_pass secondary_flags_consumer): its fall-through is simply its next instruction - there is no paired jcc to skip over.
+    lcond_real_fallthrough(addr, real_ft) <--
+        linear_inst(addr, ?LinearInst::Lcond(_, _, _)),
+        mcond_at_jcc(addr),
+        next(addr, real_ft);
 
     ltl_inst(addr, ltlinst) <--
         linear_inst(addr, ?LinearInst::Lcond(cond, args, target_sym)),
@@ -485,12 +451,17 @@ ascent_par! {
     ltl_canonical_node(n, n) <--
         mach_imm_stack_init(n, _, _, _);
 
+    // Same hazard for the whole no-linear-op side-effect class: it surfaces as a bare label+Lbranch, so keep it self-canonical or threading drops the update.
+    ltl_canonical_node(n, n) <--
+        node_unlowered_side_effect(n);
+
     ltl_canonical_node(n, canon) <--
         ltl_inst(n, inst),
         if let LTLInst::Lbranch(Either::Right(t)) = inst,
         if *t != *n,
         !ltl_branch_cycle(n),
         !mach_imm_stack_init(n, _, _, _),
+        !node_unlowered_side_effect(n),
         ltl_canonical_node(*t, canon);
 
     ltl_canonical_node(*target_addr, *target_addr) <--
@@ -609,15 +580,12 @@ ascent_par! {
     emit_function_has_return_candidate(func) <--
         function_return_point(func, _);
 
+    // A function with no return point of its own is noreturn, which covers always-exit wrappers since they emit no Lreturn.
     function_noreturn(func) <--
         emit_function(func, _, _),
         !emit_function_has_return_candidate(func);
 
-
-    function_noreturn(func) <--
-        emit_function(func, name, _),
-        is_known_noreturn_function(name.clone());
-
+    // A function whose declared symbol is itself a known-noreturn name is noreturn (a binary defining exit/abort directly).
     function_noreturn(func) <--
         emit_function(func, name, _),
         is_known_noreturn_function(name);
@@ -634,13 +602,6 @@ ascent_par! {
 
     ltl_succ(ret_inst, ret_addr) <--
         return_may_reach(ret_inst, ret_addr);
-
-
-    ltl_intra_function_edge(src, dst, func) <--
-        ltl_succ(src, dst),
-        block_in_function(src, func),
-        block_in_function(dst, func2),
-        if func == func2;
 
 
     emit_sseq(start, start) <--
@@ -689,11 +650,13 @@ ascent_par! {
         ltl_inst(current, inst),
         if let LTLInst::Lbuiltin(..) = inst;
 
+    // A call continues the block sequence ONLY if it can return; a noreturn call terminates it, since the fallthrough successor is dead code.
     emit_sseq(head, next) <--
         emit_sseq(head, current),
         ltl_fallthrough(current, next),
         ltl_inst(current, inst),
-        if let LTLInst::Lcall(..) = inst;
+        if let LTLInst::Lcall(..) = inst,
+        !call_targets_noreturn(current);
 
 
 }

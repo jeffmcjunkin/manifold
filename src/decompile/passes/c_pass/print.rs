@@ -155,7 +155,7 @@ impl Printer {
             }
 
             CExpr::Call(func, args) => {
-                // A function-pointer cast on a call target only ever wraps an INDIRECT callee (a memory deref, an address computed by arithmetic, or a register/parameter holding a code pointer). Direct named-function calls carry a bare callee with no such cast, so they are never affected here. The cast supplies the call signature, hence it must be preserved for the call to type-check, e.g. (*(T (*)(args))(p))(...). Dropping it produced a call through long ("called object is not a function or function pointer") or an arity mismatch against a differently-declared parameter.
+                // A function-pointer cast on a call target only ever wraps an INDIRECT callee and supplies the call signature, so it must be preserved or the call is through a long and fails to type-check.
                 self.print_expr_prec(func.as_ref(), 15);
                 self.write("(");
                 for (i, arg) in args.iter().enumerate() {
@@ -492,28 +492,30 @@ impl Printer {
                 self.writeln(";");
             }
 
-            CStmt::Labeled(label, body) => {
-                let saved_indent = self.indent_level;
-                self.indent_level = 0;
-
-                match label {
-                    Label::Named(name) => {
-                        self.write(name);
-                        self.writeln(":");
-                    }
-                    Label::Case(expr) => {
-                        self.write("case ");
-                        self.print_expr(expr);
-                        self.writeln(":");
-                    }
-                    Label::Default => {
-                        self.writeln("default:");
-                    }
+            CStmt::Labeled(label, body) => match label {
+                // Goto targets conventionally sit at column 0.
+                Label::Named(name) => {
+                    let saved_indent = self.indent_level;
+                    self.indent_level = 0;
+                    self.write(name);
+                    self.writeln(":");
+                    self.indent_level = saved_indent;
+                    self.print_stmt(body);
                 }
-
-                self.indent_level = saved_indent;
-                self.print_stmt(body);
-            }
+                // case/default labels are indented with the enclosing switch body.
+                Label::Case(expr) => {
+                    self.write_indent();
+                    self.write("case ");
+                    self.print_expr(expr);
+                    self.writeln(":");
+                    self.print_case_body(body);
+                }
+                Label::Default => {
+                    self.write_indent();
+                    self.writeln("default:");
+                    self.print_case_body(body);
+                }
+            },
 
             CStmt::Decl(decls) => {
                 for decl in decls {
@@ -526,6 +528,16 @@ impl Printer {
                     self.print_stmt(stmt);
                 }
             }
+        }
+    }
+
+    /// Body of a `case`/`default` arm. A stacked fall-through label (`case a: case b:`) stays at the label's level; any real statement body is indented one level beneath the label.
+    fn print_case_body(&mut self, body: &CStmt) {
+        match body {
+            CStmt::Labeled(Label::Case(_), _) | CStmt::Labeled(Label::Default, _) => {
+                self.print_stmt(body)
+            }
+            _ => self.indent(|p| p.print_stmt(body)),
         }
     }
 
@@ -586,7 +598,12 @@ impl Printer {
         self.print_type(&decl.return_type);
         self.write(" ");
         self.write(&decl.name);
-        self.print_params(&decl.params, decl.is_variadic);
+        if decl.unspecified_params {
+            // K&R unspecified arg list: no argument checking at call sites.
+            self.write("()");
+        } else {
+            self.print_params(&decl.params, decl.is_variadic);
+        }
         self.writeln(";");
     }
 
@@ -764,8 +781,7 @@ impl Printer {
             self.newline();
         }
 
-        // Print in C declaration order: types, globals, forward decls, definitions.
-        // This avoids sorting tu.decls (which would invalidate tu.symbols indices).
+        // Print in C declaration order: types, globals, forward decls, definitions. This avoids sorting tu.decls (which would invalidate tu.symbols indices).
         let order = |d: &TopLevelDecl| -> u8 {
             match d {
                 TopLevelDecl::StructDef(_) | TopLevelDecl::EnumDef(_) | TopLevelDecl::Typedef(_) => 0,
@@ -823,6 +839,7 @@ fn type_to_string(ty: &CType) -> String {
                 IntSize::Int => "int",
                 IntSize::Long => "long",
                 IntSize::LongLong => "long long",
+                IntSize::Int128 => "__int128",
             };
             format!("{}{}", sign_str, size_str)
         }
@@ -843,9 +860,10 @@ fn type_to_string(ty: &CType) -> String {
             let size_str = size.map(|s| s.to_string()).unwrap_or_default();
             format!("{}[{}]", type_to_string(inner), size_str)
         }
-        CType::Function(ret, params, variadic) => {
+        CType::Function(ret, params, variadic, unprototyped) => {
             let params_str = if params.is_empty() {
-                "void".to_string()
+                // Unprototyped K&R `()` (unspecified args) vs `(void)` (no args).
+                if *unprototyped { String::new() } else { "void".to_string() }
             } else {
                 let mut s: String = params
                     .iter()
@@ -877,9 +895,10 @@ fn type_to_decl_parts(ty: &CType) -> (String, String) {
             let size_str = size.map(|s| s.to_string()).unwrap_or_default();
             (prefix, format!("[{}]{}", size_str, suffix))
         }
-        CType::Function(ret, params, variadic) => {
+        CType::Function(ret, params, variadic, unprototyped) => {
             let params_str = if params.is_empty() && !variadic {
-                "void".to_string()
+                // Unprototyped K&R `()` (unspecified args) vs `(void)` (no args).
+                if *unprototyped { String::new() } else { "void".to_string() }
             } else {
                 let mut s: String = params
                     .iter()
@@ -924,9 +943,10 @@ fn type_to_named_decl(ty: &CType, name: &str) -> String {
             let size_str = size.map(|s| s.to_string()).unwrap_or_default();
             type_to_named_decl(inner, &format!("{}[{}]", name, size_str))
         }
-        CType::Function(ret, params, variadic) => {
+        CType::Function(ret, params, variadic, unprototyped) => {
             let mut params_str = if params.is_empty() && !variadic {
-                "void".to_string()
+                // Unprototyped K&R `()` (unspecified args) vs `(void)` (no args).
+                if *unprototyped { String::new() } else { "void".to_string() }
             } else {
                 params
                     .iter()
@@ -994,6 +1014,7 @@ fn expr_precedence(expr: &CExpr) -> u8 {
         },
         CExpr::Cast(_, _) => 14,
         CExpr::Binary(op, _, _) => op.precedence(),
+        // LATENT HAZARD (PRINT-1): this 3 collides with BinaryOp::Or though ?: binds looser; unreachable today since no ternary sits under a logical operand, and a real fix must edit types.rs.
         CExpr::Ternary(_, _, _) => 3,
         CExpr::Assign(_, _, _) => 2,
         CExpr::SizeofType(_) | CExpr::SizeofExpr(_) | CExpr::AlignofType(_) => 14,
@@ -1029,7 +1050,14 @@ fn escape_char(c: char) -> String {
         '\'' => "\\'".to_string(),
         '\0' => "\\0".to_string(),
         c if c.is_ascii_graphic() || c == ' ' => c.to_string(),
-        c => format!("\\x{:02x}", c as u32),
+        // Non-graphic / non-ASCII: emit each UTF-8 byte as a 3-digit octal escape (the C lexer caps it at 3 digits, so it never runs into a following literal hex/octal digit the way greedy `\x` did, producing out-of-range escapes).
+        c => {
+            let mut buf = [0u8; 4];
+            c.encode_utf8(&mut buf)
+                .bytes()
+                .map(|b| format!("\\{:03o}", b))
+                .collect()
+        }
     }
 }
 
@@ -1129,57 +1157,15 @@ fn collect_called_names_expr(expr: &CExpr, names: &mut std::collections::HashSet
     }
 }
 
+/// The #includes the output needs, from header_functions.json; a suppressed prototype without its header is a hard error on gcc >= 14.
 fn collect_needed_includes(tu: &TranslationUnit) -> Vec<&'static str> {
     let names = collect_called_names(tu);
     let mut includes = std::collections::BTreeSet::new();
-
-    let mappings: &[(&[&str], &str)] = &[
-        (&["printf", "fprintf", "sprintf", "snprintf", "puts", "putchar", "getchar",
-           "fopen", "fclose", "fread", "fwrite", "fgets", "fputs", "fflush", "fseek",
-           "ftell", "rewind", "sscanf", "fscanf", "perror", "stdin", "stdout", "stderr",
-           "vprintf", "vfprintf", "vsprintf", "vsnprintf", "remove", "rename", "tmpfile",
-           "setbuf", "setvbuf"], "<stdio.h>"),
-        (&["malloc", "calloc", "realloc", "free", "exit", "abort", "atoi", "atol", "atof",
-           "strtol", "strtoul", "strtod", "qsort", "bsearch", "abs", "labs", "getenv",
-           "system", "rand", "srand", "EXIT_SUCCESS", "EXIT_FAILURE"], "<stdlib.h>"),
-        (&["strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat", "strncat",
-           "memcpy", "memmove", "memset", "memcmp", "strstr", "strchr", "strrchr",
-           "strtok", "strerror", "strdup", "strndup"], "<string.h>"),
-        (&["isalpha", "isdigit", "isalnum", "isspace", "isupper", "islower", "toupper",
-           "tolower", "isprint", "ispunct", "isxdigit", "iscntrl", "isgraph"], "<ctype.h>"),
-        (&["assert", "__assert_fail"], "<assert.h>"),
-        (&["va_start", "va_end", "va_arg", "va_copy"], "<stdarg.h>"),
-        (&["errno"], "<errno.h>"),
-        (&["open", "close", "read", "write", "lseek", "access", "unlink", "getpid",
-           "getcwd", "chdir", "isatty", "dup", "dup2", "pipe", "fork", "execve"], "<unistd.h>"),
-        (&["stat", "fstat", "lstat", "mkdir", "chmod"], "<sys/stat.h>"),
-        (&["time", "clock", "difftime", "mktime", "localtime", "gmtime", "strftime",
-           "ctime", "asctime"], "<time.h>"),
-        (&["sin", "cos", "tan", "sqrt", "pow", "log", "log10", "exp", "fabs", "ceil",
-           "floor", "round", "fmod", "atan2", "asin", "acos", "atan", "sinh", "cosh",
-           "tanh", "__builtin_fabs"], "<math.h>"),
-        (&["setjmp", "longjmp"], "<setjmp.h>"),
-        (&["signal", "raise"], "<signal.h>"),
-        (&["mmap", "munmap", "mprotect"], "<sys/mman.h>"),
-        (&["socket", "bind", "listen", "accept", "connect", "send", "recv",
-           "setsockopt", "getsockopt"], "<sys/socket.h>"),
-        (&["htons", "htonl", "ntohs", "ntohl", "inet_addr", "inet_ntoa"], "<arpa/inet.h>"),
-        (&["ioctl"], "<sys/ioctl.h>"),
-        (&["fcntl"], "<fcntl.h>"),
-        (&["select", "FD_SET", "FD_CLR", "FD_ISSET", "FD_ZERO"], "<sys/select.h>"),
-        (&["pthread_create", "pthread_join", "pthread_mutex_lock", "pthread_mutex_unlock",
-           "pthread_mutex_init", "pthread_mutex_destroy"], "<pthread.h>"),
-    ];
-
-    for (funcs, header) in mappings {
-        for func in *funcs {
-            if names.contains(*func) {
-                includes.insert(*header);
-                break;
-            }
+    for (header, fns) in &super::header_db::header_db().includes {
+        if fns.iter().any(|f| names.contains(*f)) {
+            includes.insert(*header);
         }
     }
-
     includes.into_iter().collect()
 }
 

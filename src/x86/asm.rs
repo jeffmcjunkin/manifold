@@ -154,6 +154,9 @@ pub enum TestCond {
     CondG,
     CondP,
     CondNp,
+    // JO/JNO: OF has no CompCert comparison, so it lowers to opaque Coverflow/Cnotoverflow.
+    CondO,
+    CondNo,
     #[allow(dead_code)]
     Unknown,
 }

@@ -4,11 +4,11 @@ use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
 use crate::{declare_io_from, run_pass};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use crate::decompile::passes::cminor_pass::*;
 
-use crate::x86::mach::Mreg;
+use crate::mreg::Mreg;
 use crate::x86::op::{Addressing, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
@@ -22,14 +22,31 @@ fn dom_set_with_self(strict: &Set<Node>, n: Node) -> Set<Node> {
     Set(s)
 }
 
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy)]
-pub enum ExitType {
-    Primary,
-    EarlyBreak,
-    #[allow(dead_code)]
-    LateBreak,
+// Substitute every Evar(old) with Evar(new) inside a Csharpminor expression.
+fn cond_subst_var_in_expr(expr: &CsharpminorExpr, old: RTLReg, new: RTLReg) -> CsharpminorExpr {
+    match expr {
+        CsharpminorExpr::Evar(r) if *r == old => CsharpminorExpr::Evar(new),
+        CsharpminorExpr::Eunop(op, inner) =>
+            CsharpminorExpr::Eunop(op.clone(), Box::new(cond_subst_var_in_expr(inner, old, new))),
+        CsharpminorExpr::Ebinop(op, l, r) =>
+            CsharpminorExpr::Ebinop(op.clone(),
+                Box::new(cond_subst_var_in_expr(l, old, new)),
+                Box::new(cond_subst_var_in_expr(r, old, new))),
+        CsharpminorExpr::Eload(chunk, addr) =>
+            CsharpminorExpr::Eload(*chunk, Box::new(cond_subst_var_in_expr(addr, old, new))),
+        CsharpminorExpr::Econdition(c, t, f) =>
+            CsharpminorExpr::Econdition(
+                Box::new(cond_subst_var_in_expr(c, old, new)),
+                Box::new(cond_subst_var_in_expr(t, old, new)),
+                Box::new(cond_subst_var_in_expr(f, old, new))),
+        _ => expr.clone(),
+    }
 }
+
+fn cond_subst_exprs(args: &[CsharpminorExpr], old: RTLReg, new: RTLReg) -> Vec<CsharpminorExpr> {
+    args.iter().map(|e| cond_subst_var_in_expr(e, old, new)).collect()
+}
+
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Copy)]
 pub enum LoopType {
@@ -69,8 +86,17 @@ ascent_par! {
     relation emit_var_type_candidate(RTLReg, XType);
     relation idom(Address, Node, Node);
     relation stack_var(Address, Address, i64, RTLReg);
+    // rtl_pass export: the single escaped canonical local per (func, offset), used to resolve synthetic-only stack loads that have no per-node stack_var.
+    relation slot_escaped_canonical(Address, i64, RTLReg);
+    // Noreturn recognition inputs: the always-noreturn symbol set, single-def constants for resolving an error-family status arg, and function_noreturn for user-defined wrappers.
+    relation is_known_noreturn_function(Symbol);
+    relation single_def_const(RTLReg, Constant);
+    relation function_noreturn(Address);
+    relation symbol_resolved_addr(Symbol, Address);
     // Memory-indirect call: the rtl_pass surfaces the load addressing so we can inline the function-pointer load into the Scall callee (renders as `(*(base + disp))(args)`).
     relation call_through_memory_load(Node, RTLReg, MemoryChunk, Addressing, Args);
+    // signature_pass: the function returns void, so a loop exit flowing to its return stays a plain break; used to gate loop_exit_to_return to value-returning functions only.
+    relation emit_function_void_candidate(Address);
 
 
     relation stmt_can_fallthrough(Node);
@@ -79,12 +105,36 @@ ascent_par! {
     relation func_entry_node(Address, Node);
     relation pred(Address, Node, Node);
 
+    // A call whose callee never returns gets no cminor_succ edge, so its dead tail drops: an always-noreturn symbol, or an error-family symbol with a nonzero constant status arg.
+    relation call_node_noreturn(Node);
+    call_node_noreturn(*node) <--
+        active_cminor_stmt(node, ?CminorStmt::Scall(_, _, Either::Right(Either::Right(name)), _)),
+        if crate::abi::is_always_noreturn(name);
+    // (2) error-family: join arg 0's register to a single-definition nonzero int constant.
+    call_node_noreturn(*node) <--
+        active_cminor_stmt(node, ?CminorStmt::Scall(_, _, Either::Right(Either::Right(name)), args)),
+        if crate::abi::is_status_noreturn_callee(name),
+        single_def_const(status_reg, cst),
+        if args.first() == Some(status_reg),
+        if matches!(cst, Constant::Ointconst(n) | Constant::Olongconst(n) if *n != 0);
+    // (3) user-defined noreturn wrapper called by direct address (die/usage/...).
+    call_node_noreturn(*node) <--
+        active_cminor_stmt(node, ?CminorStmt::Scall(_, _, Either::Right(Either::Left(addr)), _)),
+        function_noreturn(addr);
+    // (4) user-defined noreturn wrapper called by symbol that resolves to its entry.
+    call_node_noreturn(*node) <--
+        active_cminor_stmt(node, ?CminorStmt::Scall(_, _, Either::Right(Either::Right(name)), _)),
+        symbol_resolved_addr(name, addr),
+        function_noreturn(addr);
+
     stmt_can_fallthrough(node) <--
         active_cminor_stmt(node, stmt),
+        !call_node_noreturn(node),
         if !matches!(stmt,
             CminorStmt::Sjump(_) |
             CminorStmt::Sreturn(_) |
-            CminorStmt::Stailcall(_, _, _));
+            CminorStmt::Stailcall(_, _, _) |
+            CminorStmt::Sjumptable(_, _));
 
     // Walk `next` chain to first cminor node (transitive closure)
     #[local] relation next_to_cminor(Node, Node);
@@ -117,26 +167,39 @@ ascent_par! {
     cminor_succ(*node, resolved) <-- active_cminor_stmt(node, ?CminorStmt::Sifthenelse(_, _, _, ifnot)), !active_cminor_stmt(ifnot, _), next_to_cminor(*ifnot, resolved);
     cminor_succ(*node, resolved) <-- active_cminor_stmt(node, ?CminorStmt::Sjumptable(_, targets)), for target in targets.iter(), !active_cminor_stmt(target, _), next_to_cminor(*target, resolved);
 
-    // Fallthrough as successor
+    // synth_rerouted guards against re-fabricating the rtl_edge_negated-killed fallthrough for synth-carrying nodes (bits 62/63), which would give an unconditional stmt two successors and detach synth stores from their if-arms.
+    #[local] relation synth_rerouted(Node);
+    synth_rerouted(*node) <--
+        rtl_succ(node, dst),
+        if (*dst & (3u64 << 62)) != 0,
+        active_cminor_stmt(dst, _);
+
+    // Fallthrough suppressed when a synth chain carries the real flow; bridge rules below provide node -> synth -> ... -> next instead.
     cminor_succ(node, next) <--
         csh_next(node, next),
+        !synth_rerouted(node),
         active_cminor_stmt(node, _),
         active_cminor_stmt(next, _);
 
-    // Synth-node successor: bit-62 nodes (e.g. SP-indexed-load synth from rtl_pass) lack `next` entries; bridge via rtl_succ so the C emitter's DFS visits them and the synth Sset survives.
-    // rtl_succ drives the join (one tuple per CFG edge), binding node+dst so the active_cminor_stmt
-    // lookups are indexed; scanning active_cminor_stmt twice with independent unbound vars was an
-    // O(active^2) self-join (36s on large binaries). Clause order is semantics-neutral in Datalog.
+    // Synth-node successor: synthetic nodes lack next entries, so bridge via rtl_succ, which drives the join one tuple per CFG edge; scanning active_cminor_stmt twice was an O(n^2) self-join (36s).
     cminor_succ(*node, *dst) <--
         rtl_succ(node, dst),
-        if (*node & (1u64 << 62)) != 0,
+        if (*node & (3u64 << 62)) != 0,
         active_cminor_stmt(node, _),
         active_cminor_stmt(dst, _);
+
+    // Synth chain exiting to a trimmed address resolves via `next`, so suppressing the bypass edge above cannot strand the chain.
+    cminor_succ(*node, resolved) <--
+        rtl_succ(node, dst),
+        if (*node & (3u64 << 62)) != 0,
+        active_cminor_stmt(node, _),
+        !active_cminor_stmt(dst, _),
+        next_to_cminor(*dst, resolved);
 
     // The predecessor of a synth node needs an explicit cminor_succ; `next` skips synth, leaving it unreachable from its real-address predecessor.
     cminor_succ(*node, *dst) <--
         rtl_succ(node, dst),
-        if (*dst & (1u64 << 62)) != 0,
+        if (*dst & (3u64 << 62)) != 0,
         active_cminor_stmt(node, _),
         active_cminor_stmt(dst, _);
 
@@ -190,10 +253,7 @@ ascent_par! {
         dom_set(func, n, doms_dual),
         for d in doms_dual.0.iter();
 
-    // Immediate dominator: closest strict dominator. d is not n's idom iff some mid sits strictly
-    // between them on the dom chain (mid dom n, d dom mid). The original also joined dom(n,d), but
-    // that is implied transitively (dom is transitively closed), so dropping it removes one arm of
-    // the dom-triple-join (20s on large CFGs) without changing the derived set.
+    // Immediate dominator: d is not n's idom iff some mid sits strictly between them on the dom chain; dropping the implied dom(n,d) arm removes one arm of the dom-triple-join (20s).
     not_idom(func, n, d) <--
         dom(func, n, mid),
         dom(func, mid, d),
@@ -206,10 +266,13 @@ ascent_par! {
 
 
     relation csharp_stmt_candidate(Node, CsharpminorStmt);
-    relation has_csharp_stmt_candidate(Node);
 
     // Track nodes where a stack address was resolved to Eaddrof via stack_var.
     #[local] relation stack_addr_resolved(Node);
+
+    // Per-function stack offset -> canonical local, so a memory operand materialized only at cminor (a CMP's [rsp+ofs]) resolves to the slot's local instead of a bare *(const).
+    #[local] relation stack_local_at(Address, i64, RTLReg);
+    stack_local_at(func, ofs, reg) <-- stack_var(func, _, ofs, reg);
 
     // Resolve Eop(Olea(Ainstack(ofs)), []) -> Eaddrof(var_ident) when stack_var maps the offset.
     csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
@@ -238,6 +301,35 @@ ascent_par! {
         stack_var(func_start, node, *ofs, stack_rtl),
         let var_ident = ident_from_reg(*stack_rtl),
         let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Eaddrof(var_ident));
+
+    // Resolve an untracked stack Eload to the function's local for that offset; an address-escaped slot uses rtl_pass's single slot_escaped_canonical, not the multi-valued fallback.
+    csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eload(_chunk, addr, args))),
+        if let Addressing::Ainstack(ofs) = addr,
+        if args.is_empty(),
+        instr_in_function(node, func_start),
+        slot_escaped_canonical(func_start, *ofs, stack_rtl),
+        let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Evar(*stack_rtl));
+
+    csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eload(_chunk, addr, args))),
+        if let Addressing::Ainstack(ofs) = addr,
+        if args.is_empty(),
+        instr_in_function(node, func_start),
+        !slot_escaped_canonical(func_start, *ofs, _),
+        stack_local_at(func_start, *ofs, stack_rtl),
+        let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Evar(*stack_rtl));
+
+    // Upper half of a wide XMM/YMM spill: bind an untracked base+8 offset to the base slot's local, gated on no def at ofs with a tracked local 8 bytes below.
+    csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eload(_chunk, addr, args))),
+        if let Addressing::Ainstack(ofs) = addr,
+        if args.is_empty(),
+        instr_in_function(node, func_start),
+        !slot_escaped_canonical(func_start, *ofs, _),
+        !stack_local_at(func_start, *ofs, _),
+        stack_local_at(func_start, *ofs - 8, stack_rtl),
+        let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Evar(*stack_rtl));
 
     // Generic Sassign -> Sset conversion (skipped when stack_addr_resolved handles the node).
     csharp_stmt_candidate(node, stmt) <--
@@ -334,10 +426,14 @@ ascent_par! {
         active_cminor_stmt(node, ?CminorStmt::Snop),
         let stmt = CsharpminorStmt::Snop;
 
-    csharp_stmt_candidate(node, CsharpminorStmt::Sjump(*target)) <--
-        active_cminor_stmt(node, ?CminorStmt::Sjump(target));
+    // Drop unreachable bare Sjumps: the structurer reads such an orphan goto as a loop back-edge, making the loop span everything between its label and the dead jump.
+    relation cminor_node_has_pred(Node);
+    cminor_node_has_pred(*n) <-- cminor_succ(_, n);
 
-    has_csharp_stmt_candidate(node) <-- csharp_stmt_candidate(node, _);
+    csharp_stmt_candidate(node, CsharpminorStmt::Sjump(*target)) <--
+        active_cminor_stmt(node, ?CminorStmt::Sjump(target)),
+        cminor_node_has_pred(node);
+
 
 
     relation func_exit_node(Address, Node);
@@ -363,19 +459,57 @@ ascent_par! {
         loop_back_edge(func, _, header);
 
 
-    relation loop_body(Address, Node, Node);
+    // The natural loop body (reverse-from-latch, dominance-filtered), kept as a STABLE seed the abort-region rule reads without feeding back, so folding cannot cascade.
+    relation loop_body_core(Address, Node, Node);
 
-    loop_body(func, header, header) <--
+    loop_body_core(func, header, header) <--
         loop_back_edge(func, _, header);
 
-    loop_body(func, header, latch) <--
+    loop_body_core(func, header, latch) <--
         loop_back_edge(func, latch, header);
 
-    loop_body(func, header, p) <--
-        loop_body(func, header, node),
+    loop_body_core(func, header, p) <--
+        loop_body_core(func, header, node),
         pred(func, node, p),
         dom(func, p, header),
         if *p != *header;
+
+    // n reaches a function return along the CFG; this is what separates a loop's normal exit continuation from an in-loop abort arm that only hits a noreturn sink.
+    relation reaches_return(Node);
+    reaches_return(n) <-- func_exit_node(_, n);
+    reaches_return(p) <-- cminor_succ(p, n), reaches_return(n);
+
+    // Require at least one exit that reaches a return, or a wholly-noreturn function would fold its post-loop tail into an inner loop.
+    relation loop_has_returning_exit(Address, Node);
+    loop_has_returning_exit(func, header) <--
+        loop_body_core(func, header, b),
+        cminor_succ(b, t),
+        !loop_body_core(func, header, t),
+        reaches_return(t);
+
+    // In-loop noreturn abort region: entered from the body via an exit edge whose target never reaches a return, grown forward inside the header's dominance region so the dispatch default stays in the loop.
+    relation loop_abort_region(Address, Node, Node);
+    loop_abort_region(func, header, t) <--
+        loop_has_returning_exit(func, header),
+        loop_body_core(func, header, b),
+        cminor_succ(b, t),
+        !loop_body_core(func, header, t),
+        !reaches_return(t),
+        dom(func, t, header);
+    loop_abort_region(func, header, n) <--
+        loop_abort_region(func, header, m),
+        cminor_succ(m, n),
+        !loop_body_core(func, header, n),
+        !reaches_return(n),
+        dom(func, n, header);
+
+    relation loop_body(Address, Node, Node);
+    loop_body(func, header, n) <--
+        loop_body_core(func, header, n);
+    loop_body(func, header, n) <--
+        loop_abort_region(func, header, n);
+
+    // CF-2/O-6 (removed 2026-06-10): SCC-body-extension was provably empty for recognized loops, and headerless-SCC creation regressed goto_per_func by 11%; reviving it needs emission costs cut first.
 
 
     relation loop_nesting_via_idom(Address, Node, Node);
@@ -402,68 +536,8 @@ ascent_par! {
         directly_nested_dom(func, outer, inner);
 
 
-    relation enclosing_loops(Address, Node, Node);
-    relation loop_depth(Address, Node, usize);
-
-    enclosing_loops(func, node, header) <--
-        loop_head(func, header),
-        loop_body(func, header, node);
-
-    loop_depth(func, node, depth) <--
-        instr_in_function(node, func),
-        agg depth = ascent::aggregators::count() in enclosing_loops(func, node, _);
-
-
-    relation reducible_loop(Address, Node);
-    relation has_side_entry(Address, Node);
-    relation irreducible_loop(Address, Node);
-    relation loop_preheader(Address, Node, Node);
-    relation exit_dominated_by_header(Address, Node, Node);
-
-    reducible_loop(func, header) <--
-        loop_head(func, header),
-        !has_side_entry(func, header);
-
-    has_side_entry(func, header) <--
-        loop_body(func, header, body_node),
-        pred(func, body_node, external),
-        !loop_body(func, header, external),
-        if *body_node != *header;
-
-    irreducible_loop(func, header) <--
-        loop_head(func, header),
-        has_side_entry(func, header);
-
-    loop_preheader(func, header, preheader) <--
-        loop_head(func, header),
-        idom(func, header, preheader),
-        !loop_body(func, header, preheader);
-
-    exit_dominated_by_header(func, header, exit_target) <--
-        loop_exit_edge(func, header, _, exit_target),
-        dom(func, exit_target, header);
-
-
-    relation nested_loop(Address, Node, Node);
-    relation directly_nested(Address, Node, Node);
-    relation intermediate_nesting(Address, Node, Node);
     relation innermost_loop(Address, Node, Node);
     relation node_in_nested_inner_loop(Address, Node, Node);
-
-    nested_loop(func, outer, inner) <--
-        loop_head(func, outer),
-        loop_head(func, inner),
-        if *outer != *inner,
-        loop_body(func, outer, inner),
-        !loop_body(func, inner, outer);
-
-    directly_nested(func, outer, inner) <--
-        nested_loop(func, outer, inner),
-        !intermediate_nesting(func, outer, inner);
-
-    intermediate_nesting(func, outer, inner) <--
-        nested_loop(func, outer, mid),
-        nested_loop(func, mid, inner);
 
     innermost_loop(func, node, header) <--
         loop_body(func, header, node),
@@ -488,17 +562,48 @@ ascent_par! {
         cminor_succ(from_node, to_node),
         !loop_body(func, header, to_node);
 
+    // Substitute dst->src for a loop-exit comparison reading a copy that is eliminated downstream, using the copy at the branch's unique predecessor where v == src provably holds.
+    relation cond_other_pred(Node, Node);
+    cond_other_pred(n, p) <--
+        cminor_succ(p, n),
+        cminor_succ(p2, n),
+        if p2 != p;
+
+    relation cond_read_copy(Node, RTLReg, RTLReg);
+    cond_read_copy(*branch_node, *v, *w) <--
+        csharp_stmt_candidate(branch_node, ?CsharpminorStmt::Scond(_, _, _, _)),
+        cminor_succ(pred, branch_node),
+        !cond_other_pred(branch_node, pred),
+        csharp_stmt_candidate(pred, ?CsharpminorStmt::Sset(v, src_expr)),
+        if let CsharpminorExpr::Evar(w) = src_expr;
+
     loop_exit_branch(func, header, branch_node, cond.clone(), Arc::new(args.clone()), *ifso, *ifnot, false) <--
         loop_body(func, header, branch_node),
         csharp_stmt_candidate(branch_node, ?CsharpminorStmt::Scond(cond, args, ifso, ifnot)),
         !loop_body(func, header, *ifso),
-        loop_body(func, header, *ifnot);
+        loop_body(func, header, *ifnot),
+        !cond_read_copy(branch_node, _, _);
+
+    loop_exit_branch(func, header, branch_node, cond.clone(), Arc::new(cond_subst_exprs(args, *v, *w)), *ifso, *ifnot, false) <--
+        loop_body(func, header, branch_node),
+        csharp_stmt_candidate(branch_node, ?CsharpminorStmt::Scond(cond, args, ifso, ifnot)),
+        !loop_body(func, header, *ifso),
+        loop_body(func, header, *ifnot),
+        cond_read_copy(branch_node, v, w);
 
     loop_exit_branch(func, header, branch_node, cond.clone(), Arc::new(args.clone()), *ifnot, *ifso, true) <--
         loop_body(func, header, branch_node),
         csharp_stmt_candidate(branch_node, ?CsharpminorStmt::Scond(cond, args, ifso, ifnot)),
         loop_body(func, header, *ifso),
-        !loop_body(func, header, *ifnot);
+        !loop_body(func, header, *ifnot),
+        !cond_read_copy(branch_node, _, _);
+
+    loop_exit_branch(func, header, branch_node, cond.clone(), Arc::new(cond_subst_exprs(args, *v, *w)), *ifnot, *ifso, true) <--
+        loop_body(func, header, branch_node),
+        csharp_stmt_candidate(branch_node, ?CsharpminorStmt::Scond(cond, args, ifso, ifnot)),
+        loop_body(func, header, *ifso),
+        !loop_body(func, header, *ifnot),
+        cond_read_copy(branch_node, v, w);
 
     loop_jumptable_exit(func, header, branch_node, *target) <--
         loop_body(func, header, branch_node),
@@ -548,7 +653,6 @@ ascent_par! {
 
     relation loop_type(Address, Node, LoopType);
     relation primary_exit_node(Address, Node, Node);
-    relation exit_type(Address, Node, Node, ExitType);
 
     loop_type(func, header, LoopType::Infinite) <--
         loop_head(func, header),
@@ -581,38 +685,12 @@ ascent_par! {
         loop_exit_count(func, header, 1),
         loop_exit_branch(func, header, exit_node, _, _, _, _, _);
 
-    exit_type(func, header, exit_node, ExitType::Primary) <--
-        primary_exit_node(func, header, exit_node);
 
-    exit_type(func, header, exit_node, ExitType::EarlyBreak) <--
-        loop_exit_branch(func, header, exit_node, _, _, _, _, _),
-        !primary_exit_node(func, header, exit_node);
-
-
-    relation loop_defines_reg(Address, Node, Node, RTLReg);
-    relation loop_uses_reg(Address, Node, RTLReg);
     relation loop_self_modify(Address, Node, Node, RTLReg);
     relation loop_increment(Address, Node, Node, RTLReg);
     relation exit_condition_uses_reg(Address, Node, RTLReg);
     relation induction_var(Address, Node, RTLReg);
     relation has_induction_var(Address, Node);
-
-    loop_defines_reg(func, header, node, dst) <--
-        loop_body(func, header, node),
-        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, _));
-
-    loop_uses_reg(func, header, reg) <--
-        loop_body(func, header, node),
-        active_cminor_stmt(node, ?CminorStmt::Sassign(_, expr)),
-        let vars = crate::decompile::passes::clight_pass::extract_vars_from_cminor_exprs(&[expr.clone()]),
-        for reg in vars;
-
-    loop_uses_reg(func, header, reg) <--
-        loop_body(func, header, node),
-        active_cminor_stmt(node, ?CminorStmt::Sstore(_, _, args, src)),
-        let mut all_vars = args.to_vec(),
-        let _ = all_vars.push(*src),
-        for reg in all_vars;
 
     loop_self_modify(func, header, node, dst) <--
         loop_body(func, header, node),
@@ -648,7 +726,6 @@ ascent_par! {
     relation body_stmt_count(Address, Node, usize);
     relation has_substantial_body(Address, Node);
     relation step_node(Address, Node, Node, RTLReg);
-    relation has_step_node(Address, Node);
     relation valid_loop(Address, Node);
 
     body_stmt(func, header, node) <--
@@ -669,9 +746,6 @@ ascent_par! {
         induction_var(func, header, ind_var),
         loop_increment(func, header, step, ind_var);
 
-    has_step_node(func, header) <--
-        step_node(func, header, _, _);
-
     valid_loop(func, header) <--
         has_induction_var(func, header),
         loop_has_exit(func, header);
@@ -691,23 +765,16 @@ ascent_par! {
         loop_has_exit(func, header);
 
 
-    #[local] relation valid_loop_body(Address, Node, Node);
-
-    valid_loop_body(func, header, node) <--
-        loop_body(func, header, node),
-        valid_loop(func, header);
-
     relation emit_loop_body(Address, Node, Node);
     relation emit_loop_exit(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node);
     relation trim_step(Address, Node, Node);
-    relation loop_continue_cond(Address, Node, ClightExpr);
     relation emit_break_stmt(Address, Node, Node, ClightStmt);
-    // A non-primary loop exit branch whose target flows to a function return rather than post-loop code; a valueless break here drops the returned value at the post-loop join (A5 dead-return-overwrite: the function always yields the post-loop default), so select tail-duplicates value_node + the return into the exit branch. Fields: func, header, exit_node, value_node, ret_node.
+    // A non-primary loop exit flowing to a function return rather than post-loop code: a valueless break would drop the returned value, so select tail-duplicates value_node and the return into it.
     relation loop_exit_to_return(Address, Node, Node, Node, Node);
     relation node_multi_pred(Address, Node);
     // node flows to a function return (ret_node) through zero or more pure jump nodes (no intervening assignment, branch, or side effect), so a value-set-then-`jmp epilogue` exit is recognized as a return even with the jump on its own node between them.
     relation returns_after(Address, Node, Node);
-    // any loop exit branch (bound or early) that flows to a function return, with the per-loop count: a genuine early-return defect needs >=2 such exits (an early return distinct from loop termination), while a single return exit is just a normal `while(cond){} return v` that must keep its exit as the loop condition rather than collapse to `while(1)`.
+    // Any loop exit flowing to a function return, with the per-loop count: a genuine early-return defect needs >=2, while a single return exit must keep its exit as the loop condition.
     relation loop_return_exit_any(Address, Node, Node);
     relation loop_return_exit_count(Address, Node, usize);
     relation node_owned_by_loop(Address, Node, Node);
@@ -722,25 +789,6 @@ ascent_par! {
 
     trim_step(func, header, step) <--
         step_node(func, header, step, _);
-
-    loop_continue_cond(func, header, continue_cond) <--
-        valid_loop(func, header),
-        primary_exit_node(func, header, exit_node),
-        loop_exit_branch(func, header, exit_node, cond, args, _, _, false),
-        agg all_var_types = crate::decompile::passes::clight_pass::collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
-        let vars_used = crate::decompile::passes::clight_pass::extract_vars_from_csharp_exprs(args.as_slice()),
-        let var_types = crate::decompile::passes::clight_pass::filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
-        let inverted_cond = crate::decompile::passes::clight_pass::invert_condition(&cond),
-        if let Some(continue_cond) = crate::decompile::passes::clight_pass::clight_condition_expr_with_types(&inverted_cond, args.as_slice(), &var_types);
-
-    loop_continue_cond(func, header, continue_cond) <--
-        valid_loop(func, header),
-        primary_exit_node(func, header, exit_node),
-        loop_exit_branch(func, header, exit_node, cond, args, _, _, true),
-        agg all_var_types = crate::decompile::passes::clight_pass::collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
-        let vars_used = crate::decompile::passes::clight_pass::extract_vars_from_csharp_exprs(args.as_slice()),
-        let var_types = crate::decompile::passes::clight_pass::filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
-        if let Some(continue_cond) = crate::decompile::passes::clight_pass::clight_condition_expr_with_types(&cond, args.as_slice(), &var_types);
 
     emit_break_stmt(func, header, exit_node, break_stmt) <--
         valid_loop(func, header),
@@ -789,31 +837,61 @@ ascent_par! {
         loop_head(func, header),
         agg c = ascent::aggregators::count() in loop_return_exit_any(func, header, _);
 
-    // The exit target is a plain value assignment that flows (through pure jumps only) to a function return; guards: exit_target leaves the loop, is itself an assignment (not a branch, so duplicating it is sound despite any spurious CFG fallthrough edges), reaches a return with no intervening effect, and has a single predecessor (reached only via this exit, so it can be relocated from its hoisted top-level position into the exit branch).
+    // A non-primary return-exit tail-duplicates its return unconditionally, since a valueless break would fall through to whatever the layout places after the loop and drop the value.
     loop_exit_to_return(func, header, exit_node, exit_target, ret_node) <--
         loop_exit_branch(func, header, exit_node, _, _, exit_target, _, _),
+        !emit_function_void_candidate(func),
         !primary_exit_node(func, header, exit_node),
-        !exit_at_latch(func, header, exit_node),
         !loop_body(func, header, exit_target),
         active_cminor_stmt(exit_target, ?CminorStmt::Sassign(_, _)),
         cminor_succ(exit_target, succ),
         returns_after(func, succ, ret_node),
-        !node_multi_pred(func, exit_target),
-        pred(func, exit_target, exit_node),
-        loop_return_exit_count(func, header, c),
-        if *c >= 2;
+        pred(func, exit_target, exit_node);
 
     // 0-hop: the exit target is itself the function return (value computed inline at the exit).
     loop_exit_to_return(func, header, exit_node, exit_target, exit_target) <--
         loop_exit_branch(func, header, exit_node, _, _, exit_target, _, _),
+        !emit_function_void_candidate(func),
         !primary_exit_node(func, header, exit_node),
-        !exit_at_latch(func, header, exit_node),
         !loop_body(func, header, exit_target),
         func_exit_node(func, exit_target),
-        !node_multi_pred(func, exit_target),
+        pred(func, exit_target, exit_node);
+
+    // The primary return-exit tail-duplicates only when a second distinct return-exit exists; as the sole return-exit it stays the loop condition.
+    loop_exit_to_return(func, header, exit_node, exit_target, ret_node) <--
+        loop_exit_branch(func, header, exit_node, _, _, exit_target, _, _),
+        !emit_function_void_candidate(func),
+        primary_exit_node(func, header, exit_node),
+        !loop_body(func, header, exit_target),
+        active_cminor_stmt(exit_target, ?CminorStmt::Sassign(_, _)),
+        cminor_succ(exit_target, succ),
+        returns_after(func, succ, ret_node),
         pred(func, exit_target, exit_node),
         loop_return_exit_count(func, header, c),
         if *c >= 2;
+
+    loop_exit_to_return(func, header, exit_node, exit_target, exit_target) <--
+        loop_exit_branch(func, header, exit_node, _, _, exit_target, _, _),
+        !emit_function_void_candidate(func),
+        primary_exit_node(func, header, exit_node),
+        !loop_body(func, header, exit_target),
+        func_exit_node(func, exit_target),
+        pred(func, exit_target, exit_node),
+        loop_return_exit_count(func, header, c),
+        if *c >= 2;
+
+    // Relocate a break-edge flag write (reg = INT_CONSTANT only) before the break so the post-loop test sees it; a loop increment is not a constant and is never relocated.
+    relation loop_exit_pre_break_assign(Address, Node, Node, Node);
+    loop_exit_pre_break_assign(func, header, exit_node, exit_target) <--
+        loop_exit_branch(func, header, exit_node, _, _, exit_target, _, _),
+        !loop_body(func, header, exit_target),
+        active_cminor_stmt(exit_target, ?CminorStmt::Sassign(_, rhs)),
+        if matches!(rhs, CminorExpr::Econst(Constant::Ointconst(_)) | CminorExpr::Econst(Constant::Olongconst(_))),
+        pred(func, exit_target, exit_node),
+        !node_multi_pred(func, exit_target),
+        !func_exit_node(func, exit_target),
+        cminor_succ(exit_target, succ),
+        !returns_after(func, succ, _);
 
     node_owned_by_loop(func, node, header) <--
         innermost_loop(func, node, header),
@@ -924,7 +1002,7 @@ impl CshminorPass {
                     .collect();
                 for &cmp_addr in &cmp_addrs {
                     for &idx_name in &index_regs {
-                        let mreg = Mreg::from(idx_name);
+                        let mreg = Mreg::x86(idx_name);
                         for &(addr, ref reg, rtl_reg) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl") {
                             if addr == cmp_addr && *reg == mreg {
                                 candidates.push(rtl_reg);

@@ -89,8 +89,24 @@ use crate::decompile::passes::c_pass::types::{CType, TranslationUnit};
 use crate::decompile::passes::clight_select::select::SelectedFunction;
 use crate::decompile::passes::clight_select::query::GlobalData;
 
+/// Pipeline policy fixed at the 2026-06 corpus optimum; behavior env gates were removed after A/B decisions closed -- the pass list and these constants ARE the configuration; diagnostic env vars (TRACE_NODE etc.) remain but never change output.
+pub mod config {
+    /// var_reduce: above this count, skip O(k^2) pair enumeration and use copy-only coalescing (bitset engine).
+    pub const COALESCE_GREEDY_CAP: usize = 4096;
+    /// var_reduce: liveness work bound (nodes x candidates); bail on coalescing when exceeded -- never unsafe, only forgone.
+    pub const COALESCE_WORK_BOUND: usize = 8_000_000;
+    /// select: ITE compound-assembly node cap (CF-9 backstop; post-CF-1 the dispatch duplication that motivated it is gone -- 0 binds over 30+ runs).
+    pub const ITE_MAX_NODES: usize = 1_000_000;
+    /// solve: z3 Optimize rlimit budget. CAVEAT: z3 4.8.x ignores rlimit via Optimize params (UNRESOLVED O-9) -- wall timeout below is the only effective backstop on such libs.
+    pub const SOLVE_RLIMIT: u32 = 20_000_000;
+    /// solve: z3 wall timeout per function.
+    pub const SOLVE_TIMEOUT_MS: u32 = 120_000;
+    /// forloop: max stmts in a return-tail eligible for EagerReturns/CrossJumpRevert duplication (return-ending blocks, no internal goto/label/decl).
+    pub const FORLOOP_MAX_DUP_TAIL: usize = 8;
+}
+
 use crate::util::leak;
-use crate::x86::mach::Mreg;
+use crate::mreg::Mreg;
 use crate::x86::types::*;
 use either::Either;
 use serde::{Deserialize, Serialize};
@@ -161,6 +177,9 @@ fn xtype_from_string(s: &str) -> Option<XType> {
 pub struct DecompileDB {
     pub relations: StdHashMap<&'static str, RelationEntry>,
 
+    // Target ABI lives here rather than in process-global state, as the in-process ELF/PE harness and parallel sub-DBs require.
+    pub target_abi: Option<crate::abi::AbiConfig>,
+
     // Typed per-function trees produced by ClightSelectPass and consumed by ClightEmitPass.
     pub clight_selected_functions: Vec<SelectedFunction>,
 
@@ -171,10 +190,26 @@ pub struct DecompileDB {
     pub cast_var_types_for_emission: HashMap<String, CType>,
     pub cast_raw_translation_unit: Option<TranslationUnit>,
     pub cast_optimized_translation_unit: Option<TranslationUnit>,
+
+    // P5 decl solve: program-level decl decisions from selected-statement obligations, computed before TU builds -- the field int-veto, force-long override, per-field pointer retype, and fnptr globals.
+    pub decl_solve_field_int_veto: HashSet<(String, String)>,
+    pub decl_solve_field_force_long: HashSet<(String, String)>,
+    pub decl_solve_field_ptr_selection: HashMap<(String, String), String>,
+    pub decl_solve_fnptr_globals: HashMap<String, CType>,
+    // Per-function registers force-long'd (used as integers despite a float/pointer selection); applied by from_relations when finalizing local-var types. Keyed by function address.
+    pub decl_solve_force_long_regs: HashMap<Address, HashSet<RTLReg>>,
+    // Per-function registers force-ptr'd (dereferenced despite an int selection); seeded `void *` by from_relations before usage inference. Keyed by address.
+    pub decl_solve_force_ptr_regs: HashMap<Address, HashSet<RTLReg>>,
+    // Address-taken stack regions the struct-construction synthesis recovered as a sized buffer: declared `unsigned char[size]` by from_relations so its raw byte-offset store candidates are in-bounds. Keyed by function address, var id.
+    pub stack_struct_buffers: HashMap<Address, HashMap<RTLReg, i64>>,
+    // Runtime-indexed stack arrays: array local id -> (element MemoryChunk, element count), so arr + i strides by element size.
+    pub stack_array_buffers: HashMap<Address, HashMap<RTLReg, (crate::x86::types::MemoryChunk, usize)>>,
     pub binary_path: Option<std::path::PathBuf>,
     pub trace_enabled: bool,
     pub skip_function_names: HashSet<&'static str>,
     pub skip_function_prefixes: Vec<&'static str>,
+    // Library-provided DATA globals (gnulib statics): emitted extern so they bind to the library definition instead of colliding at link.
+    pub skip_global_names: HashSet<&'static str>,
     pub measure_rule_times: bool,
     pub rule_time_reports: Vec<(String, String)>,
 }
@@ -183,6 +218,7 @@ impl Default for DecompileDB {
     fn default() -> Self {
         Self {
             relations: StdHashMap::new(),
+            target_abi: None,
 
             clight_selected_functions: Default::default(),
             cast_selected_functions: Default::default(),
@@ -192,10 +228,19 @@ impl Default for DecompileDB {
             cast_var_types_for_emission: Default::default(),
             cast_raw_translation_unit: None,
             cast_optimized_translation_unit: None,
+            decl_solve_field_int_veto: Default::default(),
+            decl_solve_field_force_long: Default::default(),
+            decl_solve_field_ptr_selection: Default::default(),
+            decl_solve_fnptr_globals: Default::default(),
+            decl_solve_force_long_regs: Default::default(),
+            decl_solve_force_ptr_regs: Default::default(),
+            stack_struct_buffers: Default::default(),
+            stack_array_buffers: Default::default(),
             binary_path: None,
             trace_enabled: false,
             skip_function_names: HashSet::new(),
             skip_function_prefixes: Vec::new(),
+            skip_global_names: HashSet::new(),
             measure_rule_times: false,
             rule_time_reports: Vec::new(),
         }
@@ -204,6 +249,12 @@ impl Default for DecompileDB {
 
 // Low-level relation store used by pass macros and codegen.
 impl DecompileDB {
+    pub fn abi(&self) -> &crate::abi::AbiConfig {
+        self.target_abi
+            .as_ref()
+            .expect("target ABI not initialized; call load_from_binary first")
+    }
+
     pub fn put_relation<T: 'static + Clone + Send + Sync>(&mut self, name: &'static str, value: T) {
         self.relations.insert(name, RelationEntry::new_clonable(value));
     }
@@ -369,6 +420,17 @@ impl DecompileDB {
                 }
                 continue;
             }
+            // Library-provided DATA globals -> skip_global_names (emitted extern), not functions.
+            if category == "gnulib_globals" {
+                if let Some(arr) = names.as_array() {
+                    for name in arr {
+                        if let Some(s) = name.as_str() {
+                            self.skip_global_names.insert(leak(s.to_string()));
+                        }
+                    }
+                }
+                continue;
+            }
             if let Some(arr) = names.as_array() {
                 for name in arr {
                     if let Some(s) = name.as_str() {
@@ -396,6 +458,12 @@ impl DecompileDB {
         false
     }
 
+    // A library-provided DATA global (gnulib static): emit extern so it binds to the library definition, not a colliding tentative one.
+    pub fn is_lib_global(&self, name: &str) -> bool {
+        let base = name.split('@').next().unwrap_or(name);
+        self.skip_global_names.contains(base)
+    }
+
     // Load external function type signatures from extern.json into known_extern_signature and related relations.
     fn load_json_signatures(&mut self) {
         let json_content = include_str!("../data/json/extern.json");
@@ -418,10 +486,6 @@ impl DecompileDB {
 
             if let (Some(args), Some(res)) = (args_opt, res_opt) {
                 let args_arc = Arc::new(args);
-                if func.builtin {
-                    self.rel_push("builtin_func_type", (name_sym, args_arc.clone(), res));
-                }
-
                 self.rel_push("known_extern_signature", (
                     name_sym,
                     args_arc.len(),
@@ -443,9 +507,6 @@ impl DecompileDB {
                 match ret.as_str() {
                     "Xptr" | "Xcharptr" | "Xintptr" | "Xfloatptr" | "Xsingleptr" | "Xfuncptr" => { self.rel_push("known_func_returns_ptr", (name_sym,)); }
                     "Xlong" => { self.rel_push("known_func_returns_long", (name_sym,)); }
-                    "Xint" => { self.rel_push("known_func_returns_int", (name_sym,)); }
-                    "Xfloat" => { self.rel_push("known_func_returns_float", (name_sym,)); }
-                    "Xsingle" => { self.rel_push("known_func_returns_single", (name_sym,)); }
                     _ => {}
                 }
             }
@@ -489,11 +550,13 @@ impl DecompileDB {
         use crate::decompile::passes::pass::{IRPass, PassScheduler};
         use crate::decompile::passes::*;
         use crate::decompile::analysis::*;
+        use crate::decompile::postselect::*;
 
         let passes: Vec<Box<dyn IRPass>> = vec![
             Box::new(abi_pass::AbiPass),
             Box::new(canary_vla_pass::CanaryVlaPass),
             Box::new(asm_pass::AsmPass),
+            Box::new(aarch64_asm_pass::Aarch64AsmPass),
             Box::new(stack_pass::StackAnalysisPass),
             Box::new(mach_pass::MachPass),
             Box::new(linear_pass::LinearPass),
@@ -513,6 +576,9 @@ impl DecompileDB {
             Box::new(clight_pass::ClightFieldPass),
             Box::new(clight_emit_pass::ClightSelectPass),
             Box::new(clight_emit_pass::ClightEmitPass),
+            // PhoenixStructurePass removed 2026-06-10: wave-2 adjudication kept it OFF (-3..-10% gotos at 28:1 line churn, UNRESOLVED O-13); recoverable at c291258.
+            Box::new(forloop::ForLoopPass),
+            Box::new(var_reduce::VarReducePass),
         ];
 
         let schedule = PassScheduler::build_schedule(&passes);
@@ -555,6 +621,7 @@ impl DecompileDB {
                         all_needed.dedup();
                         let cloned = self.try_clone_relations(&all_needed)?;
                         let mut sub_db = DecompileDB::default();
+                        sub_db.target_abi = self.target_abi.clone();
                         sub_db.measure_rule_times = self.measure_rule_times;
                         sub_db.binary_path = self.binary_path.clone();
                         sub_db.trace_enabled = self.trace_enabled;

@@ -12,15 +12,21 @@ pub fn leak<T: Borrow<TB> + 'static, TB: ?Sized>(x: T) -> &'static TB {
 /// Bit 62 marks an address as a synthetic IR node produced after a real address (e.g. arith_load/store fusion in rtl_pass emits the post-load op at this synthetic address). Used by passes that need to ignore the bit when consulting facts keyed by real addresses.
 pub const SYNTH_NODE_BIT: u64 = 1u64 << 62;
 
-/// Map a Node address to an execution-order key. Synthetic addresses (bit 62 set) execute immediately after their base address; encoding real as `2 * addr` and synth as `2 * base + 1` keeps a synth strictly between its base and the next real address when sorted numerically. u128 is used so the synth encoding cannot overflow.
+/// Bit 63 marks the synth2 read-modify-write store node: the store half of an RMW emitted after both the real address and its synth1 use. Like SYNTH_NODE_BIT it must be masked off when consulting facts keyed by real addresses.
+pub const SYNTH_NODE_BIT2: u64 = 1u64 << 63;
+
+/// Map a Node address to an execution-order key: base*3 + rank keeps a real address and its two synth nodes adjacent and strictly between their base and the next real address, in u128.
 #[inline]
 pub fn exec_order_key(node: u64) -> u128 {
-    let base = (node & !SYNTH_NODE_BIT) as u128;
-    if node & SYNTH_NODE_BIT != 0 {
-        base * 2 + 1
+    let base = (node & !(SYNTH_NODE_BIT | SYNTH_NODE_BIT2)) as u128;
+    let rank: u128 = if node & SYNTH_NODE_BIT2 != 0 {
+        2
+    } else if node & SYNTH_NODE_BIT != 0 {
+        1
     } else {
-        base * 2
-    }
+        0
+    };
+    base * 3 + rank
 }
 
 /// Parse CSV data from an embedded string (compile-time `include_str!`).

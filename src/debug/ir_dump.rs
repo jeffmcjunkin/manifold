@@ -6,7 +6,7 @@ use crate::x86::types::*;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::sync::Arc;
-use crate::x86::mach::Mreg;
+use crate::mreg::Mreg;
 use crate::decompile::passes::rtl_pass::convert_ltl_builtins_to_rtl;
 
 // Per-function collector: function address -> sorted list of (node, lines).

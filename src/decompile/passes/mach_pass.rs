@@ -7,7 +7,7 @@ use crate::decompile::passes::pass::IRPass;
 use crate::{declare_io_from, run_pass};
 
 use std::sync::Arc;
-use crate::x86::mach::Mreg;
+use crate::mreg::Mreg;
 use crate::x86::op::{Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
@@ -23,7 +23,6 @@ ascent_par! {
     relation arg_constrained_as_ptr(Node, RTLReg);
     relation base_ident_to_symbol(Ident, Symbol);
     relation block_in_function(Node, Address);
-    relation call_arg_struct_ptr(Node, usize, usize);
     relation call_return_reg(Node, RTLReg);
     relation emit_clight_stmt(Address, Node, ClightStmt);
     relation emit_function_return_type_candidate(Address, ClightType);
@@ -32,7 +31,6 @@ ascent_par! {
     relation emit_loop_exit(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node);
     relation emit_switch_chain(Address, Node, RTLReg);
     relation func_param_struct_type_candidate(Address, usize, usize);
-    relation func_return_struct_type(Address, usize);
     relation func_span(Symbol, Address, Address);
     relation global_struct_catalog(u64, usize, usize, usize);
     relation ident_to_symbol(Ident, Symbol);
@@ -40,18 +38,14 @@ ascent_par! {
     relation is_external_function(Address);
     relation known_extern_signature(Symbol, usize, XType, Arc<Vec<XType>>);
     relation known_func_param_is_ptr(Symbol, usize);
-    relation known_func_returns_float(Symbol);
-    relation known_func_returns_int(Symbol);
     relation known_func_returns_long(Symbol);
     relation known_func_returns_ptr(Symbol);
-    relation known_func_returns_single(Symbol);
     relation main_function(Address);
     relation reg_def_used(Address, Mreg, Address);
     relation reg_rtl(Node, Mreg, RTLReg);
     relation reg_xtl(Node, Mreg, RTLReg);
     relation stack_var(Address, Address, i64, RTLReg);
     relation string_data(String, String, usize);
-    relation struct_field(u64, i64, String, MemoryChunk);
     relation struct_id_to_canonical(usize, usize);
 
     relation instr_in_function(Node, Address);
@@ -63,10 +57,7 @@ ascent_par! {
     relation arch_bit(i64);
 
     relation linear_inst(Address, LinearInst);
-    relation callee_save_spill(Address, Mreg, i64);
-    relation callee_spill_pair((Address, Mreg));
 
-    relation global_fe_ofs_arg(i64);
     relation lop(Address, Operation, MregArgs, Mreg);
     relation lcall(Address, Either<Mreg, Either<Symbol, i64>>);
     relation ltailcall(Address, Either<Mreg, Either<Symbol, i64>>);
@@ -80,21 +71,6 @@ ascent_par! {
     relation lgoto(Address, Symbol);
     relation lcond(Address, Condition, MregArgs, Symbol);
     relation lreturn(Address);
-
-    global_fe_ofs_arg(32) <-- arch_bit(64);
-
-    callee_save_spill(addr, dst, ofs) <--
-        mach_inst(addr, machinst),
-        if let (ofs, _typ, dst) = match machinst {
-            MachInst::Mgetstack(ofs, typ, dst) => (ofs, typ, dst),
-            _ => return,
-        },
-        global_fe_ofs_arg(global_ofs),
-        if *ofs > *global_ofs;
-
-    callee_spill_pair(pair) <--
-        callee_save_spill(addr, reg, _),
-        let pair = (*addr, *reg);
 
     linear_inst(addr, linst) <--
         mach_inst(addr, ?MachInst::Mgetstack(ofs, typ, dst)),

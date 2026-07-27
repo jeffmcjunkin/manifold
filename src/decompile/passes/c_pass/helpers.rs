@@ -551,7 +551,7 @@ pub fn convert_param_type_from_param(
             crate::x86::types::XType::Xintptr => CType::ptr(CType::int()),
             crate::x86::types::XType::Xfloatptr => CType::ptr(CType::double()),
             crate::x86::types::XType::Xsingleptr => CType::ptr(CType::float()),
-            crate::x86::types::XType::Xfuncptr => CType::ptr(CType::Function(Box::new(CType::Void), Vec::new(), false)),
+            crate::x86::types::XType::Xfuncptr => CType::ptr(CType::Function(Box::new(CType::Void), Vec::new(), false, false)),
             crate::x86::types::XType::Xfloat => CType::double(),
             crate::x86::types::XType::Xsingle => CType::float(),
             crate::x86::types::XType::Xbool => CType::Bool,
@@ -595,7 +595,7 @@ pub fn xtype_string_to_ctype(type_str: &str) -> CType {
         "ptr_int" => CType::Pointer(Box::new(CType::int()), crate::decompile::passes::c_pass::types::TypeQualifiers::none()),
         "ptr_double" => CType::Pointer(Box::new(CType::double()), crate::decompile::passes::c_pass::types::TypeQualifiers::none()),
         "ptr_float" => CType::Pointer(Box::new(CType::float()), crate::decompile::passes::c_pass::types::TypeQualifiers::none()),
-        "ptr_func" => CType::Pointer(Box::new(CType::Function(Box::new(CType::Void), Vec::new(), false)), crate::decompile::passes::c_pass::types::TypeQualifiers::none()),
+        "ptr_func" => CType::Pointer(Box::new(CType::Function(Box::new(CType::Void), Vec::new(), false, false)), crate::decompile::passes::c_pass::types::TypeQualifiers::none()),
         "void" => CType::Void,
         _ => CType::Int(IntSize::Long, Signedness::Signed),
     }
@@ -655,10 +655,13 @@ pub fn inline_string_literals(expr: &CExpr, string_map: &HashMap<String, String>
     if let CExpr::Unary(UnaryOp::AddrOf, inner) = expr {
         if let CExpr::Var(name) = inner.as_ref() {
             if let Some(str_content) = string_map.get(name) {
-                return Some(CExpr::StringLit(crate::decompile::passes::c_pass::types::StringLiteral {
-                    value: str_content.clone(),
-                    is_wide: false,
-                }));
+                // Skip empty entries: &L_x for a 0x00-leading float constant is not a real "", which reaches char* via a pointer cast.
+                if !str_content.is_empty() {
+                    return Some(CExpr::StringLit(crate::decompile::passes::c_pass::types::StringLiteral {
+                        value: str_content.clone(),
+                        is_wide: false,
+                    }));
+                }
             }
         }
         if let CExpr::StringLit(_) = inner.as_ref() {
@@ -669,7 +672,9 @@ pub fn inline_string_literals(expr: &CExpr, string_map: &HashMap<String, String>
     if let CExpr::Cast(ty, inner) = expr {
         if let CExpr::Var(name) = inner.as_ref() {
             if let Some(str_content) = string_map.get(name) {
-                if matches!(ty, CType::Pointer(_, _)) || is_char_pointer_type(ty) {
+                // For an empty entry require a genuine char* target; a (void*)/(float*) cast of a 0x00-leading float constant is not a real "".
+                let char_ctx = is_char_pointer_type(ty);
+                if (char_ctx) || (!str_content.is_empty() && matches!(ty, CType::Pointer(_, _))) {
                     return Some(CExpr::StringLit(crate::decompile::passes::c_pass::types::StringLiteral {
                         value: str_content.clone(),
                         is_wide: false,
@@ -679,7 +684,10 @@ pub fn inline_string_literals(expr: &CExpr, string_map: &HashMap<String, String>
         }
         if let CExpr::Var(name) = inner.as_ref() {
             if let Some(str_content) = string_map.get(name) {
-                if matches!(ty, CType::Int(crate::decompile::passes::c_pass::types::IntSize::Long, _)) {
+                // In a non-char context like (long)L_x an empty entry is a 0x00-leading scalar coinciding with a string terminator, not a real "".
+                if !str_content.is_empty()
+                    && matches!(ty, CType::Int(crate::decompile::passes::c_pass::types::IntSize::Long, _))
+                {
                     return Some(CExpr::StringLit(crate::decompile::passes::c_pass::types::StringLiteral {
                         value: str_content.clone(),
                         is_wide: false,
@@ -707,7 +715,8 @@ pub fn inline_string_literals(expr: &CExpr, string_map: &HashMap<String, String>
 
     if let CExpr::Var(name) = expr {
         if let Some(str_content) = string_map.get(name) {
-            if name.starts_with(".L_") || name.starts_with("L_") {
+            // Skip empty entries: a bare L_x with no char* context is a zero-length anchor coinciding with a scalar constant, not a real "".
+            if (name.starts_with(".L_") || name.starts_with("L_")) && !str_content.is_empty() {
                 return Some(CExpr::StringLit(crate::decompile::passes::c_pass::types::StringLiteral {
                     value: str_content.clone(),
                     is_wide: false,
@@ -805,6 +814,40 @@ pub fn extract_named_label(stmt: &CStmt) -> Option<String> {
     match stmt {
         CStmt::Labeled(Label::Named(name), _) => Some(name.clone()),
         _ => None,
+    }
+}
+
+// Collect EVERY named label in a statement tree: extract_named_label sees only a top-level Labeled, so a label past a leading Sskip would build no goto edge and leave the node disconnected.
+pub fn collect_defined_labels(stmt: &CStmt, out: &mut Vec<String>) {
+    match stmt {
+        CStmt::Labeled(Label::Named(name), inner) => {
+            out.push(name.clone());
+            collect_defined_labels(inner, out);
+        }
+        CStmt::Labeled(_, inner) => collect_defined_labels(inner, out),
+        CStmt::Sequence(stmts) => {
+            for s in stmts {
+                collect_defined_labels(s, out);
+            }
+        }
+        CStmt::Block(items) => {
+            for item in items {
+                if let CBlockItem::Stmt(s) = item {
+                    collect_defined_labels(s, out);
+                }
+            }
+        }
+        CStmt::If(_, then_s, else_s) => {
+            collect_defined_labels(then_s, out);
+            if let Some(e) = else_s {
+                collect_defined_labels(e, out);
+            }
+        }
+        CStmt::While(_, body) | CStmt::DoWhile(body, _) | CStmt::For(_, _, _, body) => {
+            collect_defined_labels(body, out);
+        }
+        CStmt::Switch(_, body) => collect_defined_labels(body, out),
+        _ => {}
     }
 }
 

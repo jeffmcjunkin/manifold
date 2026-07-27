@@ -1,6 +1,8 @@
 
 use std::collections::{HashMap, HashSet};
 use object::{Object, ObjectSection};
+use crate::abi::Arch;
+use crate::decompile::disassembly::branch;
 use crate::decompile::disassembly::instruction::DecodedInsn;
 use crate::decompile::elevator::DecompileDB;
 use crate::x86::types::*;
@@ -31,7 +33,83 @@ fn read_i32_at(section_data: &[(u64, u64, Vec<u8>)], addr: u64) -> Option<i32> {
     None
 }
 
-// Build CFG edges, direct calls/jumps, and flags-and-jump pairs from decoded instructions.
+// Build CFG edges, direct calls/jumps, and flags-and-jump pairs; AArch64's B.<cond> codes map onto the x86 condition vocabulary so downstream keeps one alphabet.
+fn branch_condition(arch: Arch, mnem: &str) -> Option<&'static str> {
+    match arch {
+        Arch::Aarch64 => Some(match mnem.strip_prefix("B.")? {
+            "EQ" => "e",
+            "NE" => "ne",
+            "LT" => "l",
+            "LE" => "le",
+            "GT" => "g",
+            "GE" => "ge",
+            "LO" | "CC" => "b",
+            "LS" => "be",
+            "HI" => "a",
+            "HS" | "CS" => "ae",
+            "MI" => "s",
+            "PL" => "ns",
+            "VS" => "o",
+            "VC" => "no",
+            _ => return None,
+        }),
+        _ => Some(match mnem {
+            "JE" => "e",
+            "JNE" => "ne",
+            "JL" => "l",
+            "JLE" => "le",
+            "JG" => "g",
+            "JGE" => "ge",
+            "JB" => "b",
+            "JBE" => "be",
+            "JA" => "a",
+            "JAE" => "ae",
+            "JP" => "p",
+            "JNP" => "np",
+            "JO" => "o",
+            "JNO" => "no",
+            "JS" => "s",
+            "JNS" => "ns",
+            _ => return None,
+        }),
+    }
+}
+
+// Instructions whose flag result a following conditional branch tests; on AArch64 only the S-suffixed forms write NZCV, hence SUBS/ANDS but not SUB/AND.
+fn is_comparison(arch: Arch, mnem: &str) -> bool {
+    match arch {
+        Arch::Aarch64 => matches!(
+            mnem,
+            "CMP" | "CMN" | "TST" | "SUBS" | "ADDS" | "ANDS" | "BICS" | "CCMP" | "CCMN"
+                | "FCMP" | "FCMPE"
+        ),
+        _ => matches!(mnem, "CMP" | "TEST" | "SUB" | "AND"),
+    }
+}
+
+// Instructions that overwrite the flags without being the comparison searched for, ending the backward walk.
+fn clobbers_flags(arch: Arch, mnem: &str) -> bool {
+    match arch {
+        Arch::Aarch64 => matches!(mnem, "NEGS" | "SBCS" | "ADCS" | "FCCMP" | "FCCMPE"),
+        _ => matches!(
+            mnem,
+            "ADD" | "OR" | "XOR"
+                | "NEG" | "NOT" | "SHL" | "SHR" | "SAR" | "SAL"
+                | "INC" | "DEC" | "IMUL" | "MUL" | "DIV" | "IDIV"
+                | "ADC" | "SBB" | "RCL" | "RCR" | "ROL" | "ROR"
+                | "BSF" | "BSR" | "POPCNT" | "LZCNT" | "TZCNT"
+        ),
+    }
+}
+
+// Control transfers that end the backward walk: deliberately not every transfer, exactly the pre-existing x86 set, which lets the walk cross a conditional branch.
+fn terminates_flag_search(arch: Arch, mnem: &str) -> bool {
+    match arch {
+        Arch::Aarch64 => matches!(mnem, "B" | "BL" | "BLR" | "BR" | "RET" | "BRK"),
+        _ => matches!(mnem, "JMP" | "JMPQ" | "CALL" | "RET" | "HLT" | "INT3"),
+    }
+}
+
 pub fn build_cfg(
     db: &mut DecompileDB,
     insns: &[DecodedInsn],
@@ -40,14 +118,16 @@ pub fn build_cfg(
 ) {
     if insns.is_empty() { return; }
 
-    // Pre-compute direct branch targets from immediate operands
+    // Pre-compute direct branch targets; the target's operand slot is arch-specific, so it comes from branch::BranchInfo rather than being assumed first.
+    let arch = db.abi().arch;
     let op_imm_map = super::build_op_imm_map(db);
 
     let mut direct_targets: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-    for (addr, _, _, mnem, op1, _, _, _, _, _) in db.rel_iter::<(Address, usize, &'static str, &'static str, Symbol, Symbol, Symbol, Symbol, usize, usize)>("unrefinedinstruction") {
-        if !mnem.starts_with('J') && *mnem != "CALL" && !mnem.starts_with("LOOP") {
+    for (addr, _, _, mnem, op1, op2, op3, op4, _, _) in db.rel_iter::<(Address, usize, &'static str, &'static str, Symbol, Symbol, Symbol, Symbol, usize, usize)>("unrefinedinstruction") {
+        let Some(slot) = branch::classify(arch, mnem).target_op else {
             continue;
-        }
+        };
+        let op1 = &[*op1, *op2, *op3, *op4][slot];
         if *op1 == "0" { continue; }
         if let Some(&val) = op_imm_map.get(op1) {
             direct_targets.insert(*addr, val as u64);
@@ -91,8 +171,21 @@ pub fn build_cfg(
     for (i, insn) in insns.iter().enumerate() {
         let next_addr = insn.address + insn.size as u64;
 
-        match insn.mnemonic {
-            "JMP" => {
+        // A register or memory operand rather than an immediate means the transfer target is computed, not encoded.
+        let has_computed_target = || {
+            addr_to_op1.get(&insn.address).map_or(false, |op1| {
+                *op1 != "0" && (op_register_ids.contains(op1) || op_indirect_ids.contains(op1))
+            })
+        };
+        let push_fallthrough = |edges: &mut Vec<(u64, u64, &'static str)>| {
+            if i + 1 < insns.len() && addr_set.contains(&next_addr) {
+                edges.push((insn.address, next_addr, "fallthrough"));
+            }
+        };
+
+        match branch::classify(arch, insn.mnemonic).kind {
+            // x86 spells both direct and register/memory forms "JMP", so this arm still needs the computed-target check; AArch64 splits them into B and BR.
+            branch::BranchKind::UncondJump => {
                 if let Some(target) = get_target(insn.address) {
                     cfg_edges.push((insn.address, target, "branch"));
                     direct_jumps.push((insn.address, target));
@@ -104,49 +197,49 @@ pub fn build_cfg(
                         cfg_edges.push((insn.address, target, "branch"));
                         direct_jumps.push((insn.address, target));
                     }
-                } else if addr_to_op1.get(&insn.address).map_or(false, |op1| {
-                    *op1 != "0" && (op_register_ids.contains(op1) || op_indirect_ids.contains(op1))
-                }) {
+                } else if has_computed_target() {
                     cfg_edges.push((insn.address, 0, "indirect"));
                 }
             }
-            "CALL" => {
+            branch::BranchKind::IndirectJump => {
+                if let Some(info) = jump_table_targets.get(&insn.address) {
+                    let mut unique_targets: Vec<u64> = info.ordered_targets.clone();
+                    unique_targets.sort();
+                    unique_targets.dedup();
+                    for &target in &unique_targets {
+                        cfg_edges.push((insn.address, target, "branch"));
+                        direct_jumps.push((insn.address, target));
+                    }
+                } else {
+                    cfg_edges.push((insn.address, 0, "indirect"));
+                }
+            }
+            branch::BranchKind::Call => {
                 if let Some(target) = get_target(insn.address) {
                     cfg_edges.push((insn.address, target, "call"));
                     direct_calls.push((insn.address, target));
-                } else if addr_to_op1.get(&insn.address).map_or(false, |op1| {
-                    *op1 != "0" && (op_register_ids.contains(op1) || op_indirect_ids.contains(op1))
-                }) {
+                } else if has_computed_target() {
                     cfg_edges.push((insn.address, 0, "indirect_call"));
                 }
-                if i + 1 < insns.len() && addr_set.contains(&next_addr) {
-                    cfg_edges.push((insn.address, next_addr, "fallthrough"));
-                }
+                push_fallthrough(&mut cfg_edges);
             }
-            "RET" | "HLT" | "UD2" | "INT3" => {
+            branch::BranchKind::IndirectCall => {
+                cfg_edges.push((insn.address, 0, "indirect_call"));
+                push_fallthrough(&mut cfg_edges);
             }
-            m if matches!(m,
-                "JE" | "JNE" | "JL" | "JLE" | "JG" | "JGE"
-                | "JB" | "JBE" | "JA" | "JAE" | "JP" | "JNP"
-                | "JO" | "JNO" | "JS" | "JNS"
-                | "JCXZ" | "JECXZ" | "JRCXZ"
-                | "LOOP" | "LOOPE" | "LOOPNE"
-            ) => {
+            // Terminal: no successor edge.
+            branch::BranchKind::Return | branch::BranchKind::Trap => {}
+            branch::BranchKind::CondJump => {
                 if let Some(target) = get_target(insn.address) {
                     cfg_edges.push((insn.address, target, "branch"));
                     direct_jumps.push((insn.address, target));
                 }
-                if i + 1 < insns.len() && addr_set.contains(&next_addr) {
-                    cfg_edges.push((insn.address, next_addr, "fallthrough"));
-                }
+                push_fallthrough(&mut cfg_edges);
             }
-            _ => {
-                // Fallthrough only at block boundaries (last insn of block to next block)
-                if block_last_insns.contains(&insn.address)
-                    && i + 1 < insns.len()
-                    && addr_set.contains(&next_addr)
-                {
-                    cfg_edges.push((insn.address, next_addr, "fallthrough"));
+            // Fallthrough only at block boundaries (last insn of block to next block).
+            branch::BranchKind::None | branch::BranchKind::OpaqueTransfer => {
+                if block_last_insns.contains(&insn.address) {
+                    push_fallthrough(&mut cfg_edges);
                 }
             }
         }
@@ -159,24 +252,8 @@ pub fn build_cfg(
         insns.iter().enumerate().map(|(i, d)| (d.address, i)).collect();
 
     for insn in insns {
-        let cond = match insn.mnemonic {
-            "JE" => "e",
-            "JNE" => "ne",
-            "JL" => "l",
-            "JLE" => "le",
-            "JG" => "g",
-            "JGE" => "ge",
-            "JB" => "b",
-            "JBE" => "be",
-            "JA" => "a",
-            "JAE" => "ae",
-            "JP" => "p",
-            "JNP" => "np",
-            "JO" => "o",
-            "JNO" => "no",
-            "JS" => "s",
-            "JNS" => "ns",
-            _ => continue,
+        let Some(cond) = branch_condition(arch, insn.mnemonic) else {
+            continue;
         };
 
         if let Some(&idx) = addr_idx.get(&insn.address) {
@@ -184,21 +261,13 @@ pub fn build_cfg(
             while j > 0 {
                 j -= 1;
                 let prev = &insns[j];
-                if matches!(prev.mnemonic, "CMP" | "TEST" | "SUB" | "AND") {
+                if is_comparison(arch, prev.mnemonic) {
                     flags_pairs.push((prev.address, insn.address, cond));
                     break;
                 }
-                if matches!(prev.mnemonic,
-                    "ADD" | "OR" | "XOR"
-                    | "NEG" | "NOT" | "SHL" | "SHR" | "SAR" | "SAL"
-                    | "INC" | "DEC" | "IMUL" | "MUL" | "DIV" | "IDIV"
-                    | "ADC" | "SBB" | "RCL" | "RCR" | "ROL" | "ROR"
-                    | "BSF" | "BSR" | "POPCNT" | "LZCNT" | "TZCNT"
-                ) {
-                    break;
-                }
-                if matches!(prev.mnemonic, "JMP" | "JMPQ" | "CALL" | "RET"
-                    | "HLT" | "INT3") {
+                if clobbers_flags(arch, prev.mnemonic)
+                    || terminates_flag_search(arch, prev.mnemonic)
+                {
                     break;
                 }
             }
@@ -413,7 +482,7 @@ fn find_jump_table_info(
         None => return None,
     };
 
-    // Collect ALL rip-relative LEA / absolute-table candidates (nearest-first) rather than committing to the first; entry validation below picks the base that actually reads as a table, recovering getopt-style tables whose base LEA is hoisted before the dispatch loop (behind intervening arg-setup LEAs and a `call getopt_long`).
+    // Collect ALL rip-relative LEA / absolute-table candidates nearest-first rather than committing to the first, so entry validation can pick the base that actually reads as a table.
     let mut lea_candidates: Vec<(u64, usize)> = Vec::new();
     let mut table_bound: Option<usize> = None;
     let mut default_target: Option<u64> = None;
@@ -439,7 +508,7 @@ fn find_jump_table_info(
                     lea_candidates.push((base_addr, idx));
                 }
             }
-            // Clang -O0 non-PIE pattern: mov table(,%index,scale), %reg; jmp *%reg -- the absolute table address is the displacement in the memory operand.
+            // Clang -O0 non-PIE pattern: mov table(,%index,scale), %reg; jmp *%reg; the absolute table address is the displacement in the memory operand.
             "MOV" => {
                 for op in [op1, op2] {
                     if let Some(&(_seg, base, index, scale, disp)) = op_indirect_map.get(op) {
@@ -566,7 +635,7 @@ fn find_jump_table_info(
                 if addr_set.contains(&target) {
                     ordered_targets.push(target);
                 } else {
-                    // Membership is the real validator: the first entry that is not a known in-binary code address ends the table (mirrors the 4-byte path above). The previous magnitude test `target < 0x10000` was asymmetric - it skipped large non-member words instead of stopping, letting the scan walk past the table end and fabricate targets, so the .min(512) ceiling could not be safely raised. Terminating on membership makes the ceiling a pure safety bound rather than a correctness-load-bearing one.
+                    // Membership is the real validator: the first entry that is not a known in-binary code address ends the table, making the .min(512) ceiling a pure safety bound rather than correctness-critical.
                     break;
                 }
             } else {
@@ -594,6 +663,36 @@ fn collect_impl_addrs(insns: &[DecodedInsn], first_lea_idx: Option<usize>, jmp_i
     (start..=jmp_idx)
         .map(|i| insns[i].address)
         .collect()
+}
+
+// Next defined data-symbol address after table_base within the same rodata range, used to clamp an unbounded table so it stops at the adjacent object.
+fn next_data_symbol_boundary(
+    obj: &object::File,
+    table_base: u64,
+    rodata_ranges: &[(u64, u64, Vec<u8>)],
+) -> Option<u64> {
+    use object::ObjectSymbol;
+
+    // The rodata range that contains the table base bounds the search.
+    let (_, range_end, _) = rodata_ranges
+        .iter()
+        .find(|(start, end, _)| table_base >= *start && table_base < *end)?;
+
+    let mut boundary: Option<u64> = None;
+    for sym in obj.symbols().chain(obj.dynamic_symbols()) {
+        // Only defined symbols (those bound to a real section) mark a real boundary.
+        if !matches!(sym.section(), object::SymbolSection::Section(_)) {
+            continue;
+        }
+        let addr = sym.address();
+        // Must be after the table base and within the same rodata range.
+        if addr <= table_base || addr >= *range_end {
+            continue;
+        }
+        boundary = Some(boundary.map_or(addr, |b| b.min(addr)));
+    }
+
+    boundary
 }
 
 // Detect clang data lookup tables: `mov disp(,%reg,4), %dst` where disp is in rodata.
@@ -723,7 +822,16 @@ pub fn analyze_data_lookup_tables(
             }
         }
 
-        let entry_count = bounds_count.unwrap_or(256).min(512);
+        // Entry count: trust a recovered static bound (capped), else clamp to the next data-symbol boundary; the read loop also stops at the section end or first unreadable slot.
+        let entry_count = match bounds_count {
+            Some(n) => n.min(512),
+            None => {
+                let symbol_extent = next_data_symbol_boundary(obj, table_base, &rodata_ranges)
+                    .map(|boundary| ((boundary - table_base) / scale as u64) as usize)
+                    .filter(|&n| n > 0);
+                symbol_extent.unwrap_or(256).min(512)
+            }
+        };
 
         // Read the table values
         let mut values: Vec<i64> = Vec::new();

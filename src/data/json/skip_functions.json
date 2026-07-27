@@ -92,7 +92,16 @@
     "xstrdup",
     "xstrndup",
     "ximemdup0",
-    "xalloc_die"
+    "xalloc_die",
+    "xnrealloc",
+    "xnmalloc",
+    "xpalloc",
+    "ximalloc",
+    "xirealloc",
+    "xireallocarray",
+    "xinmalloc",
+    "xizalloc",
+    "xicalloc"
   ],
   "gnulib_xstrtol": [
     "xstrtoul",
@@ -134,12 +143,47 @@
     "setlocale_null",
     "setlocale_null_r",
     "setlocale_null_r_unlocked",
+    "setlocale_null_unlocked",
     "parse_gnu_standard_options_only",
+    "parse_long_options",
     "proper_name",
     "proper_name_lite",
     "proper_name_utf8",
     "trim_leading_blanks",
     "trim_trailing_blanks"
+  ],
+  "gnulib_argmatch": [
+    "argmatch",
+    "argmatch_exact",
+    "argmatch_invalid",
+    "argmatch_valid",
+    "argmatch_to_argument",
+    "__xargmatch_internal"
+  ],
+  "gnulib_link_extra": [
+    "mktime_internal",
+    "hash_get_first",
+    "vasnprintf",
+    "xstrtol_fatal",
+    "human_options"
+  ],
+  "gnulib_globals": [
+    "argmatch_die",
+    "error_message_count",
+    "error_one_per_line",
+    "error_print_progname",
+    "exit_failure",
+    "program_name",
+    "quote_quoting_options",
+    "quoting_style_args",
+    "quoting_style_vals",
+    "Version",
+    "version_etc_copyright",
+    "__progname",
+    "__progname_full",
+    "__dso_handle",
+    "__environ",
+    "__TMC_END__"
   ],
   "skip_prefixes": [
     "__do_global_dtors",

@@ -1,6 +1,9 @@
 #![allow(warnings)]
+mod aarch64;
+mod abi;
 mod debug;
 mod decompile;
+mod mreg;
 mod util;
 mod x86;
 use std::path::PathBuf;
@@ -22,7 +25,7 @@ fn fmt_elapsed(d: std::time::Duration) -> String {
 fn print_usage_and_exit() -> ! {
     eprintln!(
         "Usage: manifold <BINARY> [OUTPUT_BASE] [OPTIONS]\n\n\
-        	BINARY       - path to the ELF binary to decompile (file path)\n\
+            BINARY       - path to an x86 binary (ELF or native AMD64 PE32+)\n\
         	OUTPUT_BASE  - optional output path (defaults to <BINARY>.light.c)\n\n\
         Options:\n\
         	--trace          generate debug trace files (.debug.yaml, .dataflow.yaml)\n\
@@ -56,6 +59,7 @@ fn main() {
     let mut dump_ir = false;
     let mut dump_clight_json = false;
     let mut dump_deps = false;
+    let mut dump_dead_rels = false;
 
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -65,6 +69,7 @@ fn main() {
             "--dump-ir" => dump_ir = true,
             "--dump-clight-json" => dump_clight_json = true,
             "--dump-deps" => dump_deps = true,
+            "--dump-dead-rels" => dump_dead_rels = true,
             s if s.starts_with('-') => {
                 eprintln!("Unknown option: {}", s);
             }
@@ -72,6 +77,14 @@ fn main() {
         }
     }
 
+
+    // --dump-dead-rels can run without a binary input
+    if dump_dead_rels {
+        print!("{}", debug::pipeline_dot::dump_dead_relations());
+        if positional.is_empty() {
+            std::process::exit(0);
+        }
+    }
 
     // --dump-deps can run without a binary input
     if dump_deps {
