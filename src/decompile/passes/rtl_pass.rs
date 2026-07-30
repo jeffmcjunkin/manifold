@@ -106,8 +106,9 @@ ascent_par! {
     relation mach_imm_stack_init(Address, i64, i64, Typ);
     relation arith_load_op(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
     relation float_load_op(Address, Operation, MemoryChunk, Addressing, Arc<Vec<Mreg>>, Mreg, bool);
-    // cvtsi2_stack_op: a cvtsi2ss/sd reading a spilled int SCALAR slot, whose unary conversion reads the slot's canonical SSA reg directly, like arith_load_op's BP-slot path.
-    relation cvtsi2_stack_op(Address, Operation, Mreg, i64, Mreg);
+    // stack_unary_load_op: a write-only unary op reading a spilled SCALAR
+    // slot; it consumes the slot's canonical SSA reg directly.
+    relation stack_unary_load_op(Address, Operation, Mreg, i64, Mreg);
     // float_arith_stack_op: a binary float arith reading a spilled float SCALAR slot in place, with the slot operand read through its canonical SSA reg rather than a raw frame Iload.
     relation float_arith_stack_op(Address, Operation, Mreg, i64, Mreg);
     relation arith_store_reg(Address, Operation, MemoryChunk, Mreg, i64, Mreg);
@@ -1314,17 +1315,20 @@ ascent_par! {
         let synthetic_addr = *addr | (1u64 << 62),
         next(addr, next);
 
-    // cvtsi2_stack_op: the slot value is already live in stack_rtl, so the load node carries an Inop and the conversion at the synthetic address consumes stack_rtl instead of a frame Iload.
+    // stack_unary_load_op: the slot value is already live in stack_rtl, so
+    // the load node carries an Inop and the unary op at the synthetic address
+    // consumes stack_rtl instead of a frame Iload.
     rtl_inst_candidate(addr, nop) <--
-        cvtsi2_stack_op(addr, _op, _base_mreg, disp, _dst_mreg),
+        stack_unary_load_op(addr, _op, _base_mreg, disp, _dst_mreg),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, _),
         let nop = RTLInst::Inop;
 
-    // Conversion at synth: dst_xmm = convert(slot); the xmm dst is write-only, so handle both an existing canonical SSA reg and the fresh case.
+    // Unary op at synth: dst = op(slot). The destination is write-only, so
+    // handle both an existing canonical SSA reg and the fresh case.
     rtl_inst_candidate(synthetic_addr, op_inst) <--
-        cvtsi2_stack_op(addr, op, _base_mreg, disp, dst_mreg),
+        stack_unary_load_op(addr, op, _base_mreg, disp, dst_mreg),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
@@ -1333,7 +1337,7 @@ ascent_par! {
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl]), *dst_rtl);
 
     rtl_inst_candidate(synthetic_addr, op_inst) <--
-        cvtsi2_stack_op(addr, op, _base_mreg, disp, dst_mreg),
+        stack_unary_load_op(addr, op, _base_mreg, disp, dst_mreg),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
@@ -1343,24 +1347,24 @@ ascent_par! {
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl]), dst_rtl);
 
     rtl_edge_negated(addr, next) <--
-        cvtsi2_stack_op(addr, _, _, _, _),
+        stack_unary_load_op(addr, _, _, _, _),
         !has_ltl_op(addr),
         next(addr, next);
 
     rtl_succ_candidate(addr, synthetic_addr), instr_in_function(addr, func_start) <--
-        cvtsi2_stack_op(addr, _, _, _, _),
+        stack_unary_load_op(addr, _, _, _, _),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         let synthetic_addr = *addr | (1u64 << 62);
 
     rtl_succ_candidate(synthetic_addr, next), instr_in_function(synthetic_addr, func_start) <--
-        cvtsi2_stack_op(addr, _, _, _, _),
+        stack_unary_load_op(addr, _, _, _, _),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         let synthetic_addr = *addr | (1u64 << 62),
         next(addr, next);
 
-    synth_only_addr(addr) <-- cvtsi2_stack_op(addr, _, _, _, _), !has_ltl_op(addr);
+    synth_only_addr(addr) <-- stack_unary_load_op(addr, _, _, _, _), !has_ltl_op(addr);
 
     // float_arith_stack_op: the slot value is live in stack_rtl, so the binary op at the synthetic address consumes it as the second operand; the read+written dst threads its incoming value in via reg_xtl.
     reg_xtl(*addr, *dst_mreg, arg_id) <--

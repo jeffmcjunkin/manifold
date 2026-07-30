@@ -933,6 +933,7 @@ ascent_par! {
     node_unlowered_side_effect(addr) <-- arith_store_abs_reg(addr, _, _, _, _, _);
     node_unlowered_side_effect(addr) <-- arith_store_abs_imm(addr, _, _, _, _);
     node_unlowered_side_effect(addr) <-- float_load_op(addr, _, _, _, _, _, _);
+    node_unlowered_side_effect(addr) <-- stack_unary_load_op(addr, _, _, _, _);
     node_unlowered_side_effect(addr) <-- float_arith_stack_op(addr, _, _, _, _);
     relation transl_load_inferred(Address, MemoryChunk, Addrmode, Arc<Vec<Mreg>>, Mreg);
     relation transl_load(Address, MemoryChunk, Addrmode, Arc<Vec<Mreg>>, Mreg);
@@ -5359,6 +5360,51 @@ ascent_par! {
         let op = if *dst_is_64 { Operation::Osubl } else { Operation::Osub },
         let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
 
+    float_load_op(*addr, op, chunk, addressing, Arc::new(vec![base_mreg, idx_mreg]), Mreg::x86(dst_str), false) <--
+        pand(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_sp(base_str),
+        !reg_ip(base_str),
+        let base_mreg = Mreg::x86(base_str),
+        let idx_mreg = Mreg::x86(idx_str),
+        let addressing = if *scale > 1 { Addressing::Aindexed2scaled(*scale, *disp) } else { Addressing::Aindexed2(*disp) },
+        let op = if *dst_is_64 { Operation::Oandl } else { Operation::Oand },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    float_load_op(*addr, op, chunk, addressing, Arc::new(vec![base_mreg, idx_mreg]), Mreg::x86(dst_str), false) <--
+        por(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_sp(base_str),
+        !reg_ip(base_str),
+        let base_mreg = Mreg::x86(base_str),
+        let idx_mreg = Mreg::x86(idx_str),
+        let addressing = if *scale > 1 { Addressing::Aindexed2scaled(*scale, *disp) } else { Addressing::Aindexed2(*disp) },
+        let op = if *dst_is_64 { Operation::Oorl } else { Operation::Oor },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    float_load_op(*addr, op, chunk, addressing, Arc::new(vec![base_mreg, idx_mreg]), Mreg::x86(dst_str), false) <--
+        pxor(addr, dst, src),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        !reg_sp(base_str),
+        !reg_ip(base_str),
+        let base_mreg = Mreg::x86(base_str),
+        let idx_mreg = Mreg::x86(idx_str),
+        let addressing = if *scale > 1 { Addressing::Aindexed2scaled(*scale, *disp) } else { Addressing::Aindexed2(*disp) },
+        let op = if *dst_is_64 { Operation::Oxorl } else { Operation::Oxor },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
     // RIP-relative integer memory-source arithmetic (3.8c): arith_load_op cannot express a global ident and excludes RIP, so routed through float_load_op whose rtl lowering is operation-agnostic.
     float_load_op(*addr, op, chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::x86(dst_str), false) <--
         padd(addr, dst, src),
@@ -5892,6 +5938,52 @@ ascent_par! {
         ireg_of(preg_of_src, Ireg::from(src_str)),
         preg_of(src_arg, preg_of_src),
         let args = vec![*src_arg];
+
+    // A 3-operand IMUL writes dst = load(src) * imm. Keep it unary after the
+    // load: unlike 2-operand IMUL, the incoming value of dst is not an input.
+    #[local] relation imul3_mem_raw(Address, Operation, MemoryChunk, Symbol, Mreg);
+    imul3_mem_raw(*address, op, chunk, *src, Mreg::x86(dst_str)) <--
+        pimul3(address, dst, src, imm),
+        !div_consumed(address),
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, dst_is_64),
+        op_indirect(src, _, _, _, _, _, _),
+        op_immediate(imm, imm_value, _),
+        let op = if *dst_is_64 { Operation::Omullimm(*imm_value) } else { Operation::Omulimm(*imm_value) },
+        let chunk = if *dst_is_64 { MemoryChunk::MInt64 } else { MemoryChunk::MInt32 };
+
+    // Non-stack register-base and indexed sources use the generic load+op
+    // path. `true` selects its write-only/unary form, so old dst is not kept.
+    float_load_op(*addr, op.clone(), *chunk, addressing, Arc::new(args), *dst, true) <--
+        imul3_mem_raw(addr, op, chunk, src, dst),
+        op_indirect(src, _, base_str, idx_str, scale, disp, _),
+        if *base_str != "NONE" && !base_str.is_empty(),
+        if Mreg::x86(base_str) != Mreg::BP && Mreg::x86(base_str) != Mreg::SP,
+        !reg_ip(base_str),
+        let has_idx = *idx_str != "NONE" && !idx_str.is_empty(),
+        let addrmode = Addrmode {
+            base: Some(Ireg::from(base_str)),
+            index: if has_idx { Some((Ireg::from(idx_str), *scale)) } else { None },
+            disp: Displacement::from(*disp),
+        },
+        if let Ok((addressing, args)) = transl_addressing_rev(addrmode, None);
+
+    // RIP-relative IMUL sources use the same resolved-global unary path.
+    float_load_op(*addr, op.clone(), *chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), *dst, true) <--
+        imul3_mem_raw(addr, op, chunk, src, dst),
+        op_indirect(src, _, base_str, idx_str, _, _, _),
+        reg_ip(*base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        rip_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset);
+
+    // A BP/SP scalar source is lowered through stack_unary_load_op below so
+    // the canonical stack-slot SSA value is used instead of a raw frame load.
+    stack_unary_load_op(*addr, op.clone(), Mreg::x86(base_str), *disp, *dst) <--
+        imul3_mem_raw(addr, op, _chunk, src, dst),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if Mreg::x86(base_str) == Mreg::BP || Mreg::x86(base_str) == Mreg::SP,
+        if *idx_str == "NONE" || idx_str.is_empty();
 
     // IMUL with a SIMPLE memory source loads the value and multiplies via arith_load_op; the legacy rules treated the memory operand as its base register's value and dropped the load.
     arith_load_op(*address, op, chunk, Mreg::x86(base_str), *disp, Mreg::x86(dst_str)) <--
@@ -7274,9 +7366,11 @@ ascent_par! {
         rip_target_addr(addr, target_addr),
         resolved_addr_to_symbol(target_addr, ident, offset);
 
-    // A BP/SP-relative SCALAR stack slot must be read through the slot-variable model, not a raw Iload that would re-materialize it as *(&local + k); an indexed access is a stack array.
-    relation cvtsi2_stack_op(Address, Operation, Mreg, i64, Mreg);
-    cvtsi2_stack_op(*addr, op.clone(), Mreg::x86(base_str), *disp, *dst) <--
+    // A unary op reading a BP/SP-relative SCALAR stack slot must use the
+    // slot-variable model, not a raw Iload that would re-materialize it as
+    // *(&local + k); an indexed access is a stack array.
+    relation stack_unary_load_op(Address, Operation, Mreg, i64, Mreg);
+    stack_unary_load_op(*addr, op.clone(), Mreg::x86(base_str), *disp, *dst) <--
         cvtsi2_mem_raw(addr, op, _chunk, src, dst),
         op_indirect(src, _, base_str, idx_str, _, disp, _),
         if Mreg::x86(base_str) == Mreg::BP || Mreg::x86(base_str) == Mreg::SP,
