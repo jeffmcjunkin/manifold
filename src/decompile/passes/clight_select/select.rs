@@ -436,6 +436,14 @@ fn thread_gotos_through_empty_landings(
             if !seen.insert(next) {
                 break;
             }
+            // Synthetic nodes at the same base address carry another lowered
+            // part of the *same* instruction (commonly a memory side effect).
+            // The real landing is therefore not semantically empty, and its
+            // identity is already used by the structuring metadata.
+            const SYNTH_BITS: Node = (1u64 << 62) | (1u64 << 63);
+            if (current & !SYNTH_BITS) == (next & !SYNTH_BITS) {
+                break;
+            }
             match statements.get(&next) {
                 Some(stmt) if is_nonempty_stmt(stmt) => {
                     redirect_map.insert(target, next);
