@@ -48,6 +48,15 @@ pub struct StackVar {
     pub ptr_class: String,
 }
 
+fn sort_stack_vars(stack_vars: &mut [StackVar]) {
+    stack_vars.sort_by(|a, b| {
+        a.offset
+            .cmp(&b.offset)
+            .then_with(|| a.rtl_reg.cmp(&b.rtl_reg))
+            .then_with(|| a.ptr_class.cmp(&b.ptr_class))
+    });
+}
+
 
 // Dump all IR stages (mach, linear, ltl, rtl, cminor, clight) per instruction to YAML.
 pub fn dump_debug(
@@ -209,7 +218,7 @@ pub fn dump_debug(
                 ptr_class,
             })
             .collect();
-        stack_vars.sort_by(|a, b| a.offset.cmp(&b.offset));
+        sort_stack_vars(&mut stack_vars);
 
         let mut rtl = Vec::new();
         if let Some(rtl_insts) = rtl_map.get(&node) {
@@ -281,4 +290,51 @@ pub fn dump_debug(
         .map_err(|e| format!("Failed to write YAML file {}: {}", output_path, e))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sort_stack_vars, StackVar};
+
+    #[test]
+    fn stack_vars_are_sorted_by_every_serialized_field() {
+        let mut stack_vars = vec![
+            StackVar {
+                offset: 40,
+                rtl_reg: 9,
+                ptr_class: "unknown".to_string(),
+            },
+            StackVar {
+                offset: 40,
+                rtl_reg: 3,
+                ptr_class: "unknown".to_string(),
+            },
+            StackVar {
+                offset: 32,
+                rtl_reg: 9,
+                ptr_class: "unknown".to_string(),
+            },
+            StackVar {
+                offset: 40,
+                rtl_reg: 3,
+                ptr_class: "pointer".to_string(),
+            },
+        ];
+
+        sort_stack_vars(&mut stack_vars);
+
+        let keys: Vec<_> = stack_vars
+            .iter()
+            .map(|var| (var.offset, var.rtl_reg, var.ptr_class.as_str()))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (32, 9, "unknown"),
+                (40, 3, "pointer"),
+                (40, 3, "unknown"),
+                (40, 9, "unknown"),
+            ]
+        );
+    }
 }
