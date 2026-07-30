@@ -200,8 +200,11 @@ impl AbiConfig {
     }
 
     /// Windows x64 assigns integer and FP registers from the same four ordinal slots; SysV keeps independent GP and XMM sequences.
+    /// Native AMD64 COFF objects use the same calling convention and shadow-space layout as
+    /// their eventual PE images, even though their container format is still relocatable COFF.
     pub fn uses_shared_arg_slots(&self) -> bool {
-        self.format == BinaryFormat::Pe && self.arch == Arch::X86_64
+        matches!(self.format, BinaryFormat::Pe | BinaryFormat::Coff)
+            && self.arch == Arch::X86_64
     }
 
     pub fn first_stack_arg_position(&self) -> usize {
