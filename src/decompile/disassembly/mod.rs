@@ -2,6 +2,7 @@ pub mod aarch64;
 pub mod block;
 pub mod branch;
 pub mod cfg;
+pub mod coff;
 pub mod function;
 pub mod instruction;
 pub mod operand;
@@ -24,10 +25,20 @@ pub fn build_op_imm_map<'a>(db: &'a DecompileDB) -> HashMap<&'a str, i64> {
 }
 
 // Top-level entry point: disassemble and analyze a binary, populating all DB relations.
-pub fn load_from_binary(db: &mut DecompileDB, binary_path: &Path) {
-    let bin_data = std::fs::read(binary_path)
+pub fn load_from_binary(
+    db: &mut DecompileDB,
+    binary_path: &Path,
+) -> Option<coff::CoffAddressMap> {
+    let mut bin_data = std::fs::read(binary_path)
         .unwrap_or_else(|e| panic!("Failed to read binary {:?}: {}", binary_path, e));
-    let obj = object::File::parse(&*bin_data)
+    // A COFF object is not a loaded image.  Build a deterministic linked-image
+    // view in this private byte buffer before the normal object::File parse;
+    // every downstream analysis can keep using the standard object API.
+    let coff_image = coff::prepare_image(&mut bin_data)
+        .unwrap_or_else(|e| panic!("Failed to prepare COFF binary {:?}: {}", binary_path, e));
+    let bin_data = std::sync::Arc::new(bin_data);
+    db.loaded_binary_data = Some(std::sync::Arc::clone(&bin_data));
+    let obj = object::File::parse(&**bin_data)
         .unwrap_or_else(|e| panic!("Failed to parse binary {:?}: {}", binary_path, e));
 
     // Detect ABI from binary headers
@@ -42,7 +53,7 @@ pub fn load_from_binary(db: &mut DecompileDB, binary_path: &Path) {
     pe::validate_native_pe(&obj)
         .unwrap_or_else(|e| panic!("Unsupported PE binary {:?}: {}", binary_path, e));
 
-    symbol::load_symbols(db, &obj);
+    symbol::load_symbols(db, &obj, coff_image.as_ref());
     symbol::load_eh_frame_ranges(db, &obj);
     let pe_function_leaders = pe::load_metadata(db, &obj)
         .unwrap_or_else(|e| panic!("Failed to load PE metadata from {:?}: {}", binary_path, e));
@@ -125,6 +136,7 @@ pub fn load_from_binary(db: &mut DecompileDB, binary_path: &Path) {
     let bits = if db.abi().is_64bit() { 64 } else { 32 };
     db.rel_set("arch_bit", vec![(bits,)].into_iter().collect::<ascent::boxcar::Vec<_>>());
 
+    coff_image.map(|image| image.address_map)
 }
 
 // Load extern function signatures (call after load_from_binary).

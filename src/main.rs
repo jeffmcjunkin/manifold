@@ -25,12 +25,14 @@ fn fmt_elapsed(d: std::time::Duration) -> String {
 fn print_usage_and_exit() -> ! {
     eprintln!(
         "Usage: manifold <BINARY> [OUTPUT_BASE] [OPTIONS]\n\n\
-            BINARY       - path to an x86 binary (ELF or native AMD64 PE32+)\n\
+            BINARY       - path to an x86 binary (ELF, native AMD64 PE32+, or AMD64 COFF object)\n\
         	OUTPUT_BASE  - optional output path (defaults to <BINARY>.light.c)\n\n\
         Options:\n\
         	--trace          generate debug trace files (.debug.yaml, .dataflow.yaml)\n\
         	--dump-ir        dump each IR stage to separate files (.asm, .mach, .linear, etc.)\n\
         	--dump-clight-json   export selected Clight IR as JSON (.clight.json)\n\
+        \t--dump-coff-map      export the deterministic COFF address map (.coff-map.json)\n\
+        \t--version            print build and COFF-loader identity\n\
         	--measure-rule-times  dump per-pass Ascent rule timing to debug/rule_times/\n\
         	--dump-deps          dump pipeline dependency graph as Graphviz DOT to pipeline.dot"
     );
@@ -58,8 +60,10 @@ fn main() {
     let mut measure_rule_times = false;
     let mut dump_ir = false;
     let mut dump_clight_json = false;
+    let mut dump_coff_map = false;
     let mut dump_deps = false;
     let mut dump_dead_rels = false;
+    let mut show_version = false;
 
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -68,12 +72,26 @@ fn main() {
             "--measure-rule-times" => measure_rule_times = true,
             "--dump-ir" => dump_ir = true,
             "--dump-clight-json" => dump_clight_json = true,
+            "--dump-coff-map" => dump_coff_map = true,
+            "--version" => show_version = true,
             "--dump-deps" => dump_deps = true,
             "--dump-dead-rels" => dump_dead_rels = true,
             s if s.starts_with('-') => {
                 eprintln!("Unknown option: {}", s);
             }
             _ => positional.push(arg),
+        }
+    }
+
+    if show_version {
+        println!(
+            "manifold {} (upstream {}; {})",
+            env!("CARGO_PKG_VERSION"),
+            crate::decompile::disassembly::coff::MANIFOLD_UPSTREAM_COMMIT,
+            crate::decompile::disassembly::coff::COFF_LOADER_ID,
+        );
+        if positional.is_empty() {
+            return;
         }
     }
 
@@ -131,11 +149,22 @@ fn main() {
     }
 
     println!("Disassembling binary: {}", input_path.display());
-    decompile::disassembly::load_from_binary(&mut prog, &input_path);
+    let coff_address_map = decompile::disassembly::load_from_binary(&mut prog, &input_path);
     decompile::disassembly::load_preset(&mut prog);
 
     let load_elapsed = load_start.elapsed();
     println!("  Loading/disassembly: {}", fmt_elapsed(load_elapsed));
+
+    if dump_coff_map {
+        let map_path = PathBuf::from(format!("{}.coff-map.json", out_file_path.display()));
+        match &coff_address_map {
+            Some(map) => match map.write_json(&map_path) {
+                Ok(()) => println!("COFF address map exported to: {}", map_path.display()),
+                Err(e) => eprintln!("Failed to export COFF address map: {e}"),
+            },
+            None => eprintln!("--dump-coff-map ignored: input is not a COFF object"),
+        }
+    }
 
     let pipeline_start = Instant::now();
     println!("Started");
@@ -236,6 +265,7 @@ fn main() {
     if let Err(err) = write_outputs(
         raw_tu,
         optimized_tu,
+        prog.abi().format,
         out_file_str,
         explicit_output,
         trace_enabled,
@@ -262,6 +292,7 @@ fn main() {
 fn write_outputs(
     raw_tu: &crate::decompile::passes::c_pass::TranslationUnit,
     optimized_tu: &crate::decompile::passes::c_pass::TranslationUnit,
+    binary_format: crate::abi::BinaryFormat,
     output_path: &str,
     explicit_output: bool,
     trace_enabled: bool,
@@ -272,7 +303,11 @@ fn write_outputs(
     let canonical_path = crate::decompile::passes::clight_select::derive_canonical_path(output_path);
 
     if trace_enabled {
-        let light_c_source = crate::decompile::passes::c_pass::print_translation_unit(raw_tu);
+        let light_c_source =
+            crate::decompile::passes::c_pass::print_translation_unit_for_format(
+                raw_tu,
+                binary_format,
+            );
         {
             let mut file = File::create(&canonical_path)?;
             file.write_all(light_c_source.as_bytes())?;
@@ -286,7 +321,11 @@ fn write_outputs(
     } else {
         crate::decompile::passes::clight_select::derive_optimized_c_path(&canonical_path)
     };
-    let optimized_c_source = crate::decompile::passes::c_pass::print_translation_unit(optimized_tu);
+    let optimized_c_source =
+        crate::decompile::passes::c_pass::print_translation_unit_for_format(
+            optimized_tu,
+            binary_format,
+        );
     {
         let mut file = File::create(&optimized_c_path)?;
         file.write_all(optimized_c_source.as_bytes())?;

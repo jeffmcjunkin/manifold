@@ -91,10 +91,18 @@ pub fn load_eh_frame_ranges(db: &mut DecompileDB, obj: &object::File) {
 }
 
 // Populate symbol_table, symbols, symbol_size, PLT, main_function, and data pointer relations.
-pub fn load_symbols(db: &mut DecompileDB, obj: &object::File) {
+pub fn load_symbols(
+    db: &mut DecompileDB,
+    obj: &object::File,
+    coff_image: Option<&super::coff::CoffImage>,
+) {
     let mut symbols_vec: Vec<(u64, usize, &'static str, &'static str,
                                &'static str, usize, &'static str, usize, &'static str)> = Vec::new();
-    let mut best_sym: Vec<(u64, &'static str, &'static str)> = Vec::new();
+    // Exactly one deterministic display/provider name per address.  File and
+    // section bookkeeping symbols must never shadow a real function at offset
+    // zero (common in COFF objects).
+    let mut best_sym: std::collections::BTreeMap<u64, (u8, &'static str)> =
+        std::collections::BTreeMap::new();
 
     let leak_str = |s: String| -> &'static str {
         Box::leak(s.into_boxed_str())
@@ -102,10 +110,22 @@ pub fn load_symbols(db: &mut DecompileDB, obj: &object::File) {
 
     for sym in obj.symbols().chain(obj.dynamic_symbols()) {
         let addr = sym.address();
-        let size = sym.size() as usize;
+        let mut size = sym.size() as usize;
         let name_raw = sym.name().unwrap_or("");
         if name_raw.is_empty() { continue; }
-        let name: &'static str = leak_str(sanitize_symbol_name(name_raw));
+        let provider_name = coff_image
+            .and_then(|image| image.provider_name(addr, name_raw))
+            .map(str::to_string)
+            .unwrap_or_else(|| sanitize_symbol_name(name_raw));
+        let name: &'static str = leak_str(provider_name);
+
+        if size == 0 && sym.kind() == SymbolKind::Text {
+            if let Some(inferred) = coff_image
+                .and_then(|image| image.function_size(addr, name_raw))
+            {
+                size = inferred as usize;
+            }
+        }
 
         let sym_type: &'static str = match sym.kind() {
             SymbolKind::Text => "FUNC",
@@ -134,7 +154,9 @@ pub fn load_symbols(db: &mut DecompileDB, obj: &object::File) {
                         ("DEFAULT", idx.0, "")
                     }
                 }
-                object::SymbolSection::Undefined => ("UNDEF", 0, ""),
+                object::SymbolSection::Undefined | object::SymbolSection::Common => {
+                    ("UNDEF", 0, "")
+                }
                 object::SymbolSection::Absolute => ("ABS", 0, ""),
                 _ => ("UNKNOWN", 0, ""),
             };
@@ -145,13 +167,35 @@ pub fn load_symbols(db: &mut DecompileDB, obj: &object::File) {
         symbols_vec.push((addr, size, sym_type, binding, sect_type_s,
                           section_idx, sect_name_s, 0, name));
 
-        if section_type != "UNDEF" {
-            best_sym.push((addr, name, "Beg"));
+        if section_type != "UNDEF"
+            && !matches!(sym.kind(), SymbolKind::File | SymbolKind::Section)
+        {
+            let rank = match sym.kind() {
+                SymbolKind::Text => 0,
+                SymbolKind::Data | SymbolKind::Tls => 1,
+                _ => 2,
+            };
+            let replace = best_sym
+                .get(&addr)
+                .map_or(true, |(old_rank, old_name)| (rank, name) < (*old_rank, *old_name));
+            if replace {
+                best_sym.insert(addr, (rank, name));
+            }
         }
     }
 
     db.rel_set("symbol_table", symbols_vec.into_iter().collect::<ascent::boxcar::Vec<_>>());
-    db.rel_set("symbols", best_sym.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    db.rel_set(
+        "symbols",
+        best_sym
+            .into_iter()
+            .map(|(addr, (_, name))| (addr, name, "Beg"))
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    if let Some(image) = coff_image {
+        image.load_synthetic_symbols(db);
+    }
 
     db.rel_set("symbol_size", db.rel_iter::<(Address, usize, Symbol, Symbol, Symbol, usize, Symbol, usize, Symbol)>("symbol_table")
         .filter(|(_, size, sym_type, ..)| *size > 0 && *sym_type == "OBJECT")

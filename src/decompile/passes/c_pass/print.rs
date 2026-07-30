@@ -3,6 +3,15 @@
 use crate::decompile::passes::c_pass::types::*;
 use std::fmt::Write;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegerModel {
+    /// LP64-style output: Clight's 64-bit Tlong is spelled C `long`.
+    Lp64,
+    /// Windows LLP64 output for VS2013: C `long` is only 32 bits, so Clight's
+    /// Tlong must use Microsoft's explicit 64-bit spelling.
+    MsvcLlp64,
+}
+
 #[derive(Debug, Clone)]
 pub struct PrintConfig {
     pub indent_size: usize,
@@ -12,6 +21,7 @@ pub struct PrintConfig {
     pub emit_comments: bool,
     #[allow(dead_code)]
     pub compact: bool,
+    pub integer_model: IntegerModel,
 }
 
 impl Default for PrintConfig {
@@ -21,6 +31,7 @@ impl Default for PrintConfig {
             max_line_width: 100,
             emit_comments: true,
             compact: false,
+            integer_model: IntegerModel::Lp64,
         }
     }
 }
@@ -87,11 +98,11 @@ impl Printer {
 
 
     pub fn print_type(&mut self, ty: &CType) {
-        self.write(&type_to_string(ty));
+        self.write(&type_to_string(ty, self.config.integer_model));
     }
 
     pub fn print_type_with_name(&mut self, ty: &CType, name: &str) {
-        self.write(&type_to_named_decl(ty, name));
+        self.write(&type_to_named_decl(ty, name, self.config.integer_model));
     }
 
 
@@ -277,10 +288,16 @@ impl Printer {
             IntLiteralSuffix::U => self.output.push('U'),
             IntLiteralSuffix::L => {
                 if lit.value > i32::MAX as i128 || lit.value < i32::MIN as i128 {
-                    self.output.push('L');
+                    self.output.push_str(match self.config.integer_model {
+                        IntegerModel::Lp64 => "L",
+                        IntegerModel::MsvcLlp64 => "LL",
+                    });
                 }
             }
-            IntLiteralSuffix::UL => self.output.push_str("UL"),
+            IntLiteralSuffix::UL => self.output.push_str(match self.config.integer_model {
+                IntegerModel::Lp64 => "UL",
+                IntegerModel::MsvcLlp64 => "ULL",
+            }),
             IntLiteralSuffix::LL => self.output.push_str("LL"),
             IntLiteralSuffix::ULL => self.output.push_str("ULL"),
         }
@@ -824,7 +841,7 @@ impl Printer {
 }
 
 
-fn type_to_string(ty: &CType) -> String {
+fn type_to_string(ty: &CType, integer_model: IntegerModel) -> String {
     match ty {
         CType::Void => "void".to_string(),
         CType::Bool => "int".to_string(),
@@ -837,7 +854,10 @@ fn type_to_string(ty: &CType) -> String {
                 IntSize::Char => "char",
                 IntSize::Short => "short",
                 IntSize::Int => "int",
-                IntSize::Long => "long",
+                IntSize::Long => match integer_model {
+                    IntegerModel::Lp64 => "long",
+                    IntegerModel::MsvcLlp64 => "__int64",
+                },
                 IntSize::LongLong => "long long",
                 IntSize::Int128 => "__int128",
             };
@@ -851,14 +871,14 @@ fn type_to_string(ty: &CType) -> String {
         CType::Pointer(inner, quals) => {
             let quals_str = qualifiers_to_string(quals);
             if matches!(inner.as_ref(), CType::Function(..)) {
-                let (prefix, suffix) = type_to_decl_parts(inner);
+                let (prefix, suffix) = type_to_decl_parts(inner, integer_model);
                 return format!("{} (*{}){}", prefix, quals_str.trim(), suffix);
             }
-            format!("{} *{}", type_to_string(inner), quals_str)
+            format!("{} *{}", type_to_string(inner, integer_model), quals_str)
         }
         CType::Array(inner, size) => {
             let size_str = size.map(|s| s.to_string()).unwrap_or_default();
-            format!("{}[{}]", type_to_string(inner), size_str)
+            format!("{}[{}]", type_to_string(inner, integer_model), size_str)
         }
         CType::Function(ret, params, variadic, unprototyped) => {
             let params_str = if params.is_empty() {
@@ -867,7 +887,7 @@ fn type_to_string(ty: &CType) -> String {
             } else {
                 let mut s: String = params
                     .iter()
-                    .map(type_to_string)
+                    .map(|ty| type_to_string(ty, integer_model))
                     .collect::<Vec<_>>()
                     .join(", ");
                 if *variadic {
@@ -875,7 +895,7 @@ fn type_to_string(ty: &CType) -> String {
                 }
                 s
             };
-            format!("{} (*)({})", type_to_string(ret), params_str)
+            format!("{} (*)({})", type_to_string(ret, integer_model), params_str)
         }
         CType::Struct(name) => format!("struct {}", name),
         CType::Union(name) => format!("union {}", name),
@@ -883,15 +903,15 @@ fn type_to_string(ty: &CType) -> String {
         CType::TypedefName(name) => name.clone(),
         CType::Qualified(inner, quals) => {
             let quals_str = qualifiers_to_string(quals);
-            format!("{}{}", quals_str, type_to_string(inner))
+            format!("{}{}", quals_str, type_to_string(inner, integer_model))
         }
     }
 }
 
-fn type_to_decl_parts(ty: &CType) -> (String, String) {
+fn type_to_decl_parts(ty: &CType, integer_model: IntegerModel) -> (String, String) {
     match ty {
         CType::Array(inner, size) => {
-            let (prefix, suffix) = type_to_decl_parts(inner);
+            let (prefix, suffix) = type_to_decl_parts(inner, integer_model);
             let size_str = size.map(|s| s.to_string()).unwrap_or_default();
             (prefix, format!("[{}]{}", size_str, suffix))
         }
@@ -902,7 +922,7 @@ fn type_to_decl_parts(ty: &CType) -> (String, String) {
             } else {
                 let mut s: String = params
                     .iter()
-                    .map(type_to_string)
+                    .map(|ty| type_to_string(ty, integer_model))
                     .collect::<Vec<_>>()
                     .join(", ");
                 if *variadic {
@@ -913,10 +933,10 @@ fn type_to_decl_parts(ty: &CType) -> (String, String) {
                 }
                 s
             };
-            (type_to_string(ret), format!("({})", params_str))
+            (type_to_string(ret, integer_model), format!("({})", params_str))
         }
         CType::Pointer(inner, quals) => {
-            let (prefix, suffix) = type_to_decl_parts(inner);
+            let (prefix, suffix) = type_to_decl_parts(inner, integer_model);
             let quals_str = qualifiers_to_string(quals);
             if suffix.is_empty() {
                 (format!("{} *{}", prefix, quals_str), String::new())
@@ -924,11 +944,11 @@ fn type_to_decl_parts(ty: &CType) -> (String, String) {
                 (format!("{} (*{})", prefix, quals_str), suffix)
             }
         }
-        _ => (type_to_string(ty), String::new()),
+        _ => (type_to_string(ty, integer_model), String::new()),
     }
 }
 
-fn type_to_named_decl(ty: &CType, name: &str) -> String {
+fn type_to_named_decl(ty: &CType, name: &str, integer_model: IntegerModel) -> String {
     match ty {
         CType::Pointer(inner, quals) => {
             let quals_str = qualifiers_to_string(quals);
@@ -937,11 +957,11 @@ fn type_to_named_decl(ty: &CType, name: &str) -> String {
             } else {
                 format!("*{}{}", quals_str, name)
             };
-            type_to_named_decl(inner, &declarator)
+            type_to_named_decl(inner, &declarator, integer_model)
         }
         CType::Array(inner, size) => {
             let size_str = size.map(|s| s.to_string()).unwrap_or_default();
-            type_to_named_decl(inner, &format!("{}[{}]", name, size_str))
+            type_to_named_decl(inner, &format!("{}[{}]", name, size_str), integer_model)
         }
         CType::Function(ret, params, variadic, unprototyped) => {
             let mut params_str = if params.is_empty() && !variadic {
@@ -950,7 +970,7 @@ fn type_to_named_decl(ty: &CType, name: &str) -> String {
             } else {
                 params
                     .iter()
-                    .map(type_to_string)
+                    .map(|ty| type_to_string(ty, integer_model))
                     .collect::<Vec<_>>()
                     .join(", ")
             };
@@ -960,10 +980,10 @@ fn type_to_named_decl(ty: &CType, name: &str) -> String {
                 }
                 params_str.push_str("...");
             }
-            type_to_named_decl(ret, &format!("{}({})", name, params_str))
+            type_to_named_decl(ret, &format!("{}({})", name, params_str), integer_model)
         }
         CType::Qualified(inner, quals) => {
-            let inner_decl = type_to_named_decl(inner, name);
+            let inner_decl = type_to_named_decl(inner, name, integer_model);
             let quals_str = qualifiers_to_string(quals);
             if quals_str.is_empty() {
                 inner_decl
@@ -972,7 +992,7 @@ fn type_to_named_decl(ty: &CType, name: &str) -> String {
             }
         }
         _ => {
-            let base = type_to_string(ty);
+            let base = type_to_string(ty, integer_model);
             if name.is_empty() {
                 base
             } else {
@@ -1064,6 +1084,22 @@ fn escape_char(c: char) -> String {
 
 pub fn print_translation_unit(tu: &TranslationUnit) -> String {
     let mut printer = Printer::with_default_config();
+    printer.print_translation_unit(tu);
+    printer.into_string()
+}
+
+/// Print using the target C integer model.  Clight Tlong is always 64-bit;
+/// Windows PE/COFF therefore requires `__int64`, while ELF/Mach-O retain the
+/// existing LP64 `long` spelling.
+pub fn print_translation_unit_for_format(
+    tu: &TranslationUnit,
+    format: crate::abi::BinaryFormat,
+) -> String {
+    let mut config = PrintConfig::default();
+    if matches!(format, crate::abi::BinaryFormat::Pe | crate::abi::BinaryFormat::Coff) {
+        config.integer_model = IntegerModel::MsvcLlp64;
+    }
+    let mut printer = Printer::new(config);
     printer.print_translation_unit(tu);
     printer.into_string()
 }
@@ -1169,3 +1205,58 @@ fn collect_needed_includes(tu: &TranslationUnit) -> Vec<&'static str> {
     includes.into_iter().collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn msvc_llp64_spells_clight_long_as_explicit_64_bit_type() {
+        assert_eq!(
+            type_to_string(&CType::long(), IntegerModel::MsvcLlp64),
+            "__int64"
+        );
+        assert_eq!(
+            type_to_string(&CType::ulong(), IntegerModel::MsvcLlp64),
+            "unsigned __int64"
+        );
+        assert_eq!(type_to_string(&CType::long(), IntegerModel::Lp64), "long");
+    }
+
+    #[test]
+    fn msvc_llp64_rewrites_types_structurally_inside_declarators() {
+        let callback = CType::Pointer(
+            Box::new(CType::Function(
+                Box::new(CType::long()),
+                vec![CType::ulong()],
+                false,
+                false,
+            )),
+            TypeQualifiers::none(),
+        );
+        assert_eq!(
+            type_to_named_decl(&callback, "callback", IntegerModel::MsvcLlp64),
+            "__int64 (*callback)(unsigned __int64)"
+        );
+        // A spelling embedded in an identifier/typedef is not text-replaced.
+        assert_eq!(
+            type_to_string(
+                &CType::TypedefName("long_provider_name".to_string()),
+                IntegerModel::MsvcLlp64,
+            ),
+            "long_provider_name"
+        );
+    }
+
+    #[test]
+    fn msvc_llp64_uses_64_bit_integer_literal_suffixes() {
+        let mut config = PrintConfig::default();
+        config.integer_model = IntegerModel::MsvcLlp64;
+        let mut printer = Printer::new(config);
+        printer.print_expr(&CExpr::IntLit(IntLiteral {
+            value: 0x1_0000_0000,
+            suffix: IntLiteralSuffix::L,
+            base: IntLiteralBase::Hex,
+        }));
+        assert_eq!(printer.into_string(), "0x100000000LL");
+    }
+}

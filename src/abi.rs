@@ -43,6 +43,7 @@ pub fn call_is_noreturn(callee: &str, status_arg0_nonzero_const: impl FnOnce() -
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryFormat {
+    Coff,
     Elf,
     Pe,
     MachO,
@@ -238,6 +239,7 @@ pub fn detect_abi(obj: &object::File) -> Result<AbiConfig, String> {
     use object::Object;
 
     let format = match obj.format() {
+        object::BinaryFormat::Coff => BinaryFormat::Coff,
         object::BinaryFormat::Elf => BinaryFormat::Elf,
         object::BinaryFormat::Pe => BinaryFormat::Pe,
         object::BinaryFormat::MachO => BinaryFormat::MachO,
@@ -266,7 +268,7 @@ pub fn detect_abi(obj: &object::File) -> Result<AbiConfig, String> {
     }
 
     let mut config = match (format, arch) {
-        (BinaryFormat::Pe, Arch::X86_64) => AbiConfig::win64(),
+        (BinaryFormat::Pe | BinaryFormat::Coff, Arch::X86_64) => AbiConfig::win64(),
         (_, Arch::X86_64) => AbiConfig::sysv_x86_64(),
         (_, Arch::X86_32) => AbiConfig::cdecl_x86_32(),
         (_, Arch::Aarch64) => AbiConfig::aapcs64(),

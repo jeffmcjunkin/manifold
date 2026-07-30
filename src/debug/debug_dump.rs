@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::mreg::Mreg;
 use std::sync::Arc;
+use object::{Object, ObjectSection};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DebugDump {
@@ -54,8 +55,16 @@ pub fn dump_debug(
     binary_path: &str,
     output_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let binary_data = std::fs::read(binary_path)
-        .map_err(|e| format!("Failed to read binary file {}: {}", binary_path, e))?;
+    let binary_data = db
+        .loaded_binary_data
+        .as_ref()
+        .ok_or("loaded binary image is unavailable")?;
+    let obj = object::File::parse(&***binary_data)
+        .map_err(|e| format!("Failed to parse loaded binary image: {e}"))?;
+    let image_sections: Vec<(u64, &[u8])> = obj
+        .sections()
+        .filter_map(|s| s.data().ok().map(|data| (s.address(), data)))
+        .collect();
 
     let cs = Capstone::new()
         .x86()
@@ -130,12 +139,13 @@ pub fn dump_debug(
         let node = *addr;
         let addr_key = format!("0x{:x}", addr);
 
-        // NOTE: virtual address as file offset works for PIE binaries but may be incorrect for non-PIE.
-        let start_offset = *addr as usize;
         let fallback = || Some(format!("{} {}", mnemonic, format!("{} {} {} {}", op1, op2, op3, op4).trim()));
-        let asm_info = if start_offset < binary_data.len() {
-            let max_len = std::cmp::min(*size as usize, binary_data.len() - start_offset);
-            let instruction_bytes = &binary_data[start_offset..start_offset + max_len];
+        let asm_info = if let Some((base, section_data)) = image_sections.iter().find(|(base, data)| {
+            *addr >= *base && *addr < base.saturating_add(data.len() as u64)
+        }) {
+            let start_offset = (*addr - *base) as usize;
+            let max_len = std::cmp::min(*size as usize, section_data.len() - start_offset);
+            let instruction_bytes = &section_data[start_offset..start_offset + max_len];
 
             if let Ok(insns) = cs.disasm_count(instruction_bytes, *addr, 1) {
                 if let Some(insn) = insns.iter().next() {

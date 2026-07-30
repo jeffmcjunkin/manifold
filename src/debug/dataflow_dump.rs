@@ -5,6 +5,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use crate::x86::types::*;
 use crate::mreg::Mreg;
+use object::{Object, ObjectSection};
 
 #[derive(Serialize)]
 struct DataflowOutput {
@@ -33,8 +34,16 @@ pub fn dump_dataflow(
     binary_path: &str,
     output_path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let binary_data = std::fs::read(binary_path)
-        .map_err(|e| format!("Failed to read binary file {}: {}", binary_path, e))?;
+    let binary_data = db
+        .loaded_binary_data
+        .as_ref()
+        .ok_or("loaded binary image is unavailable")?;
+    let obj = object::File::parse(&***binary_data)
+        .map_err(|e| format!("Failed to parse loaded binary image: {e}"))?;
+    let image_sections: Vec<(u64, &[u8])> = obj
+        .sections()
+        .filter_map(|s| s.data().ok().map(|data| (s.address(), data)))
+        .collect();
 
     let cs = Capstone::new()
         .x86()
@@ -105,7 +114,7 @@ pub fn dump_dataflow(
         let mut instructions = Vec::new();
 
         for addr in sorted_addrs {
-            let asm = get_asm(&cs, &binary_data, addr, &instr_info);
+            let asm = get_asm(&cs, &image_sections, addr, &instr_info);
 
             let mappings_raw = reg_rtl_map.get(&addr);
             let mut mappings = Vec::new();
@@ -154,16 +163,18 @@ pub fn dump_dataflow(
 // Disassemble a single instruction at addr, falling back to stored mnemonic/operands.
 fn get_asm(
     cs: &Capstone,
-    binary_data: &[u8],
+    image_sections: &[(u64, &[u8])],
     addr: u64,
     instr_info: &HashMap<u64, (usize, String, String)>,
 ) -> String {
     if let Some((size, mnemonic, ops)) = instr_info.get(&addr) {
-        let start_offset = addr as usize;
-        if start_offset < binary_data.len() {
-            let max_len = std::cmp::min(*size, binary_data.len() - start_offset);
+        if let Some((base, section_data)) = image_sections.iter().find(|(base, data)| {
+            addr >= *base && addr < base.saturating_add(data.len() as u64)
+        }) {
+            let start_offset = (addr - *base) as usize;
+            let max_len = std::cmp::min(*size, section_data.len() - start_offset);
             if max_len > 0 {
-                let instruction_bytes = &binary_data[start_offset..start_offset + max_len];
+                let instruction_bytes = &section_data[start_offset..start_offset + max_len];
                 if let Ok(insns) = cs.disasm_count(instruction_bytes, addr, 1) {
                     if let Some(insn) = insns.iter().next() {
                         let mnemonic_cap = insn.mnemonic().unwrap_or("");

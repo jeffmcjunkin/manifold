@@ -7,4 +7,4 @@ pub mod types;
 
 pub use types::TranslationUnit;
 
-pub use print::print_translation_unit;
+pub use print::{print_translation_unit, print_translation_unit_for_format};

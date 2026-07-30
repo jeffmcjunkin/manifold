@@ -220,10 +220,15 @@ fn serialize_function(func: &SelectedFunction, id_to_name: &HashMap<usize, Strin
     let body = serialize_function_body(func, &local_names);
 
     // Serialize successors (CFG edges)
-    let cfg: Vec<Value> = func
+    let mut cfg_edges: Vec<(Node, Node)> = func
         .successors
         .iter()
-        .flat_map(|(src, dsts)| dsts.iter().map(move |dst| json!([*src, *dst])))
+        .flat_map(|(src, dsts)| dsts.iter().map(move |dst| (*src, *dst)))
+        .collect();
+    cfg_edges.sort_unstable();
+    let cfg: Vec<Value> = cfg_edges
+        .into_iter()
+        .map(|(src, dst)| json!([src, dst]))
         .collect();
 
     json!({

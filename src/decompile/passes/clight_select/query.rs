@@ -1045,7 +1045,7 @@ fn resolve_rodata_scalar(
     value.map(|v| (v, writable))
 }
 
-pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<GlobalData>, String> {
+pub fn extract_globals(db: &DecompileDB, _binary_path: &Path) -> Result<Vec<GlobalData>, String> {
     let mut globals = Vec::new();
 
     // Globals can have several symbols at one address, so collect candidates and pick the lex-smallest name per id; HashMap::insert would pick a different alias each run and flip the type.
@@ -1072,8 +1072,12 @@ pub fn extract_globals(db: &DecompileDB, binary_path: &Path) -> Result<Vec<Globa
         .map(|(id,)| *id)
         .collect();
 
-    let bin_data = fs::read(binary_path).map_err(|e| format!("Failed to read binary: {}", e))?;
-    let obj_file = object::File::parse(&*bin_data).map_err(|e| format!("Failed to parse binary: {}", e))?;
+    let bin_data = db
+        .loaded_binary_data
+        .as_ref()
+        .ok_or("loaded binary image is unavailable")?;
+    let obj_file = object::File::parse(&***bin_data)
+        .map_err(|e| format!("Failed to parse loaded binary image: {}", e))?;
 
 
     let func_addrs: HashSet<usize> = {
