@@ -5,6 +5,7 @@ use crate::decompile::passes::clight_select::query::{
     extract_functions, extract_ite_info, extract_loop_info,
     FunctionData, IteInfo, LoopInfo,
 };
+use crate::decompile::passes::clight_pass::is_nonempty_stmt;
 use crate::decompile::passes::csh_pass::ident_from_node;
 use crate::x86::types::*;
 use std::collections::{HashMap, HashSet};
@@ -306,6 +307,22 @@ fn build_selected_function_from_program_state(
     let mut statements = materialize_statements(&per_func_state, func);
     det_fp_stage(func.address, "S1mat", &statements);
 
+    // The solver is allowed to omit an explicit Sskip candidate. Keep the raw
+    // candidate map as proof that such an absent target is empty; arbitrary
+    // missing nodes are never threaded across.
+    let explicit_empty_nodes: HashSet<Node> = func.node_statements.iter()
+        .filter(|(_, candidates)| {
+            !candidates.is_empty() && candidates.iter().all(|stmt| !is_nonempty_stmt(stmt))
+        })
+        .map(|(&node, _)| node)
+        .collect();
+    thread_gotos_through_empty_landings(
+        &mut statements,
+        &func.successors,
+        &explicit_empty_nodes,
+    );
+    det_fp_stage(func.address, "S1thread", &statements);
+
     let func_loop_info = loop_info_all.get(&func.address).cloned().unwrap_or_default();
 
     assemble_loops(&mut statements, &func_loop_info, &func.successors);
@@ -374,6 +391,92 @@ fn build_selected_function_from_program_state(
         switch_heads: func.switch_heads.clone(),
         reg_struct_ids: func.reg_struct_ids.clone(),
         loop_info: func_loop_info,
+    }
+}
+
+/// Redirect gotos whose target is an empty landing node to its first retained
+/// statement. A chain is threadable only while every empty node has exactly
+/// one successor; ambiguous control flow and cycles are left untouched.
+fn thread_gotos_through_empty_landings(
+    statements: &mut HashMap<Node, ClightStmt>,
+    successors: &HashMap<Node, Vec<Node>>,
+    explicit_empty_nodes: &HashSet<Node>,
+) {
+    let goto_targets: HashSet<Node> = statements
+        .values()
+        .flat_map(collect_goto_targets)
+        .collect();
+    if goto_targets.is_empty() {
+        return;
+    }
+
+    let mut redirect_map: HashMap<Node, Node> = HashMap::new();
+    let mut sorted_targets: Vec<Node> = goto_targets.into_iter().collect();
+    sorted_targets.sort_unstable();
+
+    for target in sorted_targets {
+        let target_is_empty = statements
+            .get(&target)
+            .map(|stmt| !is_nonempty_stmt(stmt))
+            .unwrap_or_else(|| explicit_empty_nodes.contains(&target));
+        if !target_is_empty {
+            continue;
+        }
+
+        let mut current = target;
+        let mut seen = HashSet::from([target]);
+        loop {
+            let Some(nexts) = successors.get(&current) else {
+                break;
+            };
+            if nexts.len() != 1 {
+                break;
+            }
+            let next = nexts[0];
+            if !seen.insert(next) {
+                break;
+            }
+            match statements.get(&next) {
+                Some(stmt) if is_nonempty_stmt(stmt) => {
+                    redirect_map.insert(target, next);
+                    break;
+                }
+                Some(_) => current = next,
+                None if explicit_empty_nodes.contains(&next) => current = next,
+                None => break,
+            }
+        }
+    }
+
+    if redirect_map.is_empty() {
+        return;
+    }
+
+    // The destination may not previously have been a goto target. Label it
+    // now so Sseq preserves the target with the retained statement.
+    let mut destinations: Vec<Node> = redirect_map.values().copied().collect();
+    destinations.sort_unstable();
+    destinations.dedup();
+    for destination in destinations {
+        if let Some(stmt) = statements.get(&destination).cloned() {
+            if !matches!(&stmt, ClightStmt::Slabel(label, _) if *label == ident_from_node(destination)) {
+                statements.insert(
+                    destination,
+                    ClightStmt::Slabel(ident_from_node(destination), Box::new(stmt)),
+                );
+            }
+        }
+    }
+
+    let mut nodes: Vec<Node> = statements.keys().copied().collect();
+    nodes.sort_unstable();
+    for node in nodes {
+        if let Some(stmt) = statements.get(&node).cloned() {
+            let redirected = redirect_gotos_in_stmt(&stmt, &redirect_map);
+            if redirected != stmt {
+                statements.insert(node, redirected);
+            }
+        }
     }
 }
 
@@ -916,6 +1019,14 @@ fn assemble_ite(
     // Per-branch cap on assembled-compound size to bound 2^depth shared-node duplication; 0 binds observed since CF-1, kept as a backstop with smallest-first for O(cap) construction.
     let node_cap: usize = crate::decompile::elevator::config::ITE_MAX_NODES;
 
+    // Labels targeted from another selected statement remain semantic after
+    // their node is nested into a compound arm. Preserve those wrappers when
+    // collect_body absorbs the top-level node.
+    let goto_targets: HashSet<Node> = statements
+        .values()
+        .flat_map(collect_goto_targets)
+        .collect();
+
     for (&branch, info) in &branches {
         // Branch holds Sifthenelse from clight_pass flat Scond rule, possibly wrapped in Slabel.
         let unwrapped = match statements.get(&branch) {
@@ -963,7 +1074,7 @@ fn assemble_ite(
                 if let Some(stmt) = statements.get(&node) {
                     // Strip outer label; the node identity is subsumed by the compound
                     let stripped = match stmt {
-                        ClightStmt::Slabel(_, inner) => (**inner).clone(),
+                        ClightStmt::Slabel(_, inner) if !goto_targets.contains(&node) => (**inner).clone(),
                         other => other.clone(),
                     };
                     if !matches!(&stripped, ClightStmt::Sskip) {

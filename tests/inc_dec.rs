@@ -64,6 +64,8 @@ dec_je_switch_chain:
         je .Lcase_one
         decl %ecx
         je .Lcase_two
+        decl %ecx
+        je .Lcase_three
         leal 13(%rdx), %eax
         retq
 .Lcase_zero:
@@ -74,6 +76,9 @@ dec_je_switch_chain:
         retq
 .Lcase_two:
         movl $43, %eax
+        retq
+.Lcase_three:
+        movl $211, %eax
         retq
 
         .globl dec_jb_preserves_carry
@@ -136,10 +141,10 @@ fn assert_inc_dec_results(object: &Path) {
     let jnes = instruction_addresses(&db, "JNE");
     let jes = instruction_addresses(&db, "JE");
     let jbs = instruction_addresses(&db, "JB");
-    assert_eq!(decs.len(), 4, "fixture must contain four DEC instructions");
+    assert_eq!(decs.len(), 5, "fixture must contain five DEC instructions");
     assert_eq!(incs.len(), 1, "fixture must contain one INC instruction");
     assert_eq!(jnes.len(), 1, "fixture must contain one JNE instruction");
-    assert_eq!(jes.len(), 4, "fixture must contain four JE instructions");
+    assert_eq!(jes.len(), 5, "fixture must contain five JE instructions");
     assert_eq!(jbs.len(), 1, "fixture must contain one JB instruction");
 
     let flag_pairs: Vec<_> = db
@@ -171,7 +176,7 @@ fn assert_inc_dec_results(object: &Path) {
         .collect();
     assert_eq!(
         dec_je_pairs.len(),
-        2,
+        3,
         "each DEC in the switch chain must feed its JE: {flag_pairs:#x?}"
     );
     let carry_dec = decs
@@ -260,6 +265,34 @@ fn assert_inc_dec_results(object: &Path) {
     );
 }
 
+fn assert_empty_switch_landings_reach_returns(object: &Path) {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .stack_size(64 * 1024 * 1024)
+        .build()
+        .expect("failed to build INC/DEC test thread pool");
+    let mut db = DecompileDB::default();
+    manifold::decompile::disassembly::load_from_binary(&mut db, object);
+    manifold::decompile::disassembly::load_preset(&mut db);
+    pool.install(|| db.run_pipeline(object, false, false));
+
+    let tu = db
+        .cast_optimized_translation_unit
+        .as_ref()
+        .expect("pipeline must emit an optimized translation unit");
+    let text = manifold::decompile::passes::c_pass::print_translation_unit(tu);
+    let start = text
+        .find("dec_je_switch_chain(")
+        .expect("switch-chain function missing from generated C");
+    let body = &text[start..];
+    for value in [101, -7, 43, 211] {
+        assert!(
+            body.contains(&format!("return {value};")),
+            "goto landing lost retained return {value}:\n{body}"
+        );
+    }
+}
+
 #[test]
 fn inc_dec_results_feed_equality_jccs_without_inventing_carry() {
     let Some(object) = fixture() else { return };
@@ -271,4 +304,17 @@ fn inc_dec_results_feed_equality_jccs_without_inventing_carry() {
         .expect("failed to spawn INC/DEC test thread")
         .join()
         .expect("INC/DEC test thread panicked");
+}
+
+#[test]
+fn empty_switch_landing_targets_sequence_into_retained_returns() {
+    let Some(object) = fixture() else { return };
+    let object = object.to_path_buf();
+    std::thread::Builder::new()
+        .name("inc-dec-switch-output".to_string())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || assert_empty_switch_landings_reach_returns(&object))
+        .expect("failed to spawn switch-output test thread")
+        .join()
+        .expect("switch-output test thread panicked");
 }
