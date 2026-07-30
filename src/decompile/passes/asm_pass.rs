@@ -2517,6 +2517,15 @@ ascent_par! {
         op_register(dst, dst_str),
         reg_is_64(dst_str, is_64);
 
+    // MSVC uses DEC/JNE for optimized loop latches and repeated DEC/JE for
+    // compact switch chains.  Their value lowering lives below; retain the
+    // same destination here so the branch can consume the updated result.
+    arith_result_reg(addr, dst, is_64) <--
+        instruction(addr, _, _, mnem, dst, _, _, _, _, _),
+        if *mnem == "INC" || *mnem == "DEC",
+        op_register(dst, dst_str),
+        reg_is_64(dst_str, is_64);
+
     // A SUB-immediate before a flags-reading jcc is decrement-and-branch: when the decremented value is live, keep the SUB's value op and emit the Mcond at the jcc, or the -1 is dropped.
     arith_result_reg(addr, dst, is_64) <--
         sub_result_live(addr, dst_mreg),
@@ -2573,6 +2582,14 @@ ascent_par! {
         if !is_flag_setting(mnem1),
         next(addr1, addr2),
         pjcc(addr2, test_cond, _),
+        if arith_result_testcond_ok(*test_cond);
+    // The disassembly CFG also links INC/DEC to a later Jcc across any number
+    // of intervening flag-preserving instructions.  This is needed for MSVC
+    // scheduling patterns where a MOV sits between the loop update and JNE.
+    arith_result_jcc(addr0, addr1, dst, *is_64, *test_cond) <--
+        arith_result_reg(addr0, dst, is_64),
+        flags_and_jump_pair(addr0, addr1, _),
+        pjcc(addr1, test_cond, _),
         if arith_result_testcond_ok(*test_cond);
 
     // Mcond at the jcc's OWN address: `if (R <cmp> 0) goto target`.

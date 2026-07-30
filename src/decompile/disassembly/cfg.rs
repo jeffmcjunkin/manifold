@@ -87,6 +87,15 @@ fn is_comparison(arch: Arch, mnem: &str) -> bool {
     }
 }
 
+// INC/DEC update ZF/SF/OF but preserve CF.  They are therefore the relevant
+// flag source for equality and signed-result branches, but not for unsigned
+// branches whose carry bit still comes from an older instruction.
+fn is_inc_dec_result_source(arch: Arch, mnem: &str, cond: &str) -> bool {
+    matches!(arch, Arch::X86_64 | Arch::X86_32)
+        && matches!(mnem, "INC" | "DEC")
+        && matches!(cond, "e" | "ne" | "l" | "le" | "g" | "ge" | "s" | "ns")
+}
+
 // Instructions that overwrite the flags without being the comparison searched for, ending the backward walk.
 fn clobbers_flags(arch: Arch, mnem: &str) -> bool {
     match arch {
@@ -261,7 +270,9 @@ pub fn build_cfg(
             while j > 0 {
                 j -= 1;
                 let prev = &insns[j];
-                if is_comparison(arch, prev.mnemonic) {
+                if is_comparison(arch, prev.mnemonic)
+                    || is_inc_dec_result_source(arch, prev.mnemonic, cond)
+                {
                     flags_pairs.push((prev.address, insn.address, cond));
                     break;
                 }
@@ -907,4 +918,3 @@ fn build_got_to_plt_map(
 
     got_to_plt
 }
-
