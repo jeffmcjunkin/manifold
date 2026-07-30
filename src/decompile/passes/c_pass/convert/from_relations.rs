@@ -3669,18 +3669,46 @@ fn cexpr_scalar_class(
     }
 }
 
-// Wrap `e` in a cast to `target` only at a genuine pointer<->integer mismatch (the hard-error pair).
+// Best-effort exact type for scalar expressions whose type is explicit in the
+// C AST. This intentionally stays narrower than full expression inference.
+fn cexpr_known_ctype(
+    e: &CExpr,
+    types: &HashMap<String, CType>,
+    callee_ret: &HashMap<String, CType>,
+) -> Option<CType> {
+    match e {
+        CExpr::Cast(ty, _) => Some(ty.clone()),
+        CExpr::Var(name) => types.get(name).cloned(),
+        CExpr::Paren(inner) => cexpr_known_ctype(inner, types, callee_ret),
+        CExpr::Call(f, _) => match f.as_ref() {
+            CExpr::Var(name) => callee_ret.get(name).cloned(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// Wrap `e` in a cast to `target` at a genuine pointer<->integer mismatch, or
+// when two statically-known pointer types differ. The latter is codegen-neutral
+// in C and required when the same output is compiled as C++.
 fn coerce_scalar(
     target: &CType,
     e: CExpr,
     types: &HashMap<String, CType>,
     callee_ret: &HashMap<String, CType>,
 ) -> CExpr {
-    let mismatch = matches!(
-        (ctype_scalar_class(target), cexpr_scalar_class(&e, types, callee_ret)),
+    let target_class = ctype_scalar_class(target);
+    let source_class = cexpr_scalar_class(&e, types, callee_ret);
+    let scalar_mismatch = matches!(
+        (target_class, source_class),
         (ScalarClass::Ptr, ScalarClass::Int) | (ScalarClass::Int, ScalarClass::Ptr)
     );
-    if !mismatch {
+    let pointer_type_mismatch = target_class == ScalarClass::Ptr
+        && source_class == ScalarClass::Ptr
+        && cexpr_known_ctype(&e, types, callee_ret)
+            .map(|source| source != *target)
+            .unwrap_or(false);
+    if !scalar_mismatch && !pointer_type_mismatch {
         return e;
     }
     // 0 is a valid null-pointer constant and a valid integer; it never needs a cast.
