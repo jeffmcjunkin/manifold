@@ -117,6 +117,10 @@ ascent_par! {
     relation rsp_frame_offset_at(Address, Address, i64);
     relation bp_frame_at(Address, Address);
     relation unsupported_stack_address_seed(Address, Address, Symbol);
+    relation unsupported_address_detail_seed(Address, Address, Symbol);
+    relation unsupported_address_detail(Address, Address, Symbol);
+    unsupported_address_detail(*func, *access, *detail) <--
+        unsupported_address_detail_seed(func, access, detail);
     relation unsupported_stack_address(Address, Address, Symbol);
     unsupported_stack_address(*func, *access, *reason) <--
         unsupported_stack_address_seed(func, access, reason);
@@ -7805,6 +7809,143 @@ ascent_par! {
         if *idx_str == "NONE" || idx_str.is_empty(),
         if Mreg::x86(*base_str) == *base_reg && *asm_disp == *raw_disp;
 
+    // A mutable /homeparams cell may be consumed directly by an integer
+    // ALU/CMP instruction. Preserve that as a scalar operation over the
+    // canonical cell, using the same root/synthetic-node shape as the
+    // immutable home-parameter path. Partial-cell arithmetic remains outside
+    // this closed shape set.
+    relation win64_home_scalar_arith_read(
+        Node, Address, Mreg, i64, usize, i64, Mreg, usize, Operation
+    );
+    win64_home_scalar_arith_read(
+        addr, func_start, *base_reg, *raw_disp, *pos, *entry_ofs,
+        *dst_reg, *width, op.clone()
+    ) <--
+        win64_unsafe_home_access(
+            addr, func_start, base_reg, raw_disp, pos, entry_ofs
+        ),
+        win64_home_storage_signature(func_start, pos, move_class, width),
+        if *move_class == 0,
+        arith_load_op(addr, op, chunk, seen_base, seen_disp, dst_reg),
+        if *seen_base == *base_reg && *seen_disp == *raw_disp,
+        if chunk_size_bits(chunk) as usize == *width * 8;
+
+    rtl_inst_candidate(addr, RTLInst::Inop) <--
+        win64_home_scalar_arith_read(addr, _, _, _, _, _, _, _, _);
+    rtl_inst_candidate(synthetic, inst) <--
+        win64_home_scalar_arith_read(
+            addr, func_start, _, _, pos, _, dst_reg, _, op
+        ),
+        win64_home_storage(func_start, pos, slot),
+        reaching_use_rtl(addr, dst_reg, destination),
+        let synthetic = *addr | (1u64 << 62),
+        let inst = RTLInst::Iop(
+            op.clone(), Arc::new(vec![*destination, *slot]), *destination
+        );
+
+    // VS2013 checked builds frequently compare a reassigned /homeparams cell
+    // directly against a register or immediate.  The ordinary stack-CMP
+    // lowering already expresses the branch as one Icond; publish an exact
+    // candidate over the canonical mutable cell instead of suppressing the
+    // entire function.  The selector below still requires every access in the
+    // cell to have one closed scalar shape before retaining this candidate.
+    relation win64_home_scalar_cmp_read(
+        Node, Address, Symbol, Mreg, i64, usize, i64, usize
+    );
+    win64_home_scalar_cmp_read(
+        addr, func_start, *mem, *base_reg, *raw_disp, *pos, *entry_ofs, *width
+    ) <--
+        win64_unsafe_home_access(
+            addr, func_start, base_reg, raw_disp, pos, entry_ofs
+        ),
+        win64_home_storage_signature(func_start, pos, move_class, width),
+        if *move_class == 0,
+        pcmp(addr, mem, _),
+        op_indirect(mem, _, base_str, idx_str, _, asm_disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg && *asm_disp == *raw_disp,
+        if *mem_size == *width;
+    win64_home_scalar_cmp_read(
+        addr, func_start, *mem, *base_reg, *raw_disp, *pos, *entry_ofs, *width
+    ) <--
+        win64_unsafe_home_access(
+            addr, func_start, base_reg, raw_disp, pos, entry_ofs
+        ),
+        win64_home_storage_signature(func_start, pos, move_class, width),
+        if *move_class == 0,
+        pcmp(addr, _, mem),
+        op_indirect(mem, _, base_str, idx_str, _, asm_disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg && *asm_disp == *raw_disp,
+        if *mem_size == *width;
+
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_storage(func_start, pos, slot),
+        pcmp(addr, mem, other),
+        op_register(other, reg_str),
+        let other_reg = Mreg::x86(*reg_str),
+        reaching_use_rtl(addr, other_reg, other_rtl),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *width),
+        let inst = RTLInst::Icond(cond, Arc::new(vec![*slot, *other_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough));
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_storage(func_start, pos, slot),
+        pcmp(addr, other, mem),
+        op_register(other, reg_str),
+        let other_reg = Mreg::x86(*reg_str),
+        reaching_use_rtl(addr, other_reg, other_rtl),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *width),
+        let inst = RTLInst::Icond(cond, Arc::new(vec![*other_rtl, *slot]), Either::Right(*target_addr), Either::Right(*fallthrough));
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_storage(func_start, pos, slot),
+        pcmp(addr, mem, other),
+        op_immediate(other, imm, _),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *width),
+        let cond = match sized_cond {
+            Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, *imm),
+            Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, *imm),
+            Condition::Ccompl(cmp) => Condition::Ccomplimm(cmp, *imm),
+            Condition::Ccomplu(cmp) => Condition::Ccompluimm(cmp, *imm),
+            other => other,
+        },
+        let inst = RTLInst::Icond(cond, Arc::new(vec![*slot]), Either::Right(*target_addr), Either::Right(*fallthrough));
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_storage(func_start, pos, slot),
+        pcmp(addr, other, mem),
+        op_immediate(other, imm, _),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *width),
+        let cond = match sized_cond {
+            Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, *imm),
+            Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, *imm),
+            Condition::Ccompl(cmp) => Condition::Ccomplimm(cmp, *imm),
+            Condition::Ccomplu(cmp) => Condition::Ccompluimm(cmp, *imm),
+            other => other,
+        },
+        let inst = RTLInst::Icond(cond, Arc::new(vec![*slot]), Either::Right(*target_addr), Either::Right(*fallthrough));
+
     #[local] relation win64_home_scalar_access(Node, Address, usize);
     win64_home_scalar_access(addr, func, pos) <--
         win64_home_scalar_store(addr, func, _, _, pos, _, _, _, _);
@@ -7816,12 +7957,20 @@ ascent_par! {
         // &scalar changes the meaning of subsequent integer arithmetic.  At
         // least one exact derived address must be consumed as a call argument.
         win64_home_lea_address_taken(addr, func, pos);
+    win64_home_scalar_access(addr, func, pos) <--
+        win64_home_scalar_arith_read(addr, func, _, _, pos, _, _, _, _);
+    win64_home_scalar_access(addr, func, pos) <--
+        win64_home_scalar_cmp_read(addr, func, _, _, _, pos, _, _);
 
     unsupported_stack_address(*func, *addr, "unsupported-stack-address") <--
         // A storage signature exists for every ordinary /homeparams spill,
         // including safe immutable spill/reload pairs.  Only cells already
         // proven mutable/unsafe need scalar replacement; otherwise their raw
         // overlaps are intentionally consumed by the entry-parameter fold.
+        win64_home_storage(func, pos, _),
+        win64_home_overlap(addr, func, pos),
+        !win64_home_scalar_access(addr, func, pos);
+    unsupported_address_detail(*func, *addr, "home-cell-shape-unrepresentable") <--
         win64_home_storage(func, pos, _),
         win64_home_overlap(addr, func, pos),
         !win64_home_scalar_access(addr, func, pos);
@@ -8143,6 +8292,9 @@ ascent_par! {
         if *write_start != *read_start || *write_end < *read_end;
 
     unsupported_stack_address(*func_start, *read_addr, "unsupported-stack-address") <--
+        incoming_stack_read_range(read_addr, func_start, _, _),
+        stack_param_partial_write(read_addr, _);
+    unsupported_address_detail(*func_start, *read_addr, "stack-parameter-partial-write") <--
         incoming_stack_read_range(read_addr, func_start, _, _),
         stack_param_partial_write(read_addr, _);
 
@@ -9957,7 +10109,7 @@ pub(crate) fn build_xtype_vec<'a>(
     std::iter::once(Arc::new(args))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum UnsafeHomeShape {
     Store {
         base: Mreg,
@@ -9981,13 +10133,33 @@ enum UnsafeHomeShape {
         entry_ofs: i64,
         peer: Mreg,
     },
+    ArithRead {
+        base: Mreg,
+        raw_ofs: i64,
+        entry_ofs: i64,
+        peer: Mreg,
+        width: usize,
+        op: Operation,
+    },
+    Compare {
+        base: Mreg,
+        raw_ofs: i64,
+        entry_ofs: i64,
+        width: usize,
+    },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum UnsafeHomeRewrite {
     Store { source: RTLReg, slot: RTLReg },
     Load { slot: RTLReg, destination: RTLReg },
     Lea { entry_ofs: i64, destination: RTLReg },
+    ArithRead {
+        slot: RTLReg,
+        destination: RTLReg,
+        op: Operation,
+    },
+    Compare { inst: RTLInst },
 }
 
 fn home_move_xtype(move_class: usize, width: usize) -> Option<XType> {
@@ -10316,16 +10488,25 @@ fn normalize_addr32_rtl_outputs(db: &mut DecompileDB) {
 
     if !invalid_reals.is_empty() {
         let mut reasons = existing_reasons;
+        let mut details: BTreeSet<(Address, Address, Symbol)> = db
+            .rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail")
+            .copied()
+            .collect();
         for real in invalid_reals {
             if let Some(functions) = owners.get(&real) {
                 for function in functions {
                     reasons.insert((*function, real, "unsupported-addr32-address"));
+                    details.insert((*function, real, "addr32-lowering-incomplete"));
                 }
             }
         }
         db.rel_set(
             "unsupported_stack_address",
             reasons.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "unsupported_address_detail",
+            details.into_iter().collect::<ascent::boxcar::Vec<_>>(),
         );
     }
 }
@@ -10824,6 +11005,19 @@ fn classify_indexed_stack_lowerings(db: &mut DecompileDB) {
         diagnostics
             .into_iter()
             .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    let mut details: BTreeSet<(Address, Address, Symbol)> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail")
+        .copied()
+        .collect();
+    for (node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        if incomplete.contains(node) {
+            details.insert((*function, *node, "indexed-stack-chain-incomplete"));
+        }
+    }
+    db.rel_set(
+        "unsupported_address_detail",
+        details.into_iter().collect::<ascent::boxcar::Vec<_>>(),
     );
 }
 
@@ -11538,6 +11732,55 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                 peer,
             });
     }
+    for (node, func, base, raw_ofs, pos, entry_ofs, peer, width, op) in db.rel_iter::<(
+        Node,
+        Address,
+        Mreg,
+        i64,
+        usize,
+        i64,
+        Mreg,
+        usize,
+        Operation,
+    )>("win64_home_scalar_arith_read")
+    {
+        shapes
+            .entry((*func, *pos))
+            .or_default()
+            .entry(*node)
+            .or_default()
+            .insert(UnsafeHomeShape::ArithRead {
+                base: *base,
+                raw_ofs: *raw_ofs,
+                entry_ofs: *entry_ofs,
+                peer: *peer,
+                width: *width,
+                op: op.clone(),
+            });
+    }
+    for (node, func, _mem, base, raw_ofs, pos, entry_ofs, width) in db.rel_iter::<(
+        Node,
+        Address,
+        Symbol,
+        Mreg,
+        i64,
+        usize,
+        i64,
+        usize,
+    )>("win64_home_scalar_cmp_read")
+    {
+        shapes
+            .entry((*func, *pos))
+            .or_default()
+            .entry(*node)
+            .or_default()
+            .insert(UnsafeHomeShape::Compare {
+                base: *base,
+                raw_ofs: *raw_ofs,
+                entry_ofs: *entry_ofs,
+                width: *width,
+            });
+    }
 
     // RTL candidates and rewrite nodes are node-global, while the home facts
     // above are function-scoped.  Shared/.cold ownership or two home-cell
@@ -11609,6 +11852,8 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
             match rows.iter().next().expect("one checked home shape") {
                 UnsafeHomeShape::Store { .. } => !spill_nodes.contains(&(func, pos, *node)),
                 UnsafeHomeShape::Lea { .. } => true,
+                UnsafeHomeShape::ArithRead { .. } => true,
+                UnsafeHomeShape::Compare { .. } => true,
                 UnsafeHomeShape::Load {
                     raw_ofs, entry_ofs, ..
                 } => raw_ofs != entry_ofs,
@@ -11624,7 +11869,11 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         let mut complete = true;
 
         for (&node, rows) in cell_shapes {
-            let shape = *rows.iter().next().expect("one checked home shape");
+            let shape = rows
+                .iter()
+                .next()
+                .expect("one checked home shape")
+                .clone();
             let node_candidates = candidates_at.get(&node).map(Vec::as_slice).unwrap_or(&[]);
             match shape {
                 UnsafeHomeShape::Store {
@@ -11737,6 +11986,78 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                     );
                     cell_addresses.insert((node, slot));
                 }
+                UnsafeHomeShape::ArithRead {
+                    width, op, peer, ..
+                } => {
+                    if signature.is_some_and(|seen| seen != (0, width)) {
+                        complete = false;
+                        break;
+                    }
+                    signature = Some((0, width));
+                    let synthetic = node | (1u64 << 62);
+                    let candidate_peers: BTreeSet<RTLReg> = candidates_at
+                        .get(&synthetic)
+                        .into_iter()
+                        .flat_map(|rows| rows.iter())
+                        .filter_map(|inst| match inst {
+                            RTLInst::Iop(candidate_op, args, destination)
+                                if candidate_op == &op
+                                    && args.len() == 2
+                                    && args[0] == *destination =>
+                            {
+                                Some(*destination)
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let peers = reaching_reads
+                        .get(&(node, peer))
+                        .filter(|values| values.len() == 1)
+                        .unwrap_or(&candidate_peers);
+                    if peers.len() != 1 {
+                        complete = false;
+                        break;
+                    }
+                    let destination = *peers.iter().next().unwrap();
+                    cell_rewrites.insert(
+                        node,
+                        UnsafeHomeRewrite::ArithRead {
+                            slot,
+                            destination,
+                            op,
+                        },
+                    );
+                }
+                UnsafeHomeShape::Compare { width, .. } => {
+                    if signature.is_some_and(|seen| seen != (0, width)) {
+                        complete = false;
+                        break;
+                    }
+                    signature = Some((0, width));
+                    let mut candidates: Vec<RTLInst> = node_candidates
+                        .iter()
+                        .filter_map(|inst| match inst {
+                            RTLInst::Icond(_, args, _, _)
+                                if args.iter().filter(|arg| **arg == slot).count() == 1 =>
+                            {
+                                Some((*inst).clone())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    candidates.sort_by_cached_key(|inst| format!("{inst:?}"));
+                    candidates.dedup();
+                    if candidates.len() != 1 {
+                        complete = false;
+                        break;
+                    }
+                    cell_rewrites.insert(
+                        node,
+                        UnsafeHomeRewrite::Compare {
+                            inst: candidates.pop().unwrap(),
+                        },
+                    );
+                }
             }
         }
 
@@ -11766,6 +12087,49 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
             home_escaped.insert((func, slot));
         }
         rewrites.extend(cell_rewrites);
+    }
+
+    // The positive relation above keeps the Datalog fixed point stratified;
+    // candidate uniqueness is proved only here. If that final proof fails,
+    // restore a structured per-site rejection before the public safety filter
+    // runs so an ambiguous arithmetic chain can never leak into Clight.
+    let mut failed_scalar_sites = BTreeSet::new();
+    for (&cell, by_node) in &shapes {
+        if storage.contains_key(&cell) {
+            continue;
+        }
+        for (&node, rows) in by_node {
+            for shape in rows {
+                let detail = match shape {
+                    UnsafeHomeShape::ArithRead { .. } => "home-arith-rewrite-incomplete",
+                    UnsafeHomeShape::Compare { .. } => "home-compare-rewrite-incomplete",
+                    _ => continue,
+                };
+                failed_scalar_sites.insert((cell.0, node, detail));
+            }
+        }
+    }
+    if !failed_scalar_sites.is_empty() {
+        let mut reasons: BTreeSet<(Address, Address, Symbol)> = db
+            .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+            .copied()
+            .collect();
+        let mut details: BTreeSet<(Address, Address, Symbol)> = db
+            .rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail")
+            .copied()
+            .collect();
+        for (func, node, detail) in failed_scalar_sites {
+            reasons.insert((func, node, "unsupported-stack-address"));
+            details.insert((func, node, detail));
+        }
+        db.rel_set(
+            "unsupported_stack_address",
+            reasons.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "unsupported_address_detail",
+            details.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
     }
 
     db.rel_set(
@@ -11802,6 +12166,12 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
     }
 
     let rewritten_nodes: BTreeSet<Node> = rewrites.keys().copied().collect();
+    let mut rewritten_candidate_nodes = rewritten_nodes.clone();
+    for (node, rewrite) in &rewrites {
+        if matches!(rewrite, UnsafeHomeRewrite::ArithRead { .. }) {
+            rewritten_candidate_nodes.insert(*node | (1u64 << 62));
+        }
+    }
 
     // Remove stale raw evidence owned by rewritten nodes, but never insert a
     // normalized entry coordinate or the reserved home ID into a raw-offset
@@ -11887,26 +12257,45 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
     drop(candidates_at);
     let mut selected: Vec<(Node, RTLInst)> = candidates
         .into_iter()
-        .filter(|(node, _)| !rewritten_nodes.contains(node))
+        .filter(|(node, _)| !rewritten_candidate_nodes.contains(node))
         .collect();
     for (node, rewrite) in rewrites {
         let inst = match rewrite {
             UnsafeHomeRewrite::Store { source, slot } => {
-                RTLInst::Iop(Operation::Omove, Arc::new(vec![source]), slot)
+                Some(RTLInst::Iop(Operation::Omove, Arc::new(vec![source]), slot))
             }
             UnsafeHomeRewrite::Load { slot, destination } => {
-                RTLInst::Iop(Operation::Omove, Arc::new(vec![slot]), destination)
+                Some(RTLInst::Iop(Operation::Omove, Arc::new(vec![slot]), destination))
             }
             UnsafeHomeRewrite::Lea {
                 entry_ofs,
                 destination,
-            } => RTLInst::Iop(
+            } => Some(RTLInst::Iop(
                 Operation::Oleal(Addressing::Ainstack(entry_ofs)),
                 Arc::new(vec![]),
                 destination,
-            ),
+            )),
+            UnsafeHomeRewrite::ArithRead {
+                slot,
+                destination,
+                op,
+            } => {
+                selected.push((node, RTLInst::Inop));
+                selected.push((
+                    node | (1u64 << 62),
+                    RTLInst::Iop(
+                        op,
+                        Arc::new(vec![destination, slot]),
+                        destination,
+                    ),
+                ));
+                None
+            }
+            UnsafeHomeRewrite::Compare { inst } => Some(inst),
         };
-        selected.push((node, inst));
+        if let Some(inst) = inst {
+            selected.push((node, inst));
+        }
     }
     selected.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
     selected.dedup();
@@ -11961,6 +12350,10 @@ impl IRPass for RTLPass {
         // imperative RTL normalization failures on every run.
         db.rel_set(
             "unsupported_stack_address",
+            ascent::boxcar::Vec::<(Address, Address, Symbol)>::new(),
+        );
+        db.rel_set(
+            "unsupported_address_detail",
             ascent::boxcar::Vec::<(Address, Address, Symbol)>::new(),
         );
         run_pass!(db, RTLPassProgram);

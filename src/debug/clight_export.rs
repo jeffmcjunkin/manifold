@@ -8,7 +8,7 @@ use crate::decompile::passes::clight_select::query::{
 use crate::decompile::passes::clight_select::select::{select_clight_stmts, SelectedFunction};
 use crate::x86::types::*;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 /// Export the selected Clight IR from the decompile DB to a JSON file.
@@ -99,6 +99,19 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         .collect();
     unsupported_stack_rows.sort();
     unsupported_stack_rows.dedup();
+    let mut unsupported_details: BTreeMap<(Address, Address), Vec<String>> = BTreeMap::new();
+    for (func, access, detail) in
+        db.rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail")
+    {
+        unsupported_details
+            .entry((*func, *access))
+            .or_default()
+            .push((*detail).to_string());
+    }
+    for details in unsupported_details.values_mut() {
+        details.sort();
+        details.dedup();
+    }
     let mut unsupported_functions = Vec::with_capacity(unsupported_stack_rows.len());
     for (func, access, reason) in unsupported_stack_rows {
         if !matches!(
@@ -122,6 +135,10 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
             "address": format!("0x{func:x}"),
             "access_address": format!("0x{access:x}"),
             "reason": reason,
+            "details": unsupported_details
+                .get(&(func, access))
+                .cloned()
+                .unwrap_or_default(),
         }));
     }
 

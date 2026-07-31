@@ -47,6 +47,7 @@ fn build_fixture() -> PathBuf {
         &source,
         r#"
         .text
+        .extern __imp_home_tailcall
         .globl sp_indexed_alias_collision
         .def sp_indexed_alias_collision; .scl 2; .type 32; .endef
 sp_indexed_alias_collision:
@@ -136,6 +137,50 @@ home_reassigned:
         movq %rcx, 8(%rsp)
         movq %rdx, 8(%rsp)
         movq 8(%rsp), %rax
+        retq
+
+        .globl home_reassigned_cmp
+        .def home_reassigned_cmp; .scl 2; .type 32; .endef
+home_reassigned_cmp:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        cmpq $0, 8(%rsp)
+        jne home_reassigned_cmp_nonzero
+        xorl %eax, %eax
+        retq
+home_reassigned_cmp_nonzero:
+        movl $1, %eax
+        retq
+
+        .globl home_reassigned_add
+        .def home_reassigned_add; .scl 2; .type 32; .endef
+home_reassigned_add:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movq %r8, %rax
+        addq 8(%rsp), %rax
+        retq
+
+        .globl home_import_tailcall
+        .def home_import_tailcall; .scl 2; .type 32; .endef
+home_import_tailcall:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 16(%rsp)
+        movq 8(%rsp), %rcx
+        movq 16(%rsp), %rdx
+        jmpq *__imp_home_tailcall(%rip)
+
+        .globl home_reassigned_cmp_reg
+        .def home_reassigned_cmp_reg; .scl 2; .type 32; .endef
+home_reassigned_cmp_reg:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        cmpq %r8, 8(%rsp)
+        jne home_reassigned_cmp_reg_nonzero
+        xorl %eax, %eax
+        retq
+home_reassigned_cmp_reg_nonzero:
+        movl $1, %eax
         retq
 
         .globl sp_immediate_rmw
@@ -428,6 +473,24 @@ bp_fifth:
         .def postprologue_fifth; .scl 2; .type 32; .endef
 postprologue_fifth:
         subq $40, %rsp
+        movl 80(%rsp), %eax
+        addq $40, %rsp
+        retq
+
+        .globl trap_rsp_fallthrough
+        .def trap_rsp_fallthrough; .scl 2; .type 32; .endef
+trap_rsp_fallthrough:
+        subq $40, %rsp
+        int3
+        movl 80(%rsp), %eax
+        addq $40, %rsp
+        retq
+
+        .globl trap_int2c_rsp_fallthrough
+        .def trap_int2c_rsp_fallthrough; .scl 2; .type 32; .endef
+trap_int2c_rsp_fallthrough:
+        subq $40, %rsp
+        int $0x2c
         movl 80(%rsp), %eax
         addq $40, %rsp
         retq
@@ -2154,6 +2217,27 @@ fn canonical_home_storage(db: &DecompileDB, name: &str) -> ((Address, Address), 
         .filter(|(_, func, _, _, _, _, _, _, _)| *func == span.0)
         .copied()
         .collect();
+    let arith: Vec<_> = db
+        .rel_iter::<(
+            Address,
+            Address,
+            Mreg,
+            i64,
+            usize,
+            i64,
+            Mreg,
+            usize,
+            Operation,
+        )>("win64_home_scalar_arith_read")
+        .filter(|(_, func, _, _, _, _, _, _, _)| *func == span.0)
+        .map(|row| row.clone())
+        .collect();
+    let access_nodes: HashSet<_> = accesses.iter().map(|(node, ..)| *node).collect();
+    let reaching: Vec<_> = db
+        .rel_iter::<(Address, Mreg, u64)>("reaching_use_rtl")
+        .filter(|(node, _, _)| access_nodes.contains(node))
+        .copied()
+        .collect();
     let candidate_rows: Vec<_> = accesses
         .iter()
         .map(|(node, ..)| (*node, rtl_candidates(db, *node)))
@@ -2163,7 +2247,8 @@ fn canonical_home_storage(db: &DecompileDB, name: &str) -> ((Address, Address), 
         1,
         "{name} must have one canonical mutable home cell: {storage:#x?}; \
          vetoes={vetoes:#x?}; accesses={accesses:#x?}; stores={stores:#x?}; \
-         loads={loads:#x?}; candidates={candidate_rows:#x?}"
+         loads={loads:#x?}; arith={arith:#x?}; reaching={reaching:#x?}; \
+         candidates={candidate_rows:#x?}"
     );
     assert_eq!(storage[0].0, 0, "{name} used the wrong home ordinal");
     assert!(
@@ -2220,6 +2305,10 @@ fn assert_home_accesses_use_slot(
                         .rel_iter::<(Address, u64)>("win64_home_address")
                         .any(|(node, candidate)| (*node, *candidate) == (address, slot))
             }
+            RTLInst::Inop => rtl_candidates(db, address | SYNTH1).iter().any(|inst| {
+                matches!(inst, RTLInst::Iop(_, args, _) if args.contains(&slot))
+            }),
+            RTLInst::Icond(_, args, _, _) => args.contains(&slot),
             _ => false,
         };
         assert!(
@@ -2237,6 +2326,65 @@ fn assert_home_accesses_use_slot(
 fn assert_canonical_unsafe_home_storage(db: &DecompileDB) {
     let (reassigned, reassigned_slot) = canonical_home_storage(db, "home_reassigned");
     assert_home_accesses_use_slot(db, "home_reassigned", reassigned, reassigned_slot);
+
+    let (reassigned_cmp, reassigned_cmp_slot) =
+        canonical_home_storage(db, "home_reassigned_cmp");
+    assert_home_accesses_use_slot(
+        db,
+        "home_reassigned_cmp",
+        reassigned_cmp,
+        reassigned_cmp_slot,
+    );
+    let cmp = db
+        .rel_iter::<(Address, Address, Symbol, Mreg, i64, usize, i64, usize)>(
+            "win64_home_scalar_cmp_read",
+        )
+        .find(|(_, func, _, _, _, _, _, _)| *func == reassigned_cmp.0)
+        .expect("mutable home CMP did not retain its structured comparison shape");
+    assert!(
+        rtl_candidates(db, cmp.0).iter().any(|inst| {
+            matches!(inst, RTLInst::Icond(_, args, _, _) if args.contains(&reassigned_cmp_slot))
+        }),
+        "mutable home CMP did not consume the canonical cell"
+    );
+
+    let (reassigned_cmp_reg, reassigned_cmp_reg_slot) =
+        canonical_home_storage(db, "home_reassigned_cmp_reg");
+    assert_home_accesses_use_slot(
+        db,
+        "home_reassigned_cmp_reg",
+        reassigned_cmp_reg,
+        reassigned_cmp_reg_slot,
+    );
+
+    let (reassigned_add, reassigned_add_slot) =
+        canonical_home_storage(db, "home_reassigned_add");
+    assert_home_accesses_use_slot(
+        db,
+        "home_reassigned_add",
+        reassigned_add,
+        reassigned_add_slot,
+    );
+    let add = db
+        .rel_iter::<(
+            Address,
+            Address,
+            Mreg,
+            i64,
+            usize,
+            i64,
+            Mreg,
+            usize,
+            Operation,
+        )>("win64_home_scalar_arith_read")
+        .find(|(_, func, _, _, _, _, _, _, _)| *func == reassigned_add.0)
+        .expect("mutable home ADD did not retain its structured arithmetic shape");
+    assert!(
+        rtl_candidates(db, add.0 | SYNTH1).iter().any(|inst| {
+            matches!(inst, RTLInst::Iop(op, args, _) if op == &add.8 && args.contains(&reassigned_add_slot))
+        }),
+        "mutable home ADD did not consume the canonical cell"
+    );
 
     let (literal_escape, literal_escape_slot) = canonical_home_storage(db, "home_escape_mutated");
     assert_home_accesses_use_slot(
@@ -2536,6 +2684,9 @@ fn assert_postsub_escaped_offset_keeps_ordinary_origin(db: &DecompileDB) {
 fn assert_optimized_canonical_homes(db: &DecompileDB) {
     for name in [
         "home_reassigned",
+        "home_reassigned_cmp",
+        "home_reassigned_cmp_reg",
+        "home_reassigned_add",
         "home_mixed_base_clobber",
         "home_alias_call_escape",
         "home_alias_arith_clobber",
@@ -2558,6 +2709,10 @@ fn assert_optimized_canonical_homes(db: &DecompileDB) {
             .rel_iter::<(Address, Address, Mreg, i64, usize, i64)>("win64_unsafe_home_access")
             .filter_map(|(node, func, _, _, _, _)| (*func == span.0).then_some(*node))
             .collect();
+        let raw_stack_regs: HashSet<_> = db
+            .rel_iter::<(Address, Address, i64, u64)>("stack_var")
+            .filter_map(|(func, _, _, reg)| (*func == span.0).then_some(*reg))
+            .collect();
         for (node, inst) in db
             .rel_iter::<(Address, RTLInst)>("rtl_inst")
             .filter(|(node, _)| access_nodes.contains(node))
@@ -2569,7 +2724,14 @@ fn assert_optimized_canonical_homes(db: &DecompileDB) {
                             if *destination == slot || args.as_ref() == &[slot])
                     || matches!(inst,
                         RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(8)), args, _)
-                            if args.is_empty()),
+                            if args.is_empty())
+                    // RTLOptimize may propagate the unique last stored SSA value
+                    // through a comparison and eliminate the cell read entirely.
+                    // That is safe; only a reintroduced raw stack identity is not.
+                    || matches!(inst,
+                        RTLInst::Icond(_, args, _, _)
+                            if args.contains(&slot)
+                                || args.iter().all(|arg| !raw_stack_regs.contains(arg))),
                 "{name} reintroduced split/raw storage at {node:#x}: {inst:#x?}"
             );
         }
@@ -2851,8 +3013,28 @@ fn assert_outgoing_home_coordinate_is_not_suppressed(db: &DecompileDB) {
     );
 }
 
+fn assert_resolved_import_tailcall_keeps_frame_proofs(db: &DecompileDB) {
+    let span = function_span(db, "home_import_tailcall");
+    assert!(
+        db.rel_iter::<(Address,)>("is_extern_tailcall_jmp")
+            .any(|(address,)| in_span(*address, span)),
+        "COFF import-pointer JMP was not recognized as a resolved tail call"
+    );
+    assert!(
+        !db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+            .any(|(func, _, _)| *func == span.0),
+        "resolved outgoing import tail call poisoned the function's frame provenance"
+    );
+}
+
 fn assert_bp_postprologue_and_xmm_forms(db: &DecompileDB) {
-    for name in ["bp_fifth", "postprologue_fifth", "bp_postalloc_fifth"] {
+    for name in [
+        "bp_fifth",
+        "postprologue_fifth",
+        "trap_rsp_fallthrough",
+        "trap_int2c_rsp_fallthrough",
+        "bp_postalloc_fifth",
+    ] {
         let span = function_span(db, name);
         assert!(db
             .rel_iter::<(Address, Address, i64, usize)>("stack_param_access")
@@ -2860,6 +3042,11 @@ fn assert_bp_postprologue_and_xmm_forms(db: &DecompileDB) {
         assert!(db
             .rel_iter::<(Address, usize)>("emit_function_param_count_candidate")
             .any(|(func, count)| (*func, *count) == (span.0, 5)));
+        assert!(
+            !db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+                .any(|(func, _, _)| *func == span.0),
+            "{name} lost its proved stack coordinate"
+        );
     }
 
     let xmm = function_span(db, "xmm_home_roundtrip");
@@ -3521,6 +3708,10 @@ fn assert_final_output_compiles(object: &Path) {
     );
     for function in [
         "home_escape_mutated",
+        "home_reassigned_cmp",
+        "home_reassigned_cmp_reg",
+        "home_reassigned_add",
+        "home_import_tailcall",
         "fifth_inc",
         "outgoing_reuses_home_coordinate",
         "sp_indexed_fused_arith",
@@ -3540,8 +3731,15 @@ fn assert_final_output_compiles(object: &Path) {
         );
     }
 
+    // Clight deliberately emits C's unspecified-parameter declaration for an
+    // untyped COFF import.  The downstream C++ adapter supplies the recovered
+    // prototype; relax this fixture-only declaration for the C++ syntax smoke.
+    let syntax_text = text.replace(
+        "int coff_ext_home_tailcall();",
+        "int coff_ext_home_tailcall(...);",
+    );
     let output = object.with_extension("generated.cpp");
-    std::fs::write(&output, &text).expect("failed to write stack/home generated C++");
+    std::fs::write(&output, &syntax_text).expect("failed to write stack/home generated C++");
     let compiled = Command::new("clang++")
         .args([
             "--target=x86_64-pc-windows-msvc",
@@ -3591,6 +3789,7 @@ fn coff_stack_and_home_relations_preserve_values_and_abi_ordinals() {
             assert_unknown_sp_and_high_offsets_do_not_infer_params(&db);
             assert_incoming_stack_rmw_is_initialized_and_survives(&db);
             assert_outgoing_home_coordinate_is_not_suppressed(&db);
+            assert_resolved_import_tailcall_keeps_frame_proofs(&db);
             assert_bp_postprologue_and_xmm_forms(&db);
             assert_bp_provenance_preserves_pointer_memory(&db);
             assert_bp_shortcuts_and_narrow_bases_stay_pointer_memory(&db);

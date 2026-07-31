@@ -412,11 +412,38 @@ ascent_par! {
 
     relation direct_jump(Address, Address);
 
+    // Relocation-authenticated import-pointer JMPs are resolved tail calls,
+    // not unknown intra-function predecessors.  This relation is declared
+    // here because the frame-safety proof consumes it before Mach lowering.
+    relation is_extern_tailcall_jmp(Address);
+
     relation stack_base_move(Address, Symbol, Symbol);
     // Decoder-owned affine changes to the architectural stack pointer.  This
     // is deliberately distinct from reg_def: only these exact adjustments may
     // preserve an entry-frame coordinate across an SP write.
     relation adjusts_stack(Address, Symbol, i64);
+
+    // INT/INT3 end a decoder basic block, but Windows checked-build INT 2Ch
+    // assertions and INT3 debug breaks resume at the following instruction
+    // after debugger/exception handling.
+    // Preserve only this use-specific fallthrough for frame propagation; the
+    // program CFG itself remains unchanged and still represents the trap.
+    #[local] relation trap_fallthrough(Address, Address);
+    trap_fallthrough(src, dst) <--
+        next(src, dst),
+        instruction(src, _, _, "INT3", _, _, _, _, _, _),
+        instr_in_function(src, func),
+        instr_in_function(dst, func);
+    trap_fallthrough(src, dst) <--
+        next(src, dst),
+        instruction(src, _, _, "INT", vector, _, _, _, _, _),
+        op_immediate(vector, value, _),
+        if matches!(*value, 3 | 0x2c),
+        instr_in_function(src, func),
+        instr_in_function(dst, func);
+    #[local] relation frame_cfg_step(Address, Address);
+    frame_cfg_step(src, dst) <-- cfg_step(src, dst);
+    frame_cfg_step(src, dst) <-- trap_fallthrough(src, dst);
 
     // A BP-relative access is frame based only when one particular RSP->RBP
     // copy reaches and dominates that access. A function-global "ever copied"
@@ -430,6 +457,10 @@ ascent_par! {
     bp_block_next(src_block, dst_block) <--
         ddisasm_cfg_edge(src, dst, edge_type),
         if *edge_type != "call" && *edge_type != "indirect" && *edge_type != "indirect_call",
+        code_in_block(src, src_block),
+        code_in_block(dst, dst_block);
+    bp_block_next(src_block, dst_block) <--
+        trap_fallthrough(src, dst),
         code_in_block(src, src_block),
         code_in_block(dst, dst_block);
 
@@ -453,12 +484,12 @@ ascent_par! {
     bp_def_reaches(func, def, succ) <--
         asm_reg_def(def, ?&Mreg::BP),
         instr_in_function(def, func),
-        cfg_step(def, succ),
+        frame_cfg_step(def, succ),
         instr_in_function(succ, func);
     bp_def_reaches(func, def, next_addr) <--
         bp_def_reaches(func, def, cur),
         !asm_reg_def(cur, Mreg::BP),
-        cfg_step(cur, next_addr),
+        frame_cfg_step(cur, next_addr),
         instr_in_function(next_addr, func);
 
     #[local] relation bp_copy_dominates(Address, Address, Address);
@@ -541,7 +572,7 @@ ascent_par! {
     // its header to Top just like a conflicting forward join.
     rsp_state(*func, *dst, next_state) <--
         rsp_state(func, src, state),
-        cfg_step(src, dst),
+        frame_cfg_step(src, dst),
         instr_in_function(src, func),
         instr_in_function(dst, func),
         !rsp_transfer_kill(src),
@@ -558,7 +589,7 @@ ascent_par! {
     // Identity transfer, including calls.
     rsp_state(*func, *dst, (*state).clone()) <--
         rsp_state(func, src, state),
-        cfg_step(src, dst),
+        frame_cfg_step(src, dst),
         instr_in_function(src, func),
         instr_in_function(dst, func),
         !rsp_transfer_kill(src),
@@ -567,7 +598,7 @@ ascent_par! {
     // A non-affine write destroys the coordinate for every successor.
     rsp_state(*func, *dst, ConstPropagation::Top) <--
         rsp_state(func, src, _),
-        cfg_step(src, dst),
+        frame_cfg_step(src, dst),
         instr_in_function(src, func),
         instr_in_function(dst, func),
         rsp_transfer_kill(src);
@@ -637,22 +668,22 @@ ascent_par! {
         raw_operand_at(addr, operand),
         op_indirect(operand, segment, base, index, scale, disp, _);
 
-    #[local] relation unsupported_addr32_access(Address, Address);
+    #[local] relation unsupported_addr32_access(Address, Address, Symbol);
 
     // A 32-bit effective address is not the current 64-bit stack pointer, and
     // this IR deliberately has no expression for ESP's independently wrapped
     // value. Segment overrides and absolute/symbolic forms likewise need
     // provenance which cannot be represented by Aaddr32.
-    unsupported_addr32_access(*func, *addr) <--
+    unsupported_addr32_access(*func, *addr, "addr32-segment") <--
         instr_in_function(addr, func),
         addr32_memory_operand(addr, _, segment, _, _, _, _),
         if !is_no_address_register(segment);
-    unsupported_addr32_access(*func, *addr) <--
+    unsupported_addr32_access(*func, *addr, "addr32-register") <--
         instr_in_function(addr, func),
         addr32_memory_operand(addr, _, _, base, index, _, _),
         if (!is_no_address_register(base) && !is_addr32_gp_name(base))
             || (!is_no_address_register(index) && !is_addr32_gp_name(index));
-    unsupported_addr32_access(*func, *addr) <--
+    unsupported_addr32_access(*func, *addr, "addr32-pattern") <--
         instr_in_function(addr, func),
         addr32_memory_operand(addr, _, _, base, index, scale, _),
         if (is_no_address_register(base) && is_no_address_register(index))
@@ -661,7 +692,7 @@ ascent_par! {
     // EBP is a valid addr32 scratch base, but a reaching RSP->RBP frame copy
     // means its low half is stack-derived. Do not silently reinterpret that
     // as either Ainstack or an ordinary pointer.
-    unsupported_addr32_access(*func, *addr) <--
+    unsupported_addr32_access(*func, *addr, "addr32-frame-ebp") <--
         instr_in_function(addr, func),
         addr32_memory_operand(addr, _, _, base, index, _, _),
         if *base == "EBP" || *index == "EBP",
@@ -680,20 +711,20 @@ ascent_par! {
         if frame_owner != other_owner,
         bp_rsp_value_reaches(addr, frame_owner, _),
         !bp_rsp_value_reaches(addr, other_owner, _);
-    unsupported_addr32_access(*func, *addr) <--
+    unsupported_addr32_access(*func, *addr, "addr32-shared-ebp") <--
         shared_addr32_ebp_disagreement(addr),
         instr_in_function(addr, func);
 
     // x86 normally has one explicit memory operand. If a decoder ever emits
     // more than one, selecting one by ordinal would be nondeterministic and
     // can attach the wrong effective address to a synthetic RTL node.
-    unsupported_addr32_access(*func, *addr) <--
+    unsupported_addr32_access(*func, *addr, "addr32-multiple-memory-operands") <--
         instr_in_function(addr, func),
         addr32_memory_operand(addr, first, _, _, _, _, _),
         addr32_memory_operand(addr, second, _, _, _, _, _),
         if first != second;
 
-    #[local] relation unsafe_stack_access(Address, Address);
+    #[local] relation unsafe_stack_access(Address, Address, Symbol);
 
     // Only these binary integer memory-source forms have the dedicated
     // three-node indexed-RSP lowering in RTL. A frame proof establishes the
@@ -731,19 +762,19 @@ ascent_par! {
     // memory operand at the shared structured-address boundary until segment
     // bases become first-class, rather than allowing a lowering rule that
     // ignores the segment column to scalarize it.
-    unsafe_stack_access(*func, *addr) <--
+    unsafe_stack_access(*func, *addr, "unmodeled-segment") <--
         instr_in_function(addr, func),
         raw_operand_at(addr, operand),
         op_indirect(operand, segment, _, _, _, _, _),
         if is_unmodeled_segment(segment);
 
-    unsafe_stack_access(*func, *addr) <--
+    unsafe_stack_access(*func, *addr, "rsp-coordinate-unknown") <--
         instr_in_function(addr, func),
         raw_operand_at(addr, operand),
         op_indirect(operand, _, "RSP", _, _, _, _),
         !rsp_frame_at(addr, func);
 
-    unsafe_stack_access(*func, *addr) <--
+    unsafe_stack_access(*func, *addr, "rsp-indexed-lowering-missing") <--
         instr_in_function(addr, func),
         raw_operand_at(addr, operand),
         op_indirect(operand, _, "RSP", index, _, _, _),
@@ -757,7 +788,7 @@ ascent_par! {
     // indexed accesses whose current RSP coordinate is path-dependent or
     // otherwise unknown.
 
-    unsafe_stack_access(*func, *addr) <--
+    unsafe_stack_access(*func, *addr, "rbp-coordinate-unknown") <--
         invalid_rsp_derived_bp_at(addr, func);
 
     // Node-global IR cannot safely choose between different per-function
@@ -771,7 +802,7 @@ ascent_par! {
         raw_operand_at(addr, operand),
         op_indirect(operand, _, base, _, _, _, _),
         if *base == "RSP" || *base == "RBP";
-    unsafe_stack_access(*func, *addr) <--
+    unsafe_stack_access(*func, *addr, "shared-stack-node") <--
         shared_stack_access(addr),
         instr_in_function(addr, func);
 
@@ -782,26 +813,37 @@ ascent_par! {
     function_has_unresolved_indirect(*func) <--
         ddisasm_cfg_edge(src, _, edge_type),
         if *edge_type == "indirect",
+        !is_extern_tailcall_jmp(src),
         instr_in_function(src, func);
     // An unresolved predecessor may mutate BP before reaching the access.
     // Even an apparently scratch EBP therefore lacks sufficient provenance.
-    unsupported_addr32_access(*func, *addr) <--
+    unsupported_addr32_access(*func, *addr, "addr32-unresolved-indirect") <--
         function_has_unresolved_indirect(func),
         instr_in_function(addr, func),
         addr32_memory_operand(addr, _, _, base, index, _, _),
         if *base == "EBP" || *index == "EBP";
-    unsafe_stack_access(*func, *addr) <--
+    unsafe_stack_access(*func, *addr, "unresolved-indirect-control-flow") <--
         function_has_unresolved_indirect(func),
         instr_in_function(addr, func),
         raw_operand_at(addr, operand),
         op_indirect(operand, _, base, _, _, _, _),
         if *base == "RSP" || *base == "RBP";
 
+    // Machine-readable trigger provenance.  The stable public suppression
+    // reason remains one of the two adapter-facing codes below, while this
+    // relation distinguishes cases that can gain a positive proof from cases
+    // that are architecturally unrepresentable.
+    relation unsupported_address_detail_seed(Address, Address, Symbol);
+    unsupported_address_detail_seed(*func, *addr, *detail) <--
+        unsafe_stack_access(func, addr, detail);
+    unsupported_address_detail_seed(*func, *addr, *detail) <--
+        unsupported_addr32_access(func, addr, detail);
+
     relation unsupported_stack_address_seed(Address, Address, Symbol);
     unsupported_stack_address_seed(*func, *addr, "unsupported-stack-address") <--
-        unsafe_stack_access(func, addr);
+        unsafe_stack_access(func, addr, _);
     unsupported_stack_address_seed(*func, *addr, "unsupported-addr32-address") <--
-        unsupported_addr32_access(func, addr);
+        unsupported_addr32_access(func, addr, _);
 
     #[local] relation generic_bp_sp_address(Address, Symbol, Addressing, Arc<Vec<Mreg>>);
     generic_bp_sp_address(addr, *operand, Addressing::Aindexed(*disp), Arc::new(vec![Mreg::BP])) <--
@@ -2020,7 +2062,6 @@ ascent_par! {
         plt_entry(addr, _);
 
     // Forwarder thunk (mov args; jmp <plt_stub>): the stub is not a func_entry, so classify a JMP-to-extern as its own tail-call kind or the body collapses to goto <sym> and the function is dropped.
-    relation is_extern_tailcall_jmp(Address);
     // PE import thunks end in jmp qword ptr [rip+IAT]; resolve the slot like the indirect CALL path so the thunk becomes a named tail call and inherits the extern signature.
     mach_inst(addr, MachInst::Mtailcall(Either::Right(Either::Left(name)))),
     is_extern_tailcall_jmp(*addr) <--
