@@ -391,9 +391,21 @@ impl Printer {
         match stmt {
             CStmt::Empty => {}
             CStmt::Expr(e) => {
+                let terminates_with_fastfail = self.config.integer_model == IntegerModel::MsvcLlp64
+                    && matches!(e, CExpr::Call(func, _)
+                        if matches!(func.as_ref(), CExpr::Var(name)
+                            if name == "__fastfail"));
                 self.write_indent();
                 self.print_expr(e);
                 self.writeln(";");
+                // VS2013 emits INT 29h for the intrinsic but still appends a RET
+                // unless the unreachable continuation is made explicit.  Keep
+                // that target-specific compiler fact next to the intrinsic
+                // statement rather than pattern-matching enclosing functions.
+                if terminates_with_fastfail {
+                    self.write_indent();
+                    self.writeln("__assume(0);");
+                }
             }
 
             CStmt::Block(items) => {
@@ -1358,6 +1370,7 @@ mod tests {
         assert!(output.contains("void __int2c(void);\n#pragma intrinsic(__int2c)\n"));
         assert!(!output.contains("__readcr8"));
         assert!(!output.contains("__fastfail"));
+        assert!(!output.contains("__assume(0);"));
     }
 
     #[test]
@@ -1372,6 +1385,7 @@ mod tests {
         assert_eq!(output.matches("#pragma intrinsic(__int2c)").count(), 1);
         assert_eq!(output.matches("__declspec(noreturn) void __fastfail(unsigned int);").count(), 1);
         assert_eq!(output.matches("#pragma intrinsic(__fastfail)").count(), 1);
+        assert_eq!(output.matches("__assume(0);").count(), 1);
     }
 
     #[test]
@@ -1384,6 +1398,7 @@ mod tests {
         assert!(!output.contains("unsigned __int64 __readcr8(void);"));
         assert!(!output.contains("void __int2c(void);"));
         assert!(!output.contains("void __fastfail(unsigned int);"));
+        assert!(!output.contains("__assume(0);"));
     }
 
     #[test]
