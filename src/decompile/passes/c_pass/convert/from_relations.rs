@@ -1635,6 +1635,20 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         let mut callee_params: CalleeParams = HashMap::new();
         let mut callee_ret: HashMap<String, CType> = HashMap::new();
         let mut global_types: HashMap<String, CType> = HashMap::new();
+        let struct_fields: StructFieldTypes =
+            crate::decompile::passes::clight_select::query::extract_struct_definitions(db)
+                .into_iter()
+                .filter_map(|extracted| {
+                    let name = extracted.definition.name?;
+                    let fields = extracted
+                        .definition
+                        .fields
+                        .into_iter()
+                        .filter_map(|field| field.name.map(|name| (name, field.ty)))
+                        .collect();
+                    Some((name, fields))
+                })
+                .collect();
         for decl in tu.decls.iter() {
             match decl {
                 TopLevelDecl::FuncDef(f) => {
@@ -1668,6 +1682,10 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                     types.insert(v.name.clone(), v.ty.clone());
                 }
                 let ret = f.return_type.clone();
+                let types = CastTypes {
+                    variables: &types,
+                    struct_fields: &struct_fields,
+                };
                 f.body = insert_casts_stmt(&f.body, &types, &callee_params, &callee_ret, &ret);
             }
         }
@@ -3720,13 +3738,53 @@ fn coerce_scalar(
     CExpr::Cast(target.clone(), Box::new(e))
 }
 
-// Type of an lvalue, for casting an assignment's RHS to it; handles a plain variable and a deref of a pointer variable, other lvalue forms (field, index) return None and are left untouched.
-fn lvalue_ctype(e: &CExpr, types: &HashMap<String, CType>) -> Option<CType> {
+type StructFieldTypes = HashMap<String, HashMap<String, CType>>;
+
+struct CastTypes<'a> {
+    variables: &'a HashMap<String, CType>,
+    struct_fields: &'a StructFieldTypes,
+}
+
+fn aggregate_field_ctype(
+    aggregate: &CType,
+    field: &str,
+    struct_fields: &StructFieldTypes,
+) -> Option<CType> {
+    match aggregate {
+        CType::Struct(name) | CType::Union(name) => struct_fields.get(name)?.get(field).cloned(),
+        _ => None,
+    }
+}
+
+// A cast is useful exact evidence for a member base even though the cast
+// expression is not itself an assignable lvalue: `((struct S *)p)->field` is
+// the common recovered form.
+fn member_base_ctype(e: &CExpr, types: &CastTypes<'_>) -> Option<CType> {
     match e {
-        CExpr::Var(n) => types.get(n).cloned(),
+        CExpr::Cast(ty, _) => Some(ty.clone()),
+        _ => lvalue_ctype(e, types),
+    }
+}
+
+// Type of an lvalue, for casting an assignment's RHS to it. Field lookup is
+// deliberately limited to statically named recovered structs; index and other
+// expression forms remain unknown rather than triggering broad inference.
+fn lvalue_ctype(e: &CExpr, types: &CastTypes<'_>) -> Option<CType> {
+    match e {
+        CExpr::Var(n) => types.variables.get(n).cloned(),
         CExpr::Paren(inner) => lvalue_ctype(inner, types),
-        CExpr::Unary(UnaryOp::Deref, inner) => match lvalue_ctype(inner, types) {
+        CExpr::Unary(UnaryOp::Deref, inner) => match member_base_ctype(inner, types) {
             Some(CType::Pointer(t, _)) => Some(*t),
+            _ => None,
+        },
+        CExpr::Member(inner, field) => {
+            let aggregate = member_base_ctype(inner, types)?;
+            aggregate_field_ctype(&aggregate, field, types.struct_fields)
+        }
+        CExpr::MemberPtr(inner, field) => match member_base_ctype(inner, types) {
+            Some(CType::Pointer(aggregate, _)) => {
+                aggregate_field_ctype(&aggregate, field, types.struct_fields)
+            }
             _ => None,
         },
         _ => None,
@@ -3738,7 +3796,7 @@ type CalleeParams = HashMap<String, (Vec<CType>, bool, bool)>;
 
 fn insert_casts_expr(
     e: &CExpr,
-    types: &HashMap<String, CType>,
+    types: &CastTypes<'_>,
     callee_params: &CalleeParams,
     callee_ret: &HashMap<String, CType>,
 ) -> CExpr {
@@ -3756,7 +3814,7 @@ fn insert_casts_expr(
                         for (i, a) in nargs.iter_mut().enumerate() {
                             if let Some(pt) = ptypes.get(i) {
                                 let arg = std::mem::replace(a, CExpr::int(0));
-                                *a = coerce_scalar(pt, arg, types, callee_ret);
+                                *a = coerce_scalar(pt, arg, types.variables, callee_ret);
                             }
                         }
                     }
@@ -3769,7 +3827,7 @@ fn insert_casts_expr(
             let nrhs = insert_casts_expr(rhs, types, callee_params, callee_ret);
             if *op == AssignOp::Assign {
                 if let Some(lty) = lvalue_ctype(&nlhs, types) {
-                    let nrhs = coerce_scalar(&lty, nrhs, types, callee_ret);
+                    let nrhs = coerce_scalar(&lty, nrhs, types.variables, callee_ret);
                     return CExpr::Assign(*op, Box::new(nlhs), Box::new(nrhs));
                 }
             }
@@ -3805,7 +3863,7 @@ fn insert_casts_expr(
 
 fn insert_casts_stmt(
     stmt: &CStmt,
-    types: &HashMap<String, CType>,
+    types: &CastTypes<'_>,
     callee_params: &CalleeParams,
     callee_ret: &HashMap<String, CType>,
     ret_type: &CType,
@@ -3848,7 +3906,7 @@ fn insert_casts_stmt(
         CStmt::Sequence(ss) => CStmt::Sequence(ss.iter().map(|s| insert_casts_stmt(s, types, callee_params, callee_ret, ret_type)).collect()),
         CStmt::Return(Some(e)) => {
             let ne = insert_casts_expr(e, types, callee_params, callee_ret);
-            let ne = if matches!(ret_type, CType::Void) { ne } else { coerce_scalar(ret_type, ne, types, callee_ret) };
+            let ne = if matches!(ret_type, CType::Void) { ne } else { coerce_scalar(ret_type, ne, types.variables, callee_ret) };
             CStmt::Return(Some(ne))
         }
         other => other.clone(),
@@ -6504,5 +6562,85 @@ mod arg_evidence_tests {
         assert!(!joined.contains_key("g"), "arity mismatch must fall back to K&R");
         assert!(!joined.contains_key("h"), "poison must fall back to K&R");
         assert_eq!(joined.get("z"), Some(&vec![]), "consistent zero-arity -> (void)");
+    }
+}
+
+#[cfg(test)]
+mod cast_insertion_tests {
+    use super::*;
+
+    fn one_field(field: &str, ty: CType) -> StructFieldTypes {
+        HashMap::from([(
+            "struct_1".to_string(),
+            HashMap::from([(field.to_string(), ty)]),
+        )])
+    }
+
+    #[test]
+    fn member_lvalue_uses_recovered_integer_field_type() {
+        let pointer = CType::ptr(CType::Void);
+        let variables = HashMap::from([
+            ("value".to_string(), CType::Struct("struct_1".to_string())),
+            ("p0".to_string(), pointer),
+        ]);
+        let struct_fields = one_field("ofs_8", CType::long());
+        let types = CastTypes {
+            variables: &variables,
+            struct_fields: &struct_fields,
+        };
+        let expr = CExpr::Assign(
+            AssignOp::Assign,
+            Box::new(CExpr::Member(
+                Box::new(CExpr::Var("value".to_string())),
+                "ofs_8".to_string(),
+            )),
+            Box::new(CExpr::Var("p0".to_string())),
+        );
+
+        let actual = insert_casts_expr(&expr, &types, &HashMap::new(), &HashMap::new());
+
+        let CExpr::Assign(_, _, rhs) = actual else {
+            panic!("assignment was not preserved");
+        };
+        assert_eq!(
+            *rhs,
+            CExpr::Cast(CType::long(), Box::new(CExpr::Var("p0".to_string())))
+        );
+    }
+
+    #[test]
+    fn member_ptr_lvalue_uses_recovered_pointer_field_type() {
+        let pointer = CType::ptr(CType::Void);
+        let struct_pointer = CType::ptr(CType::Struct("struct_1".to_string()));
+        let variables = HashMap::from([
+            ("var_0".to_string(), CType::long()),
+            ("p0".to_string(), CType::long()),
+        ]);
+        let struct_fields = one_field("ofs_8", pointer.clone());
+        let types = CastTypes {
+            variables: &variables,
+            struct_fields: &struct_fields,
+        };
+        let expr = CExpr::Assign(
+            AssignOp::Assign,
+            Box::new(CExpr::MemberPtr(
+                Box::new(CExpr::Cast(
+                    struct_pointer,
+                    Box::new(CExpr::Var("var_0".to_string())),
+                )),
+                "ofs_8".to_string(),
+            )),
+            Box::new(CExpr::Var("p0".to_string())),
+        );
+
+        let actual = insert_casts_expr(&expr, &types, &HashMap::new(), &HashMap::new());
+
+        let CExpr::Assign(_, _, rhs) = actual else {
+            panic!("assignment was not preserved");
+        };
+        assert_eq!(
+            *rhs,
+            CExpr::Cast(pointer, Box::new(CExpr::Var("p0".to_string())))
+        );
     }
 }
