@@ -19,6 +19,8 @@ pub const ALWAYS_NORETURN_FUNCS: &[&str] = &[
     "__chk_fail",
     "__fortify_fail",
     "assert_failed",
+    // Windows fast-fail intrinsic: architecturally terminates through int 29h.
+    "__fastfail",
 ];
 
 /// True for an always-noreturn function (the symbol-only set above).

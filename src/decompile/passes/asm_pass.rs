@@ -1379,6 +1379,19 @@ ascent_par! {
         op_immediate(vector, value, _),
         if *value == 0x2c;
 
+    relation pint29(Address);
+    pint29(addr) <--
+        instruction(addr, _, _, "INT", vector, _, _, _, _, _),
+        op_immediate(vector, value, _),
+        if *value == 0x29;
+
+    // INT 29h has an implicit ECX input on Windows x64. Capstone exposes the
+    // interrupt vector but not that ABI-defined register use, so publish it
+    // explicitly for reaching-def/SSA construction. Without this fact a
+    // preceding `mov ecx, imm` is disconnected from the __fastfail argument
+    // and eventually degrades to the default zero expression.
+    reg_use(addr, Mreg::CX) <-- pint29(addr);
+
     relation ptest(Address, Symbol, Symbol);
     ptest(addr, dst, src) <--
         instruction(addr, _, _, "TEST", src, dst, _, _, _, _);
@@ -2171,6 +2184,18 @@ ascent_par! {
     )) <--
         pint2c(addr),
         builtins("__int2c");
+
+    // Windows AMD64 fast-fail consumes its reason code in ECX and never
+    // returns.  Retain the register value as an ordinary builtin argument so
+    // existing SSA/constant propagation can recover either a literal reason
+    // code or a dynamic value without pattern-matching predecessor text.
+    mach_inst(addr, MachInst::Mbuiltin(
+        "__fastfail".to_string(),
+        vec![BuiltinArg::BA(Mreg::CX)],
+        BuiltinArg::BAInt(0)
+    )) <--
+        pint29(addr),
+        builtins("__fastfail");
 
 
     // No-result builtin: BAInt(0) is the canonical empty-result form (matching cminor_pass) so downstream does not synthesize a dst and render `var = __builtin_unreachable()`.
@@ -9803,7 +9828,8 @@ mod privileged_instruction_tests {
     const CR8_ADDR: Address = 0x1000;
     const INT2C_ADDR: Address = 0x1003;
     const INT2D_ADDR: Address = 0x1005;
-    const RET_ADDR: Address = 0x1007;
+    const INT29_ADDR: Address = 0x1007;
+    const RET_ADDR: Address = 0x1009;
     const NONE: Symbol = "privileged_test_none";
 
     fn on_pipeline_stack(test: impl FnOnce() + Send + 'static) {
@@ -9844,18 +9870,22 @@ mod privileged_instruction_tests {
         const RAX_OP: Symbol = "privileged_test_rax";
         const INT2C_OP: Symbol = "privileged_test_int2c";
         const INT2D_OP: Symbol = "privileged_test_int2d";
+        const INT29_OP: Symbol = "privileged_test_int29";
 
         let mut db = DecompileDB::default();
         db.target_abi = Some(crate::abi::AbiConfig::win64());
         db.rel_push("builtins", ("__readcr8",));
         db.rel_push("builtins", ("__int2c",));
+        db.rel_push("builtins", ("__fastfail",));
         db.rel_push("op_register", (CR8_OP, "CR8"));
         db.rel_push("op_register", (RAX_OP, "RAX"));
         db.rel_push("op_immediate", (INT2C_OP, 0x2c_i64, 0_usize));
         db.rel_push("op_immediate", (INT2D_OP, 0x2d_i64, 0_usize));
+        db.rel_push("op_immediate", (INT29_OP, 0x29_i64, 0_usize));
         db.rel_push("instruction", instruction(CR8_ADDR, 3, "MOV", CR8_OP, RAX_OP));
         db.rel_push("instruction", instruction(INT2C_ADDR, 2, "INT", INT2C_OP, NONE));
         db.rel_push("instruction", instruction(INT2D_ADDR, 2, "INT", INT2D_OP, NONE));
+        db.rel_push("instruction", instruction(INT29_ADDR, 2, "INT", INT29_OP, NONE));
 
         AsmPass.run(&mut db);
 
@@ -9887,6 +9917,20 @@ mod privileged_instruction_tests {
         assert!(!db
             .rel_iter::<(Address, MachInst)>("mach_inst")
             .any(|(addr, _)| *addr == INT2D_ADDR));
+        assert_eq!(
+            db.rel_iter::<(Address, MachInst)>("mach_inst")
+                .filter(|(addr, _)| *addr == INT29_ADDR)
+                .map(|(_, inst)| inst.clone())
+                .collect::<Vec<_>>(),
+            vec![MachInst::Mbuiltin(
+                "__fastfail".to_string(),
+                vec![BuiltinArg::BA(Mreg::CX)],
+                BuiltinArg::BAInt(0),
+            )]
+        );
+        assert!(db
+            .rel_iter::<(Address, Mreg)>("reg_use")
+            .any(|row| *row == (INT29_ADDR, Mreg::CX)));
         });
     }
 

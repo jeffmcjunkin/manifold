@@ -112,10 +112,12 @@ fn clobbers_flags(arch: Arch, mnem: &str) -> bool {
 }
 
 // Control transfers that end the backward walk: deliberately not every transfer, exactly the pre-existing x86 set, which lets the walk cross a conditional branch.
-fn terminates_flag_search(arch: Arch, mnem: &str) -> bool {
+fn terminates_flag_search(arch: Arch, insn: &DecodedInsn) -> bool {
     match arch {
-        Arch::Aarch64 => matches!(mnem, "B" | "BL" | "BLR" | "BR" | "RET" | "BRK"),
-        _ => matches!(mnem, "JMP" | "JMPQ" | "CALL" | "RET" | "HLT" | "INT3"),
+        Arch::Aarch64 => matches!(insn.mnemonic, "B" | "BL" | "BLR" | "BR" | "RET" | "BRK"),
+        _ => matches!(insn.mnemonic, "JMP" | "JMPQ" | "CALL" | "RET" | "HLT" | "INT3")
+            || branch::classify_decoded(arch, insn.mnemonic, insn.interrupt_vector).kind
+                == branch::BranchKind::Trap,
     }
 }
 
@@ -192,7 +194,7 @@ pub fn build_cfg(
             }
         };
 
-        match branch::classify(arch, insn.mnemonic).kind {
+        match branch::classify_decoded(arch, insn.mnemonic, insn.interrupt_vector).kind {
             // x86 spells both direct and register/memory forms "JMP", so this arm still needs the computed-target check; AArch64 splits them into B and BR.
             branch::BranchKind::UncondJump => {
                 if let Some(target) = get_target(insn.address) {
@@ -277,7 +279,7 @@ pub fn build_cfg(
                     break;
                 }
                 if clobbers_flags(arch, prev.mnemonic)
-                    || terminates_flag_search(arch, prev.mnemonic)
+                    || terminates_flag_search(arch, prev)
                 {
                     break;
                 }

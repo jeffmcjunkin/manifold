@@ -181,6 +181,39 @@ impl CoffImage {
             }
         }
     }
+
+    /// Publish exact addresses whose final COFF classification is data-only.
+    /// Executable sections may legitimately contain constants, GUIDs, and
+    /// strings; their named block leaders must not later be promoted into
+    /// inferred functions merely because disassembly happened to decode the
+    /// bytes.  An address authenticated as a function wins over a colocated
+    /// data alias.
+    pub fn load_defined_data_constraints(&self, db: &mut DecompileDB) {
+        let function_entries: HashSet<u64> = self
+            .address_map
+            .functions
+            .iter()
+            .map(|function| function.mapped_entry)
+            .collect();
+        let addresses: BTreeMap<u64, ()> = self
+            .address_map
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                symbol.defined
+                    && matches!(symbol.kind.as_str(), "data" | "tls")
+                    && !function_entries.contains(&symbol.mapped_address)
+            })
+            .map(|symbol| (symbol.mapped_address, ()))
+            .collect();
+        db.rel_set(
+            "coff_defined_data_symbol",
+            addresses
+                .into_keys()
+                .map(|address| (address,))
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1082,6 +1115,8 @@ fn relocation_name(flags: RelocationFlags, kind: RelocationKind, addend: i64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::x86::types::{Address, Symbol};
+    use std::collections::BTreeSet;
 
     fn x64_classifier() -> Capstone {
         Capstone::new()
@@ -1189,6 +1224,58 @@ mod tests {
         bytes
     }
 
+    fn fastfail_fixture() -> Vec<u8> {
+        // Exact instruction shapes emitted by VS2013 for a one-argument stack
+        // cookie failure and a zero-argument range-check failure.
+        let text = [
+            0x48, 0x89, 0x4c, 0x24, 0x08, // mov [rsp+8], rcx
+            0xb9, 0x02, 0x00, 0x00, 0x00, // mov ecx, 2
+            0xcd, 0x29, // int 29h
+            0xb9, 0x08, 0x00, 0x00, 0x00, // mov ecx, 8
+            0xcd, 0x29, // int 29h
+        ];
+        const SYMBOL_COUNT: u32 = 2;
+        let raw_offset = 20 + 40;
+        let symbol_offset = raw_offset + text.len() as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&object::pe::IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&symbol_offset.to_le_bytes());
+        bytes.extend_from_slice(&SYMBOL_COUNT.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        push_section_header(
+            &mut bytes,
+            b".text",
+            text.len() as u32,
+            raw_offset,
+            0x6000_0020,
+        );
+        bytes.extend_from_slice(&text);
+        let function_type =
+            object::pe::IMAGE_SYM_DTYPE_FUNCTION << object::pe::IMAGE_SYM_DTYPE_SHIFT;
+        push_symbol(
+            &mut bytes,
+            b"ff_two",
+            0,
+            1,
+            function_type,
+            object::pe::IMAGE_SYM_CLASS_EXTERNAL,
+        );
+        push_symbol(
+            &mut bytes,
+            b"ff_eight",
+            12,
+            1,
+            function_type,
+            object::pe::IMAGE_SYM_CLASS_EXTERNAL,
+        );
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn complete_code_classifier_accepts_real_function_terminators() {
         let classifier = x64_classifier();
@@ -1245,6 +1332,99 @@ mod tests {
         assert_eq!(kinds["guid"], "data");
         assert_eq!(kinds["rdata"], "data");
         assert_eq!(kinds["local"], "data");
+
+        let mut db = DecompileDB::default();
+        image.load_defined_data_constraints(&mut db);
+        let constrained: BTreeSet<u64> = db
+            .rel_iter::<(Address,)>("coff_defined_data_symbol")
+            .map(|(address,)| *address)
+            .collect();
+        let good_fn = functions["good_fn"].mapped_entry;
+        let typed_fn = functions["typed_fn"].mapped_entry;
+        assert!(!constrained.contains(&good_fn));
+        assert!(!constrained.contains(&typed_fn));
+        for name in ["jump_tbl", "guid", "rdata", "local"] {
+            let address = image
+                .address_map
+                .symbols
+                .iter()
+                .find(|symbol| symbol.original_name == name)
+                .unwrap()
+                .mapped_address;
+            assert!(constrained.contains(&address), "{name} must remain data-only");
+        }
+    }
+
+    #[test]
+    fn data_only_code_section_symbols_never_become_inferred_functions() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "manifold-coff-data-only-{}-{}.obj",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::write(&path, classifier_fixture()).unwrap();
+
+        let mut db = DecompileDB::default();
+        super::super::load_from_binary(&mut db, &path);
+        let _ = std::fs::remove_file(&path);
+
+        let entries: BTreeSet<&str> = db
+            .rel_iter::<(Symbol, Address)>("func_entry")
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(entries.contains("coff_fn_good_fn"));
+        assert!(entries.contains("coff_fn_typed_fn"));
+        for name in [
+            "coff_data_jump_tbl",
+            "coff_data_guid",
+            "coff_data_rdata",
+            "coff_data_local",
+        ] {
+            assert!(!entries.contains(name), "{name} was promoted to a function");
+        }
+    }
+
+    #[test]
+    fn fastfail_reason_codes_reach_independent_noreturn_intrinsics() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        std::thread::Builder::new()
+            .name("coff-fastfail-pipeline-test".to_string())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let path = std::env::temp_dir().join(format!(
+                    "manifold-coff-fastfail-{}-{}.obj",
+                    std::process::id(),
+                    NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
+                ));
+                std::fs::write(&path, fastfail_fixture()).unwrap();
+
+                let mut db = DecompileDB::default();
+                super::super::load_from_binary(&mut db, &path);
+                db.run_pipeline(&path, false, false);
+                let _ = std::fs::remove_file(&path);
+
+                let tu = db
+                    .cast_optimized_translation_unit
+                    .as_ref()
+                    .expect("fastfail fixture must produce C");
+                let output = crate::decompile::passes::c_pass::print_translation_unit_for_format(
+                    tu,
+                    crate::abi::BinaryFormat::Coff,
+                );
+                assert!(output.contains("coff_fn_ff_two("), "{output}");
+                assert!(output.contains("coff_fn_ff_eight("), "{output}");
+                assert!(output.contains("__fastfail(2"), "{output}");
+                assert!(output.contains("__fastfail(8"), "{output}");
+                assert_eq!(output.matches("#pragma intrinsic(__fastfail)").count(), 1);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

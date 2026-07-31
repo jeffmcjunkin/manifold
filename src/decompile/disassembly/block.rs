@@ -35,7 +35,10 @@ pub fn build_blocks(db: &mut DecompileDB, insns: &[DecodedInsn], extra_leaders: 
         insns.iter().enumerate().map(|(i, d)| (d.address, i)).collect();
 
     for (i, insn) in insns.iter().enumerate() {
-        if branch::classify(arch, insn.mnemonic).kind.is_control_transfer() {
+        if branch::classify_decoded(arch, insn.mnemonic, insn.interrupt_vector)
+            .kind
+            .is_control_transfer()
+        {
             if i + 1 < insns.len() {
                 let next_addr = insns[i + 1].address;
                 if insn.address + insn.size as u64 == next_addr {

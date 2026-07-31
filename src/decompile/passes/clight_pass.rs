@@ -607,7 +607,8 @@ ascent_par! {
         let effective_name = effective_name_init,
         let effective_dst = effective_dst_init,
         let converted_args = clight_builtin_args_with_multi_types(&effective_args_init, &var_types),
-        let stmt = ClightStmt::Scall(effective_dst, ClightExpr::EvarSymbol(effective_name, default_void_ptr_type()), converted_args);
+        let callee_type = builtin_callee_type(&effective_name),
+        let stmt = ClightStmt::Scall(effective_dst, ClightExpr::EvarSymbol(effective_name, callee_type), converted_args);
 
     // Goto-chain threading: a forwarding block is a node whose whole statement is a lone unconditional jump, excluding entry/loop/switch anchors.
     #[local] relation fwd(Node, Node);
@@ -1312,6 +1313,22 @@ pub(crate) fn default_void_ptr_type() -> ClightType {
     pointer_to(ClightType::Tvoid)
 }
 
+/// Give ABI-significant compiler intrinsics an actual callable Clight type.
+/// Most historical builtins retain the existing untyped representation; the
+/// fast-fail intrinsic is special because its implicit ECX input and void,
+/// noreturn result are architectural semantics rather than a guessed C call.
+fn builtin_callee_type(name: &str) -> ClightType {
+    if name == "__fastfail" {
+        clight_function_pointer_type(&Signature {
+            sig_args: Arc::new(vec![XType::Xint]),
+            sig_res: XType::Xvoid,
+            sig_cc: CallConv::default(),
+        })
+    } else {
+        default_void_ptr_type()
+    }
+}
+
 fn extract_vars_from_csharp_expr(expr: &CsharpminorExpr, vars: &mut Vec<RTLReg>) {
     match expr {
         CsharpminorExpr::Evar(v) => {
@@ -1716,9 +1733,10 @@ pub(crate) fn convert_csharp_stmt_to_clight(
             let vars_used = extract_vars_from_builtin_args(&effective_args);
             let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
             let converted_args = clight_builtin_args_with_multi_types(&effective_args, &var_types);
+            let callee_type = builtin_callee_type(&effective_name);
             ClightStmt::Scall(
                 dst_ident,
-                ClightExpr::EvarSymbol(effective_name, default_void_ptr_type()),
+                ClightExpr::EvarSymbol(effective_name, callee_type),
                 converted_args,
             )
         }

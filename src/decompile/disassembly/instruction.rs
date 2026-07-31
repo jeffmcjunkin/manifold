@@ -36,6 +36,9 @@ pub struct DecodedInsn {
     pub size: usize,
     pub mnemonic: &'static str,
     pub op_str: &'static str,
+    /// Structured x86 software-interrupt vector.  Kept out of `op_str` so
+    /// control-flow consumers never have to parse Capstone's display syntax.
+    pub interrupt_vector: Option<u8>,
 }
 
 // Disassemble executable sections into the instruction/operand/register relations, dispatching on target arch.
@@ -161,6 +164,7 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
 
             let mut op_ids: [&'static str; 4] = [NO_OP; 4];
             let num_operands = ops.len();
+            let mut interrupt_vector = None;
 
             let is_nop = mnemonic == "NOP" || mnemonic == "VZEROUPPER" || mnemonic == "VZEROALL";
 
@@ -199,6 +203,9 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
                         let id = alloc_op_id();
                         op_immediates.push((id, val, 0));
                         op_ids[i] = id;
+                        if mnemonic == "INT" && i == 0 {
+                            interrupt_vector = u8::try_from(val).ok();
+                        }
                     }
                     X86OperandType::Mem(mem) => {
                         let id = alloc_op_id();
@@ -432,6 +439,7 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
                 size,
                 mnemonic,
                 op_str,
+                interrupt_vector,
             });
         }
     }

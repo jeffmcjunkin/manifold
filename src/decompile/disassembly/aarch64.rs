@@ -265,7 +265,13 @@ pub fn disassemble_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
                 insn.op_str().unwrap_or("").to_ascii_uppercase().into_boxed_str(),
             );
 
-            decoded.push(DecodedInsn { address: addr, size, mnemonic, op_str });
+            decoded.push(DecodedInsn {
+                address: addr,
+                size,
+                mnemonic,
+                op_str,
+                interrupt_vector: None,
+            });
         }
     }
 

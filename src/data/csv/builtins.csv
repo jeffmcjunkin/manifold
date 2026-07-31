@@ -24,6 +24,7 @@ __builtin_nop
 __builtin_unreachable
 __readcr8
 __int2c
+__fastfail
 __compcert_i64_umulh
 __compcert_i64_smulh
 __compcert_i64_sdiv

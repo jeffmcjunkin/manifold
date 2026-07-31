@@ -59,6 +59,24 @@ pub fn classify(arch: Arch, mnem: &str) -> BranchInfo {
     }
 }
 
+/// Classify one decoded instruction using operand semantics that cannot be
+/// represented by the mnemonic alone.  Windows AMD64 fast-fail (`int 29h`)
+/// never returns, while other software interrupts such as checked-build
+/// `int 2ch` deliberately retain their existing fallthrough behavior.
+pub fn classify_decoded(
+    arch: Arch,
+    mnem: &str,
+    interrupt_vector: Option<u8>,
+) -> BranchInfo {
+    if matches!(arch, Arch::X86_64 | Arch::X86_32)
+        && mnem == "INT"
+        && interrupt_vector == Some(0x29)
+    {
+        return info(BranchKind::Trap, None);
+    }
+    classify(arch, mnem)
+}
+
 fn info(kind: BranchKind, target_op: Option<usize>) -> BranchInfo {
     BranchInfo { kind, target_op }
 }
@@ -162,5 +180,20 @@ mod tests {
             assert!(k.falls_through());
             assert!(k.is_control_transfer());
         }
+    }
+    #[test]
+    fn only_fastfail_interrupt_is_terminal() {
+        assert_eq!(
+            classify_decoded(Arch::X86_64, "INT", Some(0x29)).kind,
+            BranchKind::Trap,
+        );
+        assert_eq!(
+            classify_decoded(Arch::X86_64, "INT", Some(0x2c)).kind,
+            BranchKind::None,
+        );
+        assert_eq!(
+            classify_decoded(Arch::X86_64, "INT", None).kind,
+            BranchKind::None,
+        );
     }
 }

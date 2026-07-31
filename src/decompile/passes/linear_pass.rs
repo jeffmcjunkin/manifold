@@ -702,6 +702,28 @@ pub(crate) fn has_fallthrough(inst: &LTLInst, src: Node) -> bool {
         LTLInst::Lbranch(Either::Left(_)) => false,
         LTLInst::Lcond(..) | LTLInst::Lcall(..) => true,
         LTLInst::Ljumptable(..) | LTLInst::Ltailcall(..) | LTLInst::Lreturn => false,
+        LTLInst::Lbuiltin(name, ..) if name == "__fastfail" => false,
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod fastfail_tests {
+    use super::*;
+
+    #[test]
+    fn fastfail_builtin_never_has_fallthrough() {
+        assert!(!has_fallthrough(
+            &LTLInst::Lbuiltin(
+                "__fastfail".to_string(),
+                vec![BuiltinArg::BA(Mreg::CX)],
+                BuiltinArg::BAInt(0),
+            ),
+            0x1000,
+        ));
+        assert!(has_fallthrough(
+            &LTLInst::Lbuiltin("__int2c".to_string(), vec![], BuiltinArg::BAInt(0)),
+            0x1000,
+        ));
     }
 }

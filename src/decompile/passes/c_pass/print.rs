@@ -824,6 +824,9 @@ impl Printer {
         let emit_int2c = self.config.integer_model == IntegerModel::MsvcLlp64
             && invoked_names.contains("__int2c")
             && !has_local_definition("__int2c");
+        let emit_fastfail = self.config.integer_model == IntegerModel::MsvcLlp64
+            && invoked_names.contains("__fastfail")
+            && !has_local_definition("__fastfail");
         if emit_readcr8 {
             self.writeln("unsigned __int64 __readcr8(void);");
             self.writeln("#pragma intrinsic(__readcr8)");
@@ -832,7 +835,11 @@ impl Printer {
             self.writeln("void __int2c(void);");
             self.writeln("#pragma intrinsic(__int2c)");
         }
-        if emit_readcr8 || emit_int2c {
+        if emit_fastfail {
+            self.writeln("__declspec(noreturn) void __fastfail(unsigned int);");
+            self.writeln("#pragma intrinsic(__fastfail)");
+        }
+        if emit_readcr8 || emit_int2c || emit_fastfail {
             self.newline();
         }
 
@@ -866,7 +873,8 @@ impl Printer {
             let decl = &tu.decls[i];
             if matches!(decl, TopLevelDecl::FuncDecl(f)
                 if (emit_readcr8 && f.name == "__readcr8")
-                    || (emit_int2c && f.name == "__int2c"))
+                    || (emit_int2c && f.name == "__int2c")
+                    || (emit_fastfail && f.name == "__fastfail"))
             {
                 continue;
             }
@@ -1349,29 +1357,33 @@ mod tests {
         );
         assert!(output.contains("void __int2c(void);\n#pragma intrinsic(__int2c)\n"));
         assert!(!output.contains("__readcr8"));
+        assert!(!output.contains("__fastfail"));
     }
 
     #[test]
-    fn coff_emits_exact_cr8_and_int2c_intrinsic_preamble_once() {
+    fn coff_emits_exact_privileged_intrinsic_preamble_once() {
         let output = print_translation_unit_for_format(
-            &translation_unit_calling(&["__readcr8", "__int2c"]),
+            &translation_unit_calling(&["__readcr8", "__int2c", "__fastfail"]),
             crate::abi::BinaryFormat::Coff,
         );
         assert_eq!(output.matches("unsigned __int64 __readcr8(void);").count(), 1);
         assert_eq!(output.matches("#pragma intrinsic(__readcr8)").count(), 1);
         assert_eq!(output.matches("void __int2c(void);").count(), 1);
         assert_eq!(output.matches("#pragma intrinsic(__int2c)").count(), 1);
+        assert_eq!(output.matches("__declspec(noreturn) void __fastfail(unsigned int);").count(), 1);
+        assert_eq!(output.matches("#pragma intrinsic(__fastfail)").count(), 1);
     }
 
     #[test]
     fn privileged_intrinsic_preamble_is_msvc_only() {
         let output = print_translation_unit_for_format(
-            &translation_unit_calling(&["__readcr8", "__int2c"]),
+            &translation_unit_calling(&["__readcr8", "__int2c", "__fastfail"]),
             crate::abi::BinaryFormat::Elf,
         );
         assert!(!output.contains("#pragma intrinsic"));
         assert!(!output.contains("unsigned __int64 __readcr8(void);"));
         assert!(!output.contains("void __int2c(void);"));
+        assert!(!output.contains("void __fastfail(unsigned int);"));
     }
 
     #[test]

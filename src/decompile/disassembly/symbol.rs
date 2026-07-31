@@ -205,6 +205,7 @@ pub fn load_symbols(
 
     if let Some(image) = coff_image {
         image.load_synthetic_symbols(db);
+        image.load_defined_data_constraints(db);
     }
 
     db.rel_set("symbol_size", db.rel_iter::<(Address, usize, Symbol, Symbol, Symbol, usize, Symbol, usize, Symbol)>("symbol_table")

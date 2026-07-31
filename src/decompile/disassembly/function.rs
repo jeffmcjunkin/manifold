@@ -10,6 +10,13 @@ pub fn infer_functions(db: &mut DecompileDB, insns: &[DecodedInsn]) {
 
     // Collect function entry points from FUNC symbols, call targets, and main
     let mut entries: BTreeSet<u64> = BTreeSet::new();
+    // Only the native COFF loader publishes this relation, after its raw-type
+    // and complete-code classifier have reached a final decision.  These are
+    // true data-only addresses even if their section is executable.
+    let coff_data_only_entries: HashSet<u64> = db
+        .rel_iter::<(Address,)>("coff_defined_data_symbol")
+        .map(|(address,)| *address)
+        .collect();
 
     for (addr, _size, sym_type, _bind, sect_type, ..) in db.rel_iter::<(Address, usize, Symbol, Symbol, Symbol, usize, Symbol, usize, Symbol)>("symbol_table") {
         if *sym_type == "FUNC" && *sect_type != "UNDEF" {
@@ -96,6 +103,12 @@ pub fn infer_functions(db: &mut DecompileDB, insns: &[DecodedInsn]) {
             log::debug!("Function inference: seeded {} entries from cross-function tail-call jmps", n);
         }
     }
+
+    // Symbol type is stronger evidence than prologue-like data bytes, an
+    // orphan block, or a coincidental direct-transfer decode.  Legitimate
+    // null-type COFF functions are absent from this set because the loader
+    // authenticates and promotes them before publishing the constraint.
+    entries.retain(|entry| !coff_data_only_entries.contains(entry));
 
     // Build func_entry and ddisasm_function_entry relations
     let mut func_entry: Vec<(&'static str, u64)> = Vec::new();
@@ -234,6 +247,7 @@ pub fn infer_functions(db: &mut DecompileDB, insns: &[DecodedInsn]) {
             if assigned_blocks.contains(&block_addr) { continue; }
             if has_pred.contains(&block_addr) { continue; }
             if plt_addrs.contains(&block_addr) { continue; }
+            if coff_data_only_entries.contains(&block_addr) { continue; }
             // Do not promote a block strictly inside a known FUNC-symbol range to its own function: it is a mid-body block lacking a predecessor only because unwinder edges are unmodelled.
             if func_ranges.iter().any(|(start, end)| block_addr > *start && block_addr < *end) { continue; }
             let is_padding = db.rel_iter::<(Address, usize, &'static str, &'static str, Symbol, Symbol, Symbol, Symbol, usize, usize)>("unrefinedinstruction")
@@ -361,8 +375,9 @@ pub fn detect_prologue_entries(insns: &[DecodedInsn]) -> BTreeSet<u64> {
     let mut entries = BTreeSet::new();
     if insns.is_empty() { return entries; }
 
-    let is_terminal = |m: &str| -> bool {
-        matches!(m, "RET" | "JMP" | "HLT" | "UD2" | "INT3")
+    let is_terminal = |insn: &DecodedInsn| -> bool {
+        matches!(insn.mnemonic, "RET" | "JMP" | "HLT" | "UD2" | "INT3")
+            || (insn.mnemonic == "INT" && insn.interrupt_vector == Some(0x29))
     };
 
     let is_padding = |m: &str| -> bool {
@@ -388,9 +403,10 @@ pub fn detect_prologue_entries(insns: &[DecodedInsn]) -> BTreeSet<u64> {
             j -= 1;
         }
 
-        let prev = insns[j].mnemonic;
         // A terminal predecessor bounds any prologue; for ENDBR64 a CALL predecessor (no-return call) also bounds a fresh function, excluding EH pads.
-        if (is_terminal(prev) || (endbr && prev == "CALL")) && !is_eh_landing_pad_at(insns, i) {
+        if (is_terminal(&insns[j]) || (endbr && insns[j].mnemonic == "CALL"))
+            && !is_eh_landing_pad_at(insns, i)
+        {
             entries.insert(insns[i].address);
         }
     }
@@ -445,15 +461,17 @@ fn seed_tailcall_entries(
 ) -> Vec<u64> {
     if insns.is_empty() { return Vec::new(); }
 
-    let is_terminal = |m: &str| -> bool {
-        matches!(m, "RET" | "JMP" | "HLT" | "UD2" | "INT3")
+    let is_terminal = |insn: &DecodedInsn| -> bool {
+        matches!(insn.mnemonic, "RET" | "JMP" | "HLT" | "UD2" | "INT3")
+            || (insn.mnemonic == "INT" && insn.interrupt_vector == Some(0x29))
     };
     let is_padding = |m: &str| -> bool {
         matches!(m, "NOP" | "INT3")
     };
-    let is_uncond_terminal = |m: &str| -> bool {
+    let is_uncond_terminal = |insn: &DecodedInsn| -> bool {
         // Instructions after which control does NOT fall through to the next instruction.
-        matches!(m, "RET" | "JMP" | "HLT" | "UD2")
+        matches!(insn.mnemonic, "RET" | "JMP" | "HLT" | "UD2")
+            || (insn.mnemonic == "INT" && insn.interrupt_vector == Some(0x29))
     };
     let is_cond_jump = |m: &str| -> bool {
         matches!(m,
@@ -485,7 +503,7 @@ fn seed_tailcall_entries(
     for (k, insn) in insns.iter().enumerate() {
         let m = insn.mnemonic;
         // Fall-through to the next instruction unless this is an unconditional terminal.
-        if !is_uncond_terminal(m) {
+        if !is_uncond_terminal(insn) {
             if let Some(next) = insns.get(k + 1) {
                 uf.union(insn.address, next.address);
             }
@@ -526,7 +544,7 @@ fn seed_tailcall_entries(
         while j > 0 && is_padding(insns[j].mnemonic) {
             j -= 1;
         }
-        is_terminal(insns[j].mnemonic)
+        is_terminal(&insns[j])
     };
 
     let block_leaders: HashSet<u64> = db.rel_iter::<(Address,)>("block").map(|(a,)| *a).collect();
