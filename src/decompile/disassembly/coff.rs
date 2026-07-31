@@ -10,9 +10,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use capstone::prelude::*;
+use object::read::coff::ImageSymbol as _;
 use object::{
     Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags,
-    RelocationKind, RelocationTarget, SectionIndex, SectionKind, SymbolKind, SymbolSection,
+    RelocationKind, RelocationTarget, SectionIndex, SectionKind, SymbolIndex, SymbolKind,
+    SymbolSection,
 };
 use serde::Serialize;
 
@@ -199,6 +202,9 @@ struct SymbolPlan {
     section: SymbolSection,
     original_address: u64,
     mapped_address: u64,
+    raw_type: u16,
+    storage_class: u8,
+    authenticated_end: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +291,8 @@ fn plan_image(obj: &object::File<'_>, data: &[u8]) -> Result<(Vec<BytePatch>, Co
     for sym in obj.symbols() {
         let original_name = sym.name().unwrap_or("").to_string();
         let section = sym.section();
+        let (raw_type, storage_class) = raw_coff_symbol_fields(obj, sym.index())
+            .ok_or_else(|| format!("missing raw COFF symbol {}", sym.index().0))?;
         let mapped_address = match section {
             SymbolSection::Section(idx) => {
                 let sec = section_by_index
@@ -308,9 +316,21 @@ fn plan_image(obj: &object::File<'_>, data: &[u8]) -> Result<(Vec<BytePatch>, Co
                 section,
                 original_address: sym.address(),
                 mapped_address,
+                raw_type,
+                storage_class,
+                authenticated_end: None,
             },
         );
     }
+
+    // Ghidra's COFF exporter occasionally emits a real, externally visible
+    // function with the null COFF type.  `object` consequently reports it as
+    // Data even when it occupies executable code.  Executable sections in the
+    // same objects also contain externally named strings, GUIDs, and tables,
+    // so section membership alone is not evidence of a function.  Promote only
+    // a null-type EXTERNAL whose complete linkage-bounded byte interval is a
+    // valid instruction stream ending at an architectural function terminator.
+    promote_authenticated_untyped_functions(obj, &section_by_index, &mut symbols)?;
 
     // Classify undefined symbols from both their COFF type and their use.  Some
     // producers omit the function type, but an E8/E9 REL32 field is definitive.
@@ -438,7 +458,7 @@ fn plan_image(obj: &object::File<'_>, data: &[u8]) -> Result<(Vec<BytePatch>, Co
         provider_by_identity.insert((address, original), candidate);
     }
 
-    let mut function_rows: Vec<(usize, u64, String, String)> = Vec::new();
+    let mut function_rows: Vec<(usize, u64, String, String, Option<u64>)> = Vec::new();
     for sym in symbols.values() {
         let SymbolSection::Section(section_index) = sym.section else { continue };
         if sym.kind != SymbolKind::Text || sym.original_name.is_empty() {
@@ -453,22 +473,25 @@ fn plan_image(obj: &object::File<'_>, data: &[u8]) -> Result<(Vec<BytePatch>, Co
             sym.mapped_address,
             sym.original_name.clone(),
             provider,
+            sym.authenticated_end,
         ));
     }
     function_rows.sort();
 
     let mut functions = Vec::new();
     let mut function_sizes = HashMap::new();
-    for (section_index, mapped_entry, original_name, provider_name) in &function_rows {
+    for (section_index, mapped_entry, original_name, provider_name, authenticated_end) in &function_rows {
         let sec = section_by_index
             .get(section_index)
             .ok_or_else(|| format!("missing function section {section_index}"))?;
-        let next = function_rows
-            .iter()
-            .filter(|(idx, addr, _, _)| idx == section_index && addr > mapped_entry)
-            .map(|(_, addr, _, _)| *addr)
-            .min()
-            .unwrap_or_else(|| sec.mapped_address.saturating_add(sec.size));
+        let next = authenticated_end.unwrap_or_else(|| {
+            function_rows
+                .iter()
+                .filter(|(idx, addr, _, _, _)| idx == section_index && addr > mapped_entry)
+                .map(|(_, addr, _, _, _)| *addr)
+                .min()
+                .unwrap_or_else(|| sec.mapped_address.saturating_add(sec.size))
+        });
         let (mapped_end, size) = infer_function_extent(
             sec.mapped_address,
             sec.size,
@@ -697,6 +720,154 @@ fn plan_image(obj: &object::File<'_>, data: &[u8]) -> Result<(Vec<BytePatch>, Co
     ))
 }
 
+fn raw_coff_symbol_fields(
+    obj: &object::File<'_>,
+    index: SymbolIndex,
+) -> Option<(u16, u8)> {
+    match obj {
+        object::File::Coff(file) => file
+            .coff_symbol_table()
+            .symbol(index)
+            .ok()
+            .map(|symbol| (symbol.typ(), symbol.storage_class())),
+        object::File::CoffBig(file) => file
+            .coff_symbol_table()
+            .symbol(index)
+            .ok()
+            .map(|symbol| (symbol.typ(), symbol.storage_class())),
+        _ => None,
+    }
+}
+
+fn promote_authenticated_untyped_functions(
+    obj: &object::File<'_>,
+    sections: &HashMap<usize, &SectionPlan>,
+    symbols: &mut HashMap<usize, SymbolPlan>,
+) -> Result<(), String> {
+    // A linkage symbol is an authoritative upper bound even when it denotes
+    // data.  This prevents a candidate function from consuming an adjacent
+    // string/table merely because both were exported into one code section.
+    let mut linkage_boundaries: HashMap<usize, Vec<u64>> = HashMap::new();
+    for symbol in symbols.values() {
+        if symbol.storage_class != object::pe::IMAGE_SYM_CLASS_EXTERNAL {
+            continue;
+        }
+        let SymbolSection::Section(section_index) = symbol.section else { continue };
+        let Some(section) = sections.get(&section_index.0) else { continue };
+        let Some(offset) = symbol.original_address.checked_sub(section.original_address) else {
+            continue;
+        };
+        if offset <= section.size {
+            linkage_boundaries
+                .entry(section_index.0)
+                .or_default()
+                .push(offset);
+        }
+    }
+    for boundaries in linkage_boundaries.values_mut() {
+        boundaries.sort_unstable();
+        boundaries.dedup();
+    }
+
+    let candidates: Vec<usize> = symbols
+        .iter()
+        .filter_map(|(index, symbol)| {
+            let SymbolSection::Section(section_index) = symbol.section else { return None };
+            let section = sections.get(&section_index.0)?;
+            (symbol.kind == SymbolKind::Data
+                && symbol.raw_type == object::pe::IMAGE_SYM_TYPE_NULL
+                && symbol.storage_class == object::pe::IMAGE_SYM_CLASS_EXTERNAL
+                && section.kind == SectionKind::Text
+                && !symbol.original_name.is_empty())
+                .then_some(*index)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let capstone = Capstone::new()
+        .x86()
+        .mode(arch::x86::ArchMode::Mode64)
+        .syntax(arch::x86::ArchSyntax::Intel)
+        .detail(false)
+        .build()
+        .map_err(|e| format!("failed to initialize COFF function classifier: {e}"))?;
+
+    for index in candidates {
+        let symbol = symbols
+            .get(&index)
+            .ok_or_else(|| format!("missing COFF function candidate {index}"))?;
+        let SymbolSection::Section(section_index) = symbol.section else { continue };
+        let section = sections
+            .get(&section_index.0)
+            .ok_or_else(|| format!("missing candidate section {}", section_index.0))?;
+        let start = symbol
+            .original_address
+            .checked_sub(section.original_address)
+            .ok_or_else(|| format!("candidate {:?} lies before its section", symbol.original_name))?;
+        if start >= section.size {
+            continue;
+        }
+        let end = linkage_boundaries
+            .get(&section_index.0)
+            .and_then(|boundaries| {
+                let next = boundaries.partition_point(|offset| *offset <= start);
+                boundaries.get(next).copied()
+            })
+            .unwrap_or(section.size);
+        if end <= start || end > section.size {
+            continue;
+        }
+
+        let object_section = obj
+            .section_by_index(SectionIndex(section_index.0))
+            .map_err(|e| format!("failed to read candidate section {}: {e}", section_index.0))?;
+        let data = object_section
+            .data()
+            .map_err(|e| format!("failed to read candidate section bytes: {e}"))?;
+        let Some(body) = data.get(start as usize..end as usize) else { continue };
+        if !is_complete_function_code(&capstone, body) {
+            continue;
+        }
+
+        let symbol = symbols
+            .get_mut(&index)
+            .ok_or_else(|| format!("missing COFF function candidate {index}"))?;
+        symbol.kind = SymbolKind::Text;
+        symbol.authenticated_end = Some(
+            section
+                .mapped_address
+                .checked_add(end)
+                .ok_or("authenticated COFF function extent overflow")?,
+        );
+    }
+    Ok(())
+}
+
+fn is_complete_function_code(capstone: &Capstone, bytes: &[u8]) -> bool {
+    let Ok(instructions) = capstone.disasm_all(bytes, 0) else {
+        return false;
+    };
+    let decoded = instructions.as_ref();
+    let (Some(first), Some(last)) = (decoded.first(), decoded.last()) else {
+        return false;
+    };
+    if first.address() != 0
+        || last.address().checked_add(last.len() as u64) != Some(bytes.len() as u64)
+    {
+        return false;
+    }
+
+    match last.mnemonic().unwrap_or("").to_ascii_lowercase().as_str() {
+        "ret" | "retf" | "jmp" | "ud2" => true,
+        // 0x29 is the Windows fast-fail interrupt.  Other software interrupts
+        // are not accepted as function-boundary evidence.
+        "int" => last.op_str().map_or(false, |operand| operand.trim() == "0x29"),
+        _ => false,
+    }
+}
+
 fn merge_external_kind(
     kinds: &mut BTreeMap<String, CoffExternalKind>,
     name: &str,
@@ -912,6 +1083,170 @@ fn relocation_name(flags: RelocationFlags, kind: RelocationKind, addend: i64) ->
 mod tests {
     use super::*;
 
+    fn x64_classifier() -> Capstone {
+        Capstone::new()
+            .x86()
+            .mode(arch::x86::ArchMode::Mode64)
+            .syntax(arch::x86::ArchSyntax::Intel)
+            .detail(false)
+            .build()
+            .unwrap()
+    }
+
+    fn push_section_header(
+        bytes: &mut Vec<u8>,
+        name: &[u8],
+        size: u32,
+        raw_offset: u32,
+        characteristics: u32,
+    ) {
+        let mut padded_name = [0u8; 8];
+        padded_name[..name.len()].copy_from_slice(name);
+        bytes.extend_from_slice(&padded_name);
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // virtual size
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // virtual address
+        bytes.extend_from_slice(&size.to_le_bytes());
+        bytes.extend_from_slice(&raw_offset.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // relocations
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // line numbers
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&characteristics.to_le_bytes());
+    }
+
+    fn push_symbol(
+        bytes: &mut Vec<u8>,
+        name: &[u8],
+        value: u32,
+        section: i16,
+        typ: u16,
+        storage_class: u8,
+    ) {
+        let mut padded_name = [0u8; 8];
+        padded_name[..name.len()].copy_from_slice(name);
+        bytes.extend_from_slice(&padded_name);
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes.extend_from_slice(&section.to_le_bytes());
+        bytes.extend_from_slice(&typ.to_le_bytes());
+        bytes.push(storage_class);
+        bytes.push(0); // auxiliary symbols
+    }
+
+    fn classifier_fixture() -> Vec<u8> {
+        // One complete untyped function, followed by an externally named jump
+        // table, a normal typed function, and a local label.  PAGE contains the
+        // exact 16 bytes of the real GlobalLoggerGuid false-positive case.
+        let text = [
+            0xb8, 1, 0, 0, 0, 0xc3, // good_fn: mov eax, 1; ret
+            0, 0, 0, 0, 0, 0, 0, 0, // jump_tbl: data, no terminator
+            0xc3, // typed_fn
+            0xc3, // local label (not EXTERNAL)
+        ];
+        let page_guid = [
+            0xbc, 0x8a, 0x90, 0xe8, 0x84, 0xaa, 0xd2, 0x11,
+            0x9a, 0x93, 0x00, 0x80, 0x5f, 0x85, 0xd7, 0xc6,
+        ];
+        let rdata = [0u8; 8];
+
+        const SECTION_COUNT: u16 = 3;
+        const SYMBOL_COUNT: u32 = 6;
+        let raw_start = 20 + SECTION_COUNT as u32 * 40;
+        let text_offset = raw_start;
+        let page_offset = text_offset + text.len() as u32;
+        let rdata_offset = page_offset + page_guid.len() as u32;
+        let symbol_offset = rdata_offset + rdata.len() as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&object::pe::IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        bytes.extend_from_slice(&SECTION_COUNT.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+        bytes.extend_from_slice(&symbol_offset.to_le_bytes());
+        bytes.extend_from_slice(&SYMBOL_COUNT.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // optional header
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // characteristics
+
+        push_section_header(&mut bytes, b".text", text.len() as u32, text_offset, 0x6000_0020);
+        push_section_header(&mut bytes, b"PAGE", page_guid.len() as u32, page_offset, 0x6000_0020);
+        push_section_header(&mut bytes, b".rdata", rdata.len() as u32, rdata_offset, 0x4000_0040);
+        bytes.extend_from_slice(&text);
+        bytes.extend_from_slice(&page_guid);
+        bytes.extend_from_slice(&rdata);
+
+        push_symbol(&mut bytes, b"good_fn", 0, 1, 0, object::pe::IMAGE_SYM_CLASS_EXTERNAL);
+        push_symbol(&mut bytes, b"jump_tbl", 6, 1, 0, object::pe::IMAGE_SYM_CLASS_EXTERNAL);
+        push_symbol(
+            &mut bytes,
+            b"typed_fn",
+            14,
+            1,
+            object::pe::IMAGE_SYM_DTYPE_FUNCTION << object::pe::IMAGE_SYM_DTYPE_SHIFT,
+            object::pe::IMAGE_SYM_CLASS_EXTERNAL,
+        );
+        push_symbol(&mut bytes, b"local", 15, 1, 0, object::pe::IMAGE_SYM_CLASS_STATIC);
+        push_symbol(&mut bytes, b"guid", 0, 2, 0, object::pe::IMAGE_SYM_CLASS_EXTERNAL);
+        push_symbol(&mut bytes, b"rdata", 0, 3, 0, object::pe::IMAGE_SYM_CLASS_EXTERNAL);
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // empty string table
+        bytes
+    }
+
+    #[test]
+    fn complete_code_classifier_accepts_real_function_terminators() {
+        let classifier = x64_classifier();
+        assert!(is_complete_function_code(
+            &classifier,
+            &[0x48, 0x8d, 0x05, 0x71, 0x87, 0x06, 0x00, 0xc3],
+        ));
+        assert!(is_complete_function_code(
+            &classifier,
+            &[0x48, 0xff, 0x25, 0, 0, 0, 0],
+        ));
+        assert!(is_complete_function_code(
+            &classifier,
+            &[0xb9, 3, 0, 0, 0, 0xcd, 0x29],
+        ));
+    }
+
+    #[test]
+    fn complete_code_classifier_rejects_jump_tables_and_guid_bytes() {
+        let classifier = x64_classifier();
+        assert!(!is_complete_function_code(&classifier, &[0; 8]));
+        assert!(!is_complete_function_code(
+            &classifier,
+            &[
+                0xbc, 0x8a, 0x90, 0xe8, 0x84, 0xaa, 0xd2, 0x11,
+                0x9a, 0x93, 0x00, 0x80, 0x5f, 0x85, 0xd7, 0xc6,
+            ],
+        ));
+    }
+
+    #[test]
+    fn provider_promotes_only_linkage_bounded_authenticated_code() {
+        let mut fixture = classifier_fixture();
+        let image = prepare_image(&mut fixture).unwrap().unwrap();
+        let functions: BTreeMap<_, _> = image
+            .address_map
+            .functions
+            .iter()
+            .map(|function| (function.original_name.as_str(), function))
+            .collect();
+        assert_eq!(functions.len(), 2);
+        assert_eq!(functions["good_fn"].original_size, 6);
+        assert_eq!(functions["good_fn"].provider_name, "coff_fn_good_fn");
+        assert!(functions.contains_key("typed_fn"));
+
+        let kinds: BTreeMap<_, _> = image
+            .address_map
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.original_name.as_str(), symbol.kind.as_str()))
+            .collect();
+        assert_eq!(kinds["good_fn"], "function");
+        assert_eq!(kinds["jump_tbl"], "data");
+        assert_eq!(kinds["guid"], "data");
+        assert_eq!(kinds["rdata"], "data");
+        assert_eq!(kinds["local"], "data");
+    }
+
     #[test]
     fn rel32_external_call_uses_field_address_and_does_not_call_fallthrough() {
         let place = 0x1000_0029;
@@ -959,6 +1294,10 @@ mod tests {
             section: SymbolSection::Section(SectionIndex(1)),
             original_address: 0,
             mapped_address: COFF_IMAGE_BASE,
+            raw_type: object::pe::IMAGE_SYM_DTYPE_FUNCTION
+                << object::pe::IMAGE_SYM_DTYPE_SHIFT,
+            storage_class: object::pe::IMAGE_SYM_CLASS_EXTERNAL,
+            authenticated_end: None,
         };
         let provider = c_safe_name(&defined_provider_source_name(&sym));
         assert!(provider.starts_with("coff_fn_"));

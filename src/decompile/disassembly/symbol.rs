@@ -119,15 +119,25 @@ pub fn load_symbols(
             .unwrap_or_else(|| sanitize_symbol_name(name_raw));
         let name: &'static str = leak_str(provider_name);
 
-        if size == 0 && sym.kind() == SymbolKind::Text {
-            if let Some(inferred) = coff_image
-                .and_then(|image| image.function_size(addr, name_raw))
-            {
+        // The COFF loader may authenticate an EXTERNAL/null-type symbol as a
+        // function from its bounded instruction bytes.  The reparsed private
+        // image still exposes the raw null type through `object`, so retain the
+        // loader's effective kind when populating downstream relations.
+        let coff_function_size = coff_image
+            .and_then(|image| image.function_size(addr, name_raw));
+        let effective_kind = if coff_function_size.is_some() {
+            SymbolKind::Text
+        } else {
+            sym.kind()
+        };
+
+        if size == 0 && effective_kind == SymbolKind::Text {
+            if let Some(inferred) = coff_function_size {
                 size = inferred as usize;
             }
         }
 
-        let sym_type: &'static str = match sym.kind() {
+        let sym_type: &'static str = match effective_kind {
             SymbolKind::Text => "FUNC",
             SymbolKind::Data => "OBJECT",
             SymbolKind::Section => "SECTION",
@@ -168,9 +178,9 @@ pub fn load_symbols(
                           section_idx, sect_name_s, 0, name));
 
         if section_type != "UNDEF"
-            && !matches!(sym.kind(), SymbolKind::File | SymbolKind::Section)
+            && !matches!(effective_kind, SymbolKind::File | SymbolKind::Section)
         {
-            let rank = match sym.kind() {
+            let rank = match effective_kind {
                 SymbolKind::Text => 0,
                 SymbolKind::Data | SymbolKind::Tls => 1,
                 _ => 2,
