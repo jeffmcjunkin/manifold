@@ -1706,6 +1706,45 @@ impl IRPass for ClightEmitPass {
             db.decl_solve_force_ptr_regs = out.force_ptr_regs;
         }
 
+        // Make the reconciled struct definitions authoritative before either C
+        // translation unit is built. Assignment compatibility must use the same
+        // field types that are eventually emitted.
+        let t = std::time::Instant::now();
+        let mut struct_defs = crate::decompile::passes::clight_select::query::extract_struct_definitions(db);
+        eprintln!("[clight-emit] extract_struct_definitions: {:?} ({} structs)", t.elapsed(), struct_defs.len());
+        {
+            let t = std::time::Instant::now();
+            let mut field_selection: HashMap<(String, String), String> =
+                db.decl_solve_field_ptr_selection.clone();
+            for key in &db.decl_solve_field_force_long {
+                field_selection.insert(key.clone(), "long".to_string());
+            }
+            let patched = crate::decompile::passes::clight_select::query::apply_struct_field_type_selection(
+                &mut struct_defs,
+                &field_selection,
+            );
+            if patched > 0 {
+                eprintln!(
+                    "[clight-emit] decl-solve field-type selection: {} field(s) retyped ({:?})",
+                    patched,
+                    t.elapsed()
+                );
+            }
+        }
+        let field_types: HashMap<String, HashMap<String, CType>> = struct_defs
+            .iter()
+            .filter_map(|extracted| {
+                let name = extracted.definition.name.clone()?;
+                let fields = extracted
+                    .definition
+                    .fields
+                    .iter()
+                    .filter_map(|field| field.name.clone().map(|name| (name, field.ty.clone())))
+                    .collect();
+                Some((name, fields))
+            })
+            .collect();
+
         // The raw (.light.c) TU is only read under --trace, and building it unconditionally cost 183s on ls/dir/vdir; build it only when tracing.
         let raw_translation_unit = if db.trace_enabled {
             let edges: Vec<(Node, Node)> = db
@@ -1719,6 +1758,7 @@ impl IRPass for ClightEmitPass {
                 &globals,
                 &id_to_name,
                 &edges,
+                &field_types,
             );
             eprintln!("[clight-emit] build_cast_from_relations (raw TU): {:?}", t.elapsed());
             tu
@@ -1932,10 +1972,6 @@ impl IRPass for ClightEmitPass {
         db.cast_var_types_for_emission = var_types_for_emission.clone();
         db.cast_raw_translation_unit = Some(raw_translation_unit);
 
-        let t = std::time::Instant::now();
-        let mut struct_defs = crate::decompile::passes::clight_select::query::extract_struct_definitions(db);
-        eprintln!("[clight-emit] extract_struct_definitions: {:?} ({} structs)", t.elapsed(), struct_defs.len());
-
         let stmt_map: HashMap<Node, CStmt> = all_statements.into_iter().collect();
 
         log::info!(
@@ -1953,6 +1989,7 @@ impl IRPass for ClightEmitPass {
             &all_edges,
             &db.cast_var_types_for_emission,
             &node_to_func_addr,
+            &field_types,
         );
         eprintln!("[clight-emit] build_translation_unit (optimized TU): {:?}", t.elapsed());
 
@@ -2020,27 +2057,6 @@ impl IRPass for ClightEmitPass {
             );
         }
 
-        // CTYPING_PLAN 5.3: apply decl_solve's field-pointer selection before field_types reads it, combined with the force-long retypes; the former C-AST final veto is RETIRED as it removed nothing.
-        {
-            let t = std::time::Instant::now();
-            let mut tr3_selection: HashMap<(String, String), String> =
-                db.decl_solve_field_ptr_selection.clone();
-            for key in &db.decl_solve_field_force_long {
-                tr3_selection.insert(key.clone(), "long".to_string());
-            }
-            let patched = crate::decompile::passes::clight_select::query::apply_struct_field_type_selection(
-                &mut struct_defs,
-                &tr3_selection,
-            );
-            if patched > 0 {
-                eprintln!(
-                    "[clight-emit] decl-solve field-type selection: {} field(s) retyped ({:?})",
-                    patched,
-                    t.elapsed()
-                );
-            }
-        }
-
         // Identify opaque libc structs (FILE, DIR) via C AST scan and RTL-level analysis.
         let t = std::time::Instant::now();
         let mut opaque_map = identify_opaque_libc_structs_from_tu(&tu);
@@ -2080,19 +2096,6 @@ impl IRPass for ClightEmitPass {
         // IL-3/IL-4 evidence: which tags the final TU names at all, and which require a complete layout. The name table above is now only a naming fallback.
         let t = std::time::Instant::now();
         let mut structs_referenced_in_code = collect_all_referenced_structs(&tu);
-        let field_types: HashMap<String, HashMap<String, CType>> = struct_defs
-            .iter()
-            .filter_map(|ex| {
-                let name = ex.definition.name.clone()?;
-                let fields: HashMap<String, CType> = ex
-                    .definition
-                    .fields
-                    .iter()
-                    .filter_map(|f| f.name.clone().map(|n| (n, f.ty.clone())))
-                    .collect();
-                Some((name, fields))
-            })
-            .collect();
         let layout_ev = collect_struct_layout_evidence(&tu, &field_types);
         let analysis_complete = !layout_ev.incomplete;
         let mut needs_layout = layout_ev.needs_layout;
@@ -2216,4 +2219,3 @@ impl IRPass for ClightEmitPass {
         CLIGHT_EMIT_EXTRA_READS
     }
 }
-

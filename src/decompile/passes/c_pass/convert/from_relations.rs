@@ -312,6 +312,7 @@ pub fn build_cast_from_relations(
     globals: &[GlobalData],
     id_to_name: &HashMap<usize, String>,
     edges: &[(crate::x86::types::Node, crate::x86::types::Node)],
+    struct_fields: &HashMap<String, HashMap<String, CType>>,
 ) -> TranslationUnit {
     let mut ctx = ConversionContext::new(id_to_name.clone());
     ctx.func_renames = header_collision_policy(selected_functions).renames;
@@ -363,6 +364,7 @@ pub fn build_cast_from_relations(
         edges,
         &ctx.var_types,
         &HashMap::new(),
+        struct_fields,
     )
 }
 
@@ -376,6 +378,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     edges: &[(crate::x86::types::Node, crate::x86::types::Node)],
     var_types: &HashMap<String, CType>,
     optimized_node_to_func: &HashMap<crate::x86::types::Node, crate::x86::types::Address>,
+    struct_fields: &HashMap<String, HashMap<String, CType>>,
 ) -> TranslationUnit {
     let mut tu = TranslationUnit::new();
     let mut func_var_types = var_types.clone();
@@ -1635,20 +1638,6 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         let mut callee_params: CalleeParams = HashMap::new();
         let mut callee_ret: HashMap<String, CType> = HashMap::new();
         let mut global_types: HashMap<String, CType> = HashMap::new();
-        let struct_fields: StructFieldTypes =
-            crate::decompile::passes::clight_select::query::extract_struct_definitions(db)
-                .into_iter()
-                .filter_map(|extracted| {
-                    let name = extracted.definition.name?;
-                    let fields = extracted
-                        .definition
-                        .fields
-                        .into_iter()
-                        .filter_map(|field| field.name.map(|name| (name, field.ty)))
-                        .collect();
-                    Some((name, fields))
-                })
-                .collect();
         for decl in tu.decls.iter() {
             match decl {
                 TopLevelDecl::FuncDef(f) => {
@@ -1684,7 +1673,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 let ret = f.return_type.clone();
                 let types = CastTypes {
                     variables: &types,
-                    struct_fields: &struct_fields,
+                    struct_fields,
                 };
                 f.body = insert_casts_stmt(&f.body, &types, &callee_params, &callee_ret, &ret);
             }
