@@ -517,7 +517,16 @@ impl Printer {
                     self.write(name);
                     self.writeln(":");
                     self.indent_level = saved_indent;
-                    self.print_stmt(body);
+                    // A C label must prefix a statement.  The structured IR uses
+                    // `Empty` for a genuine landing with no work, and printing it as
+                    // nothing leaves a dangling label immediately before `}` (or a
+                    // run of labels whose final member dangles).  Materialize the
+                    // semantic no-op explicitly; it has no code-generation effect.
+                    if matches!(**body, CStmt::Empty) {
+                        self.writeln(";");
+                    } else {
+                        self.print_stmt(body);
+                    }
                 }
                 // case/default labels are indented with the enclosing switch body.
                 Label::Case(expr) => {
@@ -554,6 +563,7 @@ impl Printer {
             CStmt::Labeled(Label::Case(_), _) | CStmt::Labeled(Label::Default, _) => {
                 self.print_stmt(body)
             }
+            CStmt::Empty => self.indent(|p| p.writeln(";")),
             _ => self.indent(|p| p.print_stmt(body)),
         }
     }
@@ -1253,6 +1263,12 @@ fn collect_needed_includes(tu: &TranslationUnit) -> Vec<&'static str> {
 mod tests {
     use super::*;
 
+    fn print_statement(statement: &CStmt) -> String {
+        let mut printer = Printer::with_default_config();
+        printer.print_stmt(statement);
+        printer.into_string()
+    }
+
     fn translation_unit_calling(names: &[&str]) -> TranslationUnit {
         let calls = names
             .iter()
@@ -1356,5 +1372,41 @@ mod tests {
         assert!(!output.contains("#pragma intrinsic"));
         assert!(!output.contains("unsigned __int64 __readcr8(void);"));
         assert!(!output.contains("void __int2c(void);"));
+    }
+
+    #[test]
+    fn empty_named_label_emits_a_null_statement() {
+        let statement = CStmt::Labeled(
+            Label::Named("landing".to_string()),
+            Box::new(CStmt::Empty),
+        );
+
+        assert_eq!(print_statement(&statement), "landing:\n;\n");
+    }
+
+    #[test]
+    fn consecutive_empty_labels_terminate_with_a_null_statement() {
+        let statement = CStmt::Labeled(
+            Label::Named("first".to_string()),
+            Box::new(CStmt::Labeled(
+                Label::Named("second".to_string()),
+                Box::new(CStmt::Empty),
+            )),
+        );
+
+        assert_eq!(print_statement(&statement), "first:\nsecond:\n;\n");
+    }
+
+    #[test]
+    fn stacked_empty_switch_labels_terminate_with_a_null_statement() {
+        let statement = CStmt::Labeled(
+            Label::Case(CExpr::int(1)),
+            Box::new(CStmt::Labeled(
+                Label::Default,
+                Box::new(CStmt::Empty),
+            )),
+        );
+
+        assert_eq!(print_statement(&statement), "case 1:\ndefault:\n    ;\n");
     }
 }
