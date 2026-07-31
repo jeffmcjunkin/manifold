@@ -1649,14 +1649,25 @@ ascent_par! {
     // A unique dominating full-stride write is concrete aggregate-phase
     // evidence.  Reads, later instructions, and writes on another branch must
     // not manufacture a stack-object base for an indexed field access.
+    // Restrict the dominance workspace to the exact write/access shapes that
+    // consume it below.  The previous rules first emitted every ordered
+    // instruction pair in a block and every pair across dominated blocks,
+    // which is quadratic in a long function even when it has no fused stack
+    // access at all.
     #[local] relation sp_indexed_anchor_write_dominates(Address, Address, Address);
     sp_indexed_anchor_write_dominates(*other, *addr, *func_start) <--
+        sp_indexed_fused_load(addr, _, _, _, _, _, _),
+        direct_stack_operand(other, Mreg::SP, _, _),
+        decoded_memory_write_operand(other, _),
         real_addr_in_func(other, func_start),
         real_addr_in_func(addr, func_start),
         code_in_block(other, block),
         code_in_block(addr, block),
         if *other < *addr;
     sp_indexed_anchor_write_dominates(*other, *addr, *func_start) <--
+        sp_indexed_fused_load(addr, _, _, _, _, _, _),
+        direct_stack_operand(other, Mreg::SP, _, _),
+        decoded_memory_write_operand(other, _),
         real_addr_in_func(other, func_start),
         real_addr_in_func(addr, func_start),
         code_in_block(other, other_block),
@@ -7134,19 +7145,68 @@ ascent_par! {
     // dominate this use, and its copy-site SP coordinate must still be known.
     // This rejects conditional copies and uses after an RBP clobber while
     // correctly normalizing copies made after pushes/frame allocation.
+    //
+    // Dominance is a query, not an all-pairs output.  Every relational
+    // consumer below already requires a raw reaching-def edge, except the
+    // fused-stack initializer (a normalized write queried at one fused use).
+    // The post-fixed-point indexed-operand guard additionally needs decoded
+    // definitions and call kills at raw SP/BP-indexed sites.  Build that
+    // demand from decoder snapshots only: depending on RTL-derived indexed
+    // relations here would pull bp_base_at back into its own aggregate SCC.
+    // Materializing only this union avoids O(instructions^2) rows while
+    // retaining every observable lookup.
+    #[local] relation indexed_dominance_use(Node);
+    indexed_dominance_use(node) <--
+        indexed_stack_operand(node, base, _, _),
+        if matches!(*base, Mreg::SP | Mreg::BP);
+
+    #[local] relation indexed_dominance_operand(Node, Mreg);
+    indexed_dominance_operand(node, *reg) <--
+        indexed_dominance_use(node),
+        asm_reg_use(node, reg);
+
+    #[local] relation reg_def_dominance_query(Address, Node, Node);
+    reg_def_dominance_query(*func_start, *def_addr, *use_addr) <--
+        raw_reg_def_used(def_addr, _, use_addr),
+        real_addr_in_func(def_addr, func_start),
+        real_addr_in_func(use_addr, func_start);
+    reg_def_dominance_query(*func_start, *call_addr, *use_addr) <--
+        instruction(call_addr, _, _, "CALL", _, _, _, _, _, _),
+        indexed_dominance_use(use_addr),
+        real_addr_in_func(call_addr, func_start),
+        real_addr_in_func(use_addr, func_start);
+    // Decoder definitions cover ordinary integer, SIMD, and the original
+    // writes at addresses later replaced by Lbuiltin.  Pair only matching
+    // operands at the small set of indexed sites retained by the imperative
+    // ambiguity classifier.
+    reg_def_dominance_query(*func_start, *def_addr, *use_addr) <--
+        asm_reg_def(def_addr, reg),
+        indexed_dominance_operand(use_addr, reg),
+        real_addr_in_func(def_addr, func_start),
+        real_addr_in_func(use_addr, func_start);
+    // The relational stack-initializer consumer needs normalized direct
+    // writes only at fused indexed uses.  Raw direct writes paired with every
+    // structural SP/BP indexed site are an independent, conservative demand
+    // superset; the consumer still applies the exact normalization/fused
+    // predicates after dominance is established.
+    reg_def_dominance_query(*func_start, *write_addr, *use_addr) <--
+        direct_stack_operand(write_addr, _, _, _),
+        decoded_memory_write_operand(write_addr, _),
+        indexed_dominance_use(use_addr),
+        real_addr_in_func(write_addr, func_start),
+        real_addr_in_func(use_addr, func_start);
+
     relation reg_def_dominates_use(Address, Node, Node);
     reg_def_dominates_use(func_start, def_addr, use_addr) <--
+        reg_def_dominance_query(func_start, def_addr, use_addr),
         code_in_block(def_addr, block),
         code_in_block(use_addr, block),
-        real_addr_in_func(def_addr, func_start),
-        real_addr_in_func(use_addr, func_start),
         if *def_addr < *use_addr;
     reg_def_dominates_use(func_start, def_addr, use_addr) <--
+        reg_def_dominance_query(func_start, def_addr, use_addr),
         code_in_block(def_addr, def_block),
         code_in_block(use_addr, use_block),
         if *def_block != *use_block,
-        real_addr_in_func(def_addr, func_start),
-        real_addr_in_func(use_addr, func_start),
         block_dom_set(func_start, use_block, doms),
         if doms.0.contains(def_block);
 
@@ -12383,6 +12443,67 @@ impl IRPass for RTLPass {
 mod encoding_tests {
     use super::*;
     use crate::aarch64::mach::A64Mreg;
+
+    fn on_rtl_program_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("rtl-program-test".to_string())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn RTL program test")
+            .join()
+            .expect("RTL program test panicked");
+    }
+
+    #[test]
+    fn dominance_workspaces_are_demand_driven() {
+        on_rtl_program_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let function: Address = 0x8000;
+            let block: Address = 0x8000;
+            let definition: Node = 0x8010;
+            let write: Node = 0x8020;
+            let indexed_access: Node = 0x81f0;
+
+            // A long straight-line block used to create every ordered pair in
+            // both dominance relations, even though only these two queries
+            // can be consumed by indexed-stack recovery.
+            for address in (0x8010..=0x81f0).step_by(0x10) {
+                prog.code_in_block.push((address, block));
+                prog.real_addr_in_func.push((address, function));
+            }
+            prog.reg_def_dominance_query
+                .push((function, definition, indexed_access));
+            prog.sp_indexed_fused_load.push((
+                indexed_access,
+                Operation::Oadd,
+                MemoryChunk::MInt32,
+                4,
+                8,
+                Mreg::AX,
+                Mreg::CX,
+            ));
+            prog.direct_stack_operand.push((write, Mreg::SP, -32, 4));
+            prog.decoded_memory_write_operand
+                .push((write, "rtl_dominance_test_operand"));
+
+            prog.run();
+
+            assert_eq!(
+                prog.reg_def_dominates_use
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![(function, definition, indexed_access)]
+            );
+            assert_eq!(
+                prog.sp_indexed_anchor_write_dominates
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![(write, indexed_access, function)]
+            );
+        });
+    }
 
     fn seed_rejected_site(db: &mut DecompileDB, function: Address, real: Node) {
         db.rel_push(

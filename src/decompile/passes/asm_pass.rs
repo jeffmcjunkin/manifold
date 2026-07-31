@@ -492,13 +492,34 @@ ascent_par! {
         frame_cfg_step(cur, next_addr),
         instr_in_function(next_addr, func);
 
+    // Only RSP->RBP copies queried at BP-based memory accesses can consume a
+    // dominance fact below.  Keeping this demand relation explicit is
+    // important for large translation units: the unconstrained form of
+    // bp_copy_dominates materialized every ordered instruction pair in a
+    // block and every instruction pair across dominated blocks (quadratic in
+    // a long function), then discarded virtually all of those rows at the
+    // bp_rsp_value_reaches join.
+    #[local] relation bp_provenance_access(Address);
+    bp_provenance_access(addr) <-- exact_rbp_mem_access(addr);
+    bp_provenance_access(addr) <--
+        addr32_memory_operand(addr, _, _, base, index, _, _),
+        if *base == "EBP" || *index == "EBP";
+
     #[local] relation bp_copy_dominates(Address, Address, Address);
     bp_copy_dominates(func, copy, access) <--
+        stack_base_move(copy, src, dst),
+        if *src == "RSP" && *dst == "RBP",
+        bp_provenance_access(access),
+        bp_def_reaches(func, copy, access),
         code_in_block(copy, block),
         code_in_block(access, block),
         instr_in_function(copy, func),
         if *copy < *access;
     bp_copy_dominates(func, copy, access) <--
+        stack_base_move(copy, src, dst),
+        if *src == "RSP" && *dst == "RBP",
+        bp_provenance_access(access),
+        bp_def_reaches(func, copy, access),
         code_in_block(copy, copy_block),
         code_in_block(access, access_block),
         if *copy_block != *access_block,
@@ -509,6 +530,9 @@ ascent_par! {
 
     #[local] relation bp_competing_reaching_def(Address, Address, Address);
     bp_competing_reaching_def(func, copy, access) <--
+        stack_base_move(copy, src, dst),
+        if *src == "RSP" && *dst == "RBP",
+        bp_provenance_access(access),
         bp_def_reaches(func, copy, access),
         bp_def_reaches(func, other, access),
         if other != copy;
@@ -9896,6 +9920,40 @@ mod privileged_instruction_tests {
         assert!(db
             .rel_iter::<(Node, Node)>("ltl_fallthrough")
             .any(|edge| *edge == (INT2C_ADDR, RET_ADDR)));
+        });
+    }
+
+    #[test]
+    fn bp_dominance_workspace_is_demand_driven() {
+        on_pipeline_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            let function = 0x1000;
+            let block = 0x1000;
+            let copy = 0x1010;
+            let irrelevant_access = 0x11e0;
+            let access = 0x11f0;
+
+            // A long straight-line block used to create every ordered pair,
+            // even though only this one frame-copy/access query was usable.
+            for address in (0x1000..=0x11f0).step_by(0x10) {
+                prog.code_in_block.push((address, block));
+                prog.instr_in_function.push((address, function));
+            }
+            prog.stack_base_move.push((copy, "RSP", "RBP"));
+            prog.bp_provenance_access.push((access,));
+            prog.bp_def_reaches.push((function, copy, access));
+            prog.bp_def_reaches
+                .push((function, 0x1020, irrelevant_access));
+            prog.bp_def_reaches
+                .push((function, 0x1030, irrelevant_access));
+
+            prog.run();
+
+            assert_eq!(
+                prog.bp_copy_dominates.iter().copied().collect::<Vec<_>>(),
+                vec![(function, copy, access)]
+            );
+            assert!(prog.bp_competing_reaching_def.is_empty());
         });
     }
 }
