@@ -1,7 +1,6 @@
-
 use log::info;
-use std::collections::{HashMap, BTreeMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -11,7 +10,6 @@ use crate::mreg::Mreg;
 use crate::x86::op::{Addressing, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
-
 
 pub fn chunk_byte_size(chunk: &MemoryChunk) -> usize {
     match chunk {
@@ -23,9 +21,16 @@ pub fn chunk_byte_size(chunk: &MemoryChunk) -> usize {
     }
 }
 
+fn scaled_record_access_fits(scale: i64, offset: i64, chunk: &MemoryChunk) -> bool {
+    matches!(scale, 2 | 4 | 8)
+        && offset >= 0
+        && offset
+            .checked_add(chunk_byte_size(chunk) as i64)
+            .is_some_and(|end| end <= scale)
+}
+
 // SR-4: cap is a false-folding guard -- raising it folds more unrelated locals into fake fields; bound the window by observed deref extent (stack_lea_used_for_access) before raising.
 const MAX_STACK_STRUCT_SIZE: i64 = 1024;
-
 
 // Pointer/stack/global struct detection via load/store offset analysis
 ascent_par! {
@@ -48,6 +53,10 @@ ascent_par! {
     relation ident_to_symbol(Ident, Symbol);
     relation stack_var(Address, Address, i64, RTLReg);
     relation stack_var_chunk(Address, i64, MemoryChunk);
+    relation normalized_stack_lea_base(Address, Node, RTLReg, i64);
+    relation normalized_stack_write_range(Node, Address, Mreg, i64, i64, i64);
+    relation stack_write_dominates_node(Address, Node, Node);
+    relation win64_home_spill_candidate(Node, Address, Mreg, usize);
     relation is_global_array(Ident, usize, usize);
 
 
@@ -68,6 +77,123 @@ ascent_par! {
         is_ptr(&base_reg),
         instr_in_function(node, func);
 
+    // Preserve every scaled family before applying range filters.  A malformed
+    // or out-of-stride competing access must veto record recovery rather than
+    // disappearing from the ambiguity check.
+    #[local] relation ptr_scaled_access_family(Address, RTLReg, RTLReg, i64);
+    ptr_scaled_access_family(*func, base_reg, index_reg, *scale) <--
+        rtl_inst(node, ?RTLInst::Iload(_, Addressing::Aindexed2scaled(scale, _), args, _)),
+        if args.len() >= 2,
+        let base_reg = args[0],
+        let index_reg = args[1],
+        is_ptr(&base_reg),
+        instr_in_function(node, func);
+    ptr_scaled_access_family(*func, base_reg, index_reg, *scale) <--
+        rtl_inst(node, ?RTLInst::Istore(_, Addressing::Aindexed2scaled(scale, _), args, _)),
+        if args.len() >= 2,
+        let base_reg = args[0],
+        let index_reg = args[1],
+        is_ptr(&base_reg),
+        instr_in_function(node, func);
+
+    // Valid in-stride accesses retain their exact family and whether the
+    // chunk came from a load, so post-processing never has to merge unrelated
+    // ordinary dereferences back into the exceptional record layout.
+    #[local] relation ptr_scaled_record_access(RTLReg, RTLReg, i64, i64, MemoryChunk, RTLReg, Address, bool);
+    ptr_scaled_record_access(base_reg, index_reg, *scale, *ofs, *chunk, *dst, *func, true) <--
+        rtl_inst(node, ?RTLInst::Iload(chunk, Addressing::Aindexed2scaled(scale, ofs), args, dst)),
+        if args.len() >= 2,
+        let base_reg = args[0],
+        let index_reg = args[1],
+        if scaled_record_access_fits(*scale, *ofs, chunk),
+        is_ptr(&base_reg),
+        instr_in_function(node, func);
+    ptr_scaled_record_access(base_reg, index_reg, *scale, *ofs, *chunk, *src, *func, false) <--
+        rtl_inst(node, ?RTLInst::Istore(chunk, Addressing::Aindexed2scaled(scale, ofs), args, src)),
+        if args.len() >= 2,
+        let base_reg = args[0],
+        let index_reg = args[1],
+        if scaled_record_access_fits(*scale, *ofs, chunk),
+        is_ptr(&base_reg),
+        instr_in_function(node, func);
+
+    // Independent object evidence removes the machine-code ambiguity between
+    // `records[i].field` and `scalars[k*i+j]`: the base must be an emitted
+    // stack LEA backed by a decoded full-stride write at that exact stack cell.
+    #[local] relation ptr_scaled_record_stack_object(Address, RTLReg, i64);
+    ptr_scaled_record_stack_object(*func, *base_reg, scale) <--
+        rtl_inst(lea_node, ?RTLInst::Iop(Operation::Olea(Addressing::Ainstack(_)), _, base_reg)),
+        normalized_stack_lea_base(func, lea_node, base_reg, object_start),
+        normalized_stack_write_range(write_node, func, _, _, write_start, write_end),
+        stack_write_dominates_node(func, write_node, lea_node),
+        !win64_home_spill_candidate(write_node, func, _, _),
+        if object_start == write_start,
+        let scale = *write_end - *write_start,
+        if matches!(scale, 2 | 4 | 8);
+
+    #[local] relation ptr_scaled_record_candidate_raw(Address, RTLReg, RTLReg, i64);
+    ptr_scaled_record_candidate_raw(*func, base_reg, index_reg, *scale) <--
+        ptr_scaled_record_access(base_reg, index_reg, scale, zero, zero_chunk, _, func, _),
+        if *zero == 0,
+        ptr_scaled_record_access(base_reg, index_reg, scale, field, field_chunk, _, func, _),
+        if *field > 0,
+        if chunk_byte_size(zero_chunk) as i64 <= *field,
+        if let Some(end) = field.checked_add(chunk_byte_size(field_chunk) as i64),
+        if end == *scale,
+        ptr_scaled_record_stack_object(func, base_reg, scale);
+
+    // A base mixed with a different runtime-index family or unscaled two-reg
+    // addressing is ambiguous. Do not let one good-looking pair override the
+    // ordinary variable-index veto for all of that base's accesses.
+    #[local] relation ptr_scaled_record_family_veto(Address, RTLReg, RTLReg, i64);
+    ptr_scaled_record_family_veto(*func, base_reg, *index_reg, *scale) <--
+        ptr_scaled_record_candidate_raw(func, base_reg, index_reg, scale),
+        ptr_scaled_access_family(func, base_reg, other_index, other_scale),
+        if other_index != index_reg || other_scale != scale;
+    ptr_scaled_record_family_veto(*func, base_reg, *index_reg, *scale) <--
+        ptr_scaled_record_candidate_raw(func, base_reg, index_reg, scale),
+        rtl_inst(node, ?RTLInst::Iload(_, Addressing::Aindexed2(_), args, _)),
+        instr_in_function(node, func),
+        if args.len() >= 1 && args[0] == *base_reg;
+    ptr_scaled_record_family_veto(*func, base_reg, *index_reg, *scale) <--
+        ptr_scaled_record_candidate_raw(func, base_reg, index_reg, scale),
+        rtl_inst(node, ?RTLInst::Istore(_, Addressing::Aindexed2(_), args, _)),
+        instr_in_function(node, func),
+        if args.len() >= 1 && args[0] == *base_reg;
+
+    #[local] relation ptr_scaled_record_invalid_access(Address, RTLReg, RTLReg, i64);
+    ptr_scaled_record_invalid_access(*func, base_reg, index_reg, *scale) <--
+        rtl_inst(node, ?RTLInst::Iload(chunk, Addressing::Aindexed2scaled(scale, ofs), args, _)),
+        if args.len() >= 2,
+        let base_reg = args[0],
+        let index_reg = args[1],
+        is_ptr(&base_reg),
+        instr_in_function(node, func),
+        if !scaled_record_access_fits(*scale, *ofs, chunk);
+    ptr_scaled_record_invalid_access(*func, base_reg, index_reg, *scale) <--
+        rtl_inst(node, ?RTLInst::Istore(chunk, Addressing::Aindexed2scaled(scale, ofs), args, _)),
+        if args.len() >= 2,
+        let base_reg = args[0],
+        let index_reg = args[1],
+        is_ptr(&base_reg),
+        instr_in_function(node, func),
+        if !scaled_record_access_fits(*scale, *ofs, chunk);
+
+    ptr_scaled_record_family_veto(*func, base_reg, *index_reg, *scale) <--
+        ptr_scaled_record_candidate_raw(func, base_reg, index_reg, scale),
+        ptr_scaled_record_invalid_access(func, base_reg, index_reg, scale);
+
+    #[local] relation ptr_scaled_record_candidate(Address, RTLReg, RTLReg, i64);
+    ptr_scaled_record_candidate(*func, base_reg, *index_reg, *scale) <--
+        ptr_scaled_record_candidate_raw(func, base_reg, index_reg, scale),
+        !ptr_scaled_record_family_veto(func, base_reg, index_reg, scale),
+        !ptr_rejected_as_struct(base_reg);
+
+    relation ptr_scaled_record_member(Address, RTLReg, RTLReg, i64, i64, MemoryChunk, RTLReg, bool);
+    ptr_scaled_record_member(*func, base_reg, *index_reg, *scale, *ofs, *chunk, *value, *is_load) <--
+        ptr_scaled_record_candidate(func, base_reg, index_reg, scale),
+        ptr_scaled_record_access(base_reg, index_reg, scale, ofs, chunk, value, func, is_load);
+
     // Load-evidence subset of ptr_deref; sub-register store chunks are width-unreliable upstream.
     relation ptr_deref_load(RTLReg, i64, MemoryChunk);
 
@@ -76,7 +202,6 @@ ascent_par! {
         if args.len() >= 1,
         let base_reg = args[0],
         is_ptr(&base_reg);
-
 
     #[local] relation call_site(Node, Symbol);
     #[local] relation call_arg(Node, usize, RTLReg);
@@ -356,37 +481,41 @@ ascent_par! {
         !global_has_variable_index(ident);
 }
 
-
 pub struct StructRecoveryPass;
 
 impl IRPass for StructRecoveryPass {
-    fn name(&self) -> &'static str { "struct_recovery" }
+    fn name(&self) -> &'static str {
+        "struct_recovery"
+    }
 
     fn run(&self, db: &mut DecompileDB) {
         // Enrich is_ptr for param registers used as indexed load/store bases (missed by Datalog due to physical register reuse); only params to avoid ptr_deref explosion
         {
             use crate::x86::op::Addressing;
-            let existing_ptrs: std::collections::HashSet<RTLReg> = db
-                .rel_iter::<(RTLReg,)>("is_ptr")
-                .map(|&(r,)| r)
-                .collect();
+            let existing_ptrs: std::collections::HashSet<RTLReg> =
+                db.rel_iter::<(RTLReg,)>("is_ptr").map(|&(r,)| r).collect();
             let param_regs: std::collections::HashSet<RTLReg> = db
                 .rel_iter::<(Address, RTLReg)>("emit_function_param_candidate")
                 .map(|&(_, reg)| reg)
                 .collect();
-            let new_ptrs: Vec<RTLReg> = db.rel_iter::<(Node, RTLInst)>("rtl_inst")
+            let new_ptrs: Vec<RTLReg> = db
+                .rel_iter::<(Node, RTLInst)>("rtl_inst")
                 .filter_map(|&(_, ref inst)| {
                     let (addr_mode, args) = match inst {
                         RTLInst::Iload(_, addr, args, _) => (addr, args),
                         RTLInst::Istore(_, addr, args, _) => (addr, args),
                         _ => return None,
                     };
-                    if !matches!(addr_mode,
-                        Addressing::Aindexed(_) | Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _))
-                    {
+                    if !matches!(
+                        addr_mode,
+                        Addressing::Aindexed(_)
+                            | Addressing::Aindexed2(_)
+                            | Addressing::Aindexed2scaled(_, _)
+                    ) {
                         return None;
                     }
-                    args.first().copied()
+                    args.first()
+                        .copied()
                         .filter(|r| param_regs.contains(r) && !existing_ptrs.contains(r))
                 })
                 .collect();
@@ -431,7 +560,9 @@ impl IRPass for StructRecoveryPass {
                     db.rel_iter::<(Address, i64, i64, MemoryChunk, RTLReg)>("stack_struct_field")
                 {
                     total_windows.insert((func, base));
-                    if fofs > max_field_ofs { max_field_ofs = fofs; }
+                    if fofs > max_field_ofs {
+                        max_field_ofs = fofs;
+                    }
                     if fofs > MAX_STACK_STRUCT_SIZE - 128 {
                         windows_near_cap.insert((func, base));
                     }
@@ -446,10 +577,8 @@ impl IRPass for StructRecoveryPass {
         // Post-Datalog: push Xptr for non-param registers used at 2+ offsets (can't add to is_ptr pre-Datalog due to ptr_deref explosion)
         {
             use crate::x86::op::Addressing;
-            let existing_ptrs: std::collections::HashSet<RTLReg> = db
-                .rel_iter::<(RTLReg,)>("is_ptr")
-                .map(|&(r,)| r)
-                .collect();
+            let existing_ptrs: std::collections::HashSet<RTLReg> =
+                db.rel_iter::<(RTLReg,)>("is_ptr").map(|&(r,)| r).collect();
             let mut base_offsets: HashMap<RTLReg, HashSet<i64>> = HashMap::new();
             for &(_, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
                 let (addr_mode, args) = match inst {
@@ -478,7 +607,8 @@ impl IRPass for StructRecoveryPass {
 
         // Post-Datalog: push Xfuncptr for registers used as indirect call targets.
         {
-            let funcptr_regs: Vec<RTLReg> = db.rel_iter::<(Node, RTLInst)>("rtl_inst")
+            let funcptr_regs: Vec<RTLReg> = db
+                .rel_iter::<(Node, RTLInst)>("rtl_inst")
                 .filter_map(|&(_, ref inst)| match inst {
                     RTLInst::Icall(_, either::Either::Left(reg), _, _, _) => Some(*reg),
                     RTLInst::Itailcall(_, either::Either::Left(reg), _) => Some(*reg),
@@ -489,39 +619,67 @@ impl IRPass for StructRecoveryPass {
                 db.rel_push("emit_var_type_candidate", (reg, XType::Xfuncptr));
             }
         }
+        crate::decompile::passes::rtl_pass::enforce_win64_home_slot_types(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
         &[
-            "rtl_inst", "ltl_inst", "reg_rtl",
-            "instr_in_function", "is_ptr", "emit_var_type_candidate",
-            "call_target_func", "call_arg_mapping",
-            "emit_function", "known_extern_signature",
-            "string_data", "ident_to_symbol",
-            "stack_var", "stack_var_chunk",
-            "is_global_array", "interior_to_base_ident", "global_access_ev",
-            "emit_function_param_candidate", "func_has_param_at_position",
+            "rtl_inst",
+            "ltl_inst",
+            "reg_rtl",
+            "instr_in_function",
+            "is_ptr",
+            "emit_var_type_candidate",
+            "call_target_func",
+            "call_arg_mapping",
+            "emit_function",
+            "known_extern_signature",
+            "string_data",
+            "ident_to_symbol",
+            "stack_var",
+            "stack_var_chunk",
+            "normalized_stack_lea_base",
+            "normalized_stack_write_range",
+            "stack_write_dominates_node",
+            "win64_home_spill_candidate",
+            "is_global_array",
+            "interior_to_base_ident",
+            "global_access_ev",
+            "emit_function_param_candidate",
+            "func_has_param_at_position",
             "emit_function_return",
+            "win64_home_slot_type",
         ]
     }
 
     fn outputs(&self) -> &'static [&'static str] {
         &[
             "emit_var_type_candidate",
-            "emit_struct_field", "emit_var_is_struct_candidate",
-            "global_struct_catalog", "emit_canonical_struct_id",
-            "struct_id_to_canonical", "emit_struct_def",
+            "emit_struct_field",
+            "emit_var_is_struct_candidate",
+            "global_struct_catalog",
+            "emit_canonical_struct_id",
+            "struct_id_to_canonical",
+            "emit_struct_def",
             "reg_to_struct_id",
-            "func_param_struct_type_candidate", "func_return_struct_type",
-            "ptr_deref", "ptr_deref_load", "ptr_is_struct_candidate",
-            "struct_field_type", "refined_ptr_type",
-            "stack_struct_field", "stack_is_struct_candidate", "stack_lea_reg",
-            "global_deref", "global_deref_load", "global_is_struct_candidate",
+            "func_param_struct_type_candidate",
+            "func_return_struct_type",
+            "ptr_deref",
+            "ptr_deref_load",
+            "ptr_scaled_record_member",
+            "ptr_is_struct_candidate",
+            "struct_field_type",
+            "refined_ptr_type",
+            "stack_struct_field",
+            "stack_is_struct_candidate",
+            "stack_lea_reg",
+            "global_deref",
+            "global_deref_load",
+            "global_is_struct_candidate",
             "emit_global_struct_fields",
         ]
     }
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct InferredField {
@@ -557,7 +715,11 @@ fn try_build_layout(accesses: &[(i64, MemoryChunk)]) -> Option<Vec<InferredField
             chunks
                 .iter()
                 .copied()
-                .max_by(|a, b| chunk_byte_size(a).cmp(&chunk_byte_size(b)).then_with(|| a.cmp(b)))
+                .max_by(|a, b| {
+                    chunk_byte_size(a)
+                        .cmp(&chunk_byte_size(b))
+                        .then_with(|| a.cmp(b))
+                })
                 .unwrap_or(first)
         };
         field_map.insert(ofs, chosen);
@@ -572,16 +734,16 @@ fn try_build_layout(accesses: &[(i64, MemoryChunk)]) -> Option<Vec<InferredField
         return None;
     }
 
-    let sorted: Vec<(i64, usize)> = fields.iter()
+    let sorted: Vec<(i64, usize)> = fields
+        .iter()
         .map(|f| (f.offset, chunk_byte_size(&f.chunk)))
         .collect();
     if sorted.windows(2).any(|w| w[0].0 + w[0].1 as i64 > w[1].0) {
         return None;
     }
 
-    let offset_chunks: Vec<(i64, MemoryChunk)> = fields.iter()
-        .map(|f| (f.offset, f.chunk))
-        .collect();
+    let offset_chunks: Vec<(i64, MemoryChunk)> =
+        fields.iter().map(|f| (f.offset, f.chunk)).collect();
     if is_uniform_stride(&offset_chunks) {
         return None;
     }
@@ -618,14 +780,48 @@ fn post_process_structs(db: &mut DecompileDB) {
         .cloned()
         .collect();
 
+    let scaled_record_members: Vec<(
+        Address,
+        RTLReg,
+        RTLReg,
+        i64,
+        i64,
+        MemoryChunk,
+        RTLReg,
+        bool,
+    )> = db
+        .rel_iter::<(
+            Address,
+            RTLReg,
+            RTLReg,
+            i64,
+            i64,
+            MemoryChunk,
+            RTLReg,
+            bool,
+        )>("ptr_scaled_record_member")
+        .copied()
+        .collect();
+
     let mut ptr_loads_by_base: HashMap<RTLReg, HashMap<i64, HashSet<MemoryChunk>>> = HashMap::new();
     for &(base, ofs, chunk) in db.rel_iter::<(RTLReg, i64, MemoryChunk)>("ptr_deref_load") {
-        ptr_loads_by_base.entry(base).or_default().entry(ofs).or_default().insert(chunk);
+        ptr_loads_by_base
+            .entry(base)
+            .or_default()
+            .entry(ofs)
+            .or_default()
+            .insert(chunk);
     }
 
-    let mut global_loads_by_ident: HashMap<Ident, HashMap<i64, HashSet<MemoryChunk>>> = HashMap::new();
+    let mut global_loads_by_ident: HashMap<Ident, HashMap<i64, HashSet<MemoryChunk>>> =
+        HashMap::new();
     for &(ident, ofs, chunk) in db.rel_iter::<(Ident, i64, MemoryChunk)>("global_deref_load") {
-        global_loads_by_ident.entry(ident).or_default().entry(ofs).or_default().insert(chunk);
+        global_loads_by_ident
+            .entry(ident)
+            .or_default()
+            .entry(ofs)
+            .or_default()
+            .insert(chunk);
     }
 
     let struct_field_types: Vec<(RTLReg, i64, MemoryChunk, XType)> = db
@@ -648,7 +844,10 @@ fn post_process_structs(db: &mut DecompileDB) {
             .into_iter()
             .map(|(reg, mut tys)| {
                 tys.sort_by_key(|ty| {
-                    (crate::decompile::passes::clight_pass::xtype_refine_priority(ty), *ty)
+                    (
+                        crate::decompile::passes::clight_pass::xtype_refine_priority(ty),
+                        *ty,
+                    )
                 });
                 (reg, *tys.last().unwrap())
             })
@@ -689,10 +888,14 @@ fn post_process_structs(db: &mut DecompileDB) {
     }
 
     let candidate_set: HashSet<RTLReg> = struct_candidates.iter().copied().collect();
-    let mut ptr_deref_map: HashMap<RTLReg, Vec<(i64, MemoryChunk, RTLReg, Address)>> = HashMap::new();
+    let mut ptr_deref_map: HashMap<RTLReg, Vec<(i64, MemoryChunk, RTLReg, Address)>> =
+        HashMap::new();
     for &(base, ofs, chunk, val, func) in &ptr_derefs {
         if candidate_set.contains(&base) {
-            ptr_deref_map.entry(base).or_default().push((ofs, chunk, val, func));
+            ptr_deref_map
+                .entry(base)
+                .or_default()
+                .push((ofs, chunk, val, func));
         }
     }
     // Canonicalize per-reg access lists so accesses.first() and downstream HashMap insertion orders are stable across runs (Ascent tuple-insertion order is not).
@@ -709,7 +912,8 @@ fn post_process_structs(db: &mut DecompileDB) {
         };
 
         let ofs_chunks: Vec<(i64, MemoryChunk)> = prefer_load_chunks(
-            accesses.iter()
+            accesses
+                .iter()
                 .map(|&(ofs, chunk, _, _)| (ofs, chunk))
                 .collect(),
             ptr_loads_by_base.get(&ptr_reg),
@@ -717,22 +921,91 @@ fn post_process_structs(db: &mut DecompileDB) {
 
         if let Some(fields) = try_build_layout(&ofs_chunks) {
             let func = accesses.first().map(|a| a.3).unwrap_or(0);
-            layout_ptr_regs.entry(fields.clone()).or_default().push((func, ptr_reg));
+            layout_ptr_regs
+                .entry(fields.clone())
+                .or_default()
+                .push((func, ptr_reg));
             *layout_access_count.entry(fields).or_insert(0) += accesses.len();
         }
     }
 
-    let mut stack_field_map: HashMap<(Address, i64), Vec<(i64, MemoryChunk, RTLReg)>> = HashMap::new();
-    for &(func, base_ofs, field_ofs, chunk, rtl_reg) in &stack_fields {
-        stack_field_map.entry((func, base_ofs)).or_default().push((field_ofs, chunk, rtl_reg));
+    // Exceptional scaled-record layouts stay family scoped all the way to
+    // construction.  Never merge constant dereferences or another loop's
+    // accesses into this layout, and require the recovered span to equal the
+    // hardware stride exactly.
+    let mut scaled_groups: BTreeMap<
+        (Address, RTLReg, RTLReg, i64),
+        Vec<(i64, MemoryChunk, RTLReg, bool)>,
+    > = BTreeMap::new();
+    for &(func, base, index, scale, ofs, chunk, value, is_load) in &scaled_record_members {
+        scaled_groups
+            .entry((func, base, index, scale))
+            .or_default()
+            .push((ofs, chunk, value, is_load));
     }
-    for v in stack_field_map.values_mut() { v.sort(); }
+    for accesses in scaled_groups.values_mut() {
+        accesses.sort();
+        accesses.dedup();
+    }
+
+    for ((func, base, _index, scale), accesses) in scaled_groups {
+        let mut load_chunks: HashMap<i64, HashSet<MemoryChunk>> = HashMap::new();
+        for &(ofs, chunk, _, is_load) in &accesses {
+            if is_load {
+                load_chunks.entry(ofs).or_default().insert(chunk);
+            }
+        }
+        let ofs_chunks = prefer_load_chunks(
+            accesses
+                .iter()
+                .map(|&(ofs, chunk, _, _)| (ofs, chunk))
+                .collect(),
+            Some(&load_chunks),
+        );
+        let Some(fields) = try_build_layout(&ofs_chunks) else {
+            continue;
+        };
+        if fields.first().map(|field| field.offset) != Some(0)
+            || scale <= 0
+            || compute_total_size(&fields) != scale as usize
+        {
+            continue;
+        }
+
+        layout_ptr_regs
+            .entry(fields.clone())
+            .or_default()
+            .push((func, base));
+        *layout_access_count.entry(fields.clone()).or_insert(0) += accesses.len();
+        for &(ofs, _, value, _) in &accesses {
+            if let Some(&xtype) = existing_types.get(&value) {
+                field_xtype_map
+                    .entry((base, ofs))
+                    .or_default()
+                    .push(xtype);
+            }
+        }
+    }
+
+    let mut stack_field_map: HashMap<(Address, i64), Vec<(i64, MemoryChunk, RTLReg)>> =
+        HashMap::new();
+    for &(func, base_ofs, field_ofs, chunk, rtl_reg) in &stack_fields {
+        stack_field_map
+            .entry((func, base_ofs))
+            .or_default()
+            .push((field_ofs, chunk, rtl_reg));
+    }
+    for v in stack_field_map.values_mut() {
+        v.sort();
+    }
 
     let mut stack_lea_map: HashMap<(Address, i64), Vec<RTLReg>> = HashMap::new();
     for &(func, base_ofs, reg) in &stack_lea_regs {
         stack_lea_map.entry((func, base_ofs)).or_default().push(reg);
     }
-    for v in stack_lea_map.values_mut() { v.sort(); }
+    for v in stack_lea_map.values_mut() {
+        v.sort();
+    }
 
     let mut stack_candidates_sorted = stack_candidates.clone();
     stack_candidates_sorted.sort();
@@ -743,14 +1016,18 @@ fn post_process_structs(db: &mut DecompileDB) {
             None => continue,
         };
 
-        let ofs_chunks: Vec<(i64, MemoryChunk)> = fields_data.iter()
+        let ofs_chunks: Vec<(i64, MemoryChunk)> = fields_data
+            .iter()
             .map(|&(field_ofs, chunk, _)| (field_ofs, chunk))
             .collect();
 
         if let Some(fields) = try_build_layout(&ofs_chunks) {
             if let Some(lea_regs) = stack_lea_map.get(&(func, base_ofs)) {
                 for &reg in lea_regs {
-                    layout_ptr_regs.entry(fields.clone()).or_default().push((func, reg));
+                    layout_ptr_regs
+                        .entry(fields.clone())
+                        .or_default()
+                        .push((func, reg));
                 }
             }
 
@@ -758,7 +1035,10 @@ fn post_process_structs(db: &mut DecompileDB) {
                 for &lea_reg in lea_regs {
                     for &(field_ofs, _, rtl_reg) in fields_data {
                         if let Some(&xtype) = existing_types.get(&rtl_reg) {
-                            field_xtype_map.entry((lea_reg, field_ofs)).or_default().push(xtype);
+                            field_xtype_map
+                                .entry((lea_reg, field_ofs))
+                                .or_default()
+                                .push(xtype);
                         }
                     }
                 }
@@ -773,10 +1053,15 @@ fn post_process_structs(db: &mut DecompileDB) {
     let mut global_deref_map: HashMap<Ident, Vec<(i64, MemoryChunk, RTLReg)>> = HashMap::new();
     for &(ident, ofs, chunk, val_reg) in &global_derefs {
         if global_candidate_set.contains(&ident) {
-            global_deref_map.entry(ident).or_default().push((ofs, chunk, val_reg));
+            global_deref_map
+                .entry(ident)
+                .or_default()
+                .push((ofs, chunk, val_reg));
         }
     }
-    for v in global_deref_map.values_mut() { v.sort(); }
+    for v in global_deref_map.values_mut() {
+        v.sort();
+    }
 
     let mut global_candidates_sorted = global_candidates.clone();
     global_candidates_sorted.sort();
@@ -791,7 +1076,8 @@ fn post_process_structs(db: &mut DecompileDB) {
         };
 
         let ofs_chunks: Vec<(i64, MemoryChunk)> = prefer_load_chunks(
-            accesses.iter()
+            accesses
+                .iter()
                 .map(|&(ofs, chunk, _)| (ofs, chunk))
                 .collect(),
             global_loads_by_ident.get(&ident),
@@ -800,7 +1086,10 @@ fn post_process_structs(db: &mut DecompileDB) {
         if let Some(fields) = try_build_layout(&ofs_chunks) {
             for &(ofs, _, val_reg) in accesses {
                 if let Some(&xtype) = existing_types.get(&val_reg) {
-                    field_xtype_map.entry((val_reg, ofs)).or_default().push(xtype);
+                    field_xtype_map
+                        .entry((val_reg, ofs))
+                        .or_default()
+                        .push(xtype);
                 }
             }
 
@@ -816,14 +1105,19 @@ fn post_process_structs(db: &mut DecompileDB) {
             let mut ptr_regs = layout_ptr_regs.remove(&fields).unwrap_or_default();
             // ptr_regs is built by pushing during non-deterministic iteration; sort so var_struct_map / canonical_id assignment is stable across runs.
             ptr_regs.sort();
-            CandidateStruct { ptr_regs, fields, access_count }
+            CandidateStruct {
+                ptr_regs,
+                fields,
+                access_count,
+            }
         })
         .collect();
 
-    candidates.sort_by(|a, b|
-        b.access_count.cmp(&a.access_count)
+    candidates.sort_by(|a, b| {
+        b.access_count
+            .cmp(&a.access_count)
             .then_with(|| a.fields.cmp(&b.fields))
-    );
+    });
 
     // Keep every candidate: popularity cutoff would drop real structs with few accesses.
 
@@ -898,7 +1192,12 @@ fn post_process_structs(db: &mut DecompileDB) {
     let mut gsc_vec: Vec<(u64, usize, usize, usize)> = Vec::new();
     for (&layout_hash, &canonical_id) in &hash_to_canonical {
         if let Some(fields) = struct_fields_map.get(&canonical_id) {
-            gsc_vec.push((layout_hash, canonical_id, fields.len(), compute_total_size(fields)));
+            gsc_vec.push((
+                layout_hash,
+                canonical_id,
+                fields.len(),
+                compute_total_size(fields),
+            ));
         }
     }
     let gsc: ascent::boxcar::Vec<_> = gsc_vec.into_iter().collect();
@@ -923,7 +1222,10 @@ fn post_process_structs(db: &mut DecompileDB) {
     }
 
     // Push reg->canonical struct ID mapping to DB for ClightFieldPass and clight_select bridging
-    let rtsi: ascent::boxcar::Vec<_> = var_struct_map.iter().map(|&(addr, reg, sid)| (addr, reg, sid)).collect();
+    let rtsi: ascent::boxcar::Vec<_> = var_struct_map
+        .iter()
+        .map(|&(addr, reg, sid)| (addr, reg, sid))
+        .collect();
     db.rel_set("reg_to_struct_id", rtsi);
 
     // Global ident -> struct binding: pure constant-offset globals carry no XstructPtr register, so without emit_global_struct_fields the definition is unreferenced and pruned at emission.
@@ -933,7 +1235,8 @@ fn post_process_structs(db: &mut DecompileDB) {
             let layout_hash = compute_layout_hash(fields);
             if let Some(&sid) = hash_to_canonical.get(&layout_hash) {
                 let field_tuples: Arc<Vec<(i64, Ident, MemoryChunk)>> = Arc::new(
-                    fields.iter()
+                    fields
+                        .iter()
                         .map(|f| (f.offset, make_field_ident(f.offset, f.chunk), f.chunk))
                         .collect(),
                 );
@@ -982,7 +1285,15 @@ fn post_process_structs(db: &mut DecompileDB) {
 
     for &(reg, xtype) in &refined_ptrs {
         if let Some(existing) = existing_types.get(&reg) {
-            if matches!(existing, XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr) {
+            if matches!(
+                existing,
+                XType::Xcharptr
+                    | XType::Xcharptrptr
+                    | XType::Xintptr
+                    | XType::Xfloatptr
+                    | XType::Xsingleptr
+                    | XType::Xfuncptr
+            ) {
                 continue;
             }
         }
@@ -1005,7 +1316,6 @@ fn post_process_structs(db: &mut DecompileDB) {
         );
     }
 }
-
 
 fn is_uniform_stride(offsets: &[(i64, MemoryChunk)]) -> bool {
     if offsets.len() < 3 {
@@ -1042,14 +1352,16 @@ fn compute_layout_hash(fields: &[InferredField]) -> u64 {
 }
 
 fn compute_total_size(fields: &[InferredField]) -> usize {
-    if fields.is_empty() { return 0; }
+    if fields.is_empty() {
+        return 0;
+    }
     let first = &fields[0];
     let last = &fields[fields.len() - 1];
     let span = (last.offset - first.offset) as usize;
     span + chunk_byte_size(&last.chunk)
 }
 
-pub use crate::decompile::passes::csh_pass::{make_field_ident, field_ident_to_name};
+pub use crate::decompile::passes::csh_pass::{field_ident_to_name, make_field_ident};
 
 pub fn compute_layout_hash_from_tuples(fields: &[(i64, usize, MemoryChunk)]) -> u64 {
     let mut sorted: Vec<_> = fields.to_vec();
@@ -1075,8 +1387,12 @@ fn xtype_to_field_type(xtype: XType) -> FieldType {
         XType::Xfloat => FieldType::Scalar(MemoryChunk::MFloat64),
         XType::Xsingle => FieldType::Scalar(MemoryChunk::MFloat32),
         XType::Xptr => FieldType::Pointer(Box::new(FieldType::Unknown)),
-        XType::Xcharptr => FieldType::Pointer(Box::new(FieldType::Scalar(MemoryChunk::MInt8Signed))),
-        XType::Xcharptrptr => FieldType::Pointer(Box::new(FieldType::Pointer(Box::new(FieldType::Scalar(MemoryChunk::MInt8Signed))))),
+        XType::Xcharptr => {
+            FieldType::Pointer(Box::new(FieldType::Scalar(MemoryChunk::MInt8Signed)))
+        }
+        XType::Xcharptrptr => FieldType::Pointer(Box::new(FieldType::Pointer(Box::new(
+            FieldType::Scalar(MemoryChunk::MInt8Signed),
+        )))),
         XType::Xintptr => FieldType::Pointer(Box::new(FieldType::Scalar(MemoryChunk::MInt32))),
         XType::Xfloatptr => FieldType::Pointer(Box::new(FieldType::Scalar(MemoryChunk::MFloat64))),
         XType::Xsingleptr => FieldType::Pointer(Box::new(FieldType::Scalar(MemoryChunk::MFloat32))),
@@ -1085,5 +1401,198 @@ fn xtype_to_field_type(xtype: XType) -> FieldType {
         XType::Xany32 => FieldType::Scalar(MemoryChunk::MAny32),
         XType::Xany64 => FieldType::Scalar(MemoryChunk::MAny64),
         XType::Xvoid => FieldType::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod scaled_record_tests {
+    use super::*;
+
+    const FUNC: Address = 0x1000;
+    const LEA: Node = 0x1010;
+    const ACCESS_ZERO: Node = 0x1020;
+    const ACCESS_MALFORMED: Node = 0x1028;
+    const ACCESS_FIELD: Node = 0x1030;
+    const WRITE: Node = 0x1008;
+    const BASE: RTLReg = 0x2000;
+    const INDEX: RTLReg = 0x2001;
+
+    fn run_with_write_range(
+        start: i64,
+        end: i64,
+        dominates: bool,
+        home_spill: bool,
+        malformed_access: bool,
+    ) -> DecompileDB {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        db.rel_push(
+            "rtl_inst",
+            (
+                LEA,
+                RTLInst::Iop(
+                    Operation::Olea(Addressing::Ainstack(8)),
+                    Arc::new(vec![]),
+                    BASE,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                ACCESS_ZERO,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2scaled(8, 0),
+                    Arc::new(vec![BASE, INDEX]),
+                    0x3000,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                ACCESS_FIELD,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2scaled(8, 4),
+                    Arc::new(vec![BASE, INDEX]),
+                    0x3001,
+                ),
+            ),
+        );
+        if malformed_access {
+            db.rel_push(
+                "rtl_inst",
+                (
+                    ACCESS_MALFORMED,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt32,
+                        Addressing::Aindexed2scaled(8, 7),
+                        Arc::new(vec![BASE, INDEX]),
+                        0x3002,
+                    ),
+                ),
+            );
+        }
+        for node in [LEA, ACCESS_ZERO, ACCESS_FIELD, WRITE] {
+            db.rel_push("instr_in_function", (node, FUNC));
+        }
+        if malformed_access {
+            db.rel_push("instr_in_function", (ACCESS_MALFORMED, FUNC));
+        }
+        db.rel_push("is_ptr", (BASE,));
+        db.rel_push("normalized_stack_lea_base", (FUNC, LEA, BASE, -64_i64));
+        db.rel_push(
+            "normalized_stack_write_range",
+            (WRITE, FUNC, Mreg::SP, 8_i64, start, end),
+        );
+        if dominates {
+            db.rel_push("stack_write_dominates_node", (FUNC, WRITE, LEA));
+        }
+        if home_spill {
+            db.rel_push(
+                "win64_home_spill_candidate",
+                (WRITE, FUNC, Mreg::CX, 0_usize),
+            );
+        }
+        StructRecoveryPass.run(&mut db);
+        db
+    }
+
+    #[test]
+    fn scaled_record_requires_write_at_the_selected_normalized_cell() {
+        let db = run_with_write_range(-32, -24, true, false, false);
+        assert_eq!(
+            db.rel_iter::<(
+                Address,
+                RTLReg,
+                RTLReg,
+                i64,
+                i64,
+                MemoryChunk,
+                RTLReg,
+                bool,
+            )>("ptr_scaled_record_member")
+            .count(),
+            0,
+            "an unrelated full-width stack write must not prove record layout"
+        );
+    }
+
+    #[test]
+    fn scaled_record_accepts_exact_full_stride_write_evidence() {
+        let db = run_with_write_range(-64, -56, true, false, false);
+        assert_eq!(
+            db.rel_iter::<(
+                Address,
+                RTLReg,
+                RTLReg,
+                i64,
+                i64,
+                MemoryChunk,
+                RTLReg,
+                bool,
+            )>("ptr_scaled_record_member")
+            .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn scaled_record_rejects_non_dominating_write_evidence() {
+        let db = run_with_write_range(-64, -56, false, false, false);
+        assert_eq!(
+            db.rel_iter::<(
+                Address,
+                RTLReg,
+                RTLReg,
+                i64,
+                i64,
+                MemoryChunk,
+                RTLReg,
+                bool,
+            )>("ptr_scaled_record_member")
+            .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn scaled_record_rejects_home_spill_as_object_evidence() {
+        let db = run_with_write_range(-64, -56, true, true, false);
+        assert_eq!(
+            db.rel_iter::<(
+                Address,
+                RTLReg,
+                RTLReg,
+                i64,
+                i64,
+                MemoryChunk,
+                RTLReg,
+                bool,
+            )>("ptr_scaled_record_member")
+            .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn scaled_record_rejects_malformed_same_family_access() {
+        let db = run_with_write_range(-64, -56, true, false, true);
+        assert_eq!(
+            db.rel_iter::<(
+                Address,
+                RTLReg,
+                RTLReg,
+                i64,
+                i64,
+                MemoryChunk,
+                RTLReg,
+                bool,
+            )>("ptr_scaled_record_member")
+            .count(),
+            0
+        );
     }
 }

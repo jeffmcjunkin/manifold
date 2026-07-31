@@ -1,21 +1,18 @@
-
-
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
 use crate::{declare_io_from, run_pass};
 
-use std::sync::Arc;
-use std::collections::HashMap;
 use crate::decompile::passes::cminor_pass::*;
 use crate::decompile::passes::csh_pass::*;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::mreg::Mreg;
-use crate::x86::op::{Comparison, Condition, Operation, Addressing};
+use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
-use log::debug;
 use ascent::ascent_par;
 use either::Either;
-
+use log::debug;
 
 ascent_par! {
     #![measure_rule_times]
@@ -1023,7 +1020,9 @@ ascent_par! {
 pub struct ClightPass;
 
 impl IRPass for ClightPass {
-    fn name(&self) -> &'static str { "clight" }
+    fn name(&self) -> &'static str {
+        "clight"
+    }
 
     fn run(&self, db: &mut DecompileDB) {
         run_pass!(db, ClightPassProgram);
@@ -1035,22 +1034,49 @@ impl IRPass for ClightPass {
 pub struct ClightFieldPass;
 
 impl IRPass for ClightFieldPass {
-    fn name(&self) -> &'static str { "clight_field" }
+    fn name(&self) -> &'static str {
+        "clight_field"
+    }
 
     fn run(&self, db: &mut DecompileDB) {
         rewrite_clight_stmts_with_struct_fields(db);
+        crate::decompile::passes::rtl_pass::enforce_win64_home_slot_types(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
-        &["emit_struct_fields", "emit_struct_field", "instr_in_function", "clight_stmt", "emit_clight_stmt", "clight_stmt_dead", "mach_imm_stack_init", "global_struct_catalog", "emit_function", "reg_rtl", "call_arg_mapping", "call_target_func", "reg_to_struct_id", "rtl_inst", "stack_var"]
+        &[
+            "emit_struct_fields",
+            "emit_struct_field",
+            "instr_in_function",
+            "clight_stmt",
+            "emit_clight_stmt",
+            "clight_stmt_dead",
+            "mach_imm_stack_init",
+            "global_struct_catalog",
+            "emit_function",
+            "reg_rtl",
+            "call_arg_mapping",
+            "call_target_func",
+            "reg_to_struct_id",
+            "rtl_inst",
+            "stack_var",
+            "emit_var_type_candidate",
+            "win64_home_slot_type",
+        ]
     }
 
     fn outputs(&self) -> &'static [&'static str] {
         // emit_struct_fields is read-modify-write: infer_struct_fields_from_stack_inits pushes rows and SR-2 rel_sets the pruned copy; declaring it an output persists both through parallel-stage sub-dbs.
-        &["clight_stmt", "emit_clight_stmt", "clight_stmt_dead", "reg_to_struct_id", "emit_struct_fields"]
+        &[
+            "clight_stmt",
+            "emit_clight_stmt",
+            "clight_stmt_dead",
+            "reg_to_struct_id",
+            "emit_struct_fields",
+            "emit_var_type_candidate",
+        ]
     }
 }
-
 
 pub type VarTypeMap = HashMap<RTLReg, ClightType>;
 pub type MultiVarTypeMap = HashMap<RTLReg, Vec<ClightType>>;
@@ -1090,7 +1116,6 @@ pub fn collect_switch_cases<'a>(
     std::iter::once(pairs)
 }
 
-
 pub(crate) fn refine_indirect_call_signature(
     crude_sig: &Signature,
     args: &[CsharpminorExpr],
@@ -1103,9 +1128,7 @@ pub(crate) fn refine_indirect_call_signature(
         .map(|(i, expr)| {
             if let CsharpminorExpr::Evar(reg) = expr {
                 best_xtype_for_reg(reg, all_var_types)
-                    .unwrap_or_else(|| {
-                        crude_sig.sig_args.get(i).cloned().unwrap_or(XType::Xlong)
-                    })
+                    .unwrap_or_else(|| crude_sig.sig_args.get(i).cloned().unwrap_or(XType::Xlong))
             } else {
                 crude_sig.sig_args.get(i).cloned().unwrap_or(XType::Xlong)
             }
@@ -1115,8 +1138,7 @@ pub(crate) fn refine_indirect_call_signature(
     let refined_ret = if crude_sig.sig_res == XType::Xvoid {
         XType::Xvoid
     } else if let Some(dst_reg) = dst {
-        best_xtype_for_reg(dst_reg, all_var_types)
-            .unwrap_or(crude_sig.sig_res.clone())
+        best_xtype_for_reg(dst_reg, all_var_types).unwrap_or(crude_sig.sig_res.clone())
     } else {
         XType::Xvoid
     };
@@ -1156,7 +1178,6 @@ pub(crate) fn xtype_refine_priority(xtype: &XType) -> u8 {
         _ => 0,
     }
 }
-
 
 /// Extract the discriminant register from the address expression of an Eload used as a data lookup table. The address is `Ebinop(Oaddl, table_base_const, Ebinop(scale_op, Evar(idx), scale_const))` or related shapes. Returns the idx RTLReg.
 pub(crate) fn data_lookup_extract_index(addr_expr: &CsharpminorExpr) -> Option<RTLReg> {
@@ -1218,10 +1239,7 @@ pub(crate) fn build_data_lookup_switch_cases(
     let entry_is_64bit = entry_scale >= 8;
     let mut entries = Vec::with_capacity(cases_sorted.len());
     for (idx, val) in cases_sorted {
-        let set_stmt = ClightStmt::Sset(
-            dst_ident,
-            switch_case_const(*val, entry_is_64bit),
-        );
+        let set_stmt = ClightStmt::Sset(dst_ident, switch_case_const(*val, entry_is_64bit));
         // case k: { dst = val_k; break; }
         let case_body = ClightStmt::Ssequence(vec![set_stmt, ClightStmt::Sbreak]);
         entries.push((Some(*idx as Z), case_body));
@@ -1250,25 +1268,18 @@ pub(crate) fn build_closed_form_switch_cases(
     let dst_is_64bit = matches!(dst_ty, ClightType::Tlong(_, _) | ClightType::Tpointer(_, _));
     let mut entries: ClightLabeledStatements = Vec::with_capacity(cases_sorted.len() + 1);
     for (case_idx, case_val) in cases_sorted {
-        let set_stmt = ClightStmt::Sset(
-            dst_ident,
-            switch_case_const(*case_val, dst_is_64bit),
-        );
+        let set_stmt = ClightStmt::Sset(dst_ident, switch_case_const(*case_val, dst_is_64bit));
         let case_body = ClightStmt::Ssequence(vec![set_stmt, ClightStmt::Sbreak]);
         entries.push((Some(*case_idx as Z), case_body));
     }
     if has_default {
-        let set_stmt = ClightStmt::Sset(
-            dst_ident,
-            switch_case_const(default_val, dst_is_64bit),
-        );
+        let set_stmt = ClightStmt::Sset(dst_ident, switch_case_const(default_val, dst_is_64bit));
         let default_body = ClightStmt::Ssequence(vec![set_stmt, ClightStmt::Sbreak]);
         // CompCert ClightLabeledStatements uses None as the default case.
         entries.push((None, default_body));
     }
     entries
 }
-
 
 pub(crate) fn extract_vars_from_csharp_exprs(exprs: &[CsharpminorExpr]) -> Vec<RTLReg> {
     let mut vars = Vec::new();
@@ -1284,12 +1295,12 @@ pub(crate) fn extract_vars_from_builtin_args(args: &[BuiltinArg<CsharpminorExpr>
         match arg {
             BuiltinArg::BA(expr) => extract_vars_from_csharp_expr(expr, &mut vars),
             BuiltinArg::BASplitLong(lo, hi) | BuiltinArg::BAAddPtr(lo, hi) => {
-                 if let BuiltinArg::BA(lo_expr) = lo.as_ref() {
+                if let BuiltinArg::BA(lo_expr) = lo.as_ref() {
                     extract_vars_from_csharp_expr(lo_expr, &mut vars);
-                 }
-                 if let BuiltinArg::BA(hi_expr) = hi.as_ref() {
+                }
+                if let BuiltinArg::BA(hi_expr) = hi.as_ref() {
                     extract_vars_from_csharp_expr(hi_expr, &mut vars);
-                 }
+                }
             }
             _ => {}
         }
@@ -1402,7 +1413,9 @@ pub(crate) fn build_var_type_map_variants(
     // Check if any variable has cross-class candidates (pointer AND non-pointer)
     let has_conflict = base.values().any(|types| {
         let has_ptr = types.iter().any(|t| is_pointer_type(t));
-        let has_non_ptr = types.iter().any(|t| !is_pointer_type(t) && !matches!(t, ClightType::Tfloat(_, _)));
+        let has_non_ptr = types
+            .iter()
+            .any(|t| !is_pointer_type(t) && !matches!(t, ClightType::Tfloat(_, _)));
         has_ptr && has_non_ptr
     });
 
@@ -1415,11 +1428,21 @@ pub(crate) fn build_var_type_map_variants(
     let mut int_preferred = MultiVarTypeMap::new();
     for (reg, types) in &base {
         let has_ptr = types.iter().any(|t| is_pointer_type(t));
-        let has_non_ptr = types.iter().any(|t| !is_pointer_type(t) && !matches!(t, ClightType::Tfloat(_, _)));
+        let has_non_ptr = types
+            .iter()
+            .any(|t| !is_pointer_type(t) && !matches!(t, ClightType::Tfloat(_, _)));
         if has_ptr && has_non_ptr {
             // Conflicted: split
-            let ptr_types: Vec<_> = types.iter().filter(|t| is_pointer_type(t)).cloned().collect();
-            let int_types: Vec<_> = types.iter().filter(|t| !is_pointer_type(t)).cloned().collect();
+            let ptr_types: Vec<_> = types
+                .iter()
+                .filter(|t| is_pointer_type(t))
+                .cloned()
+                .collect();
+            let int_types: Vec<_> = types
+                .iter()
+                .filter(|t| !is_pointer_type(t))
+                .cloned()
+                .collect();
             if !ptr_types.is_empty() {
                 ptr_preferred.insert(*reg, ptr_types);
             }
@@ -1482,14 +1505,20 @@ pub(crate) fn select_type_from_candidates(
 
         // Integer hint -> prefer non-pointer non-float
         if !hint_is_ptr && !hint_is_float {
-            if let Some(int_ty) = types.iter().find(|t| !is_pointer_type(t) && !matches!(t, ClightType::Tfloat(_, _))) {
+            if let Some(int_ty) = types
+                .iter()
+                .find(|t| !is_pointer_type(t) && !matches!(t, ClightType::Tfloat(_, _)))
+            {
                 return int_ty.clone();
             }
         }
     }
 
     // No hint: prefer non-pointer non-float (integer is safer for arithmetic contexts)
-    if let Some(int_ty) = types.iter().find(|t| !is_pointer_type(t) && !matches!(t, ClightType::Tfloat(_, _))) {
+    if let Some(int_ty) = types
+        .iter()
+        .find(|t| !is_pointer_type(t) && !matches!(t, ClightType::Tfloat(_, _)))
+    {
         return int_ty.clone();
     }
 
@@ -1530,7 +1559,8 @@ pub(crate) fn convert_csharp_stmt_to_clight(
                 }
                 Either::Right(Either::Left(addr)) => {
                     let ident = *addr as Ident;
-                    let name = func_symbols.iter()
+                    let name = func_symbols
+                        .iter()
                         .find(|(id, _)| *id == ident)
                         .map(|(_, sym)| sym.to_string())
                         .unwrap_or_else(|| format!("sub_{:x}", addr));
@@ -1538,7 +1568,8 @@ pub(crate) fn convert_csharp_stmt_to_clight(
                 }
                 Either::Left(expr) => {
                     let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]);
-                    let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
+                    let var_types =
+                        filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
                     clight_expr_from_csharp_with_multi_types(expr, &var_types)
                 }
             };
@@ -1554,7 +1585,9 @@ pub(crate) fn convert_csharp_stmt_to_clight(
         CsharpminorStmt::Scond(cond, args, ifso, ifnot) => {
             let vars_used = extract_vars_from_csharp_exprs(args.as_slice());
             let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
-            if let Some(condition) = clight_condition_expr_with_types(cond, args.as_slice(), &var_types) {
+            if let Some(condition) =
+                clight_condition_expr_with_types(cond, args.as_slice(), &var_types)
+            {
                 let then_stmt = ClightStmt::Sgoto(ident_from_node(*ifso));
                 let else_stmt = ClightStmt::Sgoto(ident_from_node(*ifnot));
                 ClightStmt::Sifthenelse(condition, Box::new(then_stmt), Box::new(else_stmt))
@@ -1578,9 +1611,13 @@ pub(crate) fn convert_csharp_stmt_to_clight(
         CsharpminorStmt::Sifthenelse(cond, args, then_body, else_body) => {
             let vars_used = extract_vars_from_csharp_exprs(args.as_slice());
             let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
-            if let Some(condition) = clight_condition_expr_with_types(cond, args.as_slice(), &var_types) {
-                let then_clight = convert_csharp_stmt_to_clight(then_body, all_var_type_pairs, func_symbols);
-                let else_clight = convert_csharp_stmt_to_clight(else_body, all_var_type_pairs, func_symbols);
+            if let Some(condition) =
+                clight_condition_expr_with_types(cond, args.as_slice(), &var_types)
+            {
+                let then_clight =
+                    convert_csharp_stmt_to_clight(then_body, all_var_type_pairs, func_symbols);
+                let else_clight =
+                    convert_csharp_stmt_to_clight(else_body, all_var_type_pairs, func_symbols);
                 ClightStmt::Sifthenelse(condition, Box::new(then_clight), Box::new(else_clight))
             } else {
                 ClightStmt::Sskip
@@ -1597,13 +1634,18 @@ pub(crate) fn convert_csharp_stmt_to_clight(
             if let Some(CsharpminorStmt::Sjumptable(expr, targets)) = stmts.first() {
                 if stmts.len() == 1 + targets.len() {
                     let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]);
-                    let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
+                    let var_types =
+                        filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
                     let discr = clight_expr_from_csharp_with_multi_types(expr, &var_types);
                     let table: ClightLabeledStatements = stmts[1..]
                         .iter()
                         .enumerate()
                         .map(|(idx, case_body)| {
-                            let body_clight = convert_csharp_stmt_to_clight(case_body, all_var_type_pairs, func_symbols);
+                            let body_clight = convert_csharp_stmt_to_clight(
+                                case_body,
+                                all_var_type_pairs,
+                                func_symbols,
+                            );
                             (Some(idx as Z), body_clight)
                         })
                         .collect();
@@ -1625,7 +1667,8 @@ pub(crate) fn convert_csharp_stmt_to_clight(
                 }
                 Either::Right(Either::Left(addr)) => {
                     let ident = *addr as Ident;
-                    let name = func_symbols.iter()
+                    let name = func_symbols
+                        .iter()
                         .find(|(id, _)| *id == ident)
                         .map(|(_, sym)| sym.to_string())
                         .unwrap_or_else(|| format!("sub_{:x}", addr));
@@ -1633,7 +1676,8 @@ pub(crate) fn convert_csharp_stmt_to_clight(
                 }
                 Either::Left(expr) => {
                     let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]);
-                    let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
+                    let var_types =
+                        filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
                     clight_expr_from_csharp_with_multi_types(expr, &var_types)
                 }
             };
@@ -1659,22 +1703,31 @@ pub(crate) fn convert_csharp_stmt_to_clight(
                 name.clone()
             };
             let effective_args: Vec<_> = if let Some(dst_reg) = dst {
-                args.iter().filter(|arg| match arg {
-                    BuiltinArg::BA(CsharpminorExpr::Evar(r)) => r != dst_reg,
-                    _ => true,
-                }).cloned().collect()
+                args.iter()
+                    .filter(|arg| match arg {
+                        BuiltinArg::BA(CsharpminorExpr::Evar(r)) => r != dst_reg,
+                        _ => true,
+                    })
+                    .cloned()
+                    .collect()
             } else {
                 args.clone()
             };
             let vars_used = extract_vars_from_builtin_args(&effective_args);
             let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
             let converted_args = clight_builtin_args_with_multi_types(&effective_args, &var_types);
-            ClightStmt::Scall(dst_ident, ClightExpr::EvarSymbol(effective_name, default_void_ptr_type()), converted_args)
+            ClightStmt::Scall(
+                dst_ident,
+                ClightExpr::EvarSymbol(effective_name, default_void_ptr_type()),
+                converted_args,
+            )
         }
         CsharpminorStmt::Scond(cond, args, ifso, ifnot) => {
             let vars_used = extract_vars_from_csharp_exprs(args.as_slice());
             let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
-            if let Some(condition) = clight_condition_expr_with_types(cond, args.as_slice(), &var_types) {
+            if let Some(condition) =
+                clight_condition_expr_with_types(cond, args.as_slice(), &var_types)
+            {
                 let then_stmt = ClightStmt::Sgoto(ident_from_node(*ifso));
                 let else_stmt = ClightStmt::Sgoto(ident_from_node(*ifnot));
                 ClightStmt::Sifthenelse(condition, Box::new(then_stmt), Box::new(else_stmt))
@@ -1818,9 +1871,7 @@ pub(crate) fn invert_condition(cond: &Condition) -> Condition {
     }
 }
 
-
 pub type FieldInfo = HashMap<(i64, i64), (Ident, MemoryChunk)>;
-
 
 pub(crate) fn generate_field_name(offset: i64) -> Ident {
     offset as Ident
@@ -1930,21 +1981,11 @@ fn is_valid_field_offset(offset: i64, chunk: &MemoryChunk) -> bool {
     }
 
     match chunk {
-        MemoryChunk::MBool | MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => {
-            true
-        }
-        MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => {
-            offset % 2 == 0
-        }
-        MemoryChunk::MInt32 | MemoryChunk::MFloat32 => {
-            offset % 4 == 0
-        }
-        MemoryChunk::MInt64 | MemoryChunk::MFloat64 => {
-            offset % 4 == 0
-        }
-        MemoryChunk::MAny32 | MemoryChunk::MAny64 | MemoryChunk::Unknown => {
-            offset % 4 == 0
-        }
+        MemoryChunk::MBool | MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => true,
+        MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => offset % 2 == 0,
+        MemoryChunk::MInt32 | MemoryChunk::MFloat32 => offset % 4 == 0,
+        MemoryChunk::MInt64 | MemoryChunk::MFloat64 => offset % 4 == 0,
+        MemoryChunk::MAny32 | MemoryChunk::MAny64 | MemoryChunk::Unknown => offset % 4 == 0,
     }
 }
 
@@ -2047,7 +2088,8 @@ pub fn extract_struct_field_info(expr: &CsharpminorExpr) -> Option<(i64, i64)> {
                         if matches!(op, CminorBinop::Oadd | CminorBinop::Oaddl) =>
                     {
                         let base_reg = match (lhs.as_ref(), rhs.as_ref()) {
-                            (CsharpminorExpr::Evar(r), other) | (other, CsharpminorExpr::Evar(r))
+                            (CsharpminorExpr::Evar(r), other)
+                            | (other, CsharpminorExpr::Evar(r))
                                 if !matches!(other, CsharpminorExpr::Econst(_)) =>
                             {
                                 Some(*r)
@@ -2096,7 +2138,7 @@ pub fn extract_struct_field_info(expr: &CsharpminorExpr) -> Option<(i64, i64)> {
                             return Some((base_key, 0));
                         }
                     }
-    // `Oaddrstack(ofs) + idx*scale` (clang -O1 SP-indexed load): treat stack offset as a field in a bucket-0 stack-base struct so the load emits field-access instead of `*(int *)(-N + idx*S)`.
+                    // `Oaddrstack(ofs) + idx*scale` (clang -O1 SP-indexed load): treat stack offset as a field in a bucket-0 stack-base struct so the load emits field-access instead of `*(int *)(-N + idx*S)`.
                     let stack_base = match (lhs.as_ref(), rhs.as_ref()) {
                         (CsharpminorExpr::Econst(Constant::Oaddrstack(ofs)), other)
                         | (other, CsharpminorExpr::Econst(Constant::Oaddrstack(ofs)))
@@ -2292,9 +2334,19 @@ fn rebase_ptr_byte_add(
     ));
     let base_as_char_ptr = ClightExpr::Ecast(Box::new(base), char_ptr_ty.clone());
     let byte_addr = if base_is_lhs {
-        ClightExpr::Ebinop(op, Box::new(base_as_char_ptr), Box::new(offset), char_ptr_ty)
+        ClightExpr::Ebinop(
+            op,
+            Box::new(base_as_char_ptr),
+            Box::new(offset),
+            char_ptr_ty,
+        )
     } else {
-        ClightExpr::Ebinop(op, Box::new(offset), Box::new(base_as_char_ptr), char_ptr_ty)
+        ClightExpr::Ebinop(
+            op,
+            Box::new(offset),
+            Box::new(base_as_char_ptr),
+            char_ptr_ty,
+        )
     };
     ClightExpr::Ecast(Box::new(byte_addr), target_ptr_ty)
 }
@@ -2319,8 +2371,16 @@ pub fn build_binop_expr(
     match op {
         CminorBinop::Omulhs | CminorBinop::Omulhu => {
             let signed = matches!(op, CminorBinop::Omulhs);
-            let wide_ty = if signed { default_long_type() } else { default_ulong_type() };
-            let narrow_ty = if signed { default_int_type() } else { default_uint_type() };
+            let wide_ty = if signed {
+                default_long_type()
+            } else {
+                default_ulong_type()
+            };
+            let narrow_ty = if signed {
+                default_int_type()
+            } else {
+                default_uint_type()
+            };
             let l = cast_expr_to_type(coerce_ptr_to_long(lhs_expr), wide_ty.clone());
             let r = cast_expr_to_type(coerce_ptr_to_long(rhs_expr), wide_ty.clone());
             let product = ClightExpr::Ebinop(
@@ -2340,8 +2400,16 @@ pub fn build_binop_expr(
         CminorBinop::Omullhs | CminorBinop::Omullhu => {
             // 128-bit high-mul: widen both operands to __int128, multiply, take the high half with >> 64, narrow back; unlike the prior opaque builtin this recompiles and computes the right value.
             let signed = matches!(op, CminorBinop::Omullhs);
-            let res_ty = if signed { default_long_type() } else { default_ulong_type() };
-            let wide_ty = if signed { default_int128_type() } else { default_uint128_type() };
+            let res_ty = if signed {
+                default_long_type()
+            } else {
+                default_ulong_type()
+            };
+            let wide_ty = if signed {
+                default_int128_type()
+            } else {
+                default_uint128_type()
+            };
             let l = cast_expr_to_type(coerce_ptr_to_long(lhs_expr), wide_ty.clone());
             let r = cast_expr_to_type(coerce_ptr_to_long(rhs_expr), wide_ty.clone());
             let product = ClightExpr::Ebinop(
@@ -2392,7 +2460,11 @@ pub fn build_binop_expr(
             let rewritten_rhs = try_unscale_expr(rhs_final.clone(), &final_lhs_ty);
             if rewritten_rhs == rhs_final && pointee_scales(&final_lhs_ty) {
                 return rebase_ptr_byte_add(
-                    binop_op, lhs_final, rhs_final, final_lhs_ty.clone(), true,
+                    binop_op,
+                    lhs_final,
+                    rhs_final,
+                    final_lhs_ty.clone(),
+                    true,
                 );
             }
         } else if matches!(op, CminorBinop::Oadd | CminorBinop::Oaddl)
@@ -2402,7 +2474,11 @@ pub fn build_binop_expr(
             let rewritten_lhs = try_unscale_expr(lhs_final.clone(), &final_rhs_ty);
             if rewritten_lhs == lhs_final && pointee_scales(&final_rhs_ty) {
                 return rebase_ptr_byte_add(
-                    binop_op, rhs_final, lhs_final, final_rhs_ty.clone(), false,
+                    binop_op,
+                    rhs_final,
+                    lhs_final,
+                    final_rhs_ty.clone(),
+                    false,
                 );
             }
         }
@@ -2475,10 +2551,12 @@ pub fn build_binop_expr(
     };
 
     let result_ty = match op {
-        CminorBinop::Oaddf | CminorBinop::Osubf | CminorBinop::Omulf | CminorBinop::Odivf
-        | CminorBinop::Omaxf | CminorBinop::Ominf => {
-            default_float_type()
-        }
+        CminorBinop::Oaddf
+        | CminorBinop::Osubf
+        | CminorBinop::Omulf
+        | CminorBinop::Odivf
+        | CminorBinop::Omaxf
+        | CminorBinop::Ominf => default_float_type(),
         CminorBinop::Oaddfs | CminorBinop::Osubfs | CminorBinop::Omulfs | CminorBinop::Odivfs => {
             default_single_type()
         }
@@ -2528,7 +2606,12 @@ pub fn build_binop_expr(
     let result_ty = unsigned_result_ty.unwrap_or(result_ty);
 
     let binop = clight_binop_from_cminor(op).unwrap_or(ClightBinaryOp::Oadd);
-    let expr = ClightExpr::Ebinop(binop, Box::new(lhs_scaled), Box::new(rhs_scaled), result_ty.clone());
+    let expr = ClightExpr::Ebinop(
+        binop,
+        Box::new(lhs_scaled),
+        Box::new(rhs_scaled),
+        result_ty.clone(),
+    );
     // Cnotcompf/Cnotcompfs: wrap in logical NOT to preserve unordered (NaN) semantics
     if matches!(op, CminorBinop::Ocmpnotf(_) | CminorBinop::Ocmpnotfs(_)) {
         ClightExpr::Eunop(ClightUnaryOp::Onotbool, Box::new(expr), result_ty)
@@ -2546,7 +2629,10 @@ pub(crate) fn clight_expr_from_csharp_with_types(
     var_types: &VarTypeMap,
 ) -> ClightExpr {
     // Convert VarTypeMap to MultiVarTypeMap for backward compat
-    let multi: MultiVarTypeMap = var_types.iter().map(|(k, v)| (*k, vec![v.clone()])).collect();
+    let multi: MultiVarTypeMap = var_types
+        .iter()
+        .map(|(k, v)| (*k, vec![v.clone()]))
+        .collect();
     clight_expr_from_csharp_inner(expr, &HashMap::new(), &multi, None)
 }
 
@@ -2580,8 +2666,7 @@ fn clight_expr_from_csharp_inner(
         }
         CsharpminorExpr::Econst(cst) => match cst {
             Constant::Ointconst(value) => {
-                let narrowed =
-                    i32::try_from(*value).unwrap_or((*value as u32) as i32);
+                let narrowed = i32::try_from(*value).unwrap_or((*value as u32) as i32);
 
                 ClightExpr::EconstInt(narrowed, default_int_type())
             }
@@ -2661,8 +2746,11 @@ fn clight_expr_from_csharp_inner(
                 CminorUnop::Olongofint | CminorUnop::Olongofsingle | CminorUnop::Olongoffloat => {
                     ClightExpr::Ecast(Box::new(inner_expr), default_long_type())
                 }
-                CminorUnop::Osingleoffloat | CminorUnop::Osingleofint | CminorUnop::Osingleofintu
-                | CminorUnop::Osingleoflong | CminorUnop::Osingleoflongu => {
+                CminorUnop::Osingleoffloat
+                | CminorUnop::Osingleofint
+                | CminorUnop::Osingleofintu
+                | CminorUnop::Osingleoflong
+                | CminorUnop::Osingleoflongu => {
                     ClightExpr::Ecast(Box::new(inner_expr), default_single_type())
                 }
                 CminorUnop::Ofloatoflong | CminorUnop::Ofloatoflongu | CminorUnop::Ofloatofintu => {
@@ -2671,21 +2759,29 @@ fn clight_expr_from_csharp_inner(
                 CminorUnop::Ointoflong => {
                     ClightExpr::Ecast(Box::new(inner_expr), default_int_type())
                 }
+                CminorUnop::Ointuoflong => ClightExpr::Ecast(
+                    Box::new(inner_expr),
+                    ClightType::Tint(
+                        ClightIntSize::I32,
+                        ClightSignedness::Unsigned,
+                        default_attr(),
+                    ),
+                ),
                 CminorUnop::Olongofintu => {
                     ClightExpr::Ecast(Box::new(inner_expr), default_long_type())
                 }
-                CminorUnop::Ointuoffloat | CminorUnop::Ointuofsingle => {
-                    ClightExpr::Ecast(
-                        Box::new(inner_expr),
-                        ClightType::Tint(ClightIntSize::I32, ClightSignedness::Unsigned, default_attr()),
-                    )
-                }
-                CminorUnop::Olonguoffloat | CminorUnop::Olonguofsingle => {
-                    ClightExpr::Ecast(
-                        Box::new(inner_expr),
-                        ClightType::Tlong(ClightSignedness::Unsigned, default_attr()),
-                    )
-                }
+                CminorUnop::Ointuoffloat | CminorUnop::Ointuofsingle => ClightExpr::Ecast(
+                    Box::new(inner_expr),
+                    ClightType::Tint(
+                        ClightIntSize::I32,
+                        ClightSignedness::Unsigned,
+                        default_attr(),
+                    ),
+                ),
+                CminorUnop::Olonguoffloat | CminorUnop::Olonguofsingle => ClightExpr::Ecast(
+                    Box::new(inner_expr),
+                    ClightType::Tlong(ClightSignedness::Unsigned, default_attr()),
+                ),
                 _ => {
                     if let Some(unop) = clight_unop_from_cminor(op) {
                         let coerced_inner = match unop {
@@ -2704,20 +2800,30 @@ fn clight_expr_from_csharp_inner(
             }
         }
         CsharpminorExpr::Ebinop(op, lhs, rhs) => {
-            let is_add_or_sub = matches!(op,
-                CminorBinop::Oaddl | CminorBinop::Osubl |
-                CminorBinop::Oadd | CminorBinop::Osub
+            let is_add_or_sub = matches!(
+                op,
+                CminorBinop::Oaddl | CminorBinop::Osubl | CminorBinop::Oadd | CminorBinop::Osub
             );
             // Propagate pointer hint from parent to LHS (base) and integer hint to RHS (offset) for add/sub
-            let (lhs_hint, rhs_hint) = if is_add_or_sub && type_hint.map_or(false, |h| is_pointer_type(h)) {
-                (type_hint.cloned(), if is_long_cminor_binop(op) { Some(default_long_type()) } else { None })
-            } else if is_long_cminor_binop(op) {
-                (Some(default_long_type()), Some(default_long_type()))
-            } else {
-                (None, None)
-            };
-            let lhs_expr = clight_expr_from_csharp_inner(lhs, field_info, var_types, lhs_hint.as_ref());
-            let rhs_expr = clight_expr_from_csharp_inner(rhs, field_info, var_types, rhs_hint.as_ref());
+            let (lhs_hint, rhs_hint) =
+                if is_add_or_sub && type_hint.map_or(false, |h| is_pointer_type(h)) {
+                    (
+                        type_hint.cloned(),
+                        if is_long_cminor_binop(op) {
+                            Some(default_long_type())
+                        } else {
+                            None
+                        },
+                    )
+                } else if is_long_cminor_binop(op) {
+                    (Some(default_long_type()), Some(default_long_type()))
+                } else {
+                    (None, None)
+                };
+            let lhs_expr =
+                clight_expr_from_csharp_inner(lhs, field_info, var_types, lhs_hint.as_ref());
+            let rhs_expr =
+                clight_expr_from_csharp_inner(rhs, field_info, var_types, rhs_hint.as_ref());
             // Downgrade Oaddl/Osubl to Oadd/Osub for pointer operands so build_binop_expr produces pointer result type (ptr+int=ptr in C).
             let effective_op = match op {
                 CminorBinop::Oaddl
@@ -2726,9 +2832,7 @@ fn clight_expr_from_csharp_inner(
                 {
                     &CminorBinop::Oadd
                 }
-                CminorBinop::Osubl
-                    if is_pointer_type(&clight_expr_type(&lhs_expr)) =>
-                {
+                CminorBinop::Osubl if is_pointer_type(&clight_expr_type(&lhs_expr)) => {
                     &CminorBinop::Osub
                 }
                 _ => op,
@@ -2753,7 +2857,8 @@ fn clight_expr_from_csharp_inner(
 
             let elem_ty = clight_type_from_chunk(chunk);
             let ptr_hint = pointer_to(elem_ty.clone());
-            let addr_expr = clight_expr_from_csharp_inner(addr, field_info, var_types, Some(&ptr_hint));
+            let addr_expr =
+                clight_expr_from_csharp_inner(addr, field_info, var_types, Some(&ptr_hint));
 
             if matches!(
                 &addr_expr,
@@ -2834,10 +2939,17 @@ fn clight_expr_from_csharp_inner(
         }
         CsharpminorExpr::Econdition(cond, true_val, false_val) => {
             let cond_expr = clight_expr_from_csharp_inner(cond, field_info, var_types, None);
-            let true_expr = clight_expr_from_csharp_inner(true_val, field_info, var_types, type_hint);
-            let false_expr = clight_expr_from_csharp_inner(false_val, field_info, var_types, type_hint);
+            let true_expr =
+                clight_expr_from_csharp_inner(true_val, field_info, var_types, type_hint);
+            let false_expr =
+                clight_expr_from_csharp_inner(false_val, field_info, var_types, type_hint);
             let ty = type_hint.cloned().unwrap_or_else(default_int_type);
-            ClightExpr::Econdition(Box::new(cond_expr), Box::new(true_expr), Box::new(false_expr), ty)
+            ClightExpr::Econdition(
+                Box::new(cond_expr),
+                Box::new(true_expr),
+                Box::new(false_expr),
+                ty,
+            )
         }
     }
 }
@@ -3066,7 +3178,11 @@ pub(crate) fn check_clight_stmt(stmt: &ClightStmt) -> Option<ClightStmt> {
             } else if !func_ok {
                 let default_fn_ty = ClightType::Tfunction(
                     Arc::new(vec![]),
-                    Arc::new(ClightType::Tint(ClightIntSize::I32, ClightSignedness::Signed, default_attr())),
+                    Arc::new(ClightType::Tint(
+                        ClightIntSize::I32,
+                        ClightSignedness::Signed,
+                        default_attr(),
+                    )),
                     CallConv::default(),
                 );
                 let fn_ptr_ty = pointer_to(default_fn_ty);
@@ -3099,7 +3215,10 @@ pub(crate) fn check_clight_stmt(stmt: &ClightStmt) -> Option<ClightStmt> {
         ClightStmt::Sloop(body, exit) => {
             let body_checked = check_clight_stmt(body)?;
             let exit_checked = check_clight_stmt(exit)?;
-            Some(ClightStmt::Sloop(Box::new(body_checked), Box::new(exit_checked)))
+            Some(ClightStmt::Sloop(
+                Box::new(body_checked),
+                Box::new(exit_checked),
+            ))
         }
         ClightStmt::Ssequence(stmts) => {
             let checked: Vec<_> = stmts.iter().filter_map(check_clight_stmt).collect();
@@ -3125,11 +3244,19 @@ fn force_int_type_for_32bit_cmp(expr: ClightExpr, signed: bool) -> ClightExpr {
     let ty = clight_expr_type(&expr);
     // A 64-bit operand of a 32-bit-typed comparison cannot be narrowed, so coerce to signed/unsigned LONG and run the comparison at full width with the correct signedness.
     if matches!(ty, ClightType::Tlong(_, _)) {
-        let long_target = if signed { default_long_type() } else { default_ulong_type() };
+        let long_target = if signed {
+            default_long_type()
+        } else {
+            default_ulong_type()
+        };
         return cast_expr_to_type(expr, long_target);
     }
     if !matches!(ty, ClightType::Tpointer(_, _)) {
-        let target = if signed { default_int_type() } else { default_uint_type() };
+        let target = if signed {
+            default_int_type()
+        } else {
+            default_uint_type()
+        };
         // Force signedness by EMITTING A REAL CAST on every integral operand shape: a C comparison follows the operand's declared type, so a retyped-in-place annotation would stay signed.
         return match expr {
             other if is_integral_type(&clight_expr_type(&other)) => {
@@ -3139,13 +3266,21 @@ fn force_int_type_for_32bit_cmp(expr: ClightExpr, signed: bool) -> ClightExpr {
         };
     }
     // Pointer: cast to signed/unsigned long (64-bit); truncating to 32-bit would lose address bits.
-    let long_ty = if signed { default_long_type() } else { default_ulong_type() };
+    let long_ty = if signed {
+        default_long_type()
+    } else {
+        default_ulong_type()
+    };
     ClightExpr::Ecast(Box::new(expr), long_ty)
 }
 
 // CLIGHT-2: 64-bit sibling of force_int_type_for_32bit_cmp, forcing signed/unsigned long on every operand shape; pointer operands cast to long too, preserving address bits.
 fn force_long_type_for_64bit_cmp(expr: ClightExpr, signed: bool) -> ClightExpr {
-    let target = if signed { default_long_type() } else { default_ulong_type() };
+    let target = if signed {
+        default_long_type()
+    } else {
+        default_ulong_type()
+    };
     let ty = clight_expr_type(&expr);
     if is_pointer_type(&ty) || is_integral_type(&ty) {
         cast_expr_to_type(expr, target)
@@ -3206,12 +3341,10 @@ pub(crate) fn clight_condition_expr_with_types(
                             lhs_ty.clone(),
                         )
                     }
-                    (_, ClightType::Tpointer(_, _), _) if is_zero_lit(&lhs) => {
-                        ClightExpr::Ecast(
-                            Box::new(ClightExpr::EconstInt(0, default_int_type())),
-                            rhs_ty0.clone(),
-                        )
-                    }
+                    (_, ClightType::Tpointer(_, _), _) if is_zero_lit(&lhs) => ClightExpr::Ecast(
+                        Box::new(ClightExpr::EconstInt(0, default_int_type())),
+                        rhs_ty0.clone(),
+                    ),
                     _ => {
                         if matches!(lhs_ty, ClightType::Tpointer(_, _))
                             && is_zero_constant(&args[1])
@@ -3283,12 +3416,14 @@ pub(crate) fn clight_condition_expr_with_types(
         Condition::Ccompimm(comp, imm) | Condition::Ccompuimm(comp, imm) => {
             if !args.is_empty() {
                 let signed = matches!(cond, Condition::Ccompimm(_, _));
-                let imm_ty = if signed { default_int_type() } else { default_uint_type() };
+                let imm_ty = if signed {
+                    default_int_type()
+                } else {
+                    default_uint_type()
+                };
                 let lhs = clight_expr_from_csharp_with_multi_types(&args[0], var_types);
                 let lhs_final = force_int_type_for_32bit_cmp(lhs, signed);
-                let rhs_final = normalize_const_expr(
-                    ClightExpr::EconstInt(*imm as i32, imm_ty),
-                );
+                let rhs_final = normalize_const_expr(ClightExpr::EconstInt(*imm as i32, imm_ty));
                 Some(ClightExpr::Ebinop(
                     clight_cmp_from_condition(comp),
                     Box::new(lhs_final),
@@ -3302,7 +3437,11 @@ pub(crate) fn clight_condition_expr_with_types(
         Condition::Ccomplimm(comp, imm) | Condition::Ccompluimm(comp, imm) => {
             if !args.is_empty() {
                 let signed = matches!(cond, Condition::Ccomplimm(_, _));
-                let long_ty = if signed { default_long_type() } else { default_ulong_type() };
+                let long_ty = if signed {
+                    default_long_type()
+                } else {
+                    default_ulong_type()
+                };
                 let lhs = clight_expr_from_csharp_with_multi_types(&args[0], var_types);
                 let lhs_ty = clight_expr_type(&lhs);
                 let mut lhs_final = lhs.clone();
@@ -3412,11 +3551,12 @@ pub(crate) fn clight_condition_expr_with_types(
     }
 }
 
-
 fn extract_base_ident_clight(expr: &ClightExpr) -> Option<Ident> {
     match expr {
-        ClightExpr::Etempvar(ident, _) => Some(*ident),
-        ClightExpr::Ecast(inner, _) => extract_base_ident_clight(inner),
+        ClightExpr::Etempvar(ident, _) | ClightExpr::Evar(ident, _) => Some(*ident),
+        ClightExpr::Ecast(inner, _) | ClightExpr::Eaddrof(inner, _) => {
+            extract_base_ident_clight(inner)
+        }
         _ => None,
     }
 }
@@ -3439,21 +3579,36 @@ fn is_index_term_clight(expr: &ClightExpr) -> bool {
     }
 }
 
-/// Byte scale of a pointer base in clight pointer arithmetic, so base + const converts to a true byte offset; defaults to 1 for char*/void*, non-pointer bases, and aggregate pointees.
-fn clight_base_ptr_elem_size(expr: &ClightExpr) -> i64 {
+/// Sized element scale of a pointer expression.  Keeping the absence distinct
+/// from a real one-byte pointee lets nested indexed expressions prefer the
+/// outer typed pointer without mistaking a non-pointer for `char *`.
+fn clight_sized_ptr_elem_size(expr: &ClightExpr) -> Option<i64> {
     let ty = match expr {
         ClightExpr::Ecast(_, ty) => Some(ty),
         ClightExpr::Etempvar(_, ty) | ClightExpr::Evar(_, ty) => Some(ty),
         _ => None,
     };
     match ty {
-        Some(ClightType::Tpointer(elem, _)) => get_inner_type_size(elem).unwrap_or(1).max(1),
-        _ => 1,
+        Some(ClightType::Tpointer(elem, _)) => {
+            get_inner_type_size(elem).map(|size| size.max(1))
+        }
+        _ => None,
     }
 }
 
+/// Byte scale of a pointer base in clight pointer arithmetic, so base + const
+/// converts to a true byte offset; defaults to 1 for char*/void*, non-pointer
+/// bases, and aggregate pointees.
+fn clight_base_ptr_elem_size(expr: &ClightExpr) -> i64 {
+    clight_sized_ptr_elem_size(expr).unwrap_or(1)
+}
+
 /// Build the pointer-to-struct for a recovered field access, preserving any array index so base[idx] is not mis-rendered as base->ofs_0; the trailing constant addend is stripped as the field offset.
-fn struct_base_ptr_expr(inner: &ClightExpr, base_ident: Ident, struct_ptr_ty: &ClightType) -> ClightExpr {
+fn struct_base_ptr_expr(
+    inner: &ClightExpr,
+    base_ident: Ident,
+    struct_ptr_ty: &ClightType,
+) -> ClightExpr {
     let stripped = match inner {
         ClightExpr::Ecast(e, _) => e.as_ref(),
         other => other,
@@ -3466,7 +3621,11 @@ fn struct_base_ptr_expr(inner: &ClightExpr, base_ident: Ident, struct_ptr_ty: &C
             return ClightExpr::Etempvar(base_ident, struct_ptr_ty.clone());
         }
         // Indexed: the struct pointer is the address minus the trailing constant field offset, or the whole sum when there is none.
-        let base_sum = if rhs_is_const { lhs.as_ref().clone() } else { stripped.clone() };
+        let base_sum = if rhs_is_const {
+            lhs.as_ref().clone()
+        } else {
+            stripped.clone()
+        };
         return cast_expr_to_type(base_sum, struct_ptr_ty.clone());
     }
     // Bare base register (Etempvar) or any non-additive form: clean base.
@@ -3497,14 +3656,26 @@ fn extract_deref_field_pattern(inner: &ClightExpr) -> Option<(Ident, i64)> {
                         other => other,
                     }
                 {
-                    let base_scale = match (extract_base_ident_clight(inner_l), is_index_term_clight(inner_r)) {
-                        (Some(b), true) => Some((b, clight_base_ptr_elem_size(inner_l))),
-                        _ => match (is_index_term_clight(inner_l), extract_base_ident_clight(inner_r)) {
-                            (true, Some(b)) => Some((b, clight_base_ptr_elem_size(inner_r))),
+                    let base = match (
+                        extract_base_ident_clight(inner_l),
+                        is_index_term_clight(inner_r),
+                    ) {
+                        (Some(b), true) => Some((b, inner_l.as_ref())),
+                        _ => match (
+                            is_index_term_clight(inner_l),
+                            extract_base_ident_clight(inner_r),
+                        ) {
+                            (true, Some(b)) => Some((b, inner_r.as_ref())),
                             _ => None,
                         },
                     };
-                    if let Some((base_ident, scale)) = base_scale {
+                    if let Some((base_ident, inner_base)) = base {
+                        // The trailing literal belongs to the full typed `lhs`.
+                        // For `(int *)((char *)base + idx*8) + 1`, using the
+                        // unwrapped char base turns byte offset 4 into 1 and
+                        // prevents the recovered field from being selected.
+                        let scale = clight_sized_ptr_elem_size(lhs)
+                            .unwrap_or_else(|| clight_base_ptr_elem_size(inner_base));
                         let byte_offset = offset * scale;
                         if byte_offset >= 0 {
                             return Some((base_ident, byte_offset));
@@ -3549,7 +3720,11 @@ fn extract_deref_field_pattern(inner: &ClightExpr) -> Option<(Ident, i64)> {
     }
 }
 
-fn rewrite_clight_expr_fields(expr: &ClightExpr, field_info: &FieldInfo, reg_to_canonical: &HashMap<Ident, Ident>) -> ClightExpr {
+fn rewrite_clight_expr_fields(
+    expr: &ClightExpr,
+    field_info: &FieldInfo,
+    reg_to_canonical: &HashMap<Ident, Ident>,
+) -> ClightExpr {
     match expr {
         ClightExpr::Ederef(inner, deref_ty) => {
             if let Some((base_ident, offset)) = extract_deref_field_pattern(inner) {
@@ -3571,7 +3746,8 @@ fn rewrite_clight_expr_fields(expr: &ClightExpr, field_info: &FieldInfo, reg_to_
                     if width_ok {
                         let field_ty = deref_ty.clone();
                         // Use canonical struct ID if available, else fall back to register-based
-                        let struct_id = reg_to_canonical.get(&base_ident)
+                        let struct_id = reg_to_canonical
+                            .get(&base_ident)
                             .copied()
                             .unwrap_or_else(|| base_key.unsigned_abs() as Ident);
                         let struct_ty = ClightType::Tstruct(struct_id, default_attr());
@@ -3584,36 +3760,68 @@ fn rewrite_clight_expr_fields(expr: &ClightExpr, field_info: &FieldInfo, reg_to_
                 }
             }
             ClightExpr::Ederef(
-                Box::new(rewrite_clight_expr_fields(inner, field_info, reg_to_canonical)),
+                Box::new(rewrite_clight_expr_fields(
+                    inner,
+                    field_info,
+                    reg_to_canonical,
+                )),
                 deref_ty.clone(),
             )
         }
         ClightExpr::Ebinop(op, lhs, rhs, ty) => ClightExpr::Ebinop(
             op.clone(),
-            Box::new(rewrite_clight_expr_fields(lhs, field_info, reg_to_canonical)),
-            Box::new(rewrite_clight_expr_fields(rhs, field_info, reg_to_canonical)),
+            Box::new(rewrite_clight_expr_fields(
+                lhs,
+                field_info,
+                reg_to_canonical,
+            )),
+            Box::new(rewrite_clight_expr_fields(
+                rhs,
+                field_info,
+                reg_to_canonical,
+            )),
             ty.clone(),
         ),
         ClightExpr::Eunop(op, inner, ty) => ClightExpr::Eunop(
             op.clone(),
-            Box::new(rewrite_clight_expr_fields(inner, field_info, reg_to_canonical)),
+            Box::new(rewrite_clight_expr_fields(
+                inner,
+                field_info,
+                reg_to_canonical,
+            )),
             ty.clone(),
         ),
         ClightExpr::Ecast(inner, ty) => ClightExpr::Ecast(
-            Box::new(rewrite_clight_expr_fields(inner, field_info, reg_to_canonical)),
+            Box::new(rewrite_clight_expr_fields(
+                inner,
+                field_info,
+                reg_to_canonical,
+            )),
             ty.clone(),
         ),
         ClightExpr::Efield(inner, ident, ty) => ClightExpr::Efield(
-            Box::new(rewrite_clight_expr_fields(inner, field_info, reg_to_canonical)),
+            Box::new(rewrite_clight_expr_fields(
+                inner,
+                field_info,
+                reg_to_canonical,
+            )),
             *ident,
             ty.clone(),
         ),
         ClightExpr::Eaddrof(inner, ty) => ClightExpr::Eaddrof(
-            Box::new(rewrite_clight_expr_fields(inner, field_info, reg_to_canonical)),
+            Box::new(rewrite_clight_expr_fields(
+                inner,
+                field_info,
+                reg_to_canonical,
+            )),
             ty.clone(),
         ),
         ClightExpr::Econdition(cond, t, f, ty) => ClightExpr::Econdition(
-            Box::new(rewrite_clight_expr_fields(cond, field_info, reg_to_canonical)),
+            Box::new(rewrite_clight_expr_fields(
+                cond,
+                field_info,
+                reg_to_canonical,
+            )),
             Box::new(rewrite_clight_expr_fields(t, field_info, reg_to_canonical)),
             Box::new(rewrite_clight_expr_fields(f, field_info, reg_to_canonical)),
             ty.clone(),
@@ -3622,7 +3830,11 @@ fn rewrite_clight_expr_fields(expr: &ClightExpr, field_info: &FieldInfo, reg_to_
     }
 }
 
-fn rewrite_clight_stmt_fields(stmt: &ClightStmt, field_info: &FieldInfo, reg_to_canonical: &HashMap<Ident, Ident>) -> ClightStmt {
+fn rewrite_clight_stmt_fields(
+    stmt: &ClightStmt,
+    field_info: &FieldInfo,
+    reg_to_canonical: &HashMap<Ident, Ident>,
+) -> ClightStmt {
     match stmt {
         ClightStmt::Sassign(lhs, rhs) => ClightStmt::Sassign(
             rewrite_clight_expr_fields(lhs, field_info, reg_to_canonical),
@@ -3636,36 +3848,73 @@ fn rewrite_clight_stmt_fields(stmt: &ClightStmt, field_info: &FieldInfo, reg_to_
         ClightStmt::Scall(ret, func, args) => ClightStmt::Scall(
             *ret,
             rewrite_clight_expr_fields(func, field_info, reg_to_canonical),
-            args.iter().map(|a| rewrite_clight_expr_fields(a, field_info, reg_to_canonical)).collect(),
+            args.iter()
+                .map(|a| rewrite_clight_expr_fields(a, field_info, reg_to_canonical))
+                .collect(),
         ),
         ClightStmt::Sbuiltin(ret, ef, tys, args) => ClightStmt::Sbuiltin(
             *ret,
             ef.clone(),
             tys.clone(),
-            args.iter().map(|a| rewrite_clight_expr_fields(a, field_info, reg_to_canonical)).collect(),
+            args.iter()
+                .map(|a| rewrite_clight_expr_fields(a, field_info, reg_to_canonical))
+                .collect(),
         ),
-        ClightStmt::Sreturn(Some(expr)) => ClightStmt::Sreturn(
-            Some(rewrite_clight_expr_fields(expr, field_info, reg_to_canonical)),
-        ),
+        ClightStmt::Sreturn(Some(expr)) => ClightStmt::Sreturn(Some(rewrite_clight_expr_fields(
+            expr,
+            field_info,
+            reg_to_canonical,
+        ))),
         ClightStmt::Sifthenelse(cond, then_s, else_s) => ClightStmt::Sifthenelse(
             rewrite_clight_expr_fields(cond, field_info, reg_to_canonical),
-            Box::new(rewrite_clight_stmt_fields(then_s, field_info, reg_to_canonical)),
-            Box::new(rewrite_clight_stmt_fields(else_s, field_info, reg_to_canonical)),
+            Box::new(rewrite_clight_stmt_fields(
+                then_s,
+                field_info,
+                reg_to_canonical,
+            )),
+            Box::new(rewrite_clight_stmt_fields(
+                else_s,
+                field_info,
+                reg_to_canonical,
+            )),
         ),
         ClightStmt::Ssequence(stmts) => ClightStmt::Ssequence(
-            stmts.iter().map(|s| rewrite_clight_stmt_fields(s, field_info, reg_to_canonical)).collect(),
+            stmts
+                .iter()
+                .map(|s| rewrite_clight_stmt_fields(s, field_info, reg_to_canonical))
+                .collect(),
         ),
         ClightStmt::Sloop(body, cont) => ClightStmt::Sloop(
-            Box::new(rewrite_clight_stmt_fields(body, field_info, reg_to_canonical)),
-            Box::new(rewrite_clight_stmt_fields(cont, field_info, reg_to_canonical)),
+            Box::new(rewrite_clight_stmt_fields(
+                body,
+                field_info,
+                reg_to_canonical,
+            )),
+            Box::new(rewrite_clight_stmt_fields(
+                cont,
+                field_info,
+                reg_to_canonical,
+            )),
         ),
         ClightStmt::Slabel(ident, inner) => ClightStmt::Slabel(
             *ident,
-            Box::new(rewrite_clight_stmt_fields(inner, field_info, reg_to_canonical)),
+            Box::new(rewrite_clight_stmt_fields(
+                inner,
+                field_info,
+                reg_to_canonical,
+            )),
         ),
         ClightStmt::Sswitch(expr, cases) => ClightStmt::Sswitch(
             rewrite_clight_expr_fields(expr, field_info, reg_to_canonical),
-            cases.iter().map(|(label, s)| (label.clone(), rewrite_clight_stmt_fields(s, field_info, reg_to_canonical))).collect(),
+            cases
+                .iter()
+                .map(|(label, s)| {
+                    (
+                        label.clone(),
+                        rewrite_clight_stmt_fields(s, field_info, reg_to_canonical),
+                    )
+                })
+                .collect(),
         ),
         other => other.clone(),
     }
@@ -3683,7 +3932,8 @@ fn infer_struct_fields_from_stack_inits(db: &mut DecompileDB) {
     let node_to_func: HashMap<u64, u64> = {
         let mut groups: HashMap<u64, u64> = HashMap::new();
         for (n, f) in db.rel_iter::<(Node, Address)>("instr_in_function") {
-            groups.entry(*n)
+            groups
+                .entry(*n)
                 .and_modify(|curr| *curr = (*curr).min(*f))
                 .or_insert(*f);
         }
@@ -3729,7 +3979,10 @@ fn infer_struct_fields_from_stack_inits(db: &mut DecompileDB) {
         if !matches!(field_size, 1 | 2 | 4 | 8) {
             continue;
         }
-        if !entries.iter().all(|(_, c)| chunk_byte_size(c) as i64 == field_size) {
+        if !entries
+            .iter()
+            .all(|(_, c)| chunk_byte_size(c) as i64 == field_size)
+        {
             continue;
         }
         let chunk = entries[0].1.clone();
@@ -3788,12 +4041,98 @@ fn infer_struct_fields_from_stack_inits(db: &mut DecompileDB) {
     }
 
     for (func_addr, base_off, fields) in &new_fields {
-        db.rel_push("emit_struct_fields", (*func_addr, *base_off, fields.clone()));
+        db.rel_push(
+            "emit_struct_fields",
+            (*func_addr, *base_off, fields.clone()),
+        );
     }
+}
+
+/// Group synthetic indexed-stack LEA results by the one backing local proved
+/// at the same function, instruction, raw displacement, and normalized stack
+/// coordinate.  Ambiguous owners and Win64 home cells are deliberately left
+/// raw.  The local is storage rather than a pointer value, so callers must use
+/// this only as a field-rewrite alias and must not merge it into the RTL value
+/// web or give it an `XstructPtr` declaration.
+fn indexed_stack_field_aliases(
+    db: &DecompileDB,
+) -> HashMap<Address, HashMap<RTLReg, Vec<RTLReg>>> {
+    use std::collections::{BTreeSet, HashSet};
+
+    let mut local_at: HashMap<(Address, Node, i64), BTreeSet<RTLReg>> = HashMap::new();
+    for (func, node, offset, local) in
+        db.rel_iter::<(Address, Address, i64, RTLReg)>("stack_var")
+    {
+        local_at
+            .entry((*func, *node, *offset))
+            .or_default()
+            .insert(*local);
+    }
+
+    let mut normalized: HashMap<(Node, RTLReg), HashMap<Address, BTreeSet<i64>>> = HashMap::new();
+    for (func, node, base, offset) in
+        db.rel_iter::<(Address, Node, RTLReg, i64)>("normalized_stack_lea_base")
+    {
+        normalized
+            .entry((*node, *base))
+            .or_default()
+            .entry(*func)
+            .or_default()
+            .insert(*offset);
+    }
+
+    let home_storage: HashSet<(Address, RTLReg)> = db
+        .rel_iter::<(Address, usize, RTLReg)>("win64_home_storage")
+        .map(|(func, _, local)| (*func, *local))
+        .collect();
+
+    let mut aliases: HashMap<Address, HashMap<RTLReg, Vec<RTLReg>>> = HashMap::new();
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        let RTLInst::Iop(Operation::Olea(Addressing::Ainstack(offset)), args, base) = inst
+        else {
+            continue;
+        };
+        if !args.is_empty() {
+            continue;
+        }
+        let Some(functions) = normalized.get(&(*node, *base)) else {
+            continue;
+        };
+        for (&func, coordinates) in functions {
+            if coordinates.len() != 1 {
+                continue;
+            }
+            let Some(locals) = local_at.get(&(func, *node, *offset)) else {
+                continue;
+            };
+            if locals.len() != 1 {
+                continue;
+            }
+            let local = *locals.first().expect("one stack local");
+            if home_storage.contains(&(func, local)) {
+                continue;
+            }
+            aliases
+                .entry(func)
+                .or_default()
+                .entry(local)
+                .or_default()
+                .push(*base);
+        }
+    }
+    for locals in aliases.values_mut() {
+        for bases in locals.values_mut() {
+            bases.sort_unstable();
+            bases.dedup();
+        }
+    }
+    aliases
 }
 
 fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
     infer_struct_fields_from_stack_inits(db);
+
+    let stack_base_aliases = indexed_stack_field_aliases(db);
 
     let mut func_field_info: HashMap<u64, FieldInfo> = HashMap::new();
     for (func_addr, base_off, fields) in
@@ -3821,7 +4160,8 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
     let mut reg_to_canonical: HashMap<Ident, Ident> = {
         let mut groups: HashMap<Ident, Ident> = HashMap::new();
         for &(_, reg, sid) in db.rel_iter::<(Address, RTLReg, usize)>("reg_to_struct_id") {
-            groups.entry(reg as Ident)
+            groups
+                .entry(reg as Ident)
                 .and_modify(|curr| *curr = (*curr).min(sid as Ident))
                 .or_insert(sid as Ident);
         }
@@ -3830,16 +4170,21 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
 
     // Canonicalize efield-detected struct identity by bucketing unmapped (func, reg) by exact (offset, chunk) shape hash and linking callsite-passing peers via union-find; kept imperative because fresh-ID allocation needs a counter Datalog cannot express directly.
     {
-        use crate::decompile::analysis::struct_recovery_pass::{compute_layout_hash_from_tuples, chunk_byte_size};
+        use crate::decompile::analysis::struct_recovery_pass::{
+            chunk_byte_size, compute_layout_hash_from_tuples,
+        };
         let mut shape_to_id: HashMap<u64, Ident> = HashMap::new();
         let mut next_id: usize = 1;
         for (h, id, _, _) in db.rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog") {
             shape_to_id.insert(*h, *id as Ident);
-            if *id >= next_id { next_id = *id + 1; }
+            if *id >= next_id {
+                next_id = *id + 1;
+            }
         }
 
         // Group all (func, base_reg) -> set of (offset, chunk) for efield-discovered structs.
-        let mut reg_fields: HashMap<(u64, i64), std::collections::BTreeSet<(i64, MemoryChunk)>> = HashMap::new();
+        let mut reg_fields: HashMap<(u64, i64), std::collections::BTreeSet<(i64, MemoryChunk)>> =
+            HashMap::new();
         for (func_addr, base_off, fields) in
             db.rel_iter::<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_struct_fields")
         {
@@ -3857,7 +4202,11 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
             // Aliased symbols can share one entry node; min addr wins to keep callsite union edges stable.
             entry_node_to_func
                 .entry(*n)
-                .and_modify(|cur| if *a < *cur { *cur = *a })
+                .and_modify(|cur| {
+                    if *a < *cur {
+                        *cur = *a
+                    }
+                })
                 .or_insert(*a);
         }
         let mut entry_mreg_to_rtl: HashMap<(Address, Mreg), RTLReg> = HashMap::new();
@@ -3866,7 +4215,11 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
                 // reg_rtl is multi-valued per (node, mreg); pick MIN RTLReg so the callee-param representative is stable across parallel-Ascent runs (last-wins flickered union-find classes and efield canonical struct ids).
                 entry_mreg_to_rtl
                     .entry((func, mreg))
-                    .and_modify(|cur| if rtl < *cur { *cur = rtl })
+                    .and_modify(|cur| {
+                        if rtl < *cur {
+                            *cur = rtl
+                        }
+                    })
                     .or_insert(rtl);
             }
         }
@@ -3893,7 +4246,11 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
             // Min-wins for indirect calls that map a call node to multiple targets.
             call_targets
                 .entry(*n)
-                .and_modify(|cur| if *a < *cur { *cur = *a })
+                .and_modify(|cur| {
+                    if *a < *cur {
+                        *cur = *a
+                    }
+                })
                 .or_insert(*a);
         }
 
@@ -3901,7 +4258,9 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
         let mut parent: HashMap<RTLReg, RTLReg> = HashMap::new();
         fn ufind(parent: &mut HashMap<RTLReg, RTLReg>, r: RTLReg) -> RTLReg {
             let p = *parent.entry(r).or_insert(r);
-            if p == r { return r; }
+            if p == r {
+                return r;
+            }
             let root = ufind(parent, p);
             parent.insert(r, root);
             root
@@ -3924,17 +4283,39 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
             }
         }
 
+        // Struct recovery observes the synthetic LEA register, while Clight
+        // deliberately renders that address through the named stack local.
+        // Join only aliases proven at the same function/node/displacement so
+        // all indexed accesses to one local share one recovered layout.
+        for (&func, locals) in &stack_base_aliases {
+            for bases in locals.values() {
+                let mut field_bases = bases
+                    .iter()
+                    .copied()
+                    .filter(|base| reg_fields.contains_key(&(func, *base as i64)));
+                let Some(first) = field_bases.next() else {
+                    continue;
+                };
+                for base in field_bases {
+                    uunion(&mut parent, first, base);
+                }
+            }
+        }
+
         // For each (func, reg) that needs canonicalization, follow the union-find to its root, then aggregate fields per root.
         let mut sorted_keys: Vec<(u64, i64)> = reg_fields.keys().copied().collect();
         sorted_keys.sort();
 
         // Group keys by union-find root. Regs that aren't in `parent` are their own root.
         let mut root_members: HashMap<RTLReg, Vec<(u64, i64)>> = HashMap::new();
-        let mut root_fields: HashMap<RTLReg, std::collections::BTreeMap<i64, MemoryChunk>> = HashMap::new();
+        let mut root_fields: HashMap<RTLReg, std::collections::BTreeMap<i64, MemoryChunk>> =
+            HashMap::new();
         for key in &sorted_keys {
             let (_func_addr, base_off) = *key;
             // base_off encodes RTLRegs (high bit set), constants, or stack-offset buckets; only RTLReg-encoded keys belong in the union-find.
-            if (base_off as u64) & (1u64 << 63) == 0 { continue; }
+            if (base_off as u64) & (1u64 << 63) == 0 {
+                continue;
+            }
             let reg = base_off as RTLReg;
             let root = ufind(&mut parent, reg);
             root_members.entry(root).or_default().push(*key);
@@ -3944,7 +4325,13 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
                 let cur = entry.get(off).cloned();
                 let pick = match cur {
                     None => chunk.clone(),
-                    Some(prev) => if chunk_byte_size(chunk) > chunk_byte_size(&prev) { chunk.clone() } else { prev },
+                    Some(prev) => {
+                        if chunk_byte_size(chunk) > chunk_byte_size(&prev) {
+                            chunk.clone()
+                        } else {
+                            prev
+                        }
+                    }
                 };
                 entry.insert(*off, pick);
             }
@@ -3953,7 +4340,8 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
         // Assign canonical IDs per root: prefer existing reg_to_canonical entries (min id) so union with struct_recovery's IDs is preserved; otherwise match by exact-shape hash or allocate a new ID.
         let mut root_to_id: HashMap<RTLReg, Ident> = HashMap::new();
         for (root, members) in &root_members {
-            let mut existing_ids: Vec<Ident> = members.iter()
+            let mut existing_ids: Vec<Ident> = members
+                .iter()
                 .filter_map(|(_, base_off)| reg_to_canonical.get(&(*base_off as Ident)).copied())
                 .collect();
             existing_ids.sort();
@@ -3966,12 +4354,15 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
         sorted_roots.sort();
 
         for root in &sorted_roots {
-            if root_to_id.contains_key(root) { continue; }
+            if root_to_id.contains_key(root) {
+                continue;
+            }
             let fields = match root_fields.get(root) {
                 Some(f) if !f.is_empty() => f,
                 _ => continue,
             };
-            let tuples: Vec<(i64, usize, MemoryChunk)> = fields.iter()
+            let tuples: Vec<(i64, usize, MemoryChunk)> = fields
+                .iter()
                 .map(|(o, c)| (*o, chunk_byte_size(c), c.clone()))
                 .collect();
             let h = compute_layout_hash_from_tuples(&tuples);
@@ -3986,10 +4377,12 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
             root_to_id.insert(*root, id);
         }
 
-        // Push new reg_to_struct_id entries (min sid wins). Iterate sorted roots with min-merge: aliased functions can share a reg-Ident across two roots (fresh regs encode node<<6|mreg), and HashMap-order overwrites flickered canonical ids.
+        // Push new reg_to_struct_id entries (min sid wins). Iterate sorted roots with min-merge: aliased functions can share a reg-Ident across two roots (fresh regs encode node<<7|mreg), and HashMap-order overwrites flickered canonical ids.
         let mut new_rtsi: Vec<(Address, RTLReg, usize)> = Vec::new();
         for root in &sorted_roots {
-            let Some(members) = root_members.get(root) else { continue };
+            let Some(members) = root_members.get(root) else {
+                continue;
+            };
             if let Some(&id) = root_to_id.get(root) {
                 for &(func_addr, base_off) in members {
                     let reg = base_off as Ident;
@@ -4043,7 +4436,9 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
             .collect();
         let mut union_fields: HashMap<Ident, BTreeSet<(i64, Ident, MemoryChunk)>> = HashMap::new();
         for (_, base_off, fields) in &rows {
-            let entry = union_fields.entry(cid_of(*base_off, &reg_to_canonical)).or_default();
+            let entry = union_fields
+                .entry(cid_of(*base_off, &reg_to_canonical))
+                .or_default();
             for f in fields.iter() {
                 entry.insert(f.clone());
             }
@@ -4062,7 +4457,12 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
             }
             let mut by_offset: Vec<(i64, Ident, MemoryChunk)> = fields.iter().cloned().collect();
             by_offset.sort_by_key(|(off, name, chunk)| {
-                (*off, std::cmp::Reverse(chunk_byte_size(chunk)), *name, *chunk)
+                (
+                    *off,
+                    std::cmp::Reverse(chunk_byte_size(chunk)),
+                    *name,
+                    *chunk,
+                )
             });
             by_offset.dedup_by_key(|f| f.0);
             let recov = recovery_extents.get(cid);
@@ -4093,25 +4493,25 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
 
         // Prune relation rows: a union of subsets of a non-overlapping set is non-overlapping, and the kept (name, chunk) winner always survives in its contributing row.
         let mut dropped = 0usize;
-        let pruned: ascent::boxcar::Vec<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)> =
-            rows.iter()
-                .map(|(fa, base, fields)| {
-                    let k = &kept[&cid_of(*base, &reg_to_canonical)];
-                    let nf: Vec<(i64, Ident, MemoryChunk)> = fields
-                        .iter()
-                        .filter(|(off, name, chunk)| {
-                            k.get(off).is_some_and(|(kn, kc)| kn == name && kc == chunk)
-                        })
-                        .cloned()
-                        .collect();
-                    if nf.len() != fields.len() {
-                        dropped += fields.len() - nf.len();
-                        (*fa, *base, Arc::new(nf))
-                    } else {
-                        (*fa, *base, fields.clone())
-                    }
-                })
-                .collect();
+        let pruned: ascent::boxcar::Vec<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)> = rows
+            .iter()
+            .map(|(fa, base, fields)| {
+                let k = &kept[&cid_of(*base, &reg_to_canonical)];
+                let nf: Vec<(i64, Ident, MemoryChunk)> = fields
+                    .iter()
+                    .filter(|(off, name, chunk)| {
+                        k.get(off).is_some_and(|(kn, kc)| kn == name && kc == chunk)
+                    })
+                    .cloned()
+                    .collect();
+                if nf.len() != fields.len() {
+                    dropped += fields.len() - nf.len();
+                    (*fa, *base, Arc::new(nf))
+                } else {
+                    (*fa, *base, fields.clone())
+                }
+            })
+            .collect();
         if std::env::var("SR2_TRACE").is_ok() {
             let total_in: usize = rows.iter().map(|(_, _, f)| f.len()).sum();
             eprintln!(
@@ -4165,6 +4565,44 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
         }
     }
 
+    // The expression rewriter sees Evar(local), not the synthetic LEA base.
+    // Mirror only fields that survived SR-2 overlap pruning onto that exact
+    // local; canonical IDs were joined above, so the declaration and Efield
+    // expression continue to reference the same struct definition.
+    let mut local_fields = Vec::new();
+    let mut rewrite_only_aliases = std::collections::HashSet::new();
+    for (&func, locals) in &stack_base_aliases {
+        let Some(fields) = func_field_info.get(&func) else {
+            continue;
+        };
+        for (&local, bases) in locals {
+            let canonical_ids: std::collections::BTreeSet<Ident> = bases
+                .iter()
+                .filter_map(|base| reg_to_canonical.get(&(*base as Ident)).copied())
+                .collect();
+            if canonical_ids.len() != 1 {
+                continue;
+            }
+            let canonical = *canonical_ids.first().expect("one canonical struct id");
+            for &base in bases {
+                for (&(field_base, offset), &(name, ref chunk)) in fields {
+                    if field_base == base as i64 {
+                        local_fields.push((func, local as i64, offset, name, chunk.clone()));
+                    }
+                }
+            }
+            reg_to_canonical.insert(local as Ident, canonical);
+            rewrite_only_aliases.insert((func, local as i64));
+        }
+    }
+    for (func, local, offset, name, chunk) in local_fields {
+        func_field_info
+            .entry(func)
+            .or_default()
+            .entry((local, offset))
+            .or_insert((name, chunk));
+    }
+
     if func_field_info.is_empty() {
         // No struct fields; copy clight_stmt directly to clight_stmt
         let pass_through: ascent::boxcar::Vec<_> = db
@@ -4190,7 +4628,8 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
     let node_to_func: HashMap<u64, u64> = {
         let mut groups: HashMap<u64, u64> = HashMap::new();
         for (n, f) in db.rel_iter::<(Node, Address)>("instr_in_function") {
-            groups.entry(*n)
+            groups
+                .entry(*n)
                 .and_modify(|curr| *curr = (*curr).min(*f))
                 .or_insert(*f);
         }
@@ -4209,7 +4648,10 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
             } else {
                 stmt.clone()
             };
-            if let Some(fi) = node_to_func.get(node).and_then(|fa| func_field_info.get(fa)) {
+            if let Some(fi) = node_to_func
+                .get(node)
+                .and_then(|fa| func_field_info.get(fa))
+            {
                 let rewritten = rewrite_clight_stmt_fields(&stmt, fi, &reg_to_canonical);
                 let mut results = vec![(*node, rewritten.clone())];
                 if rewritten != stmt {
@@ -4220,7 +4662,12 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
                 vec![(*node, stmt)]
             }
         })
-        .chain(struct_construction.new_stmts.iter().map(|(node, stmt)| (*node, stmt.clone())))
+        .chain(
+            struct_construction
+                .new_stmts
+                .iter()
+                .map(|(node, stmt)| (*node, stmt.clone())),
+        )
         .collect();
     db.rel_set("clight_stmt", new_clight_stmt);
 
@@ -4240,8 +4687,14 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
                         let orig_ty = clight_expr_type(orig_expr);
                         let new_ty = clight_expr_type(new_expr);
                         if is_integral_type(&orig_ty) && !is_integral_type(&new_ty) {
-                            Some((*addr, *node, ClightStmt::Sset(*id,
-                                ClightExpr::Ecast(Box::new(new_expr.clone()), orig_ty))))
+                            Some((
+                                *addr,
+                                *node,
+                                ClightStmt::Sset(
+                                    *id,
+                                    ClightExpr::Ecast(Box::new(new_expr.clone()), orig_ty),
+                                ),
+                            ))
                         } else {
                             None
                         }
@@ -4261,7 +4714,12 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
                 vec![(*addr, *node, stmt)]
             }
         })
-        .chain(struct_construction.new_emit_stmts.iter().map(|(a, n, s)| (*a, *n, s.clone())))
+        .chain(
+            struct_construction
+                .new_emit_stmts
+                .iter()
+                .map(|(a, n, s)| (*a, *n, s.clone())),
+        )
         .collect();
     db.rel_set("emit_clight_stmt", new_emit);
 
@@ -4269,7 +4727,11 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
         .rel_iter::<(Address, Node, ClightStmt)>("clight_stmt_dead")
         .map(|(addr, node, stmt)| {
             if let Some(fi) = func_field_info.get(addr) {
-                (*addr, *node, rewrite_clight_stmt_fields(stmt, fi, &reg_to_canonical))
+                (
+                    *addr,
+                    *node,
+                    rewrite_clight_stmt_fields(stmt, fi, &reg_to_canonical),
+                )
             } else {
                 (*addr, *node, stmt.clone())
             }
@@ -4278,15 +4740,23 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
     db.rel_set("clight_stmt_dead", new_dead);
 
     // Push XstructPtr type candidates for registers upgraded to struct pointer types, using canonical struct IDs when available.
-    let mut seen_struct_regs: std::collections::HashSet<(RTLReg, usize)> = std::collections::HashSet::new();
-    for (_func_addr, fi) in &func_field_info {
+    let mut seen_struct_regs: std::collections::HashSet<(RTLReg, usize)> =
+        std::collections::HashSet::new();
+    for (func_addr, fi) in &func_field_info {
         for (&(base_key, _field_off), _) in fi {
+            if rewrite_only_aliases.contains(&(*func_addr, base_key)) {
+                continue;
+            }
             let reg = base_key as u64 as RTLReg;
-            let struct_id = reg_to_canonical.get(&(reg as Ident))
+            let struct_id = reg_to_canonical
+                .get(&(reg as Ident))
                 .copied()
                 .unwrap_or_else(|| base_key.unsigned_abs() as Ident);
             if seen_struct_regs.insert((reg, struct_id)) {
-                db.rel_push("emit_var_type_candidate", (reg, XType::XstructPtr(struct_id)));
+                db.rel_push(
+                    "emit_var_type_candidate",
+                    (reg, XType::XstructPtr(struct_id)),
+                );
             }
         }
     }
@@ -4342,12 +4812,17 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
             RTLInst::Iload(c, a, args, _) | RTLInst::Istore(c, a, args, _) => (c, a, args),
             _ => continue,
         };
-        let indexed = matches!(addressing, Addressing::Aindexed2scaled(_, _) | Addressing::Aindexed2(_));
+        let indexed = matches!(
+            addressing,
+            Addressing::Aindexed2scaled(_, _) | Addressing::Aindexed2(_)
+        );
         if !indexed || args.is_empty() {
             continue;
         }
         let base = args[0];
-        let Some(&(func, base_ofs)) = lea_base.get(&base) else { continue };
+        let Some(&(func, base_ofs)) = lea_base.get(&base) else {
+            continue;
+        };
         // Frame-local arrays only: extend from a negative base_ofs to the frame base 0, an over-approximation that never under-sizes, capped to a sane frame bound.
         if base_ofs >= 0 {
             continue;
@@ -4358,7 +4833,9 @@ fn size_indexed_stack_arrays(db: &mut DecompileDB) {
         }
         let elem = memchunk_byte_size(chunk).max(1);
         let count = ((byte_size as usize) + elem - 1) / elem;
-        let Some(&local) = slot_local.get(&(func, base_ofs)) else { continue };
+        let Some(&local) = slot_local.get(&(func, base_ofs)) else {
+            continue;
+        };
         // Keep the SMALLEST element width seen (most conservative stride) and the largest count for it.
         let e = sized.entry((func, local)).or_insert((*chunk, count));
         if elem < memchunk_byte_size(&e.0).max(1) {
@@ -4416,7 +4893,10 @@ fn synthesize_struct_construction(
     let mut func_stack_inits: HashMap<u64, Vec<(u64, i64, i64, Typ)>> = HashMap::new();
     for (addr, ofs, val, typ) in db.rel_iter::<(Address, i64, i64, Typ)>("mach_imm_stack_init") {
         if let Some(&func) = node_to_func.get(addr) {
-            func_stack_inits.entry(func).or_default().push((*addr, *ofs, *val, typ.clone()));
+            func_stack_inits
+                .entry(func)
+                .or_default()
+                .push((*addr, *ofs, *val, typ.clone()));
         }
     }
 
@@ -4425,7 +4905,10 @@ fn synthesize_struct_construction(
     }
 
     // Collect all known struct layouts from emit_struct_fields for matching against stack init patterns.
-    let mut known_layouts: HashMap<Vec<(i64, MemoryChunk)>, (Ident, Vec<(i64, Ident, MemoryChunk)>)> = HashMap::new();
+    let mut known_layouts: HashMap<
+        Vec<(i64, MemoryChunk)>,
+        (Ident, Vec<(i64, Ident, MemoryChunk)>),
+    > = HashMap::new();
     for (_func_addr, base_off, fields) in
         db.rel_iter::<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_struct_fields")
     {
@@ -4433,7 +4916,8 @@ fn synthesize_struct_construction(
         if fields.len() < 2 {
             continue;
         }
-        let mut layout: Vec<(i64, MemoryChunk)> = fields.iter()
+        let mut layout: Vec<(i64, MemoryChunk)> = fields
+            .iter()
             .map(|(off, _, chunk)| (*off, chunk.clone()))
             .collect();
         layout.sort_by_key(|(off, _)| *off);
@@ -4463,9 +4947,11 @@ fn synthesize_struct_construction(
         sorted.sort();
 
         // Find Oaddrstack bases: Sset(var, EconstLong(negative_val)) matching a mach_imm_stack_init cluster base.
-        let init_offsets: std::collections::BTreeSet<i64> = sorted.iter().map(|(_, ofs, _, _)| *ofs).collect();
+        let init_offsets: std::collections::BTreeSet<i64> =
+            sorted.iter().map(|(_, ofs, _, _)| *ofs).collect();
 
-        let mut stmts_for_func: Vec<(Node, ClightStmt)> = db.rel_iter::<(Node, ClightStmt)>("clight_stmt")
+        let mut stmts_for_func: Vec<(Node, ClightStmt)> = db
+            .rel_iter::<(Node, ClightStmt)>("clight_stmt")
             .filter(|(n, _)| node_to_func.get(n) == Some(func_addr))
             .map(|(n, s)| (*n, s.clone()))
             .collect();
@@ -4489,14 +4975,18 @@ fn synthesize_struct_construction(
             };
 
             // Collect mach_imm_stack_init stores that belong to this struct region
-            let matching: Vec<_> = sorted.iter()
+            let matching: Vec<_> = sorted
+                .iter()
                 .filter(|(_, ofs, _, _)| *ofs >= base_ofs && *ofs < base_ofs + 256)
                 .collect();
 
-            if matching.is_empty() { continue; }
+            if matching.is_empty() {
+                continue;
+            }
 
             // Build layout for matching against known structs
-            let mut layout: Vec<(i64, MemoryChunk)> = matching.iter()
+            let mut layout: Vec<(i64, MemoryChunk)> = matching
+                .iter()
                 .map(|(_, ofs, _, typ)| {
                     let rel_ofs = ofs - base_ofs;
                     let chunk = typ_to_chunk(typ);
@@ -4524,7 +5014,9 @@ fn synthesize_struct_construction(
                     .unwrap_or(0)
             };
             if struct_size > 0 {
-                result.stack_buffers.push((*func_addr, struct_local_id, struct_size));
+                result
+                    .stack_buffers
+                    .push((*func_addr, struct_local_id, struct_size));
             }
             let char_ptr = pointer_to(ClightType::Tint(
                 ClightIntSize::I8,
@@ -4575,7 +5067,9 @@ fn synthesize_struct_construction(
                 );
                 let raw_stmt = ClightStmt::Sassign(raw_lhs, val_expr);
                 result.new_stmts.push((*init_addr, raw_stmt.clone()));
-                result.new_emit_stmts.push((*func_addr, *init_addr, raw_stmt));
+                result
+                    .new_emit_stmts
+                    .push((*func_addr, *init_addr, raw_stmt));
             }
 
             // Rewrite the Oaddrstack Sset: var = -16 -> var = &struct_local
@@ -4588,7 +5082,11 @@ fn synthesize_struct_construction(
         }
 
         // Fallback: generate struct fields from init stores when no Oaddrstack references base.
-        if result.new_stmts.iter().all(|(a, _)| !sorted.iter().any(|(sa, _, _, _)| sa == a)) {
+        if result
+            .new_stmts
+            .iter()
+            .all(|(a, _)| !sorted.iter().any(|(sa, _, _, _)| sa == a))
+        {
             let mut offsets: Vec<i64> = sorted.iter().map(|(_, ofs, _, _)| *ofs).collect();
             offsets.sort();
             offsets.dedup();
@@ -4596,7 +5094,8 @@ fn synthesize_struct_construction(
             // Pick the widest chunk seen at each offset.
             let chunk_at: std::collections::BTreeMap<i64, MemoryChunk> = {
                 use crate::decompile::analysis::struct_recovery_pass::chunk_byte_size;
-                let mut m: std::collections::BTreeMap<i64, MemoryChunk> = std::collections::BTreeMap::new();
+                let mut m: std::collections::BTreeMap<i64, MemoryChunk> =
+                    std::collections::BTreeMap::new();
                 for (_, ofs, _, typ) in &sorted {
                     let c = typ_to_chunk(typ);
                     m.entry(*ofs)
@@ -4614,17 +5113,23 @@ fn synthesize_struct_construction(
             let mut layout_candidates: Vec<_> = known_layouts.iter().collect();
             layout_candidates.sort_by(|a, b| (a.1 .0, a.0).cmp(&(b.1 .0, b.0)));
             for (layout, (struct_id, fields)) in layout_candidates {
-                let struct_size: i64 = layout.iter().map(|(off, chunk)| {
-                    off + match chunk {
-                        MemoryChunk::MInt32 => 4,
-                        MemoryChunk::MInt64 => 8,
-                        MemoryChunk::MFloat32 => 4,
-                        MemoryChunk::MFloat64 => 8,
-                        _ => 4,
-                    }
-                }).max().unwrap_or(0);
+                let struct_size: i64 = layout
+                    .iter()
+                    .map(|(off, chunk)| {
+                        off + match chunk {
+                            MemoryChunk::MInt32 => 4,
+                            MemoryChunk::MInt64 => 8,
+                            MemoryChunk::MFloat32 => 4,
+                            MemoryChunk::MFloat64 => 8,
+                            _ => 4,
+                        }
+                    })
+                    .max()
+                    .unwrap_or(0);
                 let field_count = layout.len();
-                if field_count == 0 || struct_size == 0 { continue; }
+                if field_count == 0 || struct_size == 0 {
+                    continue;
+                }
 
                 let min_ofs = offsets.first().copied().unwrap_or(0);
                 let mut instance_idx = 0;
@@ -4632,7 +5137,8 @@ fn synthesize_struct_construction(
                 let mut matched_count = 0;
 
                 for &ofs in &offsets {
-                    let expected_ofs = min_ofs + (instance_idx as i64) * struct_size + layout[field_idx].0;
+                    let expected_ofs =
+                        min_ofs + (instance_idx as i64) * struct_size + layout[field_idx].0;
                     // Offset AND chunk must match: offset-only let int inits satisfy long fields, synthesizing field assigns for unrelated locals.
                     if ofs == expected_ofs && chunk_at.get(&ofs) == Some(&layout[field_idx].1) {
                         matched_count += 1;
@@ -4644,14 +5150,18 @@ fn synthesize_struct_construction(
                     }
                 }
 
-                if matched_count < offsets.len() || instance_idx < 2 { continue; }
+                if matched_count < offsets.len() || instance_idx < 2 {
+                    continue;
+                }
 
                 let struct_ty = ClightType::Tstruct(*struct_id, default_attr());
                 let struct_var_id = min_ofs.unsigned_abs() as Ident;
                 // Declare the recovered region `unsigned char[total]` so the raw byte-offset store candidates below are in-bounds across every instance; `(long)var`/`&var` stay valid via array decay.
                 let total_size = (instance_idx as i64) * struct_size;
                 if total_size > 0 {
-                    result.stack_buffers.push((*func_addr, struct_var_id, total_size));
+                    result
+                        .stack_buffers
+                        .push((*func_addr, struct_var_id, total_size));
                 }
                 let char_ptr = pointer_to(ClightType::Tint(
                     ClightIntSize::I8,
@@ -4663,10 +5173,14 @@ fn synthesize_struct_construction(
                     let base_ofs = min_ofs + (s as i64) * struct_size;
                     for (field_off, field_name, _chunk) in fields {
                         let target_ofs = base_ofs + field_off;
-                        if let Some((init_addr, _, val, typ)) = sorted.iter().find(|(_, ofs, _, _)| *ofs == target_ofs) {
+                        if let Some((init_addr, _, val, typ)) =
+                            sorted.iter().find(|(_, ofs, _, _)| *ofs == target_ofs)
+                        {
                             let field_ty = typ_to_clight_type(typ);
                             let val_expr = match typ {
-                                Typ::Tlong | Typ::Tany64 => ClightExpr::EconstLong(*val, default_long_type()),
+                                Typ::Tlong | Typ::Tany64 => {
+                                    ClightExpr::EconstLong(*val, default_long_type())
+                                }
                                 _ => ClightExpr::EconstInt(*val as i32, default_int_type()),
                             };
 
@@ -4686,7 +5200,10 @@ fn synthesize_struct_construction(
                                 ClightBinaryOp::Oadd,
                                 Box::new(ClightExpr::Ecast(
                                     Box::new(ClightExpr::Eaddrof(
-                                        Box::new(ClightExpr::Evar(struct_var_id, struct_ty.clone())),
+                                        Box::new(ClightExpr::Evar(
+                                            struct_var_id,
+                                            struct_ty.clone(),
+                                        )),
                                         pointer_to(struct_ty.clone()),
                                     )),
                                     char_ptr.clone(),
@@ -4703,7 +5220,9 @@ fn synthesize_struct_construction(
                             );
                             let raw_stmt = ClightStmt::Sassign(raw_lhs, val_expr);
                             result.new_stmts.push((*init_addr, raw_stmt.clone()));
-                            result.new_emit_stmts.push((*func_addr, *init_addr, raw_stmt));
+                            result
+                                .new_emit_stmts
+                                .push((*func_addr, *init_addr, raw_stmt));
                         }
                     }
                 }

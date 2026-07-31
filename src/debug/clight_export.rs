@@ -1,7 +1,10 @@
 // Export selected Clight IR to JSON mirroring CompCert's Clight AST for OCaml-side reconstruction.
 
 use crate::decompile::elevator::DecompileDB;
-use crate::decompile::passes::clight_select::query::{extract_globals, extract_struct_definitions};
+use crate::decompile::passes::clight_select::query::{
+    build_param_xtypes, build_rtl_to_mreg_at_entry, extract_callee_signatures, extract_globals,
+    extract_struct_definitions, insert_preferred_symbol_name,
+};
 use crate::decompile::passes::clight_select::select::{select_clight_stmts, SelectedFunction};
 use crate::x86::types::*;
 use serde_json::{json, Value};
@@ -11,10 +14,16 @@ use std::sync::Arc;
 /// Export the selected Clight IR from the decompile DB to a JSON file.
 pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), String> {
     // Diagnostics
-    let csharp_count = db.rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt").count();
+    let csharp_count = db
+        .rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt")
+        .count();
     let clight_count = db.rel_iter::<(Node, ClightStmt)>("clight_stmt").count();
-    let emit_count = db.rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt").count();
-    let var_type_count = db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate").count();
+    let emit_count = db
+        .rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt")
+        .count();
+    let var_type_count = db
+        .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+        .count();
     eprintln!("=== Clight Pipeline Diagnostics ===");
     eprintln!("  csharp_stmt:                    {}", csharp_count);
     eprintln!("  clight_stmt:                    {}", clight_count);
@@ -24,30 +33,96 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
 
     let selected_functions = select_clight_stmts(db)?;
 
-    let binary_path = db
-        .binary_path
-        .as_ref()
-        .ok_or("binary_path not set")?;
+    let binary_path = db.binary_path.as_ref().ok_or("binary_path not set")?;
 
     // Build id_to_name mapping
     let mut id_to_name: HashMap<usize, String> = HashMap::new();
     for (id, name) in db.rel_iter::<(Ident, Symbol)>("ident_to_symbol") {
-        id_to_name
-            .entry(*id)
-            .and_modify(|existing| {
-                if name.len() < existing.len() {
-                    *existing = name.to_string();
-                }
-            })
-            .or_insert_with(|| name.to_string());
+        insert_preferred_symbol_name(&mut id_to_name, *id, name);
     }
+    let mut symbol_names: HashMap<usize, String> = HashMap::new();
     for (addr, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
-        id_to_name.entry(*addr as usize).or_insert_with(|| name.to_string());
+        insert_preferred_symbol_name(&mut symbol_names, *addr as usize, name);
+    }
+    for (id, name) in symbol_names {
+        id_to_name.insert(id, name);
     }
     for func in &selected_functions {
         id_to_name
             .entry(func.address as usize)
             .or_insert_with(|| func.name.clone());
+    }
+
+    // Use the same emit_function authority and FUN_ fallback as normal
+    // function extraction. func_span can contain aliases and its parallel
+    // relation order is not a deterministic provider-name choice.
+    let mut emit_name_rows: Vec<(Address, String)> = db
+        .rel_iter::<(Address, Symbol, Node)>("emit_function")
+        .map(|(address, name, _)| {
+            let final_name = if name.starts_with("FUN_") {
+                id_to_name
+                    .get(&(*address as usize))
+                    .cloned()
+                    .unwrap_or_else(|| (*name).to_string())
+            } else {
+                (*name).to_string()
+            };
+            (*address, final_name)
+        })
+        .collect();
+    emit_name_rows.sort();
+    emit_name_rows.dedup();
+    let mut provider_names: HashMap<Address, String> = HashMap::new();
+    for (address, name) in emit_name_rows {
+        if let Some(previous) = provider_names.insert(address, name.clone()) {
+            if previous != name {
+                return Err(format!(
+                    "emit_function gives address 0x{address:x} conflicting provider names"
+                ));
+            }
+        }
+    }
+    // Provider identity is authoritative for emitted definitions, direct
+    // Evar call targets, and any declaration synthesized for an omitted
+    // internal function.
+    for (address, name) in &provider_names {
+        id_to_name.insert(*address as usize, name.clone());
+    }
+
+    let selected_addresses: std::collections::HashSet<Address> = selected_functions
+        .iter()
+        .map(|function| function.address)
+        .collect();
+    let mut unsupported_stack_rows: Vec<(Address, Address, String)> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .map(|(func, access, reason)| (*func, *access, (*reason).to_string()))
+        .collect();
+    unsupported_stack_rows.sort();
+    unsupported_stack_rows.dedup();
+    let mut unsupported_functions = Vec::with_capacity(unsupported_stack_rows.len());
+    for (func, access, reason) in unsupported_stack_rows {
+        if !matches!(
+            reason.as_str(),
+            "unsupported-stack-address" | "unsupported-addr32-address"
+        ) {
+            return Err(format!(
+                "unsupported function 0x{func:x} has unknown reason code {reason:?}"
+            ));
+        }
+        if selected_addresses.contains(&func) {
+            return Err(format!(
+                "function 0x{func:x} is both selected and unsupported"
+            ));
+        }
+        let name = provider_names.get(&func).ok_or_else(|| {
+            format!("unsupported function 0x{func:x} has no emit_function provider name")
+        })?;
+        unsupported_functions.push(json!({
+            "name": name,
+            "address": format!("0x{func:x}"),
+            "access_address": format!("0x{access:x}"),
+            "reason": reason,
+        }));
     }
 
     let external_funcs: std::collections::HashSet<u64> = db
@@ -56,10 +131,16 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         .collect();
 
     const CRT_FUNCTIONS: &[&str] = &[
-        "_start", "_init", "_fini",
-        "__libc_csu_init", "__libc_csu_fini", "__libc_start_main",
-        "deregister_tm_clones", "register_tm_clones",
-        "__do_global_dtors_aux", "frame_dummy",
+        "_start",
+        "_init",
+        "_fini",
+        "__libc_csu_init",
+        "__libc_csu_fini",
+        "__libc_start_main",
+        "deregister_tm_clones",
+        "register_tm_clones",
+        "__do_global_dtors_aux",
+        "frame_dummy",
         "__x86.get_pc_thunk.bx",
     ];
 
@@ -80,12 +161,17 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
     let composites: Vec<Value> = struct_defs
         .iter()
         .map(|s| {
-            let fields: Vec<Value> = s.definition.fields.iter().map(|f| {
-                json!({
-                    "name": f.name,
-                    "ty": serialize_ctype_from_field(&f.ty)
+            let fields: Vec<Value> = s
+                .definition
+                .fields
+                .iter()
+                .map(|f| {
+                    json!({
+                        "name": f.name,
+                        "ty": serialize_ctype_from_field(&f.ty)
+                    })
                 })
-            }).collect();
+                .collect();
             json!({
                 "id": s.struct_id,
                 "name": format!("struct_{:x}", s.struct_id),
@@ -117,32 +203,109 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         .collect();
 
     // Collect names of functions that are actually called from internal functions
-    let internal_names: std::collections::HashSet<&str> = internal_functions
-        .iter()
-        .map(|f| f.name.as_str())
-        .collect();
+    let internal_names: std::collections::HashSet<&str> =
+        internal_functions.iter().map(|f| f.name.as_str()).collect();
     let mut called_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for func in &internal_functions {
         for stmt in func.statements.values() {
-            collect_called_functions(stmt, &mut called_names);
+            collect_called_functions(stmt, &mut called_names, &id_to_name);
         }
     }
 
     // Build external function declarations (only for actually-called externals)
-    let extern_sigs: Vec<Value> = db
+    let mut known_extern_rows: Vec<(String, usize, XType, Vec<XType>)> = db
         .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
-        .filter(|(name, _, _, _)| {
-            called_names.contains(*name) && !internal_names.contains(*name)
+        .filter(|(name, _, _, _)| called_names.contains(*name) && !internal_names.contains(*name))
+        .map(|(name, param_count, ret_type, param_types)| {
+            (
+                name.to_string(),
+                *param_count,
+                *ret_type,
+                param_types.as_ref().clone(),
+            )
         })
+        .collect();
+    known_extern_rows.sort();
+    known_extern_rows.dedup();
+    let mut extern_sigs: Vec<Value> = known_extern_rows
+        .into_iter()
         .map(|(name, param_count, ret_type, param_types)| {
             json!({
-                "name": name.to_string(),
+                "name": name,
                 "param_count": param_count,
-                "return_type": serialize_xtype(ret_type),
+                "return_type": serialize_xtype(&ret_type),
                 "param_types": param_types.iter().map(serialize_xtype).collect::<Vec<_>>()
             })
         })
         .collect();
+
+    // A selected sibling may call an internal function omitted by the
+    // structured unsupported-address path. Such a callee still needs a real
+    // declaration: otherwise the JSON-to-C consumer either relies on an
+    // implicit-int declaration or fails C++ compilation. Reuse the same
+    // deterministic recovered signatures that type direct calls.
+    let declared_names: std::collections::HashSet<String> = extern_sigs
+        .iter()
+        .filter_map(|value| value.get("name")?.as_str().map(str::to_owned))
+        .collect();
+    let mut provider_addresses_by_name: HashMap<String, Vec<Address>> = HashMap::new();
+    for (address, name) in &provider_names {
+        provider_addresses_by_name
+            .entry(name.clone())
+            .or_default()
+            .push(*address);
+    }
+    for addresses in provider_addresses_by_name.values_mut() {
+        addresses.sort_unstable();
+        addresses.dedup();
+    }
+    let param_xtypes = build_param_xtypes(db);
+    let rtl_to_mreg = build_rtl_to_mreg_at_entry(db);
+    let recovered_sigs = extract_callee_signatures(db, &param_xtypes, &rtl_to_mreg);
+    let unsupported_addresses: std::collections::HashSet<Address> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .map(|(func, _, _)| *func)
+        .collect();
+    let mut omitted_called_names: Vec<String> = called_names
+        .iter()
+        .filter(|name| !internal_names.contains(name.as_str()) && !declared_names.contains(*name))
+        .cloned()
+        .collect();
+    omitted_called_names.sort();
+    omitted_called_names.dedup();
+    for name in omitted_called_names {
+        let Some(addresses) = provider_addresses_by_name.get(&name) else {
+            continue;
+        };
+        let unsupported: Vec<Address> = addresses
+            .iter()
+            .copied()
+            .filter(|address| unsupported_addresses.contains(address))
+            .collect();
+        if unsupported.is_empty() {
+            continue;
+        }
+        if unsupported.len() != 1 {
+            return Err(format!(
+                "called omitted internal {name} has ambiguous provider addresses: {unsupported:x?}"
+            ));
+        }
+        let address = unsupported[0];
+        let signature = recovered_sigs.get(&(address as Ident)).ok_or_else(|| {
+            format!("called omitted internal {name} at 0x{address:x} has no recovered signature")
+        })?;
+        let mut param_types = signature.param_types.clone();
+        param_types.resize(signature.param_count, XType::Xint);
+        param_types.truncate(signature.param_count);
+        extern_sigs.push(json!({
+            "name": name,
+            "param_count": signature.param_count,
+            "return_type": serialize_xtype(&signature.return_type),
+            "param_types": param_types.iter().map(serialize_xtype).collect::<Vec<_>>()
+        }));
+    }
+    extern_sigs.sort_by_cached_key(external_decl_sort_key);
+    extern_sigs.dedup();
 
     // Serialize internal functions
     let functions_json: Vec<Value> = internal_functions
@@ -157,6 +320,7 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         "globals": globals_json,
         "externals": extern_sigs,
         "functions": functions_json,
+        "unsupported_functions": unsupported_functions,
     });
 
     let json_str = serde_json::to_string_pretty(&program)
@@ -168,17 +332,42 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
     Ok(())
 }
 
+fn external_decl_sort_key(value: &Value) -> (String, u64, String, String) {
+    (
+        value
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        value
+            .get("param_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        value
+            .get("return_type")
+            .map(Value::to_string)
+            .unwrap_or_default(),
+        value
+            .get("param_types")
+            .map(Value::to_string)
+            .unwrap_or_default(),
+    )
+}
+
 fn serialize_function(func: &SelectedFunction, id_to_name: &HashMap<usize, String>) -> Value {
     // Build a local name map including param/temp register names for consistent identifiers.
     let mut local_names = id_to_name.clone();
     for reg in &func.param_regs {
-        local_names.entry(*reg as usize).or_insert_with(|| format!("param_{}", reg));
+        local_names
+            .entry(*reg as usize)
+            .or_insert_with(|| format!("param_{}", reg));
     }
-    let param_set: std::collections::HashSet<RTLReg> =
-        func.param_regs.iter().copied().collect();
+    let param_set: std::collections::HashSet<RTLReg> = func.param_regs.iter().copied().collect();
     for reg in &func.used_regs {
         if !param_set.contains(reg) {
-            local_names.entry(*reg as usize).or_insert_with(|| format!("var_{}", reg));
+            local_names
+                .entry(*reg as usize)
+                .or_insert_with(|| format!("var_{}", reg));
         }
     }
 
@@ -247,10 +436,7 @@ fn serialize_function(func: &SelectedFunction, id_to_name: &HashMap<usize, Strin
 }
 
 /// Serialize all statements for a function, providing both per-node and flattened CFG representations.
-fn serialize_function_body(
-    func: &SelectedFunction,
-    id_to_name: &HashMap<usize, String>,
-) -> Value {
+fn serialize_function_body(func: &SelectedFunction, id_to_name: &HashMap<usize, String>) -> Value {
     // Per-node statements (preserves CFG structure)
     let mut node_stmts: Vec<(Node, Value)> = func
         .statements
@@ -681,16 +867,32 @@ fn xtype_to_clight_type_json(xtype: &XType) -> Value {
     match xtype {
         XType::Xbool => json!({"tag": "Tint", "size": "IBool", "sign": "Unsigned", "attr": null}),
         XType::Xint8signed => json!({"tag": "Tint", "size": "I8", "sign": "Signed", "attr": null}),
-        XType::Xint8unsigned => json!({"tag": "Tint", "size": "I8", "sign": "Unsigned", "attr": null}),
-        XType::Xint16signed => json!({"tag": "Tint", "size": "I16", "sign": "Signed", "attr": null}),
-        XType::Xint16unsigned => json!({"tag": "Tint", "size": "I16", "sign": "Unsigned", "attr": null}),
-        XType::Xint | XType::Xany32 => json!({"tag": "Tint", "size": "I32", "sign": "Signed", "attr": null}),
-        XType::Xintunsigned => json!({"tag": "Tint", "size": "I32", "sign": "Unsigned", "attr": null}),
+        XType::Xint8unsigned => {
+            json!({"tag": "Tint", "size": "I8", "sign": "Unsigned", "attr": null})
+        }
+        XType::Xint16signed => {
+            json!({"tag": "Tint", "size": "I16", "sign": "Signed", "attr": null})
+        }
+        XType::Xint16unsigned => {
+            json!({"tag": "Tint", "size": "I16", "sign": "Unsigned", "attr": null})
+        }
+        XType::Xint | XType::Xany32 => {
+            json!({"tag": "Tint", "size": "I32", "sign": "Signed", "attr": null})
+        }
+        XType::Xintunsigned => {
+            json!({"tag": "Tint", "size": "I32", "sign": "Unsigned", "attr": null})
+        }
         XType::Xlong | XType::Xany64 => json!({"tag": "Tlong", "sign": "Signed", "attr": null}),
         XType::Xlongunsigned => json!({"tag": "Tlong", "sign": "Unsigned", "attr": null}),
         XType::Xfloat => json!({"tag": "Tfloat", "size": "F64", "attr": null}),
         XType::Xsingle => json!({"tag": "Tfloat", "size": "F32", "attr": null}),
-        XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr => {
+        XType::Xptr
+        | XType::Xcharptr
+        | XType::Xcharptrptr
+        | XType::Xintptr
+        | XType::Xfloatptr
+        | XType::Xsingleptr
+        | XType::Xfuncptr => {
             json!({"tag": "Tpointer", "inner": {"tag": "Tvoid"}, "attr": null})
         }
         XType::XstructPtr(id) => json!({
@@ -708,9 +910,13 @@ fn xtype_string_to_clight_type(s: &str) -> Value {
         "int_I8" => json!({"tag": "Tint", "size": "I8", "sign": "Signed", "attr": null}),
         "int_I8_unsigned" => json!({"tag": "Tint", "size": "I8", "sign": "Unsigned", "attr": null}),
         "int_I16" => json!({"tag": "Tint", "size": "I16", "sign": "Signed", "attr": null}),
-        "int_I16_unsigned" => json!({"tag": "Tint", "size": "I16", "sign": "Unsigned", "attr": null}),
+        "int_I16_unsigned" => {
+            json!({"tag": "Tint", "size": "I16", "sign": "Unsigned", "attr": null})
+        }
         "int_I32" => json!({"tag": "Tint", "size": "I32", "sign": "Signed", "attr": null}),
-        "int_I32_unsigned" => json!({"tag": "Tint", "size": "I32", "sign": "Unsigned", "attr": null}),
+        "int_I32_unsigned" => {
+            json!({"tag": "Tint", "size": "I32", "sign": "Unsigned", "attr": null})
+        }
         "int_I64" => json!({"tag": "Tlong", "sign": "Signed", "attr": null}),
         "int_I64_unsigned" => json!({"tag": "Tlong", "sign": "Unsigned", "attr": null}),
         "float_F64" => json!({"tag": "Tfloat", "size": "F64", "attr": null}),
@@ -804,16 +1010,20 @@ fn serialize_ctype_from_field(ty: &crate::decompile::passes::c_pass::types::CTyp
                 IntSize::Char => "I8",
                 IntSize::Short => "I16",
                 IntSize::Int => "I32",
-                IntSize::Long | IntSize::LongLong => return json!({
-                    "tag": "Tlong",
-                    "sign": match sign { Signedness::Signed => "Signed", Signedness::Unsigned => "Unsigned" },
-                    "attr": null,
-                }),
-                IntSize::Int128 => return json!({
-                    "tag": "Tint128",
-                    "sign": match sign { Signedness::Signed => "Signed", Signedness::Unsigned => "Unsigned" },
-                    "attr": null,
-                }),
+                IntSize::Long | IntSize::LongLong => {
+                    return json!({
+                        "tag": "Tlong",
+                        "sign": match sign { Signedness::Signed => "Signed", Signedness::Unsigned => "Unsigned" },
+                        "attr": null,
+                    })
+                }
+                IntSize::Int128 => {
+                    return json!({
+                        "tag": "Tint128",
+                        "sign": match sign { Signedness::Signed => "Signed", Signedness::Unsigned => "Unsigned" },
+                        "attr": null,
+                    })
+                }
             };
             json!({
                 "tag": "Tint",
@@ -860,41 +1070,59 @@ fn serialize_ctype_from_field(ty: &crate::decompile::passes::c_pass::types::CTyp
                 json!("cc_default")
             },
         }),
-        CType::Enum(name) => json!({"tag": "Tint", "size": "I32", "sign": "Signed", "attr": null, "enum": name}),
-        CType::TypedefName(name) => json!({"tag": "Tint", "size": "I32", "sign": "Signed", "attr": null, "typedef": name}),
+        CType::Enum(name) => {
+            json!({"tag": "Tint", "size": "I32", "sign": "Signed", "attr": null, "enum": name})
+        }
+        CType::TypedefName(name) => {
+            json!({"tag": "Tint", "size": "I32", "sign": "Signed", "attr": null, "typedef": name})
+        }
         CType::Qualified(inner, _) => serialize_ctype_from_field(inner),
     }
 }
 
 /// Collect names of functions called via Scall/EvarSymbol in a statement tree.
-fn collect_called_functions(stmt: &ClightStmt, names: &mut std::collections::HashSet<String>) {
+fn collect_called_functions(
+    stmt: &ClightStmt,
+    names: &mut std::collections::HashSet<String>,
+    id_to_name: &HashMap<usize, String>,
+) {
     match stmt {
-        ClightStmt::Scall(_, func_expr, _) => {
-            match func_expr {
-                ClightExpr::EvarSymbol(name, _) => { names.insert(name.clone()); }
-                ClightExpr::Evar(id, _) => { names.insert(format!("{}", id)); }
-                _ => {}
+        ClightStmt::Scall(_, func_expr, _) => match func_expr {
+            ClightExpr::EvarSymbol(name, _) => {
+                names.insert(name.clone());
+            }
+            ClightExpr::Evar(id, _) => {
+                names.insert(
+                    id_to_name
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| id.to_string()),
+                );
+            }
+            _ => {}
+        },
+        ClightStmt::Ssequence(stmts) => {
+            for s in stmts {
+                collect_called_functions(s, names, id_to_name);
             }
         }
-        ClightStmt::Ssequence(stmts) => {
-            for s in stmts { collect_called_functions(s, names); }
-        }
         ClightStmt::Sifthenelse(_, s1, s2) => {
-            collect_called_functions(s1, names);
-            collect_called_functions(s2, names);
+            collect_called_functions(s1, names, id_to_name);
+            collect_called_functions(s2, names, id_to_name);
         }
         ClightStmt::Sloop(s1, s2) => {
-            collect_called_functions(s1, names);
-            collect_called_functions(s2, names);
+            collect_called_functions(s1, names, id_to_name);
+            collect_called_functions(s2, names, id_to_name);
         }
-        ClightStmt::Slabel(_, s) => collect_called_functions(s, names),
+        ClightStmt::Slabel(_, s) => collect_called_functions(s, names, id_to_name),
         ClightStmt::Sswitch(_, cases) => {
-            for (_, s) in cases { collect_called_functions(s, names); }
+            for (_, s) in cases {
+                collect_called_functions(s, names, id_to_name);
+            }
         }
         _ => {}
     }
 }
-
 
 fn resolve_name(id: usize, id_to_name: &HashMap<usize, String>) -> String {
     id_to_name

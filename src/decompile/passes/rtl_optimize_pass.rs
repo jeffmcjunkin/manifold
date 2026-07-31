@@ -6,9 +6,9 @@ use crate::x86::op::{Comparison, Condition, Operation};
 use crate::x86::types::*;
 use either::Either;
 use log::info;
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use rayon::prelude::*;
 
 #[cfg(debug_assertions)]
 use ascent::ascent_par;
@@ -26,6 +26,7 @@ ascent_par! {
     relation rtl_opt_func(Node, Address);
     relation rtl_opt_param(Address, RTLReg);
     relation rtl_opt_entry(Address, Node);
+    relation rtl_opt_escaped(Address, RTLReg);
     // Mem-indirect call target-load address regs (call node -> address reg), seeded from FunctionCFG::mem_call_addr_uses so the v2 mirror matches the imperative def/use model.
     relation rtl_opt_mem_call_use(Node, RTLReg);
 
@@ -211,6 +212,8 @@ ascent_par! {
     copy_subst_v2(*dst, *src), copy_eliminated_v2(*copy_node) <--
         copy_candidate(func, copy_node, src, dst),
         !rtl_opt_param(func, dst),
+        !rtl_opt_escaped(func, src),
+        !rtl_opt_escaped(func, dst),
         dst_single_def_at(func, copy_node, dst),
         dst_has_use(func, copy_node, dst),
         !dst_self_use(func, copy_node, dst),
@@ -229,6 +232,7 @@ ascent_par! {
     dead_store_v2(*node) <--
         rtl_def(func, node, reg),
         !rtl_opt_param(func, reg),
+        !rtl_opt_escaped(func, reg),
         !live_out(node, reg),
         rtl_opt_inst(node, inst),
         if matches!(inst, RTLInst::Iop(_,_,_) | RTLInst::Iload(_,_,_,_));
@@ -285,6 +289,7 @@ ascent_par! {
     inline_temp_v2(*reg) <--
         inline_temp_def(func, reg, _),
         inline_temp_use(func, reg, _),
+        !rtl_opt_escaped(func, reg),
         !def_arg_not_live_at_use(func, reg),
         inline_temp_reach_ok(func, reg);
 }
@@ -309,6 +314,9 @@ fn run_rtl_optimizer_program(ctx: &PassContext) -> RTLOptimizerProgram {
         for &reg in &func.params {
             prog.rtl_opt_param.push((func_addr, reg));
         }
+        for &reg in &func.escaped_slot_regs {
+            prog.rtl_opt_escaped.push((func_addr, reg));
+        }
         for (&node, regs) in &func.mem_call_addr_uses {
             for &r in regs {
                 prog.rtl_opt_mem_call_use.push((node, r));
@@ -320,7 +328,6 @@ fn run_rtl_optimizer_program(ctx: &PassContext) -> RTLOptimizerProgram {
     prog.run();
     prog
 }
-
 
 #[derive(Debug, Default, Clone, Copy)]
 struct RtlOptStats {
@@ -367,7 +374,9 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
 
     let var_types = std::mem::take(&mut ctx.var_types);
 
-    let func_regs: HashMap<Address, HashSet<RTLReg>> = ctx.functions.iter()
+    let func_regs: HashMap<Address, HashSet<RTLReg>> = ctx
+        .functions
+        .iter()
         .map(|(&addr, func)| {
             let mut regs = HashSet::new();
             for inst in func.inst.values() {
@@ -378,9 +387,11 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         })
         .collect();
 
-    let per_func_var_types: HashMap<Address, HashMap<RTLReg, XType>> = func_regs.iter()
+    let per_func_var_types: HashMap<Address, HashMap<RTLReg, XType>> = func_regs
+        .iter()
         .map(|(&addr, regs)| {
-            let ft: HashMap<RTLReg, XType> = regs.iter()
+            let ft: HashMap<RTLReg, XType> = regs
+                .iter()
                 .filter_map(|&reg| var_types.get(&reg).map(|&ty| (reg, ty)))
                 .collect();
             (addr, ft)
@@ -400,30 +411,59 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         let ascent_opt = run_rtl_optimizer_program(&ctx);
         let self_zero: HashSet<Node> = ascent_opt.self_zero_v2.iter().map(|&(n,)| n).collect();
         let dead_store: HashSet<Node> = ascent_opt.dead_store_v2.iter().map(|&(n,)| n).collect();
-        let copy_eliminated: HashSet<Node> = ascent_opt.copy_eliminated_v2.iter().map(|&(n,)| n).collect();
+        let copy_eliminated: HashSet<Node> = ascent_opt
+            .copy_eliminated_v2
+            .iter()
+            .map(|&(n,)| n)
+            .collect();
         let dead_call: HashSet<Node> = ascent_opt.dead_call_dst_v2.iter().map(|&(n,)| n).collect();
-        let copy_subst: HashMap<RTLReg, RTLReg> = ascent_opt.copy_subst_resolved_v2
-            .iter().map(|&(d, s)| (d, s)).collect();
-        let inline_temp: HashSet<RTLReg> = ascent_opt.inline_temp_v2.iter().map(|&(r,)| r).collect();
-        let dead_or_copy_eliminated: HashSet<Node> = dead_store.union(&copy_eliminated).copied().collect();
-        Some(AscentV2Snapshot { self_zero, dead_store, dead_call, copy_subst, inline_temp, dead_or_copy_eliminated })
+        let copy_subst: HashMap<RTLReg, RTLReg> = ascent_opt
+            .copy_subst_resolved_v2
+            .iter()
+            .map(|&(d, s)| (d, s))
+            .collect();
+        let inline_temp: HashSet<RTLReg> =
+            ascent_opt.inline_temp_v2.iter().map(|&(r,)| r).collect();
+        let dead_or_copy_eliminated: HashSet<Node> =
+            dead_store.union(&copy_eliminated).copied().collect();
+        Some(AscentV2Snapshot {
+            self_zero,
+            dead_store,
+            dead_call,
+            copy_subst,
+            inline_temp,
+            dead_or_copy_eliminated,
+        })
     } else {
         None
     };
 
-    let results: Vec<_> = ctx.functions.par_iter_mut()
+    let results: Vec<_> = ctx
+        .functions
+        .par_iter_mut()
         .map(|(&func_addr, func)| {
-            let mut func_var_types = per_func_var_types.lock().unwrap()
-                .remove(&func_addr).unwrap_or_default();
+            let mut func_var_types = per_func_var_types
+                .lock()
+                .unwrap()
+                .remove(&func_addr)
+                .unwrap_or_default();
 
             // Track iteration-1 imperative outputs for diffing against Ascent.
-            let imp_self_zero: HashSet<Node> = func.inst.iter()
+            let imp_self_zero: HashSet<Node> = func
+                .inst
+                .iter()
                 .filter_map(|(&n, inst)| match inst {
                     RTLInst::Iop(op, args, dst)
                         if args.len() == 2
                             && args[0] == args[1]
                             && args[0] == *dst
-                            && matches!(op, Operation::Oxor | Operation::Osub | Operation::Oxorl | Operation::Osubl) =>
+                            && matches!(
+                                op,
+                                Operation::Oxor
+                                    | Operation::Osub
+                                    | Operation::Oxorl
+                                    | Operation::Osubl
+                            ) =>
                     {
                         Some(n)
                     }
@@ -467,13 +507,17 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
                     for (&n, before) in &dead_before {
                         let after = func.inst.get(&n);
                         match (before, after) {
-                            (RTLInst::Iop(_,_,_) | RTLInst::Iload(_,_,_,_),
-                                Some(RTLInst::Inop)) => {
+                            (
+                                RTLInst::Iop(_, _, _) | RTLInst::Iload(_, _, _, _),
+                                Some(RTLInst::Inop),
+                            ) => {
                                 // Non-nop def now nop: could be copy-prop or dead-store; both map to Inop.
                                 iter1_dead_store_nodes.insert(n);
                             }
-                            (RTLInst::Icall(_, _, _, Some(_), _),
-                                Some(RTLInst::Icall(_, _, _, None, _))) => {
+                            (
+                                RTLInst::Icall(_, _, _, Some(_), _),
+                                Some(RTLInst::Icall(_, _, _, None, _)),
+                            ) => {
                                 iter1_dead_call_nodes.insert(n);
                             }
                             _ => {}
@@ -537,17 +581,28 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         ctx.inline_temps.extend(inlines);
         merged_var_types.extend(func_vt);
         imp_self_zero_all.extend(isz);
-        for (d, s) in icp { imp_copy_subst_all.insert(d, s); }
+        for (d, s) in icp {
+            imp_copy_subst_all.insert(d, s);
+        }
         imp_dead_store_all.extend(idst);
         imp_dead_call_all.extend(idcl);
-        if became_void { newly_void.insert(fa); }
+        if became_void {
+            newly_void.insert(fa);
+        }
     }
 
     // Diff logging: compare Ascent v2 vs imperative iteration-1 outputs (uses eprintln so diffs surface during test runs, where no env_logger is configured).
     #[cfg(debug_assertions)]
     if let Some(v2) = &ascent_v2 {
-        let self_zero_missing: Vec<_> = imp_self_zero_all.difference(&v2.self_zero).copied().collect();
-        let self_zero_extra: Vec<_> = v2.self_zero.difference(&imp_self_zero_all).copied().collect();
+        let self_zero_missing: Vec<_> = imp_self_zero_all
+            .difference(&v2.self_zero)
+            .copied()
+            .collect();
+        let self_zero_extra: Vec<_> = v2
+            .self_zero
+            .difference(&imp_self_zero_all)
+            .copied()
+            .collect();
         if !self_zero_missing.is_empty() || !self_zero_extra.is_empty() {
             eprintln!(
                 "rtl_v2 diff self_zero: imperative={} ascent={} missing_from_ascent={} extra_in_ascent={}",
@@ -556,8 +611,15 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
             );
         }
         // imp_dead_store_all = union of copy-eliminated and dead-store nodes (both Inop in iter 1); compare against the same Ascent union.
-        let ds_missing: Vec<_> = imp_dead_store_all.difference(&v2.dead_or_copy_eliminated).copied().collect();
-        let ds_extra: Vec<_> = v2.dead_or_copy_eliminated.difference(&imp_dead_store_all).copied().collect();
+        let ds_missing: Vec<_> = imp_dead_store_all
+            .difference(&v2.dead_or_copy_eliminated)
+            .copied()
+            .collect();
+        let ds_extra: Vec<_> = v2
+            .dead_or_copy_eliminated
+            .difference(&imp_dead_store_all)
+            .copied()
+            .collect();
         if !ds_missing.is_empty() || !ds_extra.is_empty() {
             eprintln!(
                 "rtl_v2 diff dead_or_copy_elim (iter1): imperative={} ascent_union={} missing_from_ascent={} extra_in_ascent={}",
@@ -565,28 +627,46 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
                 ds_missing.len(), ds_extra.len()
             );
         }
-        let dc_missing: Vec<_> = imp_dead_call_all.difference(&v2.dead_call).copied().collect();
-        let dc_extra: Vec<_> = v2.dead_call.difference(&imp_dead_call_all).copied().collect();
+        let dc_missing: Vec<_> = imp_dead_call_all
+            .difference(&v2.dead_call)
+            .copied()
+            .collect();
+        let dc_extra: Vec<_> = v2
+            .dead_call
+            .difference(&imp_dead_call_all)
+            .copied()
+            .collect();
         if !dc_missing.is_empty() || !dc_extra.is_empty() {
             eprintln!(
                 "rtl_v2 diff dead_call_dst (iter1): imperative={} ascent={} missing={} extra={}",
-                imp_dead_call_all.len(), v2.dead_call.len(),
-                dc_missing.len(), dc_extra.len()
+                imp_dead_call_all.len(),
+                v2.dead_call.len(),
+                dc_missing.len(),
+                dc_extra.len()
             );
         }
         // ascent copy_subst is path-conservative; expected subset of imperative.
-        let cp_missing: Vec<_> = imp_copy_subst_all.iter()
+        let cp_missing: Vec<_> = imp_copy_subst_all
+            .iter()
             .filter(|&(d, _)| !v2.copy_subst.contains_key(d))
             .map(|(&d, &s)| (d, s))
             .collect();
-        let cp_mismatch: Vec<_> = v2.copy_subst.iter()
+        let cp_mismatch: Vec<_> = v2
+            .copy_subst
+            .iter()
             .filter_map(|(&d, &s_asc)| {
                 imp_copy_subst_all.get(&d).and_then(|&s_imp| {
-                    if s_asc != s_imp { Some((d, s_imp, s_asc)) } else { None }
+                    if s_asc != s_imp {
+                        Some((d, s_imp, s_asc))
+                    } else {
+                        None
+                    }
                 })
             })
             .collect();
-        let cp_extra: Vec<_> = v2.copy_subst.iter()
+        let cp_extra: Vec<_> = v2
+            .copy_subst
+            .iter()
             .filter(|&(d, _)| !imp_copy_subst_all.contains_key(d))
             .map(|(&d, &s)| (d, s))
             .collect();
@@ -597,13 +677,23 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
                 cp_missing.len(), cp_extra.len(), cp_mismatch.len()
             );
         }
-        let it_missing: Vec<_> = ctx.inline_temps.difference(&v2.inline_temp).copied().collect();
-        let it_extra: Vec<_> = v2.inline_temp.difference(&ctx.inline_temps).copied().collect();
+        let it_missing: Vec<_> = ctx
+            .inline_temps
+            .difference(&v2.inline_temp)
+            .copied()
+            .collect();
+        let it_extra: Vec<_> = v2
+            .inline_temp
+            .difference(&ctx.inline_temps)
+            .copied()
+            .collect();
         if !it_missing.is_empty() || !it_extra.is_empty() {
             eprintln!(
                 "rtl_v2 diff inline_temp: imperative={} ascent={} missing={} extra={}",
-                ctx.inline_temps.len(), v2.inline_temp.len(),
-                it_missing.len(), it_extra.len()
+                ctx.inline_temps.len(),
+                v2.inline_temp.len(),
+                it_missing.len(),
+                it_extra.len()
             );
         }
     }
@@ -628,35 +718,50 @@ fn mark_functions_void(db: &mut DecompileDB, void_funcs: &HashSet<Address>) {
             void_cand.push((f,));
         }
     }
-    db.rel_set("emit_function_void_candidate", void_cand.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    db.rel_set(
+        "emit_function_void_candidate",
+        void_cand.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
 
     let has_ret: Vec<(Address,)> = db
         .rel_iter::<(Address,)>("emit_function_has_return_candidate")
         .filter(|&&(a,)| !void_funcs.contains(&a))
         .cloned()
         .collect();
-    db.rel_set("emit_function_has_return_candidate", has_ret.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    db.rel_set(
+        "emit_function_has_return_candidate",
+        has_ret.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
 
     let ret: Vec<(Address, RTLReg)> = db
         .rel_iter::<(Address, RTLReg)>("emit_function_return")
         .filter(|&&(a, _)| !void_funcs.contains(&a))
         .cloned()
         .collect();
-    db.rel_set("emit_function_return", ret.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    db.rel_set(
+        "emit_function_return",
+        ret.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
 
     let ret_ct: Vec<(Address, ClightType)> = db
         .rel_iter::<(Address, ClightType)>("emit_function_return_type_candidate")
         .filter(|&&(a, _)| !void_funcs.contains(&a))
         .cloned()
         .collect();
-    db.rel_set("emit_function_return_type_candidate", ret_ct.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    db.rel_set(
+        "emit_function_return_type_candidate",
+        ret_ct.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
 
     let ret_xt: Vec<(Address, XType)> = db
         .rel_iter::<(Address, XType)>("emit_function_return_type_xtype_candidate")
         .filter(|&&(a, _)| !void_funcs.contains(&a))
         .cloned()
         .collect();
-    db.rel_set("emit_function_return_type_xtype_candidate", ret_xt.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    db.rel_set(
+        "emit_function_return_type_xtype_candidate",
+        ret_xt.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
 }
 
 pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
@@ -672,9 +777,7 @@ pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
     // RTL's first signature candidate holds register params only; include the upstream stack-param count now, or this pass deletes recovered stack arguments before reconciliation widens the callee.
     let shared_arg_slots = db.abi().uses_shared_arg_slots();
     let first_stack_arg_position = db.abi().first_stack_arg_position();
-    for &(addr, stack_count) in
-        db.rel_iter::<(Address, usize)>("emit_function_stack_param_count")
-    {
+    for &(addr, stack_count) in db.rel_iter::<(Address, usize)>("emit_function_stack_param_count") {
         let arity = callee_arity.entry(addr).or_insert(0);
         if shared_arg_slots && stack_count > 0 {
             // Win64's home space fixes the first stack parameter at ordinal 4, so preserve unobserved register-slot gaps instead of treating stack params as a dense suffix.
@@ -767,7 +870,9 @@ pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
     call_nodes.extend(args_by_call.keys().copied());
 
     let mut existing_call_args: HashMap<Node, Arc<Vec<RTLReg>>> = HashMap::new();
-    for &(node, ref args) in db.rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate") {
+    for &(node, ref args) in
+        db.rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
+    {
         let should_replace = existing_call_args
             .get(&node)
             .map(|curr| curr.len() < args.len())
@@ -794,9 +899,13 @@ pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
         .collect();
 
     // Merge float args after integer args for each call node
-    for &(call_node, ref float_args) in db.rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_float_args_collected") {
+    for &(call_node, ref float_args) in
+        db.rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_float_args_collected")
+    {
         if !float_args.is_empty() {
-            let int_args = rebuilt_args.entry(call_node).or_insert_with(|| Arc::new(vec![]));
+            let int_args = rebuilt_args
+                .entry(call_node)
+                .or_insert_with(|| Arc::new(vec![]));
             let mut combined = (**int_args).clone();
             combined.extend_from_slice(float_args);
             *int_args = Arc::new(combined);
@@ -808,22 +917,18 @@ pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
         .map(|(node, inst)| {
             let replacement_args = rebuilt_args.get(node);
             let patched = match inst {
-                RTLInst::Icall(sig, callee, args, dst, next) => {
-                    RTLInst::Icall(
-                        sig.clone(),
-                        callee.clone(),
-                        replacement_args.cloned().unwrap_or_else(|| args.clone()),
-                        *dst,
-                        *next,
-                    )
-                }
-                RTLInst::Itailcall(sig, callee, args) => {
-                    RTLInst::Itailcall(
-                        sig.clone(),
-                        callee.clone(),
-                        replacement_args.cloned().unwrap_or_else(|| args.clone()),
-                    )
-                }
+                RTLInst::Icall(sig, callee, args, dst, next) => RTLInst::Icall(
+                    sig.clone(),
+                    callee.clone(),
+                    replacement_args.cloned().unwrap_or_else(|| args.clone()),
+                    *dst,
+                    *next,
+                ),
+                RTLInst::Itailcall(sig, callee, args) => RTLInst::Itailcall(
+                    sig.clone(),
+                    callee.clone(),
+                    replacement_args.cloned().unwrap_or_else(|| args.clone()),
+                ),
                 _ => inst.clone(),
             };
             (*node, patched)
@@ -835,7 +940,9 @@ pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
 pub struct RTLOptimizePass;
 
 impl IRPass for RTLOptimizePass {
-    fn name(&self) -> &'static str { "rtl_optimize" }
+    fn name(&self) -> &'static str {
+        "rtl_optimize"
+    }
 
     fn run(&self, db: &mut DecompileDB) {
         trim_direct_call_args_to_callee_arity(db);
@@ -892,8 +999,17 @@ impl IRPass for RTLOptimizePass {
     }
 
     fn extra_reads(&self) -> &'static [&'static str] {
-        // Read imperatively in PassContext::load: call_through_memory_load (keeps a vtable Iload alive), jump_table_* (protects an in-loop dispatch entry), slot_escaped_canonical (protects escaped-slot stores from DSE).
-        &["call_through_memory_load", "jump_table_impl", "jump_table_cmp", "jump_table_target", "slot_escaped_canonical"]
+        // Read imperatively in PassContext::load: call_through_memory_load
+        // keeps a vtable Iload alive; jump_table_* protects in-loop dispatch;
+        // both ordinary and canonical-home escaped slots are mutable memory.
+        &[
+            "call_through_memory_load",
+            "jump_table_impl",
+            "jump_table_cmp",
+            "jump_table_target",
+            "slot_escaped_canonical",
+            "win64_home_escaped",
+        ]
     }
 }
 
@@ -913,7 +1029,6 @@ pub(crate) struct FunctionCFG {
     // Canonical SSA regs of address-escaped stack slots: the callee may write through the escaped pointer, a use reg liveness cannot see, so their stores are excluded from DSE.
     pub(crate) escaped_slot_regs: HashSet<RTLReg>,
 }
-
 
 struct PassContext {
     functions: BTreeMap<Address, FunctionCFG>,
@@ -948,7 +1063,11 @@ impl PassContext {
         for &(impl_addr, jmp_addr) in db.rel_iter::<(Node, Node)>("jump_table_impl") {
             dispatch_entry_by_table
                 .entry(jmp_addr)
-                .and_modify(|e| { if impl_addr < *e { *e = impl_addr; } })
+                .and_modify(|e| {
+                    if impl_addr < *e {
+                        *e = impl_addr;
+                    }
+                })
                 .or_insert(impl_addr);
         }
         let mut table_guard: HashMap<Node, Node> = HashMap::new();
@@ -960,7 +1079,8 @@ impl PassContext {
             table_cases.entry(jmp_addr).or_default().push(target);
         }
         // (dispatch_entry, guard, case_targets) per table that has both an entry and a guard.
-        let dispatch_loop_probes: Vec<(Node, Node, Vec<Node>)> = dispatch_entry_by_table.iter()
+        let dispatch_loop_probes: Vec<(Node, Node, Vec<Node>)> = dispatch_entry_by_table
+            .iter()
             .filter_map(|(&jmp, &entry)| {
                 let guard = *table_guard.get(&jmp)?;
                 let cases = table_cases.get(&jmp).cloned().unwrap_or_default();
@@ -970,8 +1090,13 @@ impl PassContext {
 
         // Address regs feeding a mem-indirect call's target load, per call node (node -> [base, idx?]); see FunctionCFG::mem_call_addr_uses. Declared in extra_reads().
         let mut mem_call_addr_uses: HashMap<Node, Vec<RTLReg>> = HashMap::new();
-        for (node, _temp, _chunk, _addr, args) in
-            db.rel_iter::<(Node, RTLReg, MemoryChunk, crate::x86::op::Addressing, Arc<Vec<RTLReg>>)>("call_through_memory_load")
+        for (node, _temp, _chunk, _addr, args) in db.rel_iter::<(
+            Node,
+            RTLReg,
+            MemoryChunk,
+            crate::x86::op::Addressing,
+            Arc<Vec<RTLReg>>,
+        )>("call_through_memory_load")
         {
             let entry = mem_call_addr_uses.entry(*node).or_default();
             for &r in args.iter() {
@@ -986,9 +1111,17 @@ impl PassContext {
         for &(func, _ofs, reg) in db.rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical") {
             escaped_slot_regs.entry(func).or_default().insert(reg);
         }
+        for &(func, reg) in db.rel_iter::<(Address, RTLReg)>("win64_home_escaped") {
+            escaped_slot_regs.entry(func).or_default().insert(reg);
+        }
         // Per reg, keep the max-(refine_priority, type) candidate via fold-during-insert (avoids intermediate Vec; key embeds type so equal-key ties are identical values, making the winner iteration-order-independent).
         let var_types: HashMap<RTLReg, XType> = {
-            let key = |ty: &XType| (crate::decompile::passes::clight_pass::xtype_refine_priority(ty), *ty);
+            let key = |ty: &XType| {
+                (
+                    crate::decompile::passes::clight_pass::xtype_refine_priority(ty),
+                    *ty,
+                )
+            };
             let mut chosen: HashMap<RTLReg, XType> = HashMap::new();
             for (reg, xty) in db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate") {
                 chosen
@@ -1006,14 +1139,16 @@ impl PassContext {
         let node_to_func: HashMap<Node, Address> = {
             let mut groups: HashMap<Node, Address> = HashMap::new();
             for &(n, f) in &instr_in_func {
-                groups.entry(n)
+                groups
+                    .entry(n)
                     .and_modify(|curr| *curr = (*curr).min(f))
                     .or_insert(f);
             }
             groups
         };
 
-        let func_entries: HashMap<Address, Node> = emit_funcs.iter()
+        let func_entries: HashMap<Address, Node> = emit_funcs
+            .iter()
             .map(|&(addr, _, entry)| (addr, entry))
             .collect();
 
@@ -1022,11 +1157,16 @@ impl PassContext {
             func_params.entry(addr).or_default().insert(reg);
         }
 
-        let mut func_node_candidates: HashMap<Address, HashMap<Node, Vec<RTLInst>>> = HashMap::new();
+        let mut func_node_candidates: HashMap<Address, HashMap<Node, Vec<RTLInst>>> =
+            HashMap::new();
         for (node, inst) in &rtl_insts {
             if let Some(&func) = node_to_func.get(node) {
-                func_node_candidates.entry(func).or_default()
-                    .entry(*node).or_default().push(inst.clone());
+                func_node_candidates
+                    .entry(func)
+                    .or_default()
+                    .entry(*node)
+                    .or_default()
+                    .push(inst.clone());
             }
         }
 
@@ -1077,8 +1217,12 @@ impl PassContext {
         let mut func_succs: HashMap<Address, HashMap<Node, Vec<Node>>> = HashMap::new();
         for &(src, dst) in &rtl_succs {
             if let Some(&func) = node_to_func.get(&src) {
-                func_succs.entry(func).or_default()
-                    .entry(src).or_default().push(dst);
+                func_succs
+                    .entry(func)
+                    .or_default()
+                    .entry(src)
+                    .or_default()
+                    .push(dst);
             }
         }
 
@@ -1107,9 +1251,14 @@ impl PassContext {
                     Some(inst) => inst,
                     None => continue,
                 };
-                let needs_fallthrough = matches!(inst,
-                    RTLInst::Inop | RTLInst::Iop(..) | RTLInst::Iload(..)
-                    | RTLInst::Istore(..) | RTLInst::Icall(..) | RTLInst::Ibuiltin(..)
+                let needs_fallthrough = matches!(
+                    inst,
+                    RTLInst::Inop
+                        | RTLInst::Iop(..)
+                        | RTLInst::Iload(..)
+                        | RTLInst::Istore(..)
+                        | RTLInst::Icall(..)
+                        | RTLInst::Ibuiltin(..)
                 );
                 if needs_fallthrough {
                     if let Some(&next_node) = nodes_vec.get(i + 1) {
@@ -1137,7 +1286,8 @@ impl PassContext {
                 }
             }
 
-            let func_mem_call_uses: HashMap<Node, Vec<RTLReg>> = nodes.iter()
+            let func_mem_call_uses: HashMap<Node, Vec<RTLReg>> = nodes
+                .iter()
                 .filter_map(|n| mem_call_addr_uses.get(n).map(|regs| (*n, regs.clone())))
                 .collect();
 
@@ -1159,9 +1309,9 @@ impl PassContext {
                 if !func.nodes.contains(entry) || dispatch_entry_nodes.contains(entry) {
                     continue;
                 }
-                let in_loop = cases.iter().any(|c| {
-                    func.nodes.contains(c) && reachable_from(&func, *c).contains(guard)
-                });
+                let in_loop = cases
+                    .iter()
+                    .any(|c| func.nodes.contains(c) && reachable_from(&func, *c).contains(guard));
                 if in_loop {
                     dispatch_entry_nodes.insert(*entry);
                 }
@@ -1171,7 +1321,11 @@ impl PassContext {
             functions.insert(func_addr, func);
         }
 
-        PassContext { functions, var_types, inline_temps: HashSet::new() }
+        PassContext {
+            functions,
+            var_types,
+            inline_temps: HashSet::new(),
+        }
     }
 
     fn write_back(self, db: &mut DecompileDB) {
@@ -1188,7 +1342,9 @@ impl PassContext {
             let mut src_nodes: Vec<Node> = func.succs.keys().copied().collect();
             src_nodes.sort();
             for src in src_nodes {
-                if !func.inst.contains_key(&src) { continue; }
+                if !func.inst.contains_key(&src) {
+                    continue;
+                }
                 if let Some(dsts) = func.succs.get(&src) {
                     let mut sorted_dsts: Vec<Node> = dsts.clone();
                     sorted_dsts.sort();
@@ -1208,7 +1364,9 @@ impl PassContext {
                         if func.escaped_slot_regs.contains(dst) {
                             continue;
                         }
-                        if let Some(cst) = crate::decompile::passes::cminor_pass::constant_from_operation(op) {
+                        if let Some(cst) =
+                            crate::decompile::passes::cminor_pass::constant_from_operation(op)
+                        {
                             new_sdc.push((*dst, cst));
                         }
                     }
@@ -1238,36 +1396,58 @@ pub(crate) fn collect_inst_regs(inst: &RTLInst, regs: &mut HashSet<RTLReg>) {
     match inst {
         RTLInst::Inop => {}
         RTLInst::Iop(_, args, dst) => {
-            for &a in args.iter() { regs.insert(a); }
+            for &a in args.iter() {
+                regs.insert(a);
+            }
             regs.insert(*dst);
         }
         RTLInst::Iload(_, _, args, dst) => {
-            for &a in args.iter() { regs.insert(a); }
+            for &a in args.iter() {
+                regs.insert(a);
+            }
             regs.insert(*dst);
         }
         RTLInst::Istore(_, _, args, src) => {
-            for &a in args.iter() { regs.insert(a); }
+            for &a in args.iter() {
+                regs.insert(a);
+            }
             regs.insert(*src);
         }
         RTLInst::Icall(_, callee, args, dst, _) => {
-            if let Either::Left(r) = callee { regs.insert(*r); }
-            for &a in args.iter() { regs.insert(a); }
-            if let Some(d) = dst { regs.insert(*d); }
+            if let Either::Left(r) = callee {
+                regs.insert(*r);
+            }
+            for &a in args.iter() {
+                regs.insert(a);
+            }
+            if let Some(d) = dst {
+                regs.insert(*d);
+            }
         }
         RTLInst::Itailcall(_, callee, args) => {
-            if let Either::Left(r) = callee { regs.insert(*r); }
-            for &a in args.iter() { regs.insert(a); }
+            if let Either::Left(r) = callee {
+                regs.insert(*r);
+            }
+            for &a in args.iter() {
+                regs.insert(a);
+            }
         }
         RTLInst::Ibuiltin(_, args, res) => {
             collect_builtin_arg_regs(args, regs);
             collect_single_builtin_arg_regs(res, regs);
         }
         RTLInst::Icond(_, args, _, _) => {
-            for &a in args.iter() { regs.insert(a); }
+            for &a in args.iter() {
+                regs.insert(a);
+            }
         }
-        RTLInst::Ijumptable(reg, _) => { regs.insert(*reg); }
+        RTLInst::Ijumptable(reg, _) => {
+            regs.insert(*reg);
+        }
         RTLInst::Ibranch(_) => {}
-        RTLInst::Ireturn(reg) => { regs.insert(*reg); }
+        RTLInst::Ireturn(reg) => {
+            regs.insert(*reg);
+        }
     }
 }
 
@@ -1279,7 +1459,9 @@ fn collect_builtin_arg_regs(args: &[BuiltinArg<RTLReg>], regs: &mut HashSet<RTLR
 
 fn collect_single_builtin_arg_regs(arg: &BuiltinArg<RTLReg>, regs: &mut HashSet<RTLReg>) {
     match arg {
-        BuiltinArg::BA(r) => { regs.insert(*r); }
+        BuiltinArg::BA(r) => {
+            regs.insert(*r);
+        }
         BuiltinArg::BASplitLong(a, b) | BuiltinArg::BAAddPtr(a, b) => {
             collect_single_builtin_arg_regs(a, regs);
             collect_single_builtin_arg_regs(b, regs);
@@ -1287,7 +1469,6 @@ fn collect_single_builtin_arg_regs(arg: &BuiltinArg<RTLReg>, regs: &mut HashSet<
         _ => {}
     }
 }
-
 
 pub(crate) struct DefUseInfo {
     node_def: HashMap<Node, RTLReg>,
@@ -1323,7 +1504,12 @@ impl DefUseInfo {
             }
         }
 
-        DefUseInfo { node_def, node_uses, defs, uses }
+        DefUseInfo {
+            node_def,
+            node_uses,
+            defs,
+            uses,
+        }
     }
 }
 
@@ -1339,17 +1525,23 @@ pub(crate) fn inst_def_use(inst: &RTLInst) -> (Option<RTLReg>, Vec<RTLReg>) {
         }
         RTLInst::Icall(_, callee, args, dst, _) => {
             let mut used: Vec<RTLReg> = args.iter().copied().collect();
-            if let Either::Left(r) = callee { used.push(*r); }
+            if let Either::Left(r) = callee {
+                used.push(*r);
+            }
             (dst.as_ref().copied(), used)
         }
         RTLInst::Itailcall(_, callee, args) => {
             let mut used: Vec<RTLReg> = args.iter().copied().collect();
-            if let Either::Left(r) = callee { used.push(*r); }
+            if let Either::Left(r) = callee {
+                used.push(*r);
+            }
             (None, used)
         }
         RTLInst::Ibuiltin(_, args, res) => {
             let mut used = Vec::new();
-            for a in args { collect_ba_uses(a, &mut used); }
+            for a in args {
+                collect_ba_uses(a, &mut used);
+            }
             let def = match res {
                 BuiltinArg::BA(r) => Some(*r),
                 _ => None,
@@ -1373,7 +1565,6 @@ fn collect_ba_uses(arg: &BuiltinArg<RTLReg>, out: &mut Vec<RTLReg>) {
         _ => {}
     }
 }
-
 
 pub(crate) struct LivenessInfo {
     pub(crate) live_in: HashMap<Node, HashSet<RTLReg>>,
@@ -1438,7 +1629,6 @@ impl LivenessInfo {
     }
 }
 
-
 fn reachable_from(func: &FunctionCFG, node: Node) -> HashSet<Node> {
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
@@ -1461,6 +1651,36 @@ fn reachable_from(func: &FunctionCFG, node: Node) -> HashSet<Node> {
     visited
 }
 
+// Whether `target` remains reachable from `start` when `blocked` is removed
+// from the CFG.  This is the negative form of a dominance query: if a use is
+// still reachable from the function entry without visiting its definition,
+// that definition does not dominate the use.
+fn reachable_avoiding(func: &FunctionCFG, start: Node, target: Node, blocked: Node) -> bool {
+    if start == blocked {
+        return false;
+    }
+
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    visited.insert(start);
+    queue.push_back(start);
+
+    while let Some(node) = queue.pop_front() {
+        if node == target {
+            return true;
+        }
+        if let Some(succs) = func.succs.get(&node) {
+            for &succ in succs {
+                if succ != blocked && func.nodes.contains(&succ) && visited.insert(succ) {
+                    queue.push_back(succ);
+                }
+            }
+        }
+    }
+
+    false
+}
+
 fn src_not_redefined_on_paths_to_uses(
     func: &FunctionCFG,
     du: &DefUseInfo,
@@ -1473,7 +1693,8 @@ fn src_not_redefined_on_paths_to_uses(
         None => return true,
     };
 
-    let redefs: Vec<Node> = src_def_nodes.iter()
+    let redefs: Vec<Node> = src_def_nodes
+        .iter()
         .filter(|&&n| n != copy_node)
         .copied()
         .collect();
@@ -1483,7 +1704,8 @@ fn src_not_redefined_on_paths_to_uses(
 
     let forward = reachable_from(func, copy_node);
 
-    let reachable_redefs: Vec<Node> = redefs.iter()
+    let reachable_redefs: Vec<Node> = redefs
+        .iter()
         .filter(|n| forward.contains(n))
         .copied()
         .collect();
@@ -1514,8 +1736,10 @@ fn src_not_redefined_on_paths_to_uses(
 // True for an integer equality/inequality comparison, where `cmp x, x` is statically known (equal -> Ceq true / Cne false) regardless of value; ordered comparisons (Clt/Cle/Cgt/Cge) and float comparisons are excluded so only provably-determined branches fold.
 fn const_eq_branch_taken(cond: &Condition) -> Option<bool> {
     match cond {
-        Condition::Ccomp(c) | Condition::Ccompu(c)
-        | Condition::Ccompl(c) | Condition::Ccomplu(c) => match c {
+        Condition::Ccomp(c)
+        | Condition::Ccompu(c)
+        | Condition::Ccompl(c)
+        | Condition::Ccomplu(c) => match c {
             Comparison::Ceq => Some(true),
             Comparison::Cne => Some(false),
             _ => None,
@@ -1532,7 +1756,9 @@ fn fold_static_eq_branches(func: &mut FunctionCFG) -> bool {
     for inst in func.inst.values() {
         if let RTLInst::Iop(op, args, dst) = inst {
             if args.is_empty() {
-                if let Some(cst) = crate::decompile::passes::cminor_pass::constant_from_operation(op) {
+                if let Some(cst) =
+                    crate::decompile::passes::cminor_pass::constant_from_operation(op)
+                {
                     if du.defs.get(dst).is_some_and(|d| d.len() == 1) {
                         const_of.insert(*dst, cst);
                     }
@@ -1565,7 +1791,8 @@ fn fold_static_eq_branches(func: &mut FunctionCFG) -> bool {
     }
 
     for &(node, taken, _dead) in &folds {
-        func.inst.insert(node, RTLInst::Ibranch(Either::Right(taken)));
+        func.inst
+            .insert(node, RTLInst::Ibranch(Either::Right(taken)));
         func.succs.insert(node, vec![taken]);
     }
 
@@ -1603,17 +1830,19 @@ pub(crate) fn self_zero_rewrite(func: &mut FunctionCFG) -> usize {
     let mut count = 0;
     for (_node, inst) in func.inst.iter_mut() {
         let rewrite = match inst {
-            RTLInst::Iop(op, args, dst) if args.len() == 2 && args[0] == args[1] => {
-                match op {
-                    Operation::Oxor | Operation::Osub => {
-                        Some(RTLInst::Iop(Operation::Ointconst(0), Arc::new(vec![]), *dst))
-                    }
-                    Operation::Oxorl | Operation::Osubl => {
-                        Some(RTLInst::Iop(Operation::Olongconst(0), Arc::new(vec![]), *dst))
-                    }
-                    _ => None,
-                }
-            }
+            RTLInst::Iop(op, args, dst) if args.len() == 2 && args[0] == args[1] => match op {
+                Operation::Oxor | Operation::Osub => Some(RTLInst::Iop(
+                    Operation::Ointconst(0),
+                    Arc::new(vec![]),
+                    *dst,
+                )),
+                Operation::Oxorl | Operation::Osubl => Some(RTLInst::Iop(
+                    Operation::Olongconst(0),
+                    Arc::new(vec![]),
+                    *dst,
+                )),
+                _ => None,
+            },
             _ => None,
         };
         if let Some(new_inst) = rewrite {
@@ -1650,6 +1879,12 @@ pub(crate) fn copy_propagation(
         let src = *src;
         let dst = *dst;
         let mut safe = !func.params.contains(&dst)
+            // An escaped stack slot represents mutable memory, not an SSA
+            // temporary.  Propagating either the initialization into later
+            // reads or a later read back to its pre-call source would erase
+            // mutations performed through an escaped address.
+            && !func.escaped_slot_regs.contains(&src)
+            && !func.escaped_slot_regs.contains(&dst)
             && du.defs.get(&dst).map_or(0, |d| d.len()) == 1;
         if safe {
             match du.uses.get(&dst) {
@@ -1665,7 +1900,8 @@ pub(crate) fn copy_propagation(
                         }
                     }
                     if safe {
-                        safe = src_not_redefined_on_paths_to_uses(func, du, *copy_node, src, dst_uses);
+                        safe =
+                            src_not_redefined_on_paths_to_uses(func, du, *copy_node, src, dst_uses);
                     }
                 }
             }
@@ -1775,20 +2011,25 @@ pub(crate) fn subst_in_inst(inst: &RTLInst, map: &HashMap<RTLReg, RTLReg>) -> RT
 }
 
 pub(crate) fn subst_args(args: &Args, map: &HashMap<RTLReg, RTLReg>) -> Args {
-    Arc::new(args.iter().map(|r| map.get(r).copied().unwrap_or(*r)).collect())
+    Arc::new(
+        args.iter()
+            .map(|r| map.get(r).copied().unwrap_or(*r))
+            .collect(),
+    )
 }
 
-pub(crate) fn subst_ba(ba: &BuiltinArg<RTLReg>, map: &HashMap<RTLReg, RTLReg>) -> BuiltinArg<RTLReg> {
+pub(crate) fn subst_ba(
+    ba: &BuiltinArg<RTLReg>,
+    map: &HashMap<RTLReg, RTLReg>,
+) -> BuiltinArg<RTLReg> {
     match ba {
         BuiltinArg::BA(r) => BuiltinArg::BA(map.get(r).copied().unwrap_or(*r)),
-        BuiltinArg::BASplitLong(a, b) => BuiltinArg::BASplitLong(
-            Box::new(subst_ba(a, map)),
-            Box::new(subst_ba(b, map)),
-        ),
-        BuiltinArg::BAAddPtr(a, b) => BuiltinArg::BAAddPtr(
-            Box::new(subst_ba(a, map)),
-            Box::new(subst_ba(b, map)),
-        ),
+        BuiltinArg::BASplitLong(a, b) => {
+            BuiltinArg::BASplitLong(Box::new(subst_ba(a, map)), Box::new(subst_ba(b, map)))
+        }
+        BuiltinArg::BAAddPtr(a, b) => {
+            BuiltinArg::BAAddPtr(Box::new(subst_ba(a, map)), Box::new(subst_ba(b, map)))
+        }
         other => other.clone(),
     }
 }
@@ -1800,7 +2041,9 @@ pub(crate) fn dead_store_elimination(
 ) -> usize {
     let mut count = 0;
 
-    let dead_nodes: Vec<Node> = func.inst.iter()
+    let dead_nodes: Vec<Node> = func
+        .inst
+        .iter()
         .filter_map(|(&node, inst)| {
             let def_reg = du.node_def.get(&node)?;
 
@@ -1833,7 +2076,9 @@ pub(crate) fn dead_store_elimination(
         }
     }
 
-    let dead_call_nodes: Vec<Node> = func.inst.iter()
+    let dead_call_nodes: Vec<Node> = func
+        .inst
+        .iter()
         .filter_map(|(&node, inst)| {
             if let RTLInst::Icall(_, _, _, Some(dst), _) = inst {
                 if func.params.contains(dst) {
@@ -1850,7 +2095,8 @@ pub(crate) fn dead_store_elimination(
 
     for node in dead_call_nodes {
         if let Some(RTLInst::Icall(sig, callee, args, _, next)) = func.inst.get(&node).cloned() {
-            func.inst.insert(node, RTLInst::Icall(sig, callee, args, None, next));
+            func.inst
+                .insert(node, RTLInst::Icall(sig, callee, args, None, next));
             count += 1;
         }
     }
@@ -1858,11 +2104,12 @@ pub(crate) fn dead_store_elimination(
     count
 }
 
-
 pub(crate) fn nop_collapse(func: &mut FunctionCFG) -> usize {
     // An in-loop dispatch entry is DSE-nopped but not removable: keep it self-canonical, or threading the guard past the switch leaves a dead switch.
     let dispatch_entry = &func.dispatch_entry_nodes;
-    let nop_nodes: Vec<Node> = func.inst.iter()
+    let nop_nodes: Vec<Node> = func
+        .inst
+        .iter()
         .filter(|(&node, inst)| {
             matches!(inst, RTLInst::Inop) && node != func.entry && !dispatch_entry.contains(&node)
         })
@@ -1971,7 +2218,8 @@ fn retarget_inst(inst: &mut RTLInst, nop_target: &HashMap<Node, Node>) {
             }
         }
         RTLInst::Ijumptable(_, targets) => {
-            let new_targets: Vec<Node> = targets.iter()
+            let new_targets: Vec<Node> = targets
+                .iter()
                 .map(|n| nop_target.get(n).copied().unwrap_or(*n))
                 .collect();
             if new_targets != **targets {
@@ -1990,7 +2238,6 @@ pub(crate) fn retarget_either(target: &mut Either<Symbol, Node>, nop_target: &Ha
     }
 }
 
-
 pub(crate) fn find_inline_temps(
     func: &FunctionCFG,
     du: &DefUseInfo,
@@ -1999,7 +2246,9 @@ pub(crate) fn find_inline_temps(
     let mut result = HashSet::new();
 
     for (&reg, def_nodes) in &du.defs {
-        if def_nodes.len() != 1 { continue; }
+        if def_nodes.len() != 1 {
+            continue;
+        }
         let def_node = def_nodes[0];
 
         let use_node = match du.uses.get(&reg) {
@@ -2007,13 +2256,23 @@ pub(crate) fn find_inline_temps(
                 let mut distinct: Vec<Node> = u.clone();
                 distinct.sort_unstable();
                 distinct.dedup();
-                if distinct.len() != 1 { continue; }
+                if distinct.len() != 1 {
+                    continue;
+                }
                 distinct[0]
             }
             _ => continue,
         };
 
-        if func.params.contains(&reg) { continue; }
+        if func.params.contains(&reg) {
+            continue;
+        }
+        // An address-escaped canonical slot is mutable memory.  Treating its
+        // sole syntactic def/use as an inline expression would move a pre-call
+        // value across an opaque mutation through &slot.
+        if func.escaped_slot_regs.contains(&reg) {
+            continue;
+        }
 
         let inst = match func.inst.get(&def_node) {
             Some(i) => i,
@@ -2038,6 +2297,14 @@ pub(crate) fn find_inline_temps(
             continue;
         }
 
+        // Reachability from def to use is insufficient: a conditional def can
+        // reach a join that also has a bypass edge.  Inlining such a def
+        // fabricates its value on the bypass path (notably for a conditional
+        // `lea stack, bp`).  Require the sole definition to dominate its use.
+        if def_node != func.entry && reachable_avoiding(func, func.entry, use_node, def_node) {
+            continue;
+        }
+
         // Refuse to inline if any source operand is redefined on a CFG path from the temp's def to its use; liveness at the use does not preclude an intervening redefinition.
         if !def_args
             .iter()
@@ -2050,4 +2317,80 @@ pub(crate) fn find_inline_temps(
     }
 
     result
+}
+
+#[cfg(test)]
+mod inline_temp_tests {
+    use super::*;
+    use crate::x86::op::Addressing;
+
+    const ENTRY: Node = 0x100;
+    const DEF: Node = 0x110;
+    const BYPASS: Node = 0x120;
+    const USE: Node = 0x130;
+    const TEMP: RTLReg = 0x8000_0000_0000_0110;
+
+    fn stack_address_cfg(with_bypass: bool) -> FunctionCFG {
+        let mut nodes = BTreeSet::from([ENTRY, DEF, USE]);
+        let mut inst = BTreeMap::from([
+            (ENTRY, RTLInst::Inop),
+            (
+                DEF,
+                RTLInst::Iop(
+                    Operation::Olea(Addressing::Ainstack(0)),
+                    Arc::new(Vec::new()),
+                    TEMP,
+                ),
+            ),
+            (USE, RTLInst::Ireturn(TEMP)),
+        ]);
+        let mut succs = HashMap::from([(DEF, vec![USE])]);
+
+        if with_bypass {
+            nodes.insert(BYPASS);
+            inst.insert(BYPASS, RTLInst::Inop);
+            succs.insert(ENTRY, vec![DEF, BYPASS]);
+            succs.insert(BYPASS, vec![USE]);
+        } else {
+            succs.insert(ENTRY, vec![DEF]);
+        }
+
+        let mut preds: HashMap<Node, Vec<Node>> = HashMap::new();
+        for (&src, destinations) in &succs {
+            for &dst in destinations {
+                preds.entry(dst).or_default().push(src);
+            }
+        }
+
+        FunctionCFG {
+            func_addr: ENTRY,
+            entry: ENTRY,
+            nodes,
+            inst,
+            succs,
+            preds,
+            params: HashSet::new(),
+            mem_call_addr_uses: HashMap::new(),
+            dispatch_entry_nodes: HashSet::new(),
+            escaped_slot_regs: HashSet::new(),
+        }
+    }
+
+    fn inline_temps(func: &FunctionCFG) -> HashSet<RTLReg> {
+        let du = DefUseInfo::build(func);
+        let liveness = LivenessInfo::build(func, &du);
+        find_inline_temps(func, &du, &liveness)
+    }
+
+    #[test]
+    fn conditional_stack_address_def_does_not_inline_across_bypass() {
+        let func = stack_address_cfg(true);
+        assert!(!inline_temps(&func).contains(&TEMP));
+    }
+
+    #[test]
+    fn dominating_stack_address_def_remains_inlineable() {
+        let func = stack_address_cfg(false);
+        assert!(inline_temps(&func).contains(&TEMP));
+    }
 }

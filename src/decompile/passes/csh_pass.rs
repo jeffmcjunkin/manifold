@@ -1,22 +1,20 @@
-
-
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
 use crate::{declare_io_from, run_pass};
 
-use std::sync::Arc;
 use crate::decompile::passes::cminor_pass::*;
 use crate::x86::op::Addressing;
 use crate::x86::types::*;
 use ascent::ascent_par;
 use log::warn;
+use std::sync::Arc;
 
 // True when `name` is an auto-generated L_<hex> label (disassembler-emitted, used by absorbed-fragment detection).
 pub(crate) fn is_generated_label_name(name: &str) -> bool {
-    name.strip_prefix("L_")
-        .map_or(false, |h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+    name.strip_prefix("L_").map_or(false, |h| {
+        !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit())
+    })
 }
-
 
 ascent_par! {
     #![measure_rule_times]
@@ -105,19 +103,21 @@ ascent_par! {
     base_addr_usage(node, *reg, 0) <--
         cminorsel_stmt(node, ?CminorStmt::Sassign(_, expr)),
         if let CminorExpr::Eload(_, addr, args) = expr,
-        if !matches!(addr, Addressing::Aglobal(_, _)),
+        if !matches!(addr, Addressing::Aglobal(_, _) | Addressing::Aaddr32(_)),
         if let Some(reg) = args.first();
 
     base_addr_usage(node, *reg, 0) <--
         cminorsel_stmt(node, ?CminorStmt::Sstore(_, addr, args, _)),
-        if !matches!(addr, Addressing::Aglobal(_, _)),
+        if !matches!(addr, Addressing::Aglobal(_, _) | Addressing::Aaddr32(_)),
         if let Some(reg) = args.first();
 }
 
 pub struct CshPass;
 
 impl IRPass for CshPass {
-    fn name(&self) -> &'static str { "csh" }
+    fn name(&self) -> &'static str {
+        "csh"
+    }
 
     fn run(&self, db: &mut DecompileDB) {
         run_pass!(db, CshPassProgram);
@@ -125,7 +125,6 @@ impl IRPass for CshPass {
 
     declare_io_from!(CshPassProgram);
 }
-
 
 pub fn make_field_ident(offset: i64, _chunk: MemoryChunk) -> Ident {
     // Preserve the sign (two's complement) instead of clamping to 0: clamping collapsed every negative-offset field onto `ofs_0`, colliding with the real offset-0 field and producing duplicate struct members. Non-negative offsets are unaffected.
@@ -183,7 +182,11 @@ pub fn default_int_type() -> ClightType {
 }
 
 pub fn default_uint_type() -> ClightType {
-    ClightType::Tint(ClightIntSize::I32, ClightSignedness::Unsigned, default_attr())
+    ClightType::Tint(
+        ClightIntSize::I32,
+        ClightSignedness::Unsigned,
+        default_attr(),
+    )
 }
 
 pub fn default_long_type() -> ClightType {
@@ -235,7 +238,6 @@ pub fn default_expr_for_type(ty: &ClightType) -> ClightExpr {
     }
 }
 
-
 pub fn simplify_type(ty: ClightType) -> ClightType {
     match ty {
         ClightType::Tpointer(inner, attr) => {
@@ -254,7 +256,6 @@ pub fn pointer_to(inner: ClightType) -> ClightType {
     let ptr = ClightType::Tpointer(Arc::new(inner), default_attr());
     simplify_type(ptr)
 }
-
 
 pub fn clight_type_from_chunk(chunk: &MemoryChunk) -> ClightType {
     match chunk {
@@ -346,7 +347,11 @@ pub fn clight_function_pointer_type(sig: &Signature) -> ClightType {
     } else {
         clight_type_from_xtype(&sig.sig_res)
     };
-    pointer_to(ClightType::Tfunction(Arc::new(arg_types), Arc::new(ret_type), sig.sig_cc))
+    pointer_to(ClightType::Tfunction(
+        Arc::new(arg_types),
+        Arc::new(ret_type),
+        sig.sig_cc,
+    ))
 }
 
 pub fn default_function_signature() -> Signature {
@@ -360,7 +365,6 @@ pub fn default_function_signature() -> Signature {
 pub fn resolve_signature(sig_opt: &Option<Signature>) -> Signature {
     sig_opt.clone().unwrap_or_else(default_function_signature)
 }
-
 
 pub fn clight_cast_supported(from: &ClightType, to: &ClightType) -> bool {
     use ClightFloatSize::*;
@@ -521,7 +525,6 @@ pub fn clight_unop_from_cminor(op: &CminorUnop) -> Option<ClightUnaryOp> {
     }
 }
 
-
 pub fn types_equal_ignoring_attr(t1: &ClightType, t2: &ClightType) -> bool {
     match (t1, t2) {
         (ClightType::Tint(s1, sn1, _), ClightType::Tint(s2, sn2, _)) => s1 == s2 && sn1 == sn2,
@@ -557,13 +560,12 @@ pub fn cast_expr_to_type(expr: ClightExpr, target_ty: ClightType) -> ClightExpr 
     }
 
     // Narrowing integer cast check (inlined)
-    if matches!(expr_ty, ClightType::Tlong(_, _)) && matches!(target_ty, ClightType::Tint(_, _, _)) {
+    if matches!(expr_ty, ClightType::Tlong(_, _)) && matches!(target_ty, ClightType::Tint(_, _, _))
+    {
         return expr;
     }
-    if let (
-        ClightType::Tint(ClightIntSize::I32, _, _),
-        ClightType::Tint(to_size, _, _),
-    ) = (&expr_ty, &target_ty)
+    if let (ClightType::Tint(ClightIntSize::I32, _, _), ClightType::Tint(to_size, _, _)) =
+        (&expr_ty, &target_ty)
     {
         if matches!(to_size, ClightIntSize::I8 | ClightIntSize::I16) {
             return expr;
@@ -612,15 +614,13 @@ pub fn cast_expr_to_type(expr: ClightExpr, target_ty: ClightType) -> ClightExpr 
     } else if is_function_type(&target_ty) || is_function_type(&expr_ty) {
         warn!(
             "Skipping cast involving function type: from {:?} to {:?}",
-            expr_ty,
-            target_ty
+            expr_ty, target_ty
         );
         expr
     } else if !clight_cast_supported(&expr_ty, &target_ty) {
         warn!(
             "Unsupported cast from {:?} to {:?} - leaving expression unchanged",
-            expr_ty,
-            target_ty
+            expr_ty, target_ty
         );
         expr
     } else {
@@ -703,7 +703,8 @@ pub fn rewrite_expr_as_pointer(expr: ClightExpr, target_ptr_ty: ClightType) -> C
                     default_attr(),
                 ));
                 let base_as_char_ptr = cast_expr_to_type(*lhs, char_ptr_ty.clone());
-                let byte_addr = ClightExpr::Ebinop(op, Box::new(base_as_char_ptr), rhs, char_ptr_ty);
+                let byte_addr =
+                    ClightExpr::Ebinop(op, Box::new(base_as_char_ptr), rhs, char_ptr_ty);
                 cast_expr_to_type(byte_addr, target_ptr_ty)
             } else if is_integral_type(&lhs_ty) && !is_pointer_type(&rhs_ty) {
                 let char_ptr_ty = pointer_to(ClightType::Tint(
@@ -712,7 +713,8 @@ pub fn rewrite_expr_as_pointer(expr: ClightExpr, target_ptr_ty: ClightType) -> C
                     default_attr(),
                 ));
                 let base_as_char_ptr = cast_expr_to_type(*rhs, char_ptr_ty.clone());
-                let byte_addr = ClightExpr::Ebinop(op, lhs, Box::new(base_as_char_ptr), char_ptr_ty);
+                let byte_addr =
+                    ClightExpr::Ebinop(op, lhs, Box::new(base_as_char_ptr), char_ptr_ty);
                 cast_expr_to_type(byte_addr, target_ptr_ty)
             } else {
                 // A typed pointer plus an already-byte-scaled offset would make C scale a second time; re-base through char* exactly once, then cast back.
@@ -737,8 +739,7 @@ pub fn rewrite_expr_as_pointer(expr: ClightExpr, target_ptr_ty: ClightType) -> C
                     };
                 match pointee_size {
                     Some(sz)
-                        if is_pointer_type(&lhs_ty)
-                            && is_byte_offset_for_pointee(&rhs, sz) =>
+                        if is_pointer_type(&lhs_ty) && is_byte_offset_for_pointee(&rhs, sz) =>
                     {
                         rebase_through_char(rhs, lhs, false)
                     }
@@ -800,9 +801,7 @@ pub fn normalize_const_expr(expr: ClightExpr) -> ClightExpr {
         }
         ClightExpr::EconstInt(v, ty) => {
             if matches!(ty, ClightType::Tlong(_, _)) {
-                warn!(
-                    "normalize_const_expr: EconstInt had Tlong type, fixing to Tint"
-                );
+                warn!("normalize_const_expr: EconstInt had Tlong type, fixing to Tint");
                 ClightExpr::EconstInt(v, default_int_type())
             } else {
                 ClightExpr::EconstInt(v, ty)
@@ -811,7 +810,6 @@ pub fn normalize_const_expr(expr: ClightExpr) -> ClightExpr {
         other => other,
     }
 }
-
 
 pub fn ident_from_reg(reg: RTLReg) -> Ident {
     match usize::try_from(reg) {
@@ -848,4 +846,3 @@ pub fn make_binarith_check(lhs_ty: &ClightType, rhs_ty: &ClightType) -> bool {
         _ => false,
     }
 }
-

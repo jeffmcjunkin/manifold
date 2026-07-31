@@ -1,24 +1,22 @@
-
-
 use crate::decompile::elevator::DecompileDB;
 use crate::run_pass;
 
-use std::sync::Arc;
+use crate::decompile::passes::asm_pass::transl_addressing_rev_sized;
 use crate::decompile::passes::cminor_pass::*;
 use crate::decompile::passes::csh_pass::*;
-use crate::x86::asm::{Ireg, TestCond};
+use crate::decompile::passes::pass::IRPass;
 use crate::mreg::Mreg;
+use crate::util::DEFAULT_VAR;
+use crate::x86::asm::{Ireg, TestCond};
 use crate::x86::mach::X86Mreg;
 use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
-use ascent::Dual;
 use ascent::lattice::set::Set;
+use ascent::Dual;
 use either::Either;
-use std::collections::HashMap;
-use crate::util::DEFAULT_VAR;
-use crate::decompile::passes::asm_pass::transl_addressing_rev;
-use crate::decompile::passes::pass::IRPass;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 const ENDBR64_LEN: u64 = 4;
 
@@ -49,6 +47,37 @@ fn extending_load_chunk(mnem: &str, size: usize) -> Option<MemoryChunk> {
     }
 }
 
+fn is_x86_64_gp_register_name(name: &str) -> bool {
+    matches!(
+        name,
+        "RAX"
+            | "RBX"
+            | "RCX"
+            | "RDX"
+            | "RSI"
+            | "RDI"
+            | "RBP"
+            | "RSP"
+            | "R8"
+            | "R9"
+            | "R10"
+            | "R11"
+            | "R12"
+            | "R13"
+            | "R14"
+            | "R15"
+    )
+}
+
+// Operand decoding collapses subregister spellings into one Mreg family. That
+// is useful for value flow, but unsafe for frame analysis: every E*-based
+// memory operand has 32-bit address-size semantics. In particular, a proven
+// RAX copy of RSP does not make a later [eax] access stack-relative. Keep the
+// raw spelling boundary closed over the complete 64-bit GP register set.
+fn is_valid_stack_operand_base_name(name: &str) -> bool {
+    is_x86_64_gp_register_name(name)
+}
+
 ascent_par! {
     #![measure_rule_times]
 
@@ -56,10 +85,9 @@ ascent_par! {
     pub struct RTLPassProgram;
 
     relation arch_bit(i64);
-    // RSP adjustments from disassembly; drives sp_entry_ofs to anchor raw SP displacements to the function-entry frame (ABI-1/3.2e).
-    relation adjusts_stack(Address, Symbol, i64);
     relation arg_constrained_as_ptr(Node, RTLReg);
-    // RSP<->RBP register moves from disassembly; drives func_sets_frame_pointer for BP-relative stack-param rules.
+    // RSP<->RBP register moves from disassembly; use-specific proofs below
+    // decide whether an individual BP-relative access is frame based.
     relation stack_base_move(Address, Symbol, Symbol);
     relation block_in_function(Node, Address);
     relation emit_clight_stmt(Address, Node, ClightStmt);
@@ -80,6 +108,18 @@ ascent_par! {
     relation known_func_returns_ptr(Symbol);
     relation main_function(Address);
     relation reg_def_used(Address, Mreg, Address);
+    relation asm_reg_use(Address, Mreg);
+    relation asm_reg_def(Address, Mreg);
+    // CFG-safe entry-frame proof produced by AsmPass.  Every BP/SP shortcut in
+    // this pass must be use-specific rather than relying on a function-wide or
+    // linear-fallthrough approximation.
+    relation rsp_frame_at(Address, Address);
+    relation rsp_frame_offset_at(Address, Address, i64);
+    relation bp_frame_at(Address, Address);
+    relation unsupported_stack_address_seed(Address, Address, Symbol);
+    relation unsupported_stack_address(Address, Address, Symbol);
+    unsupported_stack_address(*func, *access, *reason) <--
+        unsupported_stack_address_seed(func, access, reason);
     relation string_data(String, String, usize);
     relation struct_id_to_canonical(usize, usize);
     relation symbol_resolved_addr(Symbol, Address);
@@ -92,6 +132,12 @@ ascent_par! {
     relation emit_var_type_candidate(RTLReg, XType);
     relation instr_in_function(Node, Address);
     relation instruction(Address, usize, &'static str, &'static str, Symbol, Symbol, Symbol, Symbol, usize, usize);
+    relation instruction_address_size(Address, u8);
+    #[local] relation effective_address_size(Address, u8);
+    effective_address_size(*addr, *size) <-- instruction_address_size(addr, size);
+    effective_address_size(*addr, 8) <--
+        instruction(addr, _, _, _, _, _, _, _, _, _),
+        !instruction_address_size(addr, _);
     relation ireg_hold_type(String, Typ);
     relation is_not_ptr(RTLReg);
     relation is_ptr(RTLReg);
@@ -140,6 +186,8 @@ ascent_par! {
     relation reg_def(Address, Mreg);
     relation reg_def_used(Address, Mreg, Address);
     relation reg_use(Address, Mreg);
+    relation stack_def(Address, Symbol, i64);
+    relation decoded_memory_write_operand(Address, Symbol);
     relation trim_instruction(Address);
     relation stack_def_used(Address, Symbol, i64, Address, Symbol, i64);
     relation symbols(Address, Symbol, Symbol);
@@ -229,6 +277,12 @@ ascent_par! {
     relation temp_cmp_reg(Address, RTLReg);
     relation temp_cmp_mreg_args(Address, usize, Mreg);
     relation temp_cmp_args_rtl(Address, usize, RTLReg);
+    // A memory CMP materializes its operand in a root-owned temporary, then a
+    // following JCC/SETcc consumes that value at another decoded node.  Keep
+    // the exact root, consumer, temporary and shared function owner so the
+    // post-fixed-point safety filter can remove only the dependent candidate
+    // when the memory root is rejected.
+    relation cmp_memory_temp_consumer(Address, Address, RTLReg, Address);
     relation call_returns_value(Address, Mreg);
     relation ax_value_addr(Address, Address);
     relation func_ax_def(Address, Address, RTLReg);
@@ -236,15 +290,32 @@ ascent_par! {
     relation stack_mem_sub_imm(Address, i64, i64, usize);
 
     // SP-indexed load/store detection: loads/stores with 2 mregs where mregs[0] == SP
-    #[local] relation sp_indexed_load(Node);
-    #[local] relation sp_indexed_store(Node);
+    // Retained after the Datalog fixed point: the imperative completeness
+    // classifier must see the structural witnesses before synthetic CFG
+    // chains are either accepted or rejected atomically.
+    relation sp_indexed_load(Node);
+    relation sp_indexed_store(Node);
+    relation sp_indexed_load_complete(Node);
+    relation sp_indexed_store_complete(Node);
 
     // BP-frame-pointer-indexed load/store detection (mregs[0] == BP in a framed function), expanded like the SP-indexed case, or the base collapses to the whole-frame Olea(Ainstack(0)) and walks off the frame.
-    #[local] relation bp_indexed_load(Node);
-    #[local] relation bp_indexed_store(Node);
+    relation bp_indexed_load(Node);
+    relation bp_indexed_store(Node);
+    relation bp_indexed_load_complete(Node);
+    relation bp_indexed_store_complete(Node);
 
     // The synthetic Olea(Ainstack(ofs)) base from an SP/BP-indexed expansion, driving a per-node stack_xtl and same-offset alias so it resolves to the array's named local instead of a bare frame integer.
-    #[local] relation indexed_synth_stack_base(Address, Node, i64, RTLReg);
+    // The raw synthetic base is always emitted so an indexed operation never
+    // consumes an undefined RTL register. Normalized coordinates are optional
+    // evidence used only to alias bases whose SP/BP provenance is proved.
+    #[local] relation indexed_synth_stack_base(Address, Node, Node, Mreg, i64, RTLReg);
+    #[local] relation indexed_synth_stack_coord(Address, Node, i64, RTLReg);
+    // Selected stack-address base, keyed to its normalized entry-SP
+    // coordinate.  Struct recovery consumes this exact provenance instead of
+    // combining raw offsets and widths aggregated from unrelated accesses.
+    relation normalized_stack_lea_base(Address, Node, RTLReg, i64);
+    #[local] relation bp_base_at(Address, Node, i64);
+    #[local] relation stack_claim_base_at(Address, Node, Mreg);
 
     // sp_synth_skip_to_ltl(start, func, dst): start has no ltl_inst; walking next within func reaches dst with one. Function-bounded; used ONLY by SP-indexed-load/store synth so it doesn't affect ltl_fallthrough.
     #[local] relation sp_synth_skip_to_ltl(Address, Address, Node);
@@ -394,29 +465,35 @@ ascent_par! {
     sp_indexed_load(addr) <--
         ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, _)),
         if mregs.len() == 2,
-        if mregs[0] == Mreg::SP;
+        if mregs[0] == Mreg::SP,
+        indexed_stack_operand(addr, Mreg::SP, _, _),
+        rsp_frame_at(addr, _);
 
     // Detect SP-indexed stores (2 mregs where mregs[0] is SP)
     sp_indexed_store(addr) <--
         ltl_inst(addr, ?LTLInst::Lstore(_, _, mregs, _)),
         if mregs.len() == 2,
-        if mregs[0] == Mreg::SP;
+        if mregs[0] == Mreg::SP,
+        indexed_stack_operand(addr, Mreg::SP, _, _),
+        rsp_frame_at(addr, _);
 
     // Detect BP-frame-pointer-indexed loads (2 mregs where mregs[0] is BP) in a framed function.
     bp_indexed_load(addr) <--
         ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, _)),
         if mregs.len() == 2,
         if mregs[0] == Mreg::BP,
-        instr_in_function(addr, func_start),
-        func_sets_frame_pointer(func_start);
+        real_addr_in_func(addr, func_start),
+        indexed_stack_operand(addr, Mreg::BP, _, _),
+        bp_base_at(func_start, addr, _);
 
     // Detect BP-frame-pointer-indexed stores (2 mregs where mregs[0] is BP) in a framed function.
     bp_indexed_store(addr) <--
         ltl_inst(addr, ?LTLInst::Lstore(_, _, mregs, _)),
         if mregs.len() == 2,
         if mregs[0] == Mreg::BP,
-        instr_in_function(addr, func_start),
-        func_sets_frame_pointer(func_start);
+        real_addr_in_func(addr, func_start),
+        indexed_stack_operand(addr, Mreg::BP, _, _),
+        bp_base_at(func_start, addr, _);
 
     // Address-arg position whose register is NOT the load's destination: its value is the register's ordinary canonical at this node.
     load_arg_mapping(addr, pos, arg_rtl) <--
@@ -427,15 +504,18 @@ ascent_par! {
         if arg != dst_reg,
         reg_rtl(addr, *arg, arg_rtl);
 
-    // Address-arg position whose register IS reused as the load's destination: resolve via the load_overwrite_use_id shadow id, the value BEFORE the load writes, or two conflicting arg vectors drop the load.
+    // Address-arg position whose register IS reused as the load's destination:
+    // use the canonical value reaching the read side.  The node-local
+    // load-overwrite shadow is only an SSA separator; treating it as the
+    // address loses a real prior definition such as `mov rdx, [home]; mov
+    // rdx, [rdx]` before a call.
     load_arg_mapping(addr, pos, arg_rtl) <--
         ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, dst_reg)),
         !sp_indexed_load(addr),
         !bp_indexed_load(addr),
         for (pos, arg) in mregs.iter().enumerate(),
         if arg == dst_reg,
-        load_overwrite_use_id(addr, *dst_reg, src_xtl),
-        xtl_canonical(src_xtl, arg_rtl);
+        reaching_use_rtl(addr, *dst_reg, arg_rtl);
 
     load_args_collected(addr, args) <--
         ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, _)),
@@ -757,7 +837,7 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         mach_imm_stack_init(addr, ofs, imm_val, typ),
-        instr_in_function(addr, func_start),
+        real_addr_in_func(addr, func_start),
         stack_var(func_start, addr, ofs, rtl_reg),
         let op = match typ {
             Typ::Tint => Operation::Ointconst(*imm_val),
@@ -768,9 +848,9 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         mach_imm_stack_init(addr, ofs, imm_val, typ),
-        instr_in_function(addr, func_start),
+        real_addr_in_func(addr, func_start),
         !stack_xtl(func_start, addr, ofs, _),
-        let rtl_reg = fresh_xtl_reg(*addr, Mreg::BP),
+        let rtl_reg = fresh_stack_cell_reg(*addr),
         let op = match typ {
             Typ::Tint => Operation::Ointconst(*imm_val),
             Typ::Tlong | Typ::Tany64 => Operation::Olongconst(*imm_val),
@@ -793,25 +873,47 @@ ascent_par! {
 
     rtl_succ_candidate(src, dst) <-- rtl_next(src, dst), !rtl_edge_negated(src, dst);
 
-    // True for cmps with a non-BP/non-SP mem base; these fold into an Icond at the jcc address (not the cmp), so the cmp -> jcc edge must remain to reach the Icond.
+    // Classify one raw CMP memory operand as generic pointer memory. Narrow
+    // EBP/ESP spellings, indexed forms, and scalar RBP/RSP accesses lacking a
+    // use-specific stack proof all stay on this route instead of being dropped
+    // between the old stack and non-stack shortcuts.
+    #[local] relation cmp_mem_operand(Node, Symbol, &'static str, &'static str);
+    cmp_mem_operand(addr, *sym, *base_str, *idx_str) <--
+        pcmp(addr, _, sym),
+        op_indirect(sym, _, base_str, idx_str, _, _, _);
+    cmp_mem_operand(addr, *sym, *base_str, *idx_str) <--
+        pcmp(addr, sym, _),
+        op_indirect(sym, _, base_str, idx_str, _, _, _);
+
+    #[local] relation cmp_generic_mem_operand(Node, Symbol);
+    cmp_generic_mem_operand(addr, *sym) <--
+        cmp_mem_operand(addr, sym, base_str, _),
+        if *base_str != "RBP" && *base_str != "RSP";
+    cmp_generic_mem_operand(addr, *sym) <--
+        cmp_mem_operand(addr, sym, _, idx_str),
+        if *idx_str != "NONE" && !idx_str.is_empty();
+    cmp_generic_mem_operand(addr, *sym) <--
+        cmp_mem_operand(addr, sym, base_str, idx_str),
+        if *base_str == "RBP",
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        real_addr_in_func(addr, func_start),
+        !bp_base_at(func_start, addr, _);
+    cmp_generic_mem_operand(addr, *sym) <--
+        cmp_mem_operand(addr, sym, base_str, idx_str),
+        if *base_str == "RSP",
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        real_addr_in_func(addr, func_start),
+        !sp_entry_ofs(func_start, addr, _);
+
+    // Generic-memory cmps fold into an Icond at the jcc address (not the cmp),
+    // so the cmp -> jcc edge must remain to reach the Icond.
     relation cmp_has_non_stack_mem(Address);
     cmp_has_non_stack_mem(*addr) <--
         pcmp(addr, _, sym),
-        op_indirect(sym, _, base_str, _, _, _, _),
-        if !base_str.ends_with("BP") && !base_str.ends_with("SP");
+        cmp_generic_mem_operand(addr, sym);
     cmp_has_non_stack_mem(*addr) <--
         pcmp(addr, sym, _),
-        op_indirect(sym, _, base_str, _, _, _, _),
-        if !base_str.ends_with("BP") && !base_str.ends_with("SP");
-    // An INDEXED BP/SP operand is an array/heap element access, not a scalar frame slot, so flag it non-stack and let it take the generic Iload+Icond-at-jcc path or the jcc's taken edge is dropped.
-    cmp_has_non_stack_mem(*addr) <--
-        pcmp(addr, _, sym),
-        op_indirect(sym, _, _, idx_str, _, _, _),
-        if *idx_str != "NONE" && !idx_str.is_empty();
-    cmp_has_non_stack_mem(*addr) <--
-        pcmp(addr, sym, _),
-        op_indirect(sym, _, _, idx_str, _, _, _),
-        if *idx_str != "NONE" && !idx_str.is_empty();
+        cmp_generic_mem_operand(addr, sym);
 
     // cmp+jcc fold: when fused into one Icond AT the cmp addr (BP-relative mem / Lcond->Icond), kill the cmp->jcc edge and replace with edges to Icond's true target and fallthrough; else liveness misses cross-cmp use and DSE nops the loop. Must NOT fire for non-stack-mem cmps (Icond at jcc_addr).
     rtl_edge_negated(addr, *jcc_addr) <--
@@ -879,8 +981,9 @@ ascent_par! {
         if *idx_str != "NONE" && !idx_str.is_empty(),
         if !is_rip(base_str),
         let base_mreg = Mreg::x86(*base_str),
-        // SP stays excluded, but BP is allowed for the INDEXED case: a BP base with an index is a genuine stack-array element write, not the scalar frame-slot init carried by mach_imm_stack_init.
-        if base_mreg != Mreg::SP,
+        // Exact RSP stays excluded, but address-size-overridden ESP is an
+        // ordinary pointer base and must retain the generic indexed route.
+        if *base_str != "RSP",
         let mc = match *sz {
             1 => MemoryChunk::MInt8Unsigned,
             2 => MemoryChunk::MInt16Unsigned,
@@ -897,17 +1000,12 @@ ascent_par! {
     real_addr_in_func(addr, func) <--
         block_in_function(block, func),
         code_in_block(addr, block);
-    #[local] relation func_sets_fp_stable(Address);
-    func_sets_fp_stable(func) <--
-        stack_base_move(addr, src, dst),
-        if *src == "RSP" && *dst == "RBP",
-        real_addr_in_func(addr, func);
     #[local] relation imm_indirect_store_bp_indexed(Address, i64, MemoryChunk, &'static str, i64, i64);
     imm_indirect_store_bp_indexed(*addr, *imm_val, mc.clone(), *idx_str, *scale, *disp) <--
         imm_indirect_store_indexed(addr, imm_val, mc, base_str, idx_str, scale, disp),
-        if Mreg::x86(*base_str) == Mreg::BP,
+        if *base_str == "RBP",
         real_addr_in_func(addr, func_start),
-        func_sets_fp_stable(func_start);
+        bp_base_at(func_start, *addr, _);
 
     // Base-only Istore: only when there is no index to preserve (indexed case handled below).
     rtl_inst_candidate(synthetic_addr, istore_inst) <--
@@ -938,7 +1036,7 @@ ascent_par! {
 
     // BP-frame-pointer indexed immediate store as a 3-node chain (const, Olea(Ainstack(disp)), indexed Istore), with indexed_synth_stack_base resolving the base to the array's named local.
     rtl_inst_candidate(synth1, lea_inst), op_produces_ptr(synth1, bp_addr_rtl),
-    indexed_synth_stack_base(func_start, synth1, *disp, bp_addr_rtl) <--
+    indexed_synth_stack_base(func_start, synth1, *addr, Mreg::BP, *disp, bp_addr_rtl) <--
         imm_indirect_store_bp_indexed(addr, _imm_val, _mc, _idx_str, _scale, disp),
         instr_in_function(addr, func_start),
         let synth1 = *addr | (1u64 << 62),
@@ -1178,22 +1276,43 @@ ascent_par! {
         is_def(defaddr, arg_id),
         reg_xtl(defaddr, *dst_mreg, arg_id);
 
+    // A proved immutable /homeparams arithmetic read consumes the incoming
+    // register value directly.  Keep the real node as the CFG anchor and put
+    // the binary operation at the standard synthetic successor.
+    #[local] relation arith_load_uses_home_param(Node);
+    arith_load_uses_home_param(addr) <--
+        win64_home_arith_read(addr, _, _, _);
+
+    rtl_inst_candidate(addr, nop) <--
+        arith_load_uses_home_param(addr),
+        let nop = RTLInst::Inop;
+
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        arith_load_op(addr, op, _chunk, _base_mreg, _disp, dst_mreg),
+        win64_home_arith_read(addr, func_start, param_mreg, _),
+        reg_rtl(addr, *dst_mreg, dst_rtl),
+        let param_rtl = fresh_xtl_reg(*func_start, *param_mreg),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, param_rtl]), *dst_rtl);
+
     // arith_load_op on a THREADED spilled slot reads the slot's canonical SSA reg directly: a real frame Iload would re-materialize the slot as *(&var_0 + k) garbage, so the load node carries an Inop.
     rtl_inst_candidate(addr, nop) <--
         arith_load_op(addr, _op, _chunk, base_mreg, disp, _dst_mreg),
         !has_ltl_op(addr),
+        !arith_load_uses_home_param(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, _),
-        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
+        stack_claim_base_at(func_start, addr, *base_mreg),
         let nop = RTLInst::Inop;
 
     rtl_inst_candidate(synthetic_addr, op_inst) <--
         arith_load_op(addr, op, _chunk, base_mreg, disp, dst_mreg),
         !has_ltl_op(addr),
+        !arith_load_uses_home_param(addr),
         reg_rtl(addr, *dst_mreg, dst_rtl),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
-        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
+        stack_claim_base_at(func_start, addr, *base_mreg),
         let synthetic_addr = *addr | (1u64 << 62),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, *stack_rtl]), *dst_rtl);
 
@@ -1209,8 +1328,9 @@ ascent_par! {
     arith_load_uses_stack_param(addr) <--
         arith_load_op(addr, _, _, base_mreg, disp, _),
         !has_ltl_op(addr),
-        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
+        !arith_load_uses_home_param(addr),
         instr_in_function(addr, func_start),
+        stack_claim_base_at(func_start, addr, *base_mreg),
         stack_param_access(addr, func_start, disp, _);
 
     // Keep the original node as a transparent Inop anchor while the stack-param arithmetic lives at the synthetic successor, or rtl_optimize's liveness cannot carry the RMW destination across it.
@@ -1221,9 +1341,9 @@ ascent_par! {
     rtl_inst_candidate(synthetic_addr, op_inst) <--
         arith_load_op(addr, op, _chunk, base_mreg, disp, dst_mreg),
         !has_ltl_op(addr),
-        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
         reg_rtl(addr, *dst_mreg, dst_rtl),
         instr_in_function(addr, func_start),
+        stack_claim_base_at(func_start, addr, *base_mreg),
         stack_param_access(addr, func_start, disp, idx),
         !arith_load_uses_stack_var(addr),
         let param_reg = fresh_stack_param_reg(*func_start, *idx),
@@ -1235,8 +1355,8 @@ ascent_par! {
     emit_function_param_type_candidate(func_start, param_reg, xt) <--
         arith_load_op(addr, _, chunk, base_mreg, disp, _),
         !has_ltl_op(addr),
-        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
         instr_in_function(addr, func_start),
+        stack_claim_base_at(func_start, addr, *base_mreg),
         stack_param_access(addr, func_start, disp, idx),
         let param_reg = fresh_stack_param_reg(*func_start, *idx),
         let xt = match chunk {
@@ -1271,13 +1391,15 @@ ascent_par! {
     arith_load_uses_stack_var(addr) <--
         arith_load_op(addr, _, _, base_mreg, disp, _),
         !has_ltl_op(addr),
+        !arith_load_uses_home_param(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, _),
-        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP;
+        stack_claim_base_at(func_start, addr, *base_mreg);
 
     rtl_inst_candidate(addr, load_inst) <--
         arith_load_op(addr, _op, chunk, base_mreg, disp, _dst_mreg),
         !has_ltl_op(addr),
+        !arith_load_uses_home_param(addr),
         reg_rtl(addr, *base_mreg, base_rtl),
         !arith_load_uses_stack_var(addr),
         !arith_load_uses_stack_param(addr),
@@ -1287,6 +1409,7 @@ ascent_par! {
     rtl_inst_candidate(synthetic_addr, op_inst) <--
         arith_load_op(addr, op, _chunk, _base_mreg, _disp, dst_mreg),
         !has_ltl_op(addr),
+        !arith_load_uses_home_param(addr),
         reg_rtl(addr, *dst_mreg, dst_rtl),
         !arith_load_uses_stack_var(addr),
         !arith_load_uses_stack_param(addr),
@@ -1498,6 +1621,207 @@ ascent_par! {
 
     synth_only_addr(addr) <-- float_arith_stack_op(addr, _, _, _, _), !has_ltl_op(addr);
 
+    // An indexed fused memory operation rooted at a proved RSP coordinate
+    // needs one more node than the generic float_load_op expansion: materialize
+    // the stack base, load through base+index*scale, then apply the operation.
+    // Integer ADD/SUB/AND/OR/XOR use float_load_op too because that relation is
+    // the existing operation-agnostic carrier for a full Addressing value.
+    // Retained so the post-fixed-point selector can distinguish one coherent
+    // lowering from zero or multiple reaching-value combinations.
+    relation sp_indexed_fused_load(Node, Operation, MemoryChunk, i64, i64, Mreg, Mreg);
+    sp_indexed_fused_load(*addr, op.clone(), *chunk, *scale, *disp, args[1], *dst) <--
+        float_load_op(addr, op, chunk, addressing, args, dst, false),
+        if args.len() == 2 && args[0] == Mreg::SP,
+        if let Addressing::Aindexed2scaled(scale, disp) = addressing,
+        indexed_stack_operand(addr, Mreg::SP, raw_disp, _),
+        if *raw_disp == *disp;
+    sp_indexed_fused_load(*addr, op.clone(), *chunk, 1, *disp, args[1], *dst) <--
+        float_load_op(addr, op, chunk, addressing, args, dst, false),
+        if args.len() == 2 && args[0] == Mreg::SP,
+        if let Addressing::Aindexed2(disp) = addressing,
+        indexed_stack_operand(addr, Mreg::SP, raw_disp, _),
+        if *raw_disp == *disp;
+
+    // A unique dominating full-stride write is concrete aggregate-phase
+    // evidence.  Reads, later instructions, and writes on another branch must
+    // not manufacture a stack-object base for an indexed field access.
+    #[local] relation sp_indexed_anchor_write_dominates(Address, Address, Address);
+    sp_indexed_anchor_write_dominates(*other, *addr, *func_start) <--
+        real_addr_in_func(other, func_start),
+        real_addr_in_func(addr, func_start),
+        code_in_block(other, block),
+        code_in_block(addr, block),
+        if *other < *addr;
+    sp_indexed_anchor_write_dominates(*other, *addr, *func_start) <--
+        real_addr_in_func(other, func_start),
+        real_addr_in_func(addr, func_start),
+        code_in_block(other, other_block),
+        code_in_block(addr, addr_block),
+        if other_block != addr_block,
+        block_dom_set(func_start, addr_block, doms),
+        if doms.0.contains(other_block);
+
+    // A source aggregate need not be initialized by one write per record.
+    // GCC commonly emits one scalar write per field, while Clang may cover
+    // several records with one vector write.  Merge only adjacent/overlapping
+    // non-home writes that dominate this fused access; a span covering two or
+    // more whole strides gives the same independent phase evidence as the
+    // exact full-stride write below without treating a lone scalar local as an
+    // aggregate anchor.
+    #[local] relation sp_indexed_fused_init_span(Node, Address, i64, i64);
+    sp_indexed_fused_init_span(*addr, *func_start, *write_start, *write_end) <--
+        sp_indexed_fused_load(addr, _, _, _, _, _, _),
+        normalized_stack_write_range(write_node, func_start, _, _, write_start, write_end),
+        stack_write_dominates_node(func_start, write_node, addr),
+        !win64_home_spill_candidate(write_node, func_start, _, _);
+    sp_indexed_fused_init_span(*addr, *func_start, *span_start, *right_end) <--
+        sp_indexed_fused_init_span(addr, func_start, span_start, left_end),
+        sp_indexed_fused_init_span(addr, func_start, right_start, right_end),
+        if *right_start <= *left_end,
+        if *right_end > *left_end;
+
+    #[local] relation sp_indexed_fused_anchor_candidate(Node, i64);
+    sp_indexed_fused_anchor_candidate(*addr, candidate_disp) <--
+        sp_indexed_fused_load(addr, _, chunk, scale, disp, _, _),
+        if *scale > 1,
+        real_addr_in_func(addr, func_start),
+        rsp_frame_at(addr, func_start),
+        rsp_frame_offset_at(func_start, addr, sp_offset),
+        direct_stack_operand(other, Mreg::SP, other_disp, other_size),
+        decoded_memory_write_operand(other, _),
+        real_addr_in_func(other, func_start),
+        !win64_home_spill_candidate(other, func_start, _, _),
+        sp_indexed_anchor_write_dominates(other, addr, func_start),
+        rsp_frame_at(other, func_start),
+        rsp_frame_offset_at(func_start, other, other_sp_offset),
+        if *other_size as i64 == *scale,
+        if let Some(target_coord) = sp_offset.checked_add(*disp),
+        if let Some(candidate_coord) = other_sp_offset.checked_add(*other_disp),
+        if let Some(field_delta) = target_coord.checked_sub(candidate_coord),
+        if field_delta > 0,
+        if field_delta + (chunk_size_bits(chunk) as i64 / 8) <= *scale,
+        if let Some(candidate_disp) = candidate_coord.checked_sub(*sp_offset);
+    sp_indexed_fused_anchor_candidate(*addr, candidate_disp) <--
+        sp_indexed_fused_load(addr, _, chunk, scale, disp, _, _),
+        if *scale > 1,
+        real_addr_in_func(addr, func_start),
+        rsp_frame_at(addr, func_start),
+        rsp_frame_offset_at(func_start, addr, sp_offset),
+        sp_indexed_fused_init_span(addr, func_start, span_start, span_end),
+        let span_len = *span_end - *span_start,
+        if span_len >= 2 * *scale,
+        if span_len % *scale == 0,
+        if let Some(target_coord) = sp_offset.checked_add(*disp),
+        let field_delta = target_coord - *span_start,
+        if field_delta > 0,
+        if field_delta + (chunk_size_bits(chunk) as i64 / 8) <= *scale,
+        if let Some(candidate_disp) = span_start.checked_sub(*sp_offset);
+
+    #[local] relation sp_indexed_fused_anchor_ambiguous(Node);
+    sp_indexed_fused_anchor_ambiguous(addr) <--
+        sp_indexed_fused_anchor_candidate(addr, first),
+        sp_indexed_fused_anchor_candidate(addr, second),
+        if first != second;
+
+    #[local] relation sp_indexed_fused_anchor(Node, i64);
+    sp_indexed_fused_anchor(addr, *candidate) <--
+        sp_indexed_fused_anchor_candidate(addr, candidate),
+        !sp_indexed_fused_anchor_ambiguous(addr);
+
+    #[local] relation sp_indexed_fused_stack_addr(Node, Address, i64, i64);
+    sp_indexed_fused_stack_addr(*addr, *func_start, *base_disp, field_disp) <--
+        sp_indexed_fused_load(addr, _, _, _, disp, _, _),
+        real_addr_in_func(addr, func_start),
+        rsp_frame_at(addr, func_start),
+        rsp_frame_offset_at(func_start, addr, _),
+        sp_indexed_fused_anchor(addr, base_disp),
+        if let Some(field_disp) = disp.checked_sub(*base_disp);
+    sp_indexed_fused_stack_addr(*addr, *func_start, *disp, 0) <--
+        sp_indexed_fused_load(addr, _, _, _, disp, _, _),
+        real_addr_in_func(addr, func_start),
+        rsp_frame_at(addr, func_start),
+        rsp_frame_offset_at(func_start, addr, _),
+        !sp_indexed_fused_anchor(addr, _);
+
+    // One witness owns the entire three-node expansion. Incomplete or
+    // rejected sites retain their natural fallthrough and cannot leave a load
+    // or arithmetic node consuming an undefined synthetic temporary.
+    #[local] relation sp_indexed_fused_lowering(Node, Address, Operation, MemoryChunk, i64, i64, i64, Mreg, RTLReg, Mreg, RTLReg);
+    sp_indexed_fused_lowering(addr, *func_start, op.clone(), *chunk, *scale, *base_disp, *field_disp, *index, *index_rtl, *dst, *dst_rtl) <--
+        sp_indexed_fused_load(addr, op, chunk, scale, _, index, dst),
+        sp_indexed_fused_stack_addr(addr, func_start, base_disp, field_disp),
+        real_addr_in_func(addr, func_start),
+        !has_ltl_op(addr),
+        reaching_use_rtl(addr, *index, index_rtl),
+        reaching_use_rtl(addr, *dst, dst_rtl),
+        !unsupported_stack_address_seed(func_start, addr, _);
+
+    relation sp_indexed_fused_complete(Node);
+    sp_indexed_fused_complete(addr) <--
+        sp_indexed_fused_lowering(addr, _, _, _, _, _, _, _, _, _, _);
+
+    rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, sp_addr_rtl),
+    indexed_synth_stack_base(func_start, *addr, *addr, Mreg::SP, *base_disp, sp_addr_rtl) <--
+        sp_indexed_fused_lowering(addr, func_start, _, _, _, base_disp, _, _, _, _, _),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let lea_inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*base_disp)), Arc::new(vec![]), sp_addr_rtl);
+
+    rtl_inst_candidate(synth1, load_inst) <--
+        sp_indexed_fused_lowering(addr, _, _, chunk, scale, _, field_disp, _, index_rtl, _, _),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let synth1 = *addr | (1u64 << 62),
+        let addressing = if *scale > 1 {
+            Addressing::Aindexed2scaled(*scale, *field_disp)
+        } else {
+            Addressing::Aindexed2(*field_disp)
+        },
+        let load_inst = RTLInst::Iload(*chunk, addressing, Arc::new(vec![sp_addr_rtl, *index_rtl]), temp);
+
+    rtl_inst_candidate(synth2, op_inst) <--
+        sp_indexed_fused_lowering(addr, _, op, _, _, _, _, _, _, _, dst_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RTEMP")),
+        let synth2 = *addr | (1u64 << 63),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, temp]), *dst_rtl);
+
+    rtl_edge_negated(addr, next) <--
+        sp_indexed_fused_lowering(addr, _, _, _, _, _, _, _, _, _, _),
+        next(addr, next);
+
+    rtl_succ_candidate(addr, synth1) <--
+        sp_indexed_fused_lowering(addr, func_start, _, _, _, _, _, _, _, _, _),
+        let synth1 = *addr | (1u64 << 62);
+
+    rtl_succ_candidate(synth1, synth2) <--
+        sp_indexed_fused_lowering(addr, func_start, _, _, _, _, _, _, _, _, _),
+        let synth1 = *addr | (1u64 << 62),
+        let synth2 = *addr | (1u64 << 63);
+
+    relation sp_indexed_fused_member(Node, Address);
+    sp_indexed_fused_member(synth1, *func_start) <--
+        sp_indexed_fused_lowering(addr, func_start, _, _, _, _, _, _, _, _, _),
+        let synth1 = *addr | (1u64 << 62);
+    sp_indexed_fused_member(synth2, *func_start) <--
+        sp_indexed_fused_lowering(addr, func_start, _, _, _, _, _, _, _, _, _),
+        let synth2 = *addr | (1u64 << 63);
+
+    rtl_succ_candidate(synth2, next) <--
+        sp_indexed_fused_lowering(addr, func_start, _, _, _, _, _, _, _, _, _),
+        let synth2 = *addr | (1u64 << 63),
+        next(addr, next);
+
+    // If a non-lowered bookkeeping instruction follows the fused operation,
+    // bridge from the actual final node (bit 63).  The generic one-synth tail
+    // bridge below must not start at bit 62 and bypass this arithmetic node.
+    rtl_succ_candidate(synth2, dst) <--
+        sp_indexed_fused_lowering(addr, func_start, _, _, _, _, _, _, _, _, _),
+        next(addr, mid),
+        !ltl_inst(*mid, _),
+        !synth_only_addr(*mid),
+        real_addr_in_func(*mid, func_start),
+        sp_synth_skip_to_ltl(*mid, *func_start, dst),
+        let synth2 = *addr | (1u64 << 63);
+
     // float_load_op: an SSE op with a memory source produces no mach/ltl op, so lower it as a float load into a fresh temp plus the op at a synthetic address; fires only when nothing else lowered it.
     #[local] relation float_load_arg(Node, usize, Mreg);
     float_load_arg(addr, pos, *m) <--
@@ -1572,7 +1896,10 @@ ascent_par! {
         let synthetic_addr = *addr | (1u64 << 62),
         next(addr, next);
 
-    synth_only_addr(addr) <-- float_load_op(addr, _, _, _, _, _, _), !has_ltl_op(addr);
+    synth_only_addr(addr) <--
+        float_load_op(addr, _, _, _, _, _, _),
+        !has_ltl_op(addr);
+    synth_only_addr(addr) <-- sp_indexed_fused_lowering(addr, _, _, _, _, _, _, _, _, _, _);
 
     // adc_carry_op expansion: materialize the carry as the 0/1 value of the compare's carry condition at addr, then update the accumulator at synthetic addresses, reading the compared reg at cmp_addr.
     #[local] relation adc_carry_needs_k(Address);
@@ -1645,13 +1972,28 @@ ascent_par! {
     // arith_store_reg: memory-dest arithmetic with a register source; a
     // BP/SP-relative RMW operates IN-PLACE on the slot's stack_rtl so the
     // update threads to later reads of the same slot.
+    #[local] relation arith_store_reg_uses_stack_param(Node, Address, i64, usize);
+    arith_store_reg_uses_stack_param(addr, func_start, *disp, *ordinal) <--
+        arith_store_reg(addr, _, _, base_mreg, disp, _),
+        !has_ltl_op(addr),
+        incoming_stack_slot(addr, func_start, base_mreg, disp, ordinal),
+        !stack_def_used(_, _, _, addr, _, disp),
+        !stack_param_partial_write(addr, _);
+
+    // Seed a real mutable local from the incoming parameter. The existing
+    // three-node RMW chain then updates that local and later stack def-use
+    // reloads observe the updated value.
+    stack_xtl(func_start, addr, *disp, stack_rtl) <--
+        arith_store_reg_uses_stack_param(addr, func_start, disp, _),
+        let stack_rtl = fresh_stack_cell_reg(*addr);
+
     #[local] relation arith_store_reg_uses_stack_var(Node);
     arith_store_reg_uses_stack_var(addr) <--
         arith_store_reg(addr, _, _, base_mreg, disp, _),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, _),
-        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP;
+        stack_claim_base_at(func_start, addr, *base_mreg);
 
     // Stack-slot in-place RMW: the load/op/store triple collapses to a single in-place `slot = slot op src` writing the slot's stack_rtl (matches the Lsetstack model), no explicit memory load/store; the edge stays addr->next (no synthetic chain), see the guarded succ rules.
     rtl_inst_candidate(addr, op_inst) <--
@@ -1660,8 +2002,28 @@ ascent_par! {
         reg_rtl(addr, *src_mreg, src_rtl),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
-        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
+        stack_claim_base_at(func_start, addr, *base_mreg),
+        !arith_store_reg_uses_stack_param(addr, _, _, _),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl, *src_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(addr, init_inst) <--
+        arith_store_reg_uses_stack_param(addr, func_start, disp, ordinal),
+        stack_var(func_start, addr, disp, stack_rtl),
+        let param_rtl = fresh_stack_param_reg(*func_start, *ordinal),
+        let init_inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![param_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(synth1, op_inst) <--
+        arith_store_reg_uses_stack_param(addr, func_start, disp, _),
+        arith_store_reg(addr, op, _, _, _, src_mreg),
+        reg_rtl(addr, *src_mreg, src_rtl),
+        stack_var(func_start, addr, disp, stack_rtl),
+        let synth1 = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl, *src_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(synth2, nop) <--
+        arith_store_reg_uses_stack_param(addr, _, _, _),
+        let synth2 = *addr | (1u64 << 63),
+        let nop = RTLInst::Inop;
 
     rtl_inst_candidate(addr, load_inst) <--
         arith_store_reg(addr, _op, chunk, base_mreg, disp, _src_mreg),
@@ -1695,6 +2057,7 @@ ascent_par! {
         arith_store_reg(addr, _, _, _, _, _),
         !has_ltl_op(addr),
         arith_store_reg_uses_stack_var(addr),
+        !arith_store_reg_uses_stack_param(addr, _, _, _),
         let synth1 = *addr | (1u64 << 62),
         let nop = RTLInst::Inop;
 
@@ -1702,6 +2065,7 @@ ascent_par! {
         arith_store_reg(addr, _, _, _, _, _),
         !has_ltl_op(addr),
         arith_store_reg_uses_stack_var(addr),
+        !arith_store_reg_uses_stack_param(addr, _, _, _),
         let synth2 = *addr | (1u64 << 63),
         let nop = RTLInst::Inop;
 
@@ -1734,13 +2098,25 @@ ascent_par! {
     // without a real ltl op. BP/SP-relative read-modify-write operates
     // IN-PLACE on the slot's stack_rtl so the updated value threads to later
     // reads of the same slot (see arith_store_reg).
+    #[local] relation arith_store_imm_uses_stack_param(Node, Address, i64, usize);
+    arith_store_imm_uses_stack_param(addr, func_start, *disp, *ordinal) <--
+        arith_store_imm(addr, _, _, base_mreg, disp),
+        !has_ltl_op(addr),
+        incoming_stack_slot(addr, func_start, base_mreg, disp, ordinal),
+        !stack_def_used(_, _, _, addr, _, disp),
+        !stack_param_partial_write(addr, _);
+
+    stack_xtl(func_start, addr, *disp, stack_rtl) <--
+        arith_store_imm_uses_stack_param(addr, func_start, disp, _),
+        let stack_rtl = fresh_stack_cell_reg(*addr);
+
     #[local] relation arith_store_imm_uses_stack_var(Node);
     arith_store_imm_uses_stack_var(addr) <--
         arith_store_imm(addr, _, _, base_mreg, disp),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, _),
-        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP;
+        stack_claim_base_at(func_start, addr, *base_mreg);
 
     // Stack-slot in-place RMW: the load/op/store triple collapses to one in-place op writing the slot's stack_rtl, so the edge stays addr->next with no synthetic chain.
     rtl_inst_candidate(addr, op_inst) <--
@@ -1748,8 +2124,27 @@ ascent_par! {
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
-        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
+        stack_claim_base_at(func_start, addr, *base_mreg),
+        !arith_store_imm_uses_stack_param(addr, _, _, _),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(addr, init_inst) <--
+        arith_store_imm_uses_stack_param(addr, func_start, disp, ordinal),
+        stack_var(func_start, addr, disp, stack_rtl),
+        let param_rtl = fresh_stack_param_reg(*func_start, *ordinal),
+        let init_inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![param_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(synth1, op_inst) <--
+        arith_store_imm_uses_stack_param(addr, func_start, disp, _),
+        arith_store_imm(addr, op, _, _, _),
+        stack_var(func_start, addr, disp, stack_rtl),
+        let synth1 = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl]), *stack_rtl);
+
+    rtl_inst_candidate(synth2, nop) <--
+        arith_store_imm_uses_stack_param(addr, _, _, _),
+        let synth2 = *addr | (1u64 << 63),
+        let nop = RTLInst::Inop;
 
     rtl_inst_candidate(addr, load_inst) <--
         arith_store_imm(addr, _op, chunk, base_mreg, disp),
@@ -1782,6 +2177,7 @@ ascent_par! {
         arith_store_imm(addr, _, _, _, _),
         !has_ltl_op(addr),
         arith_store_imm_uses_stack_var(addr),
+        !arith_store_imm_uses_stack_param(addr, _, _, _),
         let synth1 = *addr | (1u64 << 62),
         let nop = RTLInst::Inop;
 
@@ -1789,6 +2185,7 @@ ascent_par! {
         arith_store_imm(addr, _, _, _, _),
         !has_ltl_op(addr),
         arith_store_imm_uses_stack_var(addr),
+        !arith_store_imm_uses_stack_param(addr, _, _, _),
         let synth2 = *addr | (1u64 << 63),
         let nop = RTLInst::Inop;
 
@@ -2094,15 +2491,15 @@ ascent_par! {
     // A memory-divisor div has no ltl_inst and thus no reg_use(AX), so synthesize the AX dividend-use; the divisor is the SRC field of pidiv/pudiv, the same field the mach div rules read.
     reg_use(addr, Mreg::AX) <--
         pdiv(addr, divisor_sym, _),
-        op_indirect(divisor_sym, _, reg2, _, _, _, _),
-        if reg2.ends_with("BP");
+        op_indirect(divisor_sym, _, _, _, _, _, _);
 
     // Stack-divisor div emits quotient and remainder as COMPETING candidates at the SAME node, so selection keeps only the used result and a dead quotient cannot overwrite the dividend AX.
     rtl_inst_candidate(addr, RTLInst::Iop(Operation::Odiv, args.clone(), *quot_rtl)) <--
         pidiv(addr, divisor_sym, _),
         op_indirect(divisor_sym, reg1, reg2, reg3, mult, disp, sz),
-        if reg2.ends_with("BP"),
+        if *reg2 == "RBP",
         instr_in_function(addr, func_start),
+        stack_claim_base_at(func_start, addr, Mreg::BP),
         reg_def_used(ax_def_addr, Mreg::AX, addr),
         reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
         stack_var(func_start, addr, disp, divisor_rtl),
@@ -2112,8 +2509,9 @@ ascent_par! {
     rtl_inst_candidate(addr, RTLInst::Iop(Operation::Omod, args.clone(), *rem_rtl)) <--
         pidiv(addr, divisor_sym, _),
         op_indirect(divisor_sym, reg1, reg2, reg3, mult, disp, sz),
-        if reg2.ends_with("BP"),
+        if *reg2 == "RBP",
         instr_in_function(addr, func_start),
+        stack_claim_base_at(func_start, addr, Mreg::BP),
         reg_def_used(ax_def_addr, Mreg::AX, addr),
         reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
         stack_var(func_start, addr, disp, divisor_rtl),
@@ -2123,8 +2521,9 @@ ascent_par! {
     rtl_inst_candidate(addr, RTLInst::Iop(Operation::Odivu, args.clone(), *quot_rtl)) <--
         pudiv(addr, divisor_sym, _),
         op_indirect(divisor_sym, reg1, reg2, reg3, mult, disp, sz),
-        if reg2.ends_with("BP"),
+        if *reg2 == "RBP",
         instr_in_function(addr, func_start),
+        stack_claim_base_at(func_start, addr, Mreg::BP),
         reg_def_used(ax_def_addr, Mreg::AX, addr),
         reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
         stack_var(func_start, addr, disp, divisor_rtl),
@@ -2134,8 +2533,9 @@ ascent_par! {
     rtl_inst_candidate(addr, RTLInst::Iop(Operation::Omodu, args.clone(), *rem_rtl)) <--
         pudiv(addr, divisor_sym, _),
         op_indirect(divisor_sym, reg1, reg2, reg3, mult, disp, sz),
-        if reg2.ends_with("BP"),
+        if *reg2 == "RBP",
         instr_in_function(addr, func_start),
+        stack_claim_base_at(func_start, addr, Mreg::BP),
         reg_def_used(ax_def_addr, Mreg::AX, addr),
         reg_rtl(ax_def_addr, Mreg::AX, ax_rtl),
         stack_var(func_start, addr, disp, divisor_rtl),
@@ -2167,8 +2567,7 @@ ascent_par! {
         is_def(addr, def_xtl),
         reg_xtl(addr, *dst_reg, def_xtl),
         xtl_canonical(def_xtl, dst_rtl),
-        load_overwrite_use_id(addr, dst_reg, src_xtl),
-        xtl_canonical(src_xtl, arg_rtl),
+        reaching_use_rtl(addr, *dst_reg, arg_rtl),
         let inst = RTLInst::Iload(*chunk, addressing.clone(), Arc::new(vec![*arg_rtl]), *dst_rtl);
 
     rtl_inst_candidate(addr, inst) <--
@@ -2216,7 +2615,7 @@ ascent_par! {
 
     // SP-indexed load: expand [SP, idx] to Olea(Ainstack(ofs)) + Iload(Aindexed2scaled(scale, 0)).
     rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, sp_addr_rtl),
-    indexed_synth_stack_base(func_start, *addr, *ofs, sp_addr_rtl) <--
+    indexed_synth_stack_base(func_start, *addr, *addr, Mreg::SP, *ofs, sp_addr_rtl) <--
         sp_indexed_load(addr),
         instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lload(_, addressing, mregs, _)),
@@ -2230,8 +2629,10 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
         if let Addressing::Aindexed2scaled(scale, _) = addressing,
         if mregs[1] != *dst_reg,
-        reg_rtl(addr, *dst_reg, dst_rtl),
-        reg_rtl(addr, mregs[1], idx_rtl),
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        reaching_use_rtl(addr, mregs[1], idx_rtl),
         let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
         let synth = *addr | (1u64 << 62),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
@@ -2241,14 +2642,18 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
         if let Addressing::Aindexed2(ofs) = addressing,
         if mregs[1] != *dst_reg,
-        reg_rtl(addr, *dst_reg, dst_rtl),
-        reg_rtl(addr, mregs[1], idx_rtl),
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        reaching_use_rtl(addr, mregs[1], idx_rtl),
         let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
         let synth = *addr | (1u64 << 62),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2(0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
 
     // Collision: the load overwrites its index register, so use the load's
-    // fresh def for dst and its pre-write shadow id for the index operand.
+    // fresh def for dst and the unique value reaching the read for the index.
+    // Canonicalizing the node-local shadow directly is ambiguous after alias
+    // closure: it names both the undefined shadow and the real incoming web.
     rtl_inst_candidate(synth, load_inst) <--
         sp_indexed_load(addr),
         ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
@@ -2257,8 +2662,7 @@ ascent_par! {
         is_def(addr, def_xtl),
         reg_xtl(addr, *dst_reg, def_xtl),
         xtl_canonical(def_xtl, dst_rtl),
-        load_overwrite_use_id(addr, dst_reg, idx_xtl),
-        xtl_canonical(idx_xtl, idx_rtl),
+        reaching_use_rtl(addr, *dst_reg, idx_rtl),
         let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
         let synth = *addr | (1u64 << 62),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
@@ -2271,8 +2675,7 @@ ascent_par! {
         is_def(addr, def_xtl),
         reg_xtl(addr, *dst_reg, def_xtl),
         xtl_canonical(def_xtl, dst_rtl),
-        load_overwrite_use_id(addr, dst_reg, idx_xtl),
-        xtl_canonical(idx_xtl, idx_rtl),
+        reaching_use_rtl(addr, *dst_reg, idx_rtl),
         let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
         let synth = *addr | (1u64 << 62),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2(0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
@@ -2310,7 +2713,7 @@ ascent_par! {
 
     // SP-indexed store: Aindexed2scaled/Aindexed2 with [SP, idx] -> expand similarly
     rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, sp_addr_rtl),
-    indexed_synth_stack_base(func_start, *addr, *ofs, sp_addr_rtl) <--
+    indexed_synth_stack_base(func_start, *addr, *addr, Mreg::SP, *ofs, sp_addr_rtl) <--
         sp_indexed_store(addr),
         instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lstore(_, addressing, mregs, _)),
@@ -2319,21 +2722,21 @@ ascent_par! {
         let lea_inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*ofs)), Arc::new(vec![]), sp_addr_rtl);
 
     rtl_inst_candidate(synth, store_inst) <--
+        sp_indexed_store(addr),
         ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
-        if mregs.len() == 2 && mregs[0] == Mreg::SP,
         if let Addressing::Aindexed2scaled(scale, _) = addressing,
-        reg_rtl(addr, *src_reg, src_rtl),
-        reg_rtl(addr, mregs[1], idx_rtl),
+        reaching_use_rtl(addr, *src_reg, src_rtl),
+        reaching_use_rtl(addr, mregs[1], idx_rtl),
         let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
         let synth = *addr | (1u64 << 62),
         let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *src_rtl);
 
     rtl_inst_candidate(synth, store_inst) <--
+        sp_indexed_store(addr),
         ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
-        if mregs.len() == 2 && mregs[0] == Mreg::SP,
         if let Addressing::Aindexed2(ofs) = addressing,
-        reg_rtl(addr, *src_reg, src_rtl),
-        reg_rtl(addr, mregs[1], idx_rtl),
+        reaching_use_rtl(addr, *src_reg, src_rtl),
+        reaching_use_rtl(addr, mregs[1], idx_rtl),
         let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
         let synth = *addr | (1u64 << 62),
         let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed2(0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *src_rtl);
@@ -2369,9 +2772,9 @@ ascent_par! {
         sp_synth_skip_to_ltl(*mid, *func_start, dst),
         let synth = *addr | (1u64 << 62);
 
-    // BP-frame-pointer-indexed load/store, the structural mirror of the SP-indexed expansion: expand [BP, idx] to Olea(Ainstack(disp)) plus an indexed-at-0 access, gated on func_sets_frame_pointer.
+    // BP-frame-pointer-indexed load/store, the structural mirror of the SP-indexed expansion: expand [BP, idx] to Olea(Ainstack(disp)) plus an indexed-at-0 access, gated on a use-specific frame-pointer proof.
     rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, bp_addr_rtl),
-    indexed_synth_stack_base(func_start, *addr, *ofs, bp_addr_rtl) <--
+    indexed_synth_stack_base(func_start, *addr, *addr, Mreg::BP, *ofs, bp_addr_rtl) <--
         bp_indexed_load(addr),
         instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lload(_, addressing, _, _)),
@@ -2385,8 +2788,10 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
         if let Addressing::Aindexed2scaled(scale, _) = addressing,
         if mregs[1] != *dst_reg,
-        reg_rtl(addr, *dst_reg, dst_rtl),
-        reg_rtl(addr, mregs[1], idx_rtl),
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        reaching_use_rtl(addr, mregs[1], idx_rtl),
         let bp_addr_rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_SP_BASE,
         let synth = *addr | (1u64 << 62),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![bp_addr_rtl, *idx_rtl]), *dst_rtl);
@@ -2396,13 +2801,16 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
         if let Addressing::Aindexed2(_) = addressing,
         if mregs[1] != *dst_reg,
-        reg_rtl(addr, *dst_reg, dst_rtl),
-        reg_rtl(addr, mregs[1], idx_rtl),
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        reaching_use_rtl(addr, mregs[1], idx_rtl),
         let bp_addr_rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_SP_BASE,
         let synth = *addr | (1u64 << 62),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2(0), Arc::new(vec![bp_addr_rtl, *idx_rtl]), *dst_rtl);
 
-    // Collision where the load overwrites its own index register: the dst is the fresh def and the index must be the INCOMING value from load_overwrite_use_id.
+    // Collision where the load overwrites its own index register: the dst is
+    // the fresh def and the index is the unique incoming reaching value.
     rtl_inst_candidate(synth, load_inst) <--
         bp_indexed_load(addr),
         ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
@@ -2411,8 +2819,7 @@ ascent_par! {
         is_def(addr, def_xtl),
         reg_xtl(addr, *dst_reg, def_xtl),
         xtl_canonical(def_xtl, dst_rtl),
-        load_overwrite_use_id(addr, dst_reg, idx_xtl),
-        xtl_canonical(idx_xtl, idx_rtl),
+        reaching_use_rtl(addr, *dst_reg, idx_rtl),
         let bp_addr_rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_SP_BASE,
         let synth = *addr | (1u64 << 62),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![bp_addr_rtl, *idx_rtl]), *dst_rtl);
@@ -2425,8 +2832,7 @@ ascent_par! {
         is_def(addr, def_xtl),
         reg_xtl(addr, *dst_reg, def_xtl),
         xtl_canonical(def_xtl, dst_rtl),
-        load_overwrite_use_id(addr, dst_reg, idx_xtl),
-        xtl_canonical(idx_xtl, idx_rtl),
+        reaching_use_rtl(addr, *dst_reg, idx_rtl),
         let bp_addr_rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_SP_BASE,
         let synth = *addr | (1u64 << 62),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2(0), Arc::new(vec![bp_addr_rtl, *idx_rtl]), *dst_rtl);
@@ -2461,7 +2867,7 @@ ascent_par! {
 
     // BP-indexed store: expand [BP, idx] to Olea(Ainstack(disp)) + Istore(Aindexed2scaled(scale, 0)).
     rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, bp_addr_rtl),
-    indexed_synth_stack_base(func_start, *addr, *ofs, bp_addr_rtl) <--
+    indexed_synth_stack_base(func_start, *addr, *addr, Mreg::BP, *ofs, bp_addr_rtl) <--
         bp_indexed_store(addr),
         instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lstore(_, addressing, _, _)),
@@ -2473,8 +2879,8 @@ ascent_par! {
         bp_indexed_store(addr),
         ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
         if let Addressing::Aindexed2scaled(scale, _) = addressing,
-        reg_rtl(addr, *src_reg, src_rtl),
-        reg_rtl(addr, mregs[1], idx_rtl),
+        reaching_use_rtl(addr, *src_reg, src_rtl),
+        reaching_use_rtl(addr, mregs[1], idx_rtl),
         let bp_addr_rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_SP_BASE,
         let synth = *addr | (1u64 << 62),
         let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![bp_addr_rtl, *idx_rtl]), *src_rtl);
@@ -2483,8 +2889,8 @@ ascent_par! {
         bp_indexed_store(addr),
         ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
         if let Addressing::Aindexed2(_) = addressing,
-        reg_rtl(addr, *src_reg, src_rtl),
-        reg_rtl(addr, mregs[1], idx_rtl),
+        reaching_use_rtl(addr, *src_reg, src_rtl),
+        reaching_use_rtl(addr, mregs[1], idx_rtl),
         let bp_addr_rtl = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_SP_BASE,
         let synth = *addr | (1u64 << 62),
         let store_inst = RTLInst::Istore(*chunk, Addressing::Aindexed2(0), Arc::new(vec![bp_addr_rtl, *idx_rtl]), *src_rtl);
@@ -2519,13 +2925,66 @@ ascent_par! {
 
     // Give each SP/BP-indexed synthetic Olea(Ainstack(ofs)) a per-node
     // stack_xtl so cminor resolves it to Eaddrof(&local), not a frame integer.
-    stack_xtl(func_start, addr, ofs, base_reg) <--
-        indexed_synth_stack_base(func_start, addr, ofs, base_reg);
+    stack_xtl(func_start, addr, raw_ofs, stack_cell) <--
+        indexed_synth_stack_base(func_start, addr, _, _, raw_ofs, _),
+        let stack_cell = fresh_stack_cell_reg(*addr);
 
-    // Unify the synthetic base with every stack_xtl reg at the SAME frame offset so the indexed access and the address-of resolve to ONE named local; the FRESH_NS_SP_BASE bit makes the real local win the min.
+    indexed_synth_stack_coord(func_start, addr, normalized_ofs, stack_cell) <--
+        indexed_synth_stack_base(func_start, addr, origin, base_kind, raw_ofs, _),
+        if *base_kind == Mreg::SP,
+        sp_entry_ofs(func_start, origin, sp_ofs),
+        let normalized_ofs = sp_ofs.0 + *raw_ofs,
+        let stack_cell = fresh_stack_cell_reg(*addr);
+    indexed_synth_stack_coord(func_start, addr, normalized_ofs, stack_cell) <--
+        indexed_synth_stack_base(func_start, addr, origin, base_kind, raw_ofs, _),
+        if *base_kind == Mreg::BP,
+        bp_base_at(func_start, origin, bp_base),
+        let normalized_ofs = *bp_base + *raw_ofs,
+        let stack_cell = fresh_stack_cell_reg(*addr);
+
+    normalized_stack_lea_base(func_start, addr, *emitted_base, normalized_ofs) <--
+        indexed_synth_stack_base(func_start, addr, origin, base_kind, raw_ofs, emitted_base),
+        if *base_kind == Mreg::SP,
+        sp_entry_ofs(func_start, origin, sp_ofs),
+        let normalized_ofs = sp_ofs.0 + *raw_ofs;
+    normalized_stack_lea_base(func_start, addr, *emitted_base, normalized_ofs) <--
+        indexed_synth_stack_base(func_start, addr, origin, base_kind, raw_ofs, emitted_base),
+        if *base_kind == Mreg::BP,
+        bp_base_at(func_start, origin, bp_base),
+        let normalized_ofs = *bp_base + *raw_ofs;
+
+    // Preserve the old explicit stack-LEA coverage while requiring the same
+    // decoder-owned base and normalized coordinate proof as ordinary stack
+    // accesses.  Oleal is intentionally excluded: 32-bit address semantics
+    // are not equivalent to a Win64 frame pointer.
+    normalized_stack_lea_base(func_start, node, *emitted_base, normalized_ofs) <--
+        rtl_inst_candidate(node, ?RTLInst::Iop(Operation::Olea(Addressing::Ainstack(_)), _, emitted_base)),
+        instr_in_function(node, func_start),
+        direct_stack_operand(node, decoded_base, decoded_disp, _),
+        sp_based_mem_at(node, func_start, proven_base, base_ofs),
+        if decoded_base == proven_base,
+        let normalized_ofs = *base_ofs + *decoded_disp;
+
+    // Normalize ordinary SP/BP stack variables before aliasing an indexed
+    // synthetic base. Equal raw displacements at different SP depths (or on
+    // different base registers) are not the same cell.
+    #[local] relation normalized_stack_xtl(Address, i64, RTLReg);
+    normalized_stack_xtl(func_start, normalized_ofs, *stack_reg) <--
+        stack_xtl(func_start, addr, raw_ofs, stack_reg),
+        direct_stack_operand(addr, Mreg::SP, raw_ofs, _),
+        sp_entry_ofs(func_start, addr, sp_ofs),
+        let normalized_ofs = sp_ofs.0 + *raw_ofs;
+    normalized_stack_xtl(func_start, normalized_ofs, *stack_reg) <--
+        stack_xtl(func_start, addr, raw_ofs, stack_reg),
+        direct_stack_operand(addr, Mreg::BP, raw_ofs, _),
+        bp_base_at(func_start, addr, bp_base),
+        let normalized_ofs = *bp_base + *raw_ofs;
+    normalized_stack_xtl(func_start, *normalized_ofs, *base_reg) <--
+        indexed_synth_stack_coord(func_start, _, normalized_ofs, base_reg);
+
     alias_edge(base_reg, other_reg) <--
-        indexed_synth_stack_base(func_start, _, ofs, base_reg),
-        stack_xtl(func_start, _, ofs, other_reg),
+        indexed_synth_stack_coord(func_start, _, normalized_ofs, base_reg),
+        normalized_stack_xtl(func_start, normalized_ofs, other_reg),
         if base_reg != other_reg;
 
     // Function-bounded skip walk: from a non-ltl-inst addr, walk `next` within the func until hitting one with ltl_inst. Only consumed by SP-indexed synth rules above.
@@ -2537,8 +2996,15 @@ ascent_par! {
 
     sp_synth_skip_to_ltl(start, func, dst) <--
         instr_in_function(start, func),
+        next(start, dst),
+        instr_in_function(dst, func),
+        synth_only_addr(*dst);
+
+    sp_synth_skip_to_ltl(start, func, dst) <--
+        instr_in_function(start, func),
         next(start, mid),
         !ltl_inst(*mid, _),
+        !synth_only_addr(*mid),
         instr_in_function(*mid, func),
         sp_synth_skip_to_ltl(*mid, *func, dst);
 
@@ -2590,7 +3056,7 @@ ascent_par! {
         if mnem.starts_with("CMP"),
         op_immediate(dst, _, _),
         op_indirect(src, _, base_str, idx_str, _, _, _),
-        if (!base_str.ends_with("BP") && !base_str.ends_with("SP")) || (*idx_str != "NONE" && !idx_str.is_empty()),
+        cmp_generic_mem_operand(*addr, *src),
         let fresh_reg = fresh_xtl_reg(*addr, Mreg::x86("RTEMP"));
 
     temp_cmp_mreg_args(addr, pos, mreg) <--
@@ -2598,9 +3064,15 @@ ascent_par! {
         if mnem.starts_with("CMP"),
         op_immediate(dst, _, _),
         op_indirect(src, _, base_str, idx_str, scale, disp, _),
-        if (!base_str.ends_with("BP") && !base_str.ends_with("SP")) || (*idx_str != "NONE" && !idx_str.is_empty()),
-        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
-        let res = transl_addressing_rev(addrmode, None),
+        cmp_generic_mem_operand(*addr, *src),
+        effective_address_size(addr, address_size),
+        let res = transl_generic_cmp_addressing_rev_sized(
+            base_str,
+            idx_str,
+            *scale,
+            *disp,
+            *address_size,
+        ),
         if res.is_ok(),
         let (_, mreg_vec) = res.unwrap(),
         for (pos, mreg) in mreg_vec.into_iter().enumerate();
@@ -2631,10 +3103,16 @@ ascent_par! {
         if mnem.starts_with("CMP"),
         op_immediate(dst, _, _),
         op_indirect(src, _, base_str, idx_str, scale, disp, _),
-        if (!base_str.ends_with("BP") && !base_str.ends_with("SP")) || (*idx_str != "NONE" && !idx_str.is_empty()),
+        cmp_generic_mem_operand(*addr, *src),
         temp_cmp_reg(addr, fresh_reg),
-        let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
-        let res = transl_addressing_rev(addrmode, None),
+        effective_address_size(addr, address_size),
+        let res = transl_generic_cmp_addressing_rev_sized(
+            base_str,
+            idx_str,
+            *scale,
+            *disp,
+            *address_size,
+        ),
         if res.is_ok(),
         let (addressing, _) = res.unwrap(),
         agg mreg_args = build_call_args(pos, rtl_reg) in temp_cmp_args_rtl(addr, pos, rtl_reg),
@@ -2660,7 +3138,7 @@ ascent_par! {
         if mnem.starts_with("CMP"),
         op_immediate(dst, imm_sym, _),
         op_indirect(src, _, base_str, idx_str, _, _, _),
-        if (!base_str.ends_with("BP") && !base_str.ends_with("SP")) || (*idx_str != "NONE" && !idx_str.is_empty()),
+        cmp_generic_mem_operand(*addr, *src),
         let imm_val = *imm_sym as i64,
         next(addr, next_addr),
         pjcc(next_addr, test_cond, lbl),
@@ -2690,7 +3168,8 @@ ascent_par! {
         op_register(r1, _),
         op_indirect(r2, _, base_str, idx_str, scale, disp, _),
         let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
-        let res = transl_addressing_rev(addrmode, None),
+        effective_address_size(addr, address_size),
+        let res = transl_addressing_rev_sized(addrmode, None, *address_size),
         if res.is_ok(),
         let (_, mreg_vec) = res.unwrap(),
         for (pos, mreg) in mreg_vec.into_iter().enumerate();
@@ -2703,7 +3182,8 @@ ascent_par! {
         !stack_var(cmp_func, addr, *disp, _),
         temp_cmp_reg(addr, fresh_reg),
         let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
-        let res = transl_addressing_rev(addrmode, None),
+        effective_address_size(addr, address_size),
+        let res = transl_addressing_rev_sized(addrmode, None, *address_size),
         if res.is_ok(),
         let (addressing, _) = res.unwrap(),
         agg mreg_args = build_call_args(pos, rtl_reg) in temp_cmp_args_rtl(addr, pos, rtl_reg),
@@ -2756,7 +3236,8 @@ ascent_par! {
         op_indirect(r1, _, base_str, idx_str, scale, disp, _),
         op_register(r2, _),
         let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
-        let res = transl_addressing_rev(addrmode, None),
+        effective_address_size(addr, address_size),
+        let res = transl_addressing_rev_sized(addrmode, None, *address_size),
         if res.is_ok(),
         let (_, mreg_vec) = res.unwrap(),
         for (pos, mreg) in mreg_vec.into_iter().enumerate();
@@ -2769,7 +3250,8 @@ ascent_par! {
         !stack_var(cmp_func, addr, *disp, _),
         temp_cmp_reg(addr, fresh_reg),
         let addrmode = build_cmp_addrmode(base_str, idx_str, *scale, *disp),
-        let res = transl_addressing_rev(addrmode, None),
+        effective_address_size(addr, address_size),
+        let res = transl_addressing_rev_sized(addrmode, None, *address_size),
         if res.is_ok(),
         let (addressing, _) = res.unwrap(),
         agg mreg_args = build_call_args(pos, rtl_reg) in temp_cmp_args_rtl(addr, pos, rtl_reg),
@@ -2846,6 +3328,32 @@ ascent_par! {
         instruction(addr, _, _, mnem, _, _, _, _, _, _),
         if let Some(tc) = setcc_mnem_testcond(mnem);
 
+    // Cross-node ownership for the exact CMP consumers emitted above/below.
+    // Candidate-specific filtering later still verifies that the candidate
+    // actually reads `fresh_reg`, so an unrelated lowering at the same JCC or
+    // SETcc node remains independent.
+    cmp_memory_temp_consumer(*addr, *consumer, *fresh_reg, *function) <--
+        temp_cmp_reg(addr, fresh_reg),
+        cmp_has_non_stack_mem(addr),
+        next(addr, consumer),
+        pjcc(consumer, _, _),
+        instr_in_function(addr, function),
+        instr_in_function(consumer, function);
+    cmp_memory_temp_consumer(*addr, *consumer, *fresh_reg, *function) <--
+        temp_cmp_reg(addr, fresh_reg),
+        cmp_has_non_stack_mem(addr),
+        flags_and_jump_pair(addr, consumer, _),
+        pjcc(consumer, _, _),
+        instr_in_function(addr, function),
+        instr_in_function(consumer, function);
+    cmp_memory_temp_consumer(*addr, *consumer, *fresh_reg, *function) <--
+        temp_cmp_reg(addr, fresh_reg),
+        cmp_has_non_stack_mem(addr),
+        next(addr, consumer),
+        setcc_testcond(consumer, _),
+        instr_in_function(addr, function),
+        instr_in_function(consumer, function);
+
     // pcmp(r1=indirect mem, r2=register), SETcc immediately follows: Ocmp([loaded_mem, reg], cond).
     rtl_inst_candidate(*setcc_addr, RTLInst::Iop(Operation::Ocmp(cond), Arc::new(vec![*fresh_reg, *reg_rtl]), *dst_rtl)) <--
         pcmp(addr, r1, r2),
@@ -2886,7 +3394,7 @@ ascent_par! {
         if mnem.starts_with("CMP"),
         op_indirect(dst, _, base_str, idx_str, _, _, _),
         op_immediate(src, imm_sym, _),
-        if (!base_str.ends_with("BP") && !base_str.ends_with("SP")) || (*idx_str != "NONE" && !idx_str.is_empty()),
+        cmp_generic_mem_operand(*addr, *dst),
         temp_cmp_reg(addr, fresh_reg),
         let imm_val = *imm_sym as i64,
         next(addr, setcc_addr),
@@ -3111,7 +3619,7 @@ ascent_par! {
     reg_xtl(addr, mreg, id), is_def(addr, id) <--
         reg_def_site(addr, mreg),
         let id = fresh_xtl_reg(*addr, *mreg);
-    
+
     // Lbranch addresses reg_def butno ltl op
     reg_def_site(*addr, *mreg) <--
         arith_load_op(addr, _, _, _, _, _),
@@ -3453,8 +3961,9 @@ ascent_par! {
         op_register(sym1, reg_str),
         let reg1 = Mreg::x86(reg_str.to_string()),
         op_indirect(sym2, reg_1, reg_2, reg_3, mult, disp, sz),
-        if reg_2.ends_with("BP") || reg_2.ends_with("SP"),
+        if *reg_2 == "RBP" || *reg_2 == "RSP",
         instr_in_function(addr, func_start),
+        stack_claim_base_at(func_start, addr, Mreg::x86(*reg_2)),
         next(addr, jcc_addr),
         pjcc(jcc_addr, testcond, target_sym),
         symbol_resolved_addr(*target_sym, target_addr),
@@ -3468,10 +3977,11 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         pcmp(addr, sym1, sym2),
         op_indirect(sym1, reg_1, reg_2, reg_3, mult, disp, sz),
-        if reg_2.ends_with("BP") || reg_2.ends_with("SP"),
+        if *reg_2 == "RBP" || *reg_2 == "RSP",
         op_register(sym2, reg_str),
         let reg1 = Mreg::x86(reg_str.to_string()),
         instr_in_function(addr, func_start),
+        stack_claim_base_at(func_start, addr, Mreg::x86(*reg_2)),
         next(addr, jcc_addr),
         pjcc(jcc_addr, testcond, target_sym),
         symbol_resolved_addr(*target_sym, target_addr),
@@ -3485,10 +3995,12 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         pcmp(addr, sym1, sym2),
         op_indirect(sym1, reg_1a, reg_2a, reg_3a, mult_a, disp_a, sz_a),
-        if reg_2a.ends_with("BP") || reg_2a.ends_with("SP"),
+        if *reg_2a == "RBP" || *reg_2a == "RSP",
         op_indirect(sym2, reg_1, reg_2, reg_3, mult, disp, sz),
-        if reg_2.ends_with("BP") || reg_2.ends_with("SP"),
+        if *reg_2 == "RBP" || *reg_2 == "RSP",
         instr_in_function(addr, func_start),
+        stack_claim_base_at(func_start, addr, Mreg::x86(*reg_2a)),
+        stack_claim_base_at(func_start, addr, Mreg::x86(*reg_2)),
         next(addr, jcc_addr),
         pjcc(jcc_addr, testcond, target_sym),
         symbol_resolved_addr(*target_sym, target_addr),
@@ -3502,9 +4014,10 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         pcmp(addr, sym1, sym2),
         op_indirect(sym1, reg_1, reg_2, reg_3, mult, disp, sz),
-        if reg_2.ends_with("BP") || reg_2.ends_with("SP"),
+        if *reg_2 == "RBP" || *reg_2 == "RSP",
         op_immediate(sym2, imm_val, _),
         instr_in_function(addr, func_start),
+        stack_claim_base_at(func_start, addr, Mreg::x86(*reg_2)),
         next(addr, jcc_addr),
         pjcc(jcc_addr, testcond, target_sym),
         symbol_resolved_addr(*target_sym, target_addr),
@@ -3526,8 +4039,9 @@ ascent_par! {
         pcmp(addr, sym1, sym2),
         op_immediate(sym1, imm_val, _),
         op_indirect(sym2, reg_1, reg_2, reg_3, mult, disp, sz),
-        if reg_2.ends_with("BP") || reg_2.ends_with("SP"),
+        if *reg_2 == "RBP" || *reg_2 == "RSP",
         instr_in_function(addr, func_start),
+        stack_claim_base_at(func_start, addr, Mreg::x86(*reg_2)),
         next(addr, jcc_addr),
         pjcc(jcc_addr, testcond, target_sym),
         symbol_resolved_addr(*target_sym, target_addr),
@@ -3761,7 +4275,7 @@ ascent_par! {
         !stack_var(func_start, addr, ofs, _),
         !lgetstack_is_stack_param(addr),
         !win64_home_reload(addr, _, _, _),
-        let fresh_src = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_STACK_SRC,
+        let fresh_src = fresh_stack_cell_reg(*addr),
         let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![fresh_src]), *dst_rtl);
 
     rtl_inst_candidate(addr, inst) <--
@@ -3781,7 +4295,7 @@ ascent_par! {
         !stack_var(func_start, addr, ofs, _),
         !lgetstack_is_stack_param(addr),
         !win64_home_reload(addr, _, _, _),
-        let fresh_src = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_STACK_SRC,
+        let fresh_src = fresh_stack_cell_reg(*addr),
         let fresh_dst = fresh_xtl_reg(*addr, *dst) | FRESH_NS_REG_DST,
         let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![fresh_src]), fresh_dst);
 
@@ -3847,7 +4361,7 @@ ascent_par! {
         instr_in_function(addr, func_start),
         reg_rtl(addr, *src, src_rtl),
         !stack_var(func_start, addr, ofs, _),
-        let fresh_stack = fresh_xtl_reg(*addr, Mreg::BP),
+        let fresh_stack = fresh_stack_cell_reg(*addr),
         let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*src_rtl]), fresh_stack);
 
     rtl_inst_candidate(addr, inst) <--
@@ -3876,7 +4390,9 @@ ascent_par! {
         plea(addr, dst_sym, src_addr),
         op_register(dst_sym, dst_str),
         op_indirect(src_addr, _, base_str, _, _scale, disp, _),
-        if (*base_str).ends_with("BP"),
+        if *base_str == "RBP",
+        real_addr_in_func(addr, func_start),
+        bp_base_at(func_start, addr, _),
         let dst_mreg = Mreg::x86(dst_str.to_string()),
         let dst_rtl = fresh_xtl_reg(*addr, dst_mreg),
         let inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*disp)), Arc::new(vec![]), dst_rtl);
@@ -3885,7 +4401,9 @@ ascent_par! {
         plea(addr, dst_sym, src_addr),
         op_register(dst_sym, dst_str),
         op_indirect(src_addr, _, base_str, _, _scale, disp, _),
-        if (*base_str).ends_with("BP"),
+        if *base_str == "RBP",
+        real_addr_in_func(addr, func_start),
+        bp_base_at(func_start, addr, _),
         let dst_mreg = Mreg::x86(dst_str.to_string()),
         let ltl = LTLInst::Lop(Operation::Olea(Addressing::Ainstack(*disp)), Arc::new(vec![]), dst_mreg);
 
@@ -3893,29 +4411,33 @@ ascent_par! {
     stack_mem_add_imm(addr, disp, imm_val, sz) <--
         padd(addr, dst_sym, src_sym),
         op_indirect(dst_sym, _, base_str, _, _, disp, sz),
-        if (*base_str).ends_with("BP"),
+        if *base_str == "RBP",
+        real_addr_in_func(addr, func_start),
+        bp_base_at(func_start, addr, _),
         op_immediate(src_sym, imm_val, _);
 
     stack_mem_sub_imm(addr, disp, imm_val, sz) <--
         psub(addr, dst_sym, src_sym),
         op_indirect(dst_sym, _, base_str, _, _, disp, sz),
-        if (*base_str).ends_with("BP"),
+        if *base_str == "RBP",
+        real_addr_in_func(addr, func_start),
+        bp_base_at(func_start, addr, _),
         op_immediate(src_sym, imm_val, _);
 
     stack_xtl(func_start, addr, disp, rtl_reg) <--
         stack_mem_add_imm(addr, disp, _, _),
         instr_in_function(addr, func_start),
-        let rtl_reg = fresh_xtl_reg(*addr, Mreg::BP);
+        let rtl_reg = fresh_stack_cell_reg(*addr);
 
     stack_xtl(func_start, addr, disp, rtl_reg) <--
         stack_mem_sub_imm(addr, disp, _, _),
         instr_in_function(addr, func_start),
-        let rtl_reg = fresh_xtl_reg(*addr, Mreg::BP);
+        let rtl_reg = fresh_stack_cell_reg(*addr);
 
     stack_xtl(func_start, addr, ofs, rtl_reg) <--
         ltl_inst(addr, ?LTLInst::Lsetstack(_, _, ofs, _)),
         instr_in_function(addr, func_start),
-        let rtl_reg = fresh_xtl_reg(*addr, Mreg::BP);
+        let rtl_reg = fresh_stack_cell_reg(*addr);
 
     rtl_inst_candidate(addr, inst) <--
         stack_mem_add_imm(addr, disp, imm_val, sz),
@@ -4032,6 +4554,14 @@ ascent_par! {
     ax_value_write(addr) <-- ltl_inst(addr, ?LTLInst::Lop(_, _, Mreg::AX));
     ax_value_write(addr) <-- ltl_inst(addr, ?LTLInst::Lload(_, _, _, Mreg::AX));
     ax_value_write(addr) <-- ltl_inst(addr, ?LTLInst::Lgetstack(_, _, _, Mreg::AX));
+    // A fused integer memory operation has no Lop/Lload, but its destination
+    // is still a genuine AX value definition. Without this evidence a value
+    // that is both consumed in the body and returned makes func_void_avail
+    // misclassify the function as void.
+    ax_value_write(addr) <--
+        float_load_op(addr, _, _, _, _, Mreg::AX, _),
+        !has_ltl_op(addr),
+        !unsupported_stack_address_seed(_, addr, _);
 
     // An AX def that is an internal float->int conversion is a SCRATCH integer, not the return value, so excluding it stops it lighting func_ax_def_reaches_return and suppressing func_returns_float.
     #[local] relation ax_conv_to_int_def(Address);
@@ -4332,6 +4862,107 @@ ascent_par! {
         live_var_def(def_block, reg, def_addr),
         live_var_used(use_block, reg, use_addr);
 
+    // Raw decoded-instruction reaching defs, bounded to the x86 GP register
+    // file used by frame/copied-SP provenance. Every dependency below comes
+    // from the AsmPass snapshots, so this chain cannot join RTL's augmented
+    // reg_use/reg_def_used SCC.
+    #[local] relation raw_stack_base_reg(Mreg);
+    raw_stack_base_reg(Mreg::AX); raw_stack_base_reg(Mreg::BX);
+    raw_stack_base_reg(Mreg::CX); raw_stack_base_reg(Mreg::DX);
+    raw_stack_base_reg(Mreg::SI); raw_stack_base_reg(Mreg::DI);
+    raw_stack_base_reg(Mreg::BP); raw_stack_base_reg(Mreg::SP);
+    raw_stack_base_reg(Mreg::R8); raw_stack_base_reg(Mreg::R9);
+    raw_stack_base_reg(Mreg::R10); raw_stack_base_reg(Mreg::R11);
+    raw_stack_base_reg(Mreg::R12); raw_stack_base_reg(Mreg::R13);
+    raw_stack_base_reg(Mreg::R14); raw_stack_base_reg(Mreg::R15);
+
+    // Coordinate provenance is killed by a decoded write or an ABI call
+    // clobber.  Only decoded writes seed a new coordinate below: a call kill
+    // prevents an older copied-SP value from flowing through volatile R10/R11
+    // without pretending the call produced a new stack base.
+    #[local] relation raw_reg_kill(Address, Mreg);
+    raw_reg_kill(addr, reg) <-- asm_reg_def(addr, reg), raw_stack_base_reg(reg);
+    raw_reg_kill(addr, reg) <--
+        unrefinedinstruction(addr, _, _, "CALL", _, _, _, _, _, _),
+        is_caller_saved(reg),
+        raw_stack_base_reg(reg);
+
+    #[local] relation raw_block_kill_reaches(Address, Mreg);
+    raw_block_kill_reaches(next_addr, *reg) <--
+        raw_reg_kill(kill_addr, reg),
+        !asm_reg_def(kill_addr, reg),
+        next(kill_addr, next_addr),
+        code_in_block(kill_addr, block),
+        code_in_block(next_addr, block);
+    raw_block_kill_reaches(next_addr, reg) <--
+        raw_block_kill_reaches(cur_addr, reg),
+        !asm_reg_def(cur_addr, reg),
+        next(cur_addr, next_addr),
+        code_in_block(cur_addr, block),
+        code_in_block(next_addr, block);
+
+    #[local] relation raw_block_last_def(Address, Address, Mreg);
+    raw_block_last_def(next_addr, def_addr, *reg) <--
+        asm_reg_def(def_addr, reg),
+        raw_stack_base_reg(reg),
+        next(def_addr, next_addr),
+        code_in_block(def_addr, block),
+        code_in_block(next_addr, block);
+    raw_block_last_def(next_addr, def_addr, reg) <--
+        raw_block_last_def(cur_addr, def_addr, reg),
+        !raw_reg_kill(cur_addr, reg),
+        next(cur_addr, next_addr),
+        code_in_block(cur_addr, block),
+        code_in_block(next_addr, block);
+
+    #[local] relation raw_last_def_in_block(Address, Address, Mreg);
+    raw_last_def_in_block(block, last_addr, *reg) <--
+        block_last_insn(block, last_addr),
+        asm_reg_def(last_addr, reg),
+        raw_stack_base_reg(reg);
+    raw_last_def_in_block(block, def_addr, reg) <--
+        block_last_insn(block, last_addr),
+        raw_block_last_def(last_addr, def_addr, reg),
+        !raw_reg_kill(last_addr, reg);
+
+    #[local] relation raw_reg_defined_in_block(Address, Mreg);
+    raw_reg_defined_in_block(block, *reg) <--
+        raw_reg_kill(addr, reg),
+        raw_stack_base_reg(reg),
+        code_in_block(addr, block);
+
+    #[local] relation raw_live_var_def(Address, Mreg, Address);
+    raw_live_var_def(block, reg, def_addr) <--
+        raw_last_def_in_block(block, def_addr, reg);
+
+    #[local] relation raw_live_var_used(Address, Mreg, Address);
+    raw_live_var_used(block, *reg, use_addr) <--
+        asm_reg_use(use_addr, reg),
+        raw_stack_base_reg(reg),
+        code_in_block(use_addr, block),
+        !raw_block_last_def(use_addr, _, reg),
+        !raw_block_kill_reaches(use_addr, reg);
+
+    #[local] relation raw_live_var_at_block_end(Address, Address, Mreg);
+    raw_live_var_at_block_end(prev_block, use_block, reg) <--
+        raw_live_var_used(use_block, reg, _),
+        asm_block_next(prev_block, use_block);
+    raw_live_var_at_block_end(prev_block, use_block, reg) <--
+        raw_live_var_at_block_end(mid_block, use_block, reg),
+        !raw_reg_defined_in_block(mid_block, reg),
+        asm_block_next(prev_block, mid_block);
+
+    #[local] relation raw_reg_def_used(Address, Mreg, Address);
+    raw_reg_def_used(def_addr, reg, use_addr) <--
+        asm_reg_use(use_addr, reg),
+        raw_stack_base_reg(reg),
+        raw_block_last_def(use_addr, def_addr, reg),
+        asm_reg_def(def_addr, reg);
+    raw_reg_def_used(def_addr, reg, use_addr) <--
+        raw_live_var_at_block_end(def_block, use_block, reg),
+        raw_live_var_def(def_block, reg, def_addr),
+        raw_live_var_used(use_block, reg, use_addr);
+
     param_reg_used_early(*func_start, *mreg) <--
         arg_reg_param_live_at(func_start, use_addr, mreg),
         is_arg_reg(mreg),
@@ -4436,6 +5067,59 @@ ascent_par! {
 
     reg_xtl(addr, *src, use_id) <--
         load_overwrite_use_id(addr, src, use_id);
+
+    // Canonical value reaching a read operand.  reg_rtl intentionally also
+    // contains the node-local fresh use id; joining on it directly can create
+    // a Cartesian product of defined and undefined webs for indexed memory
+    // operands (especially when one register is both index and store source).
+    // Retained for the post-fixed-point canonical-home selector as well as
+    // consumed inside this program.  Making this transient would force that
+    // selector back onto ambiguous historical reg_rtl candidates.
+    relation reaching_use_rtl(Node, Mreg, RTLReg);
+    // A real prior definition contributes exactly its destination id.  The
+    // other reg_xtl rows at that node are read-side ids and must not compete
+    // with the value written by the instruction.
+    reaching_use_rtl(use_addr, *mreg, *canonical) <--
+        reg_def_used(def_addr, mreg, use_addr),
+        if def_addr != use_addr,
+        is_def(def_addr, def_id),
+        reg_xtl(def_addr, *mreg, def_id),
+        xtl_canonical(def_id, canonical);
+
+    // Function-entry pseudo definitions are ABI live-ins, not instructions.
+    // Require the ABI value to be live at this exact use; reg_def_used can
+    // otherwise retain a stale func_start edge after a real definition.
+    relation abi_livein_reaches_use(Address, Mreg, Address);
+    abi_livein_reaches_use(*func_start, *mreg, *use_addr) <--
+        reg_def_used(func_start, mreg, use_addr),
+        func_param_validated(func_start, mreg),
+        arg_reg_param_live_at(func_start, use_addr, mreg);
+    abi_livein_reaches_use(*func_start, *mreg, *use_addr) <--
+        reg_def_used(func_start, mreg, use_addr),
+        func_float_param_validated(func_start, mreg, _),
+        arg_reg_param_live_at(func_start, use_addr, mreg);
+    // The first iteration of a loop still reads the incoming integer argument
+    // even when the ordinary MUST-live walk is tainted by its back edge.
+    abi_livein_reaches_use(*func_start, *mreg, *use_addr) <--
+        reg_def_used(func_start, mreg, use_addr),
+        arg_reg_param_live_at_fwd(func_start, use_addr, mreg),
+        !arg_reg_param_live_at(func_start, use_addr, mreg);
+
+    reaching_use_rtl(use_addr, *mreg, *canonical) <--
+        abi_livein_reaches_use(func_start, mreg, use_addr),
+        let param_id = fresh_xtl_reg(*func_start, *mreg),
+        xtl_canonical(param_id, canonical);
+
+    // A fused indexed read/modify/write can have a loop-carried reaching edge
+    // from the instruction to itself.  That edge carries the previous
+    // iteration's exact destination definition.  Ordinary load collisions do
+    // not share this rule; the post-fixed-point classifier rejects them.
+    reaching_use_rtl(node, *dst, *canonical) <--
+        sp_indexed_fused_load(node, _, _, _, _, _, dst),
+        reg_def_used(node, dst, node),
+        is_def(node, def_id),
+        reg_xtl(node, *dst, def_id),
+        xtl_canonical(def_id, canonical);
 
     // Merge use-side IDs only at the same node; defs kill values so def/use IDs must not alias (alias_edge handles def-to-use).
     alias_edge(id1, id2) <--
@@ -4832,6 +5516,19 @@ ascent_par! {
         reg_xtl(addr, *mreg, op_id),
         if param_id != op_id;
 
+    // The same two-address fused RMW can target an integer argument register.
+    // Its own def blocks ordinary entry-parameter threading, so explicitly
+    // join the incoming value to the operation web just as for XMM arguments.
+    alias_edge(param_id, op_id) <--
+        float_load_op(addr, _, _, _, _, mreg, false),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        func_param_validated(func_start, mreg),
+        param_still_live(func_start, addr, mreg),
+        reg_xtl(func_start, mreg, param_id),
+        reg_xtl(addr, *mreg, op_id),
+        if param_id != op_id;
+
     param_alias_source(useaddr, mreg) <-- arg_reg_has_external_def(useaddr, mreg);
     param_alias_source(useaddr, mreg) <-- arg_reg_used_no_def(useaddr, mreg);
     param_alias_source(useaddr, mreg) <-- arg_reg_used_very_early(useaddr, mreg);
@@ -4991,7 +5688,7 @@ ascent_par! {
     stack_xtl(func_start, addr, ofs, rtlreg) <--
         mach_imm_stack_init(addr, ofs, _, _),
         instr_in_function(addr, func_start),
-        let rtlreg = fresh_xtl_reg(*addr, Mreg::BP);
+        let rtlreg = fresh_stack_cell_reg(*addr);
 
     // Propagate stack_xtl through def-use chains, joining on def offset and emitting use offset.
     stack_xtl(func_start, use_addr, use_ofs, rtlreg) <--
@@ -5004,18 +5701,18 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lgetstack(_, ofs, _, _)),
         instr_in_function(addr, func_start),
         !stack_def_used(_, _, _, addr, _, ofs),
-        let rtlreg = fresh_xtl_reg(*addr, Mreg::BP);
+        let rtlreg = fresh_stack_cell_reg(*addr);
 
     stack_xtl(func_start, addr, ofs, rtlreg) <--
         ltl_inst(addr, ?LTLInst::Lload(_, Addressing::Ainstack(ofs), _, _)),
         instr_in_function(addr, func_start),
         !stack_def_used(_, _, _, addr, _, ofs),
-        let rtlreg = fresh_xtl_reg(*addr, Mreg::BP);
+        let rtlreg = fresh_stack_cell_reg(*addr);
 
     stack_xtl(func_start, addr, ofs, rtlreg) <--
         ltl_inst(addr, ?LTLInst::Lop(Operation::Olea(Addressing::Ainstack(ofs)), _, _)),
         instr_in_function(addr, func_start),
-        let rtlreg = fresh_xtl_reg(*addr, Mreg::BP);
+        let rtlreg = fresh_stack_cell_reg(*addr);
 
 
     alias_edge(rtlreg1, rtlreg2) <--
@@ -5061,15 +5758,20 @@ ascent_par! {
         if lea_rtl != other_rtl;
 
     // Bucket E parity for synthetic-only stack reads: export the slot's single escaped canonical so a fresh-RTEMP Iload resolves deterministically instead of via the multi-valued stack_local_at.
-    #[local] relation slot_escaped_canonical_raw(Address, i64, RTLReg);
-    slot_escaped_canonical_raw(func_start, ofs, canonical) <--
+    // Retain the escaping LEA's origin node as well as its raw displacement.
+    // The post-fixed-point Win64 home selector may replace one particular LEA
+    // with a node-keyed canonical home address.  Another, post-prologue LEA in
+    // the same function can legitimately use the same raw displacement for a
+    // different local, so filtering only by (function, offset) is unsound.
+    relation slot_escaped_origin(Address, Node, i64, RTLReg);
+    slot_escaped_origin(func_start, *lea_addr, ofs, canonical) <--
         slot_addr_escaped(func_start, lea_addr, ofs),
         stack_var(func_start, lea_addr, ofs, canonical);
 
     relation slot_escaped_canonical(Address, i64, RTLReg);
     slot_escaped_canonical(func, ofs, m) <--
-        slot_escaped_canonical_raw(func, ofs, _),
-        agg m = ascent::aggregators::min(c) in slot_escaped_canonical_raw(func, ofs, c);
+        slot_escaped_origin(func, _, ofs, _),
+        agg m = ascent::aggregators::min(c) in slot_escaped_origin(func, _, ofs, c);
 
     stack_var_chunk(*func, ofs, chunk) <--
         ltl_inst(node, ?LTLInst::Lload(chunk, Addressing::Ainstack(ofs), _, _)),
@@ -5578,26 +6280,46 @@ ascent_par! {
 
     call_arg_mapping(*call_addr, pos, rtl_reg) <--
         call_arg_setup_detected(defaddr, dst_reg, call_addr),
-        reg_rtl(defaddr, dst_reg, rtl_reg),
+        is_def(defaddr, def_id),
+        reg_xtl(defaddr, dst_reg, def_id),
+        xtl_canonical(def_id, rtl_reg),
         abi_int_arg_position(dst_reg, pos),
         call_arg_position_allowed(call_addr, pos),
         instr_in_function(defaddr, _func_start);
 
     call_arg_mapping(*call_addr, pos, rtl_reg) <--
         tailcall_arg_setup_detected(defaddr, dst_reg, call_addr),
-        reg_rtl(defaddr, dst_reg, rtl_reg),
+        is_def(defaddr, def_id),
+        reg_xtl(defaddr, dst_reg, def_id),
+        xtl_canonical(def_id, rtl_reg),
         abi_int_arg_position(dst_reg, pos),
         call_arg_position_allowed(call_addr, pos),
         instr_in_function(defaddr, _func_start);
+
+    // If a higher explicit setup proves the call's arity, every lower ABI
+    // position exists.  Bind a lower register that still holds this function's
+    // incoming parameter directly to that parameter instead of letting the
+    // positional aggregator synthesize an uninitialized placeholder.  This is
+    // the common VS2013 tail-wrapper shape `f(p0, 0)` where only RDX is written
+    // immediately before the COFF import jump.
+    call_arg_mapping(*call_addr, pos, canonical) <--
+        call_has_arg_at_position(call_addr, pos),
+        call_arg_position_allowed(call_addr, pos),
+        abi_int_arg_position(mreg, pos),
+        instr_in_function(call_addr, func_start),
+        arg_reg_param_live_at(func_start, call_addr, mreg),
+        reg_xtl(func_start, mreg, incoming),
+        xtl_canonical(incoming, canonical);
 
     // R3: outgoing STACK arguments anchored in the ENTRY frame so they reconcile against the call's RSP; an approximation that may under-recover an arg stored in an earlier block but never fabricates one for a local.
     #[local] relation og_arg_store(Address, i64, RTLReg, Address);
     og_arg_store(*st_addr, abs_slot, *src_rtl, *func) <--
         ltl_inst(st_addr, ?LTLInst::Lstore(_, Addressing::Aindexed(ofs), args, src)),
-        !win64_home_spill(st_addr, _, _, _),
+        !win64_home_spill_candidate(st_addr, _, _, _),
         if args.len() == 1 && args[0] == Mreg::SP,
         if *ofs >= 0,
         instr_in_function(st_addr, func),
+        direct_stack_operand(st_addr, Mreg::SP, ofs, _),
         !stack_var(func, st_addr, *ofs, _),
         sp_entry_ofs(func, st_addr, sp_st),
         let abs_slot = *ofs + sp_st.0,
@@ -5609,10 +6331,10 @@ ascent_par! {
     og_arg_store(*st_addr, abs_slot, *src_rtl, *func),
     og_arg_store_weak(*st_addr, abs_slot, *src_rtl) <--
         ltl_inst(st_addr, ?LTLInst::Lsetstack(src, _, ofs, _)),
-        !win64_home_spill(st_addr, _, _, _),
+        !win64_home_spill_candidate(st_addr, _, _, _),
         pmov(st_addr, dst_sym, _),
         op_indirect(dst_sym, _, base_str, idx_str, _, disp, _),
-        if Mreg::x86(*base_str) == Mreg::SP,
+        if *base_str == "RSP",
         if *idx_str == "NONE" || idx_str.is_empty(),
         if *disp == *ofs,
         instr_in_function(st_addr, func),
@@ -5626,7 +6348,7 @@ ascent_par! {
         mach_imm_stack_init(st_addr, stack_ofs, _, _),
         pmov(st_addr, dst_sym, _),
         op_indirect(dst_sym, _, base_str, idx_str, _, disp, _),
-        if Mreg::x86(*base_str) == Mreg::SP,
+        if *base_str == "RSP",
         if *idx_str == "NONE" || idx_str.is_empty(),
         instr_in_function(st_addr, func),
         sp_entry_ofs(func, st_addr, sp_st),
@@ -6116,7 +6838,9 @@ ascent_par! {
 
     call_float_arg_mapping(*call_addr, pos, rtl_reg) <--
         call_float_arg_setup_detected(defaddr, dst_reg, call_addr),
-        reg_rtl(defaddr, dst_reg, rtl_reg),
+        is_def(defaddr, def_id),
+        reg_xtl(defaddr, dst_reg, def_id),
+        xtl_canonical(def_id, rtl_reg),
         abi_float_arg_position(dst_reg, pos),
         call_float_arg_position_allowed(call_addr, pos);
 
@@ -6246,6 +6970,8 @@ ascent_par! {
         if *ofs < 0,
         for arg in args.iter(),
         if *arg == Mreg::BP,
+        direct_stack_operand(addr, Mreg::BP, ofs, _),
+        bp_base_at(func_start, addr, _),
         is_arg_reg(src),
         arg_reg_param_live_at(func_start, addr, src);
 
@@ -6264,7 +6990,7 @@ ascent_par! {
         if *dst != Mreg::SP && *dst != Mreg::BP,
         arg_reg_param_live_at(func_start, addr, src);
 
-    // Frameless (-O2 FPO) functions forward a parameter into rbp as scratch, so gate the dst==BP exclusion on func_sets_frame_pointer or every pointer param held in rbp loses its pointer evidence.
+    // Frameless (-O2 FPO) functions forward a parameter into rbp as scratch, so gate the dst==BP exclusion on whether the function ever establishes a frame pointer or every pointer param held in rbp loses its pointer evidence.
     arg_reg_copy_site(func_start, *addr, *src, *dst) <--
         ltl_inst(addr, ?LTLInst::Lop(Operation::Omove, srcs, dst)),
         if srcs.len() == 1,
@@ -6272,7 +6998,7 @@ ascent_par! {
         is_arg_reg(src),
         if *dst == Mreg::BP,
         arg_reg_param_live_at(func_start, addr, src),
-        !func_sets_frame_pointer(func_start);
+        !func_ever_sets_frame_pointer(func_start);
 
     arg_reg_copied_early(func_start, src, dst) <--
         arg_reg_copy_site(func_start, _, src, dst);
@@ -6312,6 +7038,7 @@ ascent_par! {
         is_xmm_arg_reg(src),
         for arg in args.iter(),
         if *arg == Mreg::BP || *arg == Mreg::SP,
+        stack_claim_base_at(func_start, addr, *arg),
         arg_reg_param_live_at(func_start, addr, src);
 
     // setstack form.
@@ -6392,50 +7119,204 @@ ascent_par! {
 
     #[local] relation incoming_stack_slot(Node, Address, Mreg, i64, usize);
 
-    // ABI-1: entry-anchored SP offset per instruction, so disp + sp_ofs >= 8 places a slot above the return address regardless of prologue depth; the chain stops at non-fallthrough instructions.
+    // ABI-1: consume AsmPass's CFG-safe entry-anchored SP coordinate.  Keep the
+    // historical local shape so the downstream ABI formulas stay explicit,
+    // but do not recompute or extend the proof in RTL.
     #[local] lattice sp_entry_ofs(Address, Address, Dual<i64>);
+    sp_entry_ofs(*func_start, *addr, Dual(*ofs)) <--
+        rsp_frame_offset_at(func_start, addr, ofs);
 
-    // Flow breakers: instructions whose linear successor is not reachable; breaking too eagerly only under-claims stack params, never fabricates.
-    #[local] relation sp_chain_breaker(Address);
-    sp_chain_breaker(addr) <--
-        instruction(addr, _, _, mnem, _, _, _, _, _, _),
-        if matches!(*mnem, "RET" | "RETF" | "RETFQ" | "JMP" | "LJMP" | "HLT"
-            | "UD0" | "UD1" | "UD2" | "INT3" | "IRET" | "IRETD" | "IRETQ" | "SYSRET");
+    // A frame-pointer base is use-specific: the defining MOV must reach and
+    // dominate this use, and its copy-site SP coordinate must still be known.
+    // This rejects conditional copies and uses after an RBP clobber while
+    // correctly normalizing copies made after pushes/frame allocation.
+    relation reg_def_dominates_use(Address, Node, Node);
+    reg_def_dominates_use(func_start, def_addr, use_addr) <--
+        code_in_block(def_addr, block),
+        code_in_block(use_addr, block),
+        real_addr_in_func(def_addr, func_start),
+        real_addr_in_func(use_addr, func_start),
+        if *def_addr < *use_addr;
+    reg_def_dominates_use(func_start, def_addr, use_addr) <--
+        code_in_block(def_addr, def_block),
+        code_in_block(use_addr, use_block),
+        if *def_block != *use_block,
+        real_addr_in_func(def_addr, func_start),
+        real_addr_in_func(use_addr, func_start),
+        block_dom_set(func_start, use_block, doms),
+        if doms.0.contains(def_block);
 
-    sp_entry_ofs(func_start, func_start, Dual(0)) <--
-        func_span(_, func_start, _);
+    #[local] relation competing_reaching_reg_def(Node, Mreg, Node);
+    competing_reaching_reg_def(def_addr, *reg, use_addr) <--
+        raw_reg_def_used(def_addr, reg, use_addr),
+        raw_reg_def_used(other_def, reg, use_addr),
+        if other_def != def_addr;
 
-    sp_entry_ofs(func_start, curaddr, Dual(prev_ofs.0 + *delta)) <--
-        sp_entry_ofs(func_start, prevaddr, prev_ofs),
-        next(prevaddr, curaddr),
-        !sp_chain_breaker(prevaddr),
-        instr_in_function(curaddr, func_start),
-        adjusts_stack(prevaddr, _, delta);
+    bp_base_at(*func_start, *use_addr, sp_ofs.0) <--
+        stack_base_move(copy_addr, src, dst),
+        if *src == "RSP" && *dst == "RBP",
+        bp_frame_at(use_addr, func_start),
+        raw_reg_def_used(*copy_addr, ?&Mreg::BP, use_addr),
+        reg_def_dominates_use(func_start, copy_addr, use_addr),
+        !competing_reaching_reg_def(copy_addr, Mreg::BP, use_addr),
+        sp_entry_ofs(func_start, copy_addr, sp_ofs);
 
-    sp_entry_ofs(func_start, curaddr, prev_ofs) <--
-        sp_entry_ofs(func_start, prevaddr, prev_ofs),
-        next(prevaddr, curaddr),
-        !sp_chain_breaker(prevaddr),
-        instr_in_function(curaddr, func_start),
-        !adjusts_stack(prevaddr, _, _);
+    // Shared gate for the historical BP/SP scalar shortcuts. Exact raw base
+    // spelling is required for both registers, and BP additionally needs the
+    // use-specific reaching/dominating frame-copy proof.
+    stack_claim_base_at(func_start, addr, Mreg::SP) <--
+        real_addr_in_func(addr, func_start),
+        direct_stack_operand(addr, Mreg::SP, _, _),
+        rsp_frame_at(addr, func_start);
+    stack_claim_base_at(func_start, addr, Mreg::BP) <--
+        direct_stack_operand(addr, Mreg::BP, _, _),
+        bp_base_at(func_start, addr, _);
 
     // A direct MOV copy of SP can be used as a stable base for the compiler's
     // Win64 /homeparams stores. Record the SP entry offset at the copy site;
     // later SP adjustments must not change the copied base's coordinate.
-    relation sp_base_alias_at(Address, Node, Mreg, i64);
-    sp_base_alias_at(func_start, use_addr, *alias, sp_ofs.0) <--
-        ltl_inst(copy_addr, ?LTLInst::Lop(Operation::Omove, args, alias)),
-        if args.as_ref() == &[Mreg::SP],
-        if *alias != Mreg::SP && *alias != Mreg::BP,
-        instr_in_function(copy_addr, func_start),
-        instr_in_function(use_addr, func_start),
-        reg_def_used(copy_addr, *alias, use_addr),
+    #[local] relation sp_alias_def(Address, Node, Mreg, i64);
+
+    sp_alias_def(func_start, *copy_addr, alias, sp_ofs.0) <--
+        pmov(copy_addr, dst, src),
+        instruction(copy_addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "MOV" | "MOVQ"),
+        op_register(src, src_str),
+        if *src_str == "RSP",
+        op_register(dst, dst_str),
+        if is_x86_64_gp_register_name(dst_str),
+        let alias = Mreg::x86(*dst_str),
+        if alias != Mreg::SP && alias != Mreg::BP,
+        real_addr_in_func(copy_addr, func_start),
         sp_entry_ofs(func_start, copy_addr, sp_ofs);
+
+    // A real LEA can copy SP plus a displacement. Use the raw instruction
+    // operand here: its lowered Ainstack displacement may already include the
+    // tracked SP offset, while MOV SP copies carry no raw displacement.
+    sp_alias_def(func_start, *copy_addr, alias, base_ofs) <--
+        plea(copy_addr, dst, src),
+        op_register(dst, dst_str),
+        if is_x86_64_gp_register_name(dst_str),
+        let alias = Mreg::x86(*dst_str),
+        if alias != Mreg::SP && alias != Mreg::BP,
+        op_indirect(src, _, base_str, idx_str, _, raw_ofs, _),
+        if *base_str == "RSP",
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        real_addr_in_func(copy_addr, func_start),
+        sp_entry_ofs(func_start, copy_addr, sp_ofs),
+        let base_ofs = sp_ofs.0 + *raw_ofs;
+
+    // Preserve coordinates through further value-preserving 64-bit copies.
+    sp_alias_def(func_start, *copy_addr, dst_reg, *base_ofs) <--
+        pmov(copy_addr, dst, src),
+        instruction(copy_addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "MOV" | "MOVQ"),
+        op_register(src, src_str),
+        if is_x86_64_gp_register_name(src_str),
+        let src_reg = Mreg::x86(*src_str),
+        op_register(dst, dst_str),
+        if is_x86_64_gp_register_name(dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        if dst_reg != Mreg::SP && dst_reg != Mreg::BP,
+        real_addr_in_func(copy_addr, func_start),
+        sp_base_alias_at(func_start, copy_addr, src_reg, base_ofs);
+
+    // Preserve an entry-SP coordinate through LEA k(alias), but only when the
+    // source alias is proved at this exact copy site. The 64-bit destination
+    // guard excludes truncating E* forms.
+    sp_alias_def(func_start, *copy_addr, dst_reg, base_ofs) <--
+        plea(copy_addr, dst, src),
+        op_register(dst, dst_str),
+        if is_x86_64_gp_register_name(dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        if dst_reg != Mreg::SP && dst_reg != Mreg::BP,
+        op_indirect(src, _, base_str, idx_str, _, raw_ofs, _),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if is_x86_64_gp_register_name(base_str),
+        let src_reg = Mreg::x86(*base_str),
+        real_addr_in_func(copy_addr, func_start),
+        sp_base_alias_at(func_start, copy_addr, src_reg, src_base_ofs),
+        let base_ofs = *src_base_ofs + *raw_ofs;
+
+    // A compiler may advance or retreat a copied stack base in place before
+    // using it.  The ADD/SUB instruction both reads and defines the register,
+    // so the use-site proof below names the reaching pre-definition
+    // coordinate while this row records the post-definition coordinate.  The
+    // 64-bit register-name guard rejects truncating E* writes.
+    sp_alias_def(func_start, *add_addr, alias, base_ofs) <--
+        padd(add_addr, dst, src),
+        op_register(dst, dst_str),
+        if is_x86_64_gp_register_name(dst_str),
+        let alias = Mreg::x86(*dst_str),
+        if alias != Mreg::SP && alias != Mreg::BP,
+        op_immediate(src, delta, _),
+        real_addr_in_func(add_addr, func_start),
+        sp_base_alias_at(func_start, add_addr, alias, prior_ofs),
+        let base_ofs = *prior_ofs + *delta;
+
+    sp_alias_def(func_start, *sub_addr, alias, base_ofs) <--
+        psub(sub_addr, dst, src),
+        op_register(dst, dst_str),
+        if is_x86_64_gp_register_name(dst_str),
+        let alias = Mreg::x86(*dst_str),
+        if alias != Mreg::SP && alias != Mreg::BP,
+        op_immediate(src, delta, _),
+        real_addr_in_func(sub_addr, func_start),
+        sp_base_alias_at(func_start, sub_addr, alias, prior_ofs),
+        let base_ofs = *prior_ofs - *delta;
+
+    // May-alias provenance is use-specific rather than a function-wide
+    // "ever copied RSP" bit.  A later overwrite therefore kills the alias
+    // before a call, return, or unrelated pointer use, while a conditional
+    // RSP copy still remains a possible reaching definition.  The raw chain
+    // deliberately does not require a known affine SP coordinate.
+    #[local] relation sp_may_alias_def(Address, Node, Mreg);
+    sp_may_alias_def(func_start, *def_addr, *alias) <--
+        sp_alias_def(func_start, def_addr, alias, _);
+    sp_may_alias_def(func_start, *copy_addr, alias) <--
+        pmov(copy_addr, dst, src),
+        op_register(src, "RSP"),
+        op_register(dst, dst_str),
+        if is_x86_64_gp_register_name(dst_str),
+        let alias = Mreg::x86(*dst_str),
+        if alias != Mreg::SP && alias != Mreg::BP,
+        real_addr_in_func(copy_addr, func_start);
+    sp_may_alias_def(func_start, *copy_addr, dst_reg) <--
+        sp_may_alias_def(func_start, source_def, src_reg),
+        raw_reg_def_used(*source_def, *src_reg, copy_addr),
+        pmov(copy_addr, dst, src),
+        instruction(copy_addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "MOV" | "MOVQ"),
+        op_register(src, src_str),
+        if is_x86_64_gp_register_name(src_str),
+        let seen_src = Mreg::x86(*src_str),
+        if seen_src == *src_reg,
+        op_register(dst, dst_str),
+        if is_x86_64_gp_register_name(dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        if dst_reg != Mreg::SP && dst_reg != Mreg::BP,
+        real_addr_in_func(copy_addr, func_start);
+
+    #[local] relation sp_may_alias_at(Address, Node, Mreg);
+    sp_may_alias_at(func_start, *use_addr, *alias) <--
+        sp_may_alias_def(func_start, def_addr, alias),
+        raw_reg_def_used(*def_addr, *alias, use_addr),
+        real_addr_in_func(use_addr, func_start);
+
+    relation sp_base_alias_at(Address, Node, Mreg, i64);
+    sp_base_alias_at(func_start, use_addr, *alias, *base_ofs) <--
+        sp_alias_def(func_start, def_addr, alias, base_ofs),
+        real_addr_in_func(use_addr, func_start),
+        raw_reg_def_used(*def_addr, *alias, use_addr),
+        reg_def_dominates_use(func_start, def_addr, use_addr),
+        !competing_reaching_reg_def(def_addr, *alias, use_addr);
 
     #[local] relation sp_based_mem_at(Node, Address, Mreg, i64);
     sp_based_mem_at(addr, func_start, Mreg::SP, sp_ofs.0) <--
-        instr_in_function(addr, func_start),
+        real_addr_in_func(addr, func_start),
         sp_entry_ofs(func_start, addr, sp_ofs);
+    sp_based_mem_at(addr, func_start, Mreg::BP, *base_ofs) <--
+        bp_base_at(func_start, addr, base_ofs);
     sp_based_mem_at(addr, func_start, *alias, *base_ofs) <--
         sp_base_alias_at(func_start, addr, alias, base_ofs);
 
@@ -6443,66 +7324,714 @@ ascent_par! {
     abi_home_arg_position(*reg, *pos) <-- abi_int_arg_position(reg, pos);
     abi_home_arg_position(*reg, *pos) <-- abi_float_arg_position(reg, pos);
 
-    // Exact Win64 home stores: the incoming register's ABI position must match
-    // the shadow-space slot. This positive evidence prevents an arbitrary
-    // store near entry from being mistaken for /homeparams bookkeeping.
-    relation win64_home_spill(Node, Address, Mreg, usize);
-    win64_home_spill(addr, func_start, src_reg, *pos) <--
+    // A non-indexed SP (or proven copied-SP) access normalized to one of the
+    // four Win64 home cells. This relation is deliberately independent of
+    // whether the access is a read or write.
+    #[local] relation win64_home_cell(Node, Address, Mreg, i64, usize);
+    win64_home_cell(addr, func_start, *base_reg, *disp, *pos) <--
         abi_shared_arg_slots(true),
-        pmov(addr, dst, src),
-        op_indirect(dst, _, base_str, idx_str, _, disp, _),
-        if *idx_str == "NONE" || idx_str.is_empty(),
-        op_register(src, src_str),
-        let src_reg = Mreg::x86(*src_str),
-        abi_home_arg_position(src_reg, pos),
+        direct_stack_operand(addr, base_reg, disp, _),
+        sp_based_mem_at(addr, func_start, seen_base, base_ofs),
+        if *seen_base == *base_reg,
+        abi_home_arg_position(_, pos),
         abi_first_stack_arg_position(first_stack),
         if *pos < *first_stack,
-        sp_based_mem_at(addr, func_start, base_reg, base_ofs),
-        if *base_reg == Mreg::x86(base_str),
         abi_incoming_sp_stack_base(incoming_base),
         abi_outgoing_stack_base(outgoing_base),
         abi_stack_slot_size(slot_size),
         let home_base = *incoming_base - *outgoing_base,
-        if *base_ofs + *disp == home_base + (*pos as i64 * *slot_size),
+        if *base_ofs + *disp == home_base + (*pos as i64 * *slot_size);
+
+    // Proven materializations of the address of one exact home cell.  This is
+    // deliberately stricter than general copied-SP provenance: only a
+    // non-indexed LEA into a 64-bit destination starts the proof, after which
+    // exact 64-bit register copies may carry it to a use.  In particular,
+    // passing RSP itself (or an ambiguous may-alias) is not evidence for
+    // &home[pos].
+    #[local] relation win64_home_exact_addr_def(Address, Node, Mreg, usize);
+    #[local] relation win64_home_exact_addr_at(Address, Node, Mreg, usize);
+    #[local] relation win64_home_exact_addr_call(Address, Node, Mreg, usize);
+    #[local] relation win64_home_exact_addr_copy_use(Address, Node, Mreg, usize);
+    #[local] relation win64_home_addr_origin_def(Address, Node, Node, Mreg, usize);
+    #[local] relation win64_home_addr_origin_at(Address, Node, Node, Mreg, usize);
+    #[local] relation win64_home_lea_address_taken(Node, Address, usize);
+
+    win64_home_exact_addr_def(func_start, *addr, dst_reg, *pos) <--
+        win64_home_cell(addr, func_start, base_reg, raw_disp, pos),
+        plea(addr, dst, src),
+        op_register(dst, dst_str),
+        if is_x86_64_gp_register_name(dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        op_indirect(src, _, base_str, idx_str, _, asm_disp, _),
+        if is_x86_64_gp_register_name(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg && *asm_disp == *raw_disp;
+
+    win64_home_exact_addr_def(func_start, *copy_addr, dst_reg, *pos) <--
+        pmov(copy_addr, dst, src),
+        instruction(copy_addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "MOV" | "MOVQ"),
+        op_register(src, src_str),
+        if is_x86_64_gp_register_name(src_str),
+        let src_reg = Mreg::x86(*src_str),
+        op_register(dst, dst_str),
+        if is_x86_64_gp_register_name(dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        real_addr_in_func(copy_addr, func_start),
+        win64_home_exact_addr_at(func_start, copy_addr, src_reg, pos);
+
+    win64_home_exact_addr_at(func_start, use_addr, *reg, *pos) <--
+        win64_home_exact_addr_def(func_start, def_addr, reg, pos),
+        real_addr_in_func(use_addr, func_start),
+        raw_reg_def_used(*def_addr, *reg, use_addr),
+        reg_def_dominates_use(func_start, def_addr, use_addr),
+        !competing_reaching_reg_def(def_addr, *reg, use_addr);
+
+    win64_home_exact_addr_call(func_start, *call_addr, *reg, *pos) <--
+        win64_home_exact_addr_def(func_start, def_addr, reg, pos),
+        arg_setup_candidate(def_addr, reg, call_addr),
+        real_addr_in_func(call_addr, func_start);
+
+    // The sole value-propagating non-call use admitted for an exact home
+    // address is a full-width register MOV.  In particular, an ADD/SUB or a
+    // zero-displacement LEA may still be numerically using the address and
+    // must not become exempt merely because it also creates an SP alias.
+    win64_home_exact_addr_copy_use(func_start, *copy_addr, *src_reg, *pos) <--
+        win64_home_exact_addr_at(func_start, copy_addr, src_reg, pos),
+        pmov(copy_addr, dst, src),
+        instruction(copy_addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "MOV" | "MOVQ"),
+        op_register(src, src_str),
+        if is_x86_64_gp_register_name(src_str),
+        if Mreg::x86(*src_str) == *src_reg,
+        op_register(dst, dst_str),
+        if is_x86_64_gp_register_name(dst_str);
+
+    win64_home_addr_origin_def(func_start, *lea_addr, *lea_addr, *reg, *pos) <--
+        win64_home_exact_addr_def(func_start, lea_addr, reg, pos),
+        plea(lea_addr, _, _);
+    win64_home_addr_origin_def(func_start, *origin, *copy_addr, dst_reg, *pos) <--
+        win64_home_addr_origin_at(func_start, origin, copy_addr, src_reg, pos),
+        pmov(copy_addr, dst, src),
+        instruction(copy_addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "MOV" | "MOVQ"),
+        op_register(src, src_str),
+        if is_x86_64_gp_register_name(src_str),
+        let seen_src = Mreg::x86(*src_str),
+        if seen_src == *src_reg,
+        op_register(dst, dst_str),
+        if is_x86_64_gp_register_name(dst_str),
+        let dst_reg = Mreg::x86(*dst_str);
+    win64_home_addr_origin_at(func_start, *origin, use_addr, *reg, *pos) <--
+        win64_home_addr_origin_def(func_start, origin, def_addr, reg, pos),
+        real_addr_in_func(use_addr, func_start),
+        raw_reg_def_used(*def_addr, *reg, use_addr),
+        reg_def_dominates_use(func_start, def_addr, use_addr),
+        !competing_reaching_reg_def(def_addr, *reg, use_addr);
+    win64_home_lea_address_taken(*origin, func_start, *pos) <--
+        win64_home_addr_origin_def(func_start, origin, def_addr, reg, pos),
+        arg_setup_candidate(def_addr, reg, call_addr),
+        real_addr_in_func(call_addr, func_start);
+
+    // Exported because the post-fixed-point canonical-storage selector must
+    // compare this closed set with its supported scalar shapes.
+    relation win64_home_overlap(Node, Address, usize);
+    win64_home_overlap(addr, func_start, *pos) <--
+        abi_shared_arg_slots(true),
+        direct_stack_operand(addr, base_reg, disp, mem_size),
+        if *mem_size > 0,
+        sp_based_mem_at(addr, func_start, seen_base, base_ofs),
+        if *seen_base == *base_reg,
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack,
+        abi_incoming_sp_stack_base(incoming_base),
+        abi_outgoing_stack_base(outgoing_base),
+        abi_stack_slot_size(slot_size),
+        let home_base = *incoming_base - *outgoing_base,
+        let slot_start = home_base + (*pos as i64 * *slot_size),
+        let access_start = *base_ofs + *disp,
+        let access_end = access_start + *mem_size as i64,
+        if access_start < slot_start + *slot_size && access_end > slot_start;
+
+    // Positive /homeparams candidate. Requiring the source base to denote
+    // entry SP itself (offset zero) excludes outgoing argument stores after a
+    // frame allocation that happen to reuse the same entry-frame coordinate.
+    #[local] relation win64_home_move_class(Node, usize);
+    // 0 = GP integer move, 1 = scalar single, 2 = scalar double. VEX and
+    // legacy encodings share a semantic class, but integer/scalar classes do
+    // not: equal widths alone cannot justify replacing the reload's value.
+    win64_home_move_class(addr, 0) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "MOV" | "MOVQ");
+    win64_home_move_class(addr, 1) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "MOVSS" | "VMOVSS");
+    win64_home_move_class(addr, 2) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "MOVSD" | "VMOVSD");
+
+    relation win64_home_spill_candidate(Node, Address, Mreg, usize);
+    win64_home_spill_candidate(addr, func_start, src_reg, *pos) <--
+        win64_home_move_class(addr, move_class),
+        pmov(addr, dst, src),
+        op_indirect(dst, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        abi_stack_slot_size(slot_size),
+        if *mem_size > 0 && (*mem_size as i64) <= *slot_size,
+        op_register(src, src_str),
+        let src_reg = Mreg::x86(*src_str),
+        if (*move_class == 0 && !is_float_mreg(&src_reg))
+            || (*move_class != 0 && is_float_mreg(&src_reg)),
+        abi_home_arg_position(src_reg, pos),
+        win64_home_cell(addr, func_start, base_reg, disp, pos),
+        if *base_reg == Mreg::x86(base_str),
+        sp_based_mem_at(addr, func_start, base_reg, base_ofs),
+        if *base_ofs == 0,
         arg_reg_param_live_at(func_start, addr, src_reg);
 
-    // A source-level assignment to a homed parameter turns the slot into real
-    // mutable storage. If stack def-use finds a non-home definition reaching a
-    // later read, that read must not be rewritten to the original entry value.
-    #[local] relation home_reload_clobbered(Node);
-    home_reload_clobbered(reload_addr) <--
-        stack_def_used(def_addr, _, _, reload_addr, _, _),
-        !win64_home_spill(def_addr, _, _, _);
+    // The candidate spill must dominate a reload; address ordering alone is
+    // not a control-flow proof. Within one basic block, instruction order is
+    // sufficient. Across blocks, use the existing dominator lattice.
+    #[local] relation home_spill_dominates_reload(Node, Node, Address, usize);
+    home_spill_dominates_reload(spill_addr, reload_addr, func_start, *pos) <--
+        win64_home_spill_candidate(spill_addr, func_start, _, pos),
+        win64_home_cell(reload_addr, func_start, _, _, pos),
+        code_in_block(spill_addr, block),
+        code_in_block(reload_addr, block),
+        if *spill_addr < *reload_addr;
+    home_spill_dominates_reload(spill_addr, reload_addr, func_start, *pos) <--
+        win64_home_spill_candidate(spill_addr, func_start, _, pos),
+        win64_home_cell(reload_addr, func_start, _, _, pos),
+        code_in_block(spill_addr, spill_block),
+        code_in_block(reload_addr, reload_block),
+        if *spill_block != *reload_block,
+        block_dom_set(func_start, reload_block, doms),
+        if doms.0.contains(spill_block);
 
-    // A reload from a proven home slot denotes the incoming parameter value,
-    // not the address or an unrelated fresh frame local.
-    relation win64_home_reload(Node, Address, Mreg, usize);
-    win64_home_reload(addr, func_start, *param_reg, *pos) <--
-        pmov(addr, _dst, src),
-        op_indirect(src, _, base_str, idx_str, _, disp, _),
+    // A width-matched integer arithmetic read of an exactly homed register is
+    // as immutable as a MOV reload.  VS2013 commonly consumes /homeparams
+    // slots directly (`xor eax,[rsp+24]`, for example), so treating every
+    // non-MOV read as mutation needlessly rejects otherwise lossless TUs.
+    #[local] relation win64_home_arith_read_candidate(Node, Address, Mreg, usize);
+    win64_home_arith_read_candidate(addr, func_start, *param_reg, *pos) <--
+        arith_load_op(addr, _, chunk, base_reg, disp, _),
+        win64_home_cell(addr, func_start, seen_base, seen_disp, pos),
+        if *seen_base == *base_reg && *seen_disp == *disp,
+        home_spill_dominates_reload(spill_addr, addr, func_start, pos),
+        win64_home_spill_candidate(spill_addr, func_start, param_reg, pos),
+        win64_home_move_class(spill_addr, move_class),
+        if *move_class == 0,
+        pmov(spill_addr, spill_dst, _),
+        op_indirect(spill_dst, _, _, spill_idx, _, _, spill_size),
+        if *spill_idx == "NONE" || spill_idx.is_empty(),
+        if chunk_size_bits(chunk) as usize == *spill_size * 8;
+
+    // A simple reload cell has a must-executed initial home spill, but is not
+    // yet necessarily foldable: mutation/address escape checks below decide
+    // whether it remains real storage.
+    relation win64_home_reload_cell(Node, Address, Mreg, usize);
+    win64_home_reload_cell(addr, func_start, *param_reg, *pos) <--
+        win64_home_move_class(addr, reload_class),
+        pmov(addr, dst, src),
+        op_register(dst, dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        if (*reload_class == 0 && !is_float_mreg(&dst_reg))
+            || (*reload_class != 0 && is_float_mreg(&dst_reg)),
+        op_indirect(src, _, base_str, idx_str, _, disp, reload_size),
         if *idx_str == "NONE" || idx_str.is_empty(),
-        sp_based_mem_at(addr, func_start, base_reg, base_ofs),
+        win64_home_cell(addr, func_start, base_reg, disp, pos),
         if *base_reg == Mreg::x86(base_str),
+        home_spill_dominates_reload(spill_addr, addr, func_start, pos),
+        win64_home_spill_candidate(spill_addr, func_start, param_reg, pos),
+        win64_home_move_class(spill_addr, spill_class),
+        if *spill_class == *reload_class,
+        pmov(spill_addr, spill_dst, _),
+        op_indirect(spill_dst, _, _, spill_idx, _, _, spill_size),
+        if *spill_idx == "NONE" || spill_idx.is_empty(),
+        if *spill_size == *reload_size;
+
+    // Any non-initial write, escaped address, unproved read, or competing
+    // initial spill makes the home cell real mutable storage. This is a
+    // deliberately function-wide conservative veto: it may retain a local,
+    // but it cannot fold away externally observable mutation.
+    #[local] relation win64_home_slot_unsafe(Address, usize);
+    // Any classified access that is neither the exact initial spill nor a
+    // proved reload is conservatively a mutation, escape, or unsupported
+    // access. This catches arithmetic through copied-SP aliases, which the
+    // literal-SP stack_def/stack_use relations intentionally do not record.
+    win64_home_slot_unsafe(func_start, *pos) <--
+        win64_home_overlap(addr, func_start, pos),
+        !win64_home_spill_candidate(addr, func_start, _, pos),
+        !win64_home_reload_cell(addr, func_start, _, pos),
+        !win64_home_arith_read_candidate(addr, func_start, _, pos);
+    win64_home_slot_unsafe(func_start, *pos) <--
+        indexed_stack_operand(addr, base_reg, _, _),
+        real_addr_in_func(addr, func_start),
+        sp_based_mem_at(addr, func_start, seen_base, _),
+        if *seen_base == *base_reg,
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack;
+    win64_home_slot_unsafe(func_start, *pos) <--
+        indexed_stack_operand(addr, Mreg::SP, _, _),
+        real_addr_in_func(addr, func_start),
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack;
+    // A conditional/non-dominating RSP->RBP copy gives an indexed BP access
+    // no usable coordinate. If the function ever establishes a frame pointer,
+    // conservatively retain all home cells rather than treating that access as
+    // unrelated pointer memory.
+    win64_home_slot_unsafe(func_start, *pos) <--
+        indexed_stack_operand(addr, Mreg::BP, _, _),
+        real_addr_in_func(addr, func_start),
+        func_ever_sets_frame_pointer(func_start),
+        !bp_base_at(func_start, addr, _),
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack;
+    win64_home_slot_unsafe(func_start, *pos) <--
+        direct_stack_operand(addr, Mreg::SP, _, _),
+        real_addr_in_func(addr, func_start),
+        !sp_entry_ofs(func_start, addr, _),
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack;
+    win64_home_slot_unsafe(func_start, *pos) <--
+        direct_stack_operand(addr, Mreg::BP, _, _),
+        real_addr_in_func(addr, func_start),
+        !bp_base_at(func_start, addr, _),
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack;
+    // If a possibly reaching stack alias lacks one proved coordinate at a
+    // memory use, a conditional copy may have changed the base. Retain every
+    // home cell rather than folding through that ambiguous access.
+    win64_home_slot_unsafe(func_start, *pos) <--
+        direct_stack_operand(addr, base_reg, _, _),
+        real_addr_in_func(addr, func_start),
+        sp_may_alias_at(func_start, addr, base_reg),
+        !sp_base_alias_at(func_start, addr, base_reg, _),
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack;
+    win64_home_slot_unsafe(func_start, *pos) <--
+        indexed_stack_operand(addr, base_reg, _, _),
+        real_addr_in_func(addr, func_start),
+        sp_may_alias_at(func_start, addr, base_reg),
+        !sp_base_alias_at(func_start, addr, base_reg, _),
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack;
+    // A decoded memory operand with unknown width cannot prove that it stays
+    // within one home cell, even when its base coordinate is known.
+    win64_home_slot_unsafe(func_start, *pos) <--
+        direct_stack_operand(addr, base_reg, _, mem_size),
+        if *mem_size == 0,
+        real_addr_in_func(addr, func_start),
+        sp_based_mem_at(addr, func_start, seen_base, _),
+        if *seen_base == *base_reg,
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack;
+    win64_home_slot_unsafe(func_start, *pos) <--
+        indexed_stack_operand(addr, base_reg, _, mem_size),
+        if *mem_size == 0,
+        real_addr_in_func(addr, func_start),
+        sp_based_mem_at(addr, func_start, seen_base, _),
+        if *seen_base == *base_reg,
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack;
+    // A non-memory use reached by a possible SP alias may escape the frame,
+    // including a branch where only one predecessor copied RSP. A later
+    // unrelated overwrite no longer poisons the whole function.
+    win64_home_slot_unsafe(func_start, *pos) <--
+        sp_may_alias_at(func_start, addr, alias),
+        real_addr_in_func(addr, func_start),
+        asm_reg_use(addr, alias),
+        !direct_stack_operand(addr, alias, _, _),
+        !indexed_stack_operand(addr, alias, _, _),
+        !sp_alias_def(func_start, addr, _, _),
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack;
+    // Capstone does not consistently report the ABI's implicit argument and
+    // return-register uses on CALL/RET. Use the existing exact may-reaching
+    // def lattice so only an alias definition that reaches the boundary is an
+    // escape.
+    win64_home_slot_unsafe(func_start, *pos) <--
+        abi_shared_arg_slots(true),
+        sp_may_alias_def(func_start, alias_def, alias),
+        abi_int_arg_position(alias, _),
+        def_reaches_call(call_addr, alias_def, alias),
+        real_addr_in_func(call_addr, func_start),
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack;
+    win64_home_slot_unsafe(func_start, *pos) <--
+        abi_shared_arg_slots(true),
+        sp_may_alias_def(func_start, alias_def, ?&Mreg::AX),
+        def_reaches_return(ret_addr, alias_def, ?&Mreg::AX),
+        real_addr_in_func(ret_addr, func_start),
+        instruction(ret_addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "RET" | "RETF" | "RETFQ"),
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack;
+    win64_home_slot_unsafe(func_start, *pos) <--
+        win64_home_spill_candidate(first_addr, func_start, first_reg, pos),
+        win64_home_spill_candidate(other_addr, func_start, other_reg, pos),
+        if first_addr != other_addr || first_reg != other_reg;
+
+    // Even though an affine copied-SP update can be proved precisely, keep it
+    // out of the immutable /homeparams fold.  The post-pass scalar selector
+    // can still canonicalize all of its exact accesses to one mutable local.
+    win64_home_slot_unsafe(func_start, *pos) <--
+        sp_alias_def(func_start, adjust_addr, alias, _),
+        padd(adjust_addr, _, _),
+        direct_stack_operand(use_addr, alias, _, _),
+        sp_base_alias_at(func_start, use_addr, alias, _),
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack;
+    win64_home_slot_unsafe(func_start, *pos) <--
+        sp_alias_def(func_start, adjust_addr, alias, _),
+        psub(adjust_addr, _, _),
+        direct_stack_operand(use_addr, alias, _, _),
+        sp_base_alias_at(func_start, use_addr, alias, _),
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack;
+
+    // Unsafe /homeparams cells remain ordinary mutable storage.  Keep their
+    // identity and every normalized access as exported evidence, but do not
+    // feed these unsafe-dependent rows back into stack_xtl or RTL selection in
+    // this fixed point: doing so would pull the raw escape proof into the
+    // register/call SCC.  RTLPass::run materializes these rows immediately
+    // after the fixed point instead.
+    relation win64_home_storage(Address, usize, RTLReg);
+    win64_home_storage(func_start, *pos, slot_rtl) <--
+        win64_home_spill_candidate(_, func_start, _, pos),
+        win64_home_slot_unsafe(func_start, pos),
+        let slot_rtl = fresh_home_slot_reg(*func_start, *pos);
+
+    // Exact backing type for a selected canonical home cell.  This is a rule
+    // output (rather than an imperative-only side effect) so scheduled stages
+    // retain it and TypePass can treat the storage signature as authoritative.
+    relation win64_home_slot_type(RTLReg, XType);
+    win64_home_slot_type(*slot, xtype) <--
+        win64_home_storage(func_start, pos, slot),
+        win64_home_storage_signature(func_start, pos, move_class, width),
+        if let Some(xtype) = home_move_xtype(*move_class, *width);
+
+    relation win64_unsafe_home_access(Node, Address, Mreg, i64, usize, i64);
+    win64_unsafe_home_access(addr, func_start, *base_reg, *raw_disp, *pos, entry_ofs) <--
+        win64_home_cell(addr, func_start, base_reg, raw_disp, pos),
+        win64_home_spill_candidate(_, func_start, _, pos),
+        win64_home_slot_unsafe(func_start, pos),
         abi_incoming_sp_stack_base(incoming_base),
         abi_outgoing_stack_base(outgoing_base),
         abi_stack_slot_size(slot_size),
-        let home_base = *incoming_base - *outgoing_base,
-        if *base_ofs + *disp == home_base + (*pos as i64 * *slot_size),
-        win64_home_spill(spill_addr, func_start, param_reg, pos),
-        if *spill_addr < *addr,
-        !home_reload_clobbered(addr);
+        let entry_ofs = *incoming_base - *outgoing_base + (*pos as i64 * *slot_size);
+
+    // Closed set of scalar-storage shapes.  A cell is canonicalized only when
+    // every possibly overlapping access is represented by exactly one of
+    // these rows and all moves agree with the initial spill's class and width.
+    // The selector below additionally requires an unambiguous RTL source or
+    // destination for every row before changing any instruction.
+    #[local] relation win64_home_storage_signature(Address, usize, usize, usize);
+    win64_home_storage_signature(func_start, *pos, *move_class, *mem_size) <--
+        win64_home_spill_candidate(addr, func_start, _, pos),
+        win64_home_move_class(addr, move_class),
+        pmov(addr, dst, _),
+        op_indirect(dst, _, _, idx_str, _, _, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *mem_size > 0;
+
+    // A single source parameter cannot have two different scalar home-store
+    // encodings.  Keep ambiguous slots as ordinary inference evidence rather
+    // than publishing an arbitrary source type from relation iteration order.
+    #[local] relation win64_home_storage_signature_conflict(Address, usize);
+    win64_home_storage_signature_conflict(func_start, pos) <--
+        win64_home_storage_signature(func_start, pos, first_class, first_width),
+        win64_home_storage_signature(func_start, pos, other_class, other_width),
+        if first_class != other_class || first_width != other_width;
+
+    relation win64_home_scalar_store(Node, Address, Mreg, i64, usize, i64, Mreg, usize, usize);
+    win64_home_scalar_store(addr, func_start, *base_reg, *raw_disp, *pos, *entry_ofs, src_reg, *move_class, *mem_size) <--
+        win64_unsafe_home_access(addr, func_start, base_reg, raw_disp, pos, entry_ofs),
+        win64_home_storage_signature(func_start, pos, move_class, width),
+        win64_home_move_class(addr, seen_class),
+        if *seen_class == *move_class,
+        pmov(addr, dst, src),
+        op_indirect(dst, _, base_str, idx_str, _, asm_disp, mem_size),
+        if is_x86_64_gp_register_name(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg && *asm_disp == *raw_disp,
+        if *mem_size == *width,
+        op_register(src, src_str),
+        let src_reg = Mreg::x86(*src_str),
+        if (*move_class == 0 && !is_float_mreg(&src_reg))
+            || (*move_class != 0 && is_float_mreg(&src_reg));
+
+    relation win64_home_scalar_load(Node, Address, Mreg, i64, usize, i64, Mreg, usize, usize);
+    win64_home_scalar_load(addr, func_start, *base_reg, *raw_disp, *pos, *entry_ofs, dst_reg, *move_class, *mem_size) <--
+        win64_unsafe_home_access(addr, func_start, base_reg, raw_disp, pos, entry_ofs),
+        win64_home_storage_signature(func_start, pos, move_class, width),
+        win64_home_move_class(addr, seen_class),
+        if *seen_class == *move_class,
+        pmov(addr, dst, src),
+        op_register(dst, dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        op_indirect(src, _, base_str, idx_str, _, asm_disp, mem_size),
+        if is_x86_64_gp_register_name(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg && *asm_disp == *raw_disp,
+        if *mem_size == *width,
+        if (*move_class == 0 && !is_float_mreg(&dst_reg))
+            || (*move_class != 0 && is_float_mreg(&dst_reg));
+
+    relation win64_home_scalar_lea(Node, Address, Mreg, i64, usize, i64, Mreg);
+    win64_home_scalar_lea(addr, func_start, *base_reg, *raw_disp, *pos, *entry_ofs, dst_reg) <--
+        win64_unsafe_home_access(addr, func_start, base_reg, raw_disp, pos, entry_ofs),
+        plea(addr, dst, src),
+        op_register(dst, dst_str),
+        if is_x86_64_gp_register_name(dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        op_indirect(src, _, base_str, idx_str, _, asm_disp, _),
+        if is_x86_64_gp_register_name(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg && *asm_disp == *raw_disp;
+
+    #[local] relation win64_home_scalar_access(Node, Address, usize);
+    win64_home_scalar_access(addr, func, pos) <--
+        win64_home_scalar_store(addr, func, _, _, pos, _, _, _, _);
+    win64_home_scalar_access(addr, func, pos) <--
+        win64_home_scalar_load(addr, func, _, _, pos, _, _, _, _);
+    win64_home_scalar_access(addr, func, pos) <--
+        win64_home_scalar_lea(addr, func, _, _, pos, _, _),
+        // A bare/numerically-used LEA is not enough: replacing RSP+k with
+        // &scalar changes the meaning of subsequent integer arithmetic.  At
+        // least one exact derived address must be consumed as a call argument.
+        win64_home_lea_address_taken(addr, func, pos);
+
+    unsupported_stack_address(*func, *addr, "unsupported-stack-address") <--
+        // A storage signature exists for every ordinary /homeparams spill,
+        // including safe immutable spill/reload pairs.  Only cells already
+        // proven mutable/unsafe need scalar replacement; otherwise their raw
+        // overlaps are intentionally consumed by the entry-parameter fold.
+        win64_home_storage(func, pos, _),
+        win64_home_overlap(addr, func, pos),
+        !win64_home_scalar_access(addr, func, pos);
+
+    // Reasons that make scalar replacement incomplete or ambiguous.  These
+    // rows are separate from win64_home_slot_unsafe: "unsafe" merely means the
+    // immutable parameter fold is invalid, while this relation means even a
+    // mutable canonical scalar cannot represent every possible access.
+    relation win64_home_canonical_veto(Address, usize);
+    win64_home_canonical_veto(func_start, *pos) <--
+        win64_home_storage_signature(func_start, pos, _, _),
+        win64_home_overlap(addr, func_start, pos),
+        !win64_home_scalar_access(addr, func_start, pos);
+    win64_home_canonical_veto(func_start, *pos) <--
+        win64_home_storage_signature(func_start, pos, _, _),
+        win64_unsafe_home_access(addr, func_start, _, _, pos, _),
+        !win64_home_scalar_access(addr, func_start, pos);
+    win64_home_canonical_veto(func_start, *pos) <--
+        win64_home_scalar_lea(_, func_start, _, _, pos, _, _),
+        win64_home_storage_signature(func_start, pos, _, width),
+        // An escaped home address exposes the ABI's whole eight-byte cell.
+        // A narrower scalar would not provide safe backing for an opaque
+        // callee, so retain the original stack storage instead.
+        if *width != 8;
+
+    win64_home_canonical_veto(func_start, *pos) <--
+        indexed_stack_operand(addr, base_reg, _, _),
+        real_addr_in_func(addr, func_start),
+        sp_based_mem_at(addr, func_start, seen_base, _),
+        if *seen_base == *base_reg,
+        win64_home_storage_signature(func_start, pos, _, _);
+    win64_home_canonical_veto(func_start, *pos) <--
+        indexed_stack_operand(addr, Mreg::SP, _, _),
+        real_addr_in_func(addr, func_start),
+        win64_home_storage_signature(func_start, pos, _, _);
+    win64_home_canonical_veto(func_start, *pos) <--
+        indexed_stack_operand(addr, Mreg::BP, _, _),
+        real_addr_in_func(addr, func_start),
+        func_ever_sets_frame_pointer(func_start),
+        !bp_base_at(func_start, addr, _),
+        win64_home_storage_signature(func_start, pos, _, _);
+    win64_home_canonical_veto(func_start, *pos) <--
+        direct_stack_operand(addr, Mreg::SP, _, _),
+        real_addr_in_func(addr, func_start),
+        !sp_entry_ofs(func_start, addr, _),
+        win64_home_storage_signature(func_start, pos, _, _);
+    win64_home_canonical_veto(func_start, *pos) <--
+        direct_stack_operand(addr, Mreg::BP, _, _),
+        real_addr_in_func(addr, func_start),
+        !bp_base_at(func_start, addr, _),
+        win64_home_storage_signature(func_start, pos, _, _);
+    win64_home_canonical_veto(func_start, *pos) <--
+        direct_stack_operand(addr, base_reg, _, _),
+        real_addr_in_func(addr, func_start),
+        sp_may_alias_at(func_start, addr, base_reg),
+        !sp_base_alias_at(func_start, addr, base_reg, _),
+        win64_home_storage_signature(func_start, pos, _, _);
+    win64_home_canonical_veto(func_start, *pos) <--
+        indexed_stack_operand(addr, base_reg, _, _),
+        real_addr_in_func(addr, func_start),
+        sp_may_alias_at(func_start, addr, base_reg),
+        !sp_base_alias_at(func_start, addr, base_reg, _),
+        win64_home_storage_signature(func_start, pos, _, _);
+
+    // A non-memory use of a stack-base alias is admissible only when it is one
+    // exact 64-bit MOV step in the address web or the proven consumption of
+    // that web as a call argument.  Merely proving that the value is &home[pos]
+    // cannot make arithmetic, comparisons, or returns safe scalar rewrites.
+    win64_home_canonical_veto(func_start, *pos) <--
+        sp_may_alias_at(func_start, addr, alias),
+        real_addr_in_func(addr, func_start),
+        asm_reg_use(addr, alias),
+        !direct_stack_operand(addr, alias, _, _),
+        !indexed_stack_operand(addr, alias, _, _),
+        !sp_alias_def(func_start, addr, _, _),
+        win64_home_storage_signature(func_start, pos, _, _),
+        !win64_home_exact_addr_copy_use(func_start, addr, alias, pos),
+        !win64_home_exact_addr_call(func_start, addr, alias, pos);
+    // A proved exact-home address web receives the stricter policy even when
+    // the instruction also happens to create another affine SP alias.  This
+    // closes the ADD/LEA exemption above without disabling the independently
+    // supported copied-SP affine storage pattern.
+    win64_home_canonical_veto(func_start, *pos) <--
+        win64_home_exact_addr_at(func_start, addr, alias, pos),
+        asm_reg_use(addr, alias),
+        !direct_stack_operand(addr, alias, _, _),
+        !indexed_stack_operand(addr, alias, _, _),
+        win64_home_storage_signature(func_start, pos, _, _),
+        !win64_home_exact_addr_copy_use(func_start, addr, alias, pos),
+        !win64_home_exact_addr_call(func_start, addr, alias, pos);
+    win64_home_canonical_veto(func_start, *pos) <--
+        abi_shared_arg_slots(true),
+        sp_may_alias_def(func_start, alias_def, alias),
+        abi_int_arg_position(alias, _),
+        def_reaches_call(call_addr, alias_def, alias),
+        real_addr_in_func(call_addr, func_start),
+        win64_home_storage_signature(func_start, pos, _, _),
+        !win64_home_exact_addr_at(func_start, call_addr, alias, pos),
+        !win64_home_exact_addr_call(func_start, call_addr, alias, pos);
+    win64_home_canonical_veto(func_start, *pos) <--
+        abi_shared_arg_slots(true),
+        sp_may_alias_def(func_start, alias_def, ?&Mreg::AX),
+        def_reaches_return(ret_addr, alias_def, ?&Mreg::AX),
+        real_addr_in_func(ret_addr, func_start),
+        instruction(ret_addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "RET" | "RETF" | "RETFQ"),
+        win64_home_storage_signature(func_start, pos, _, _);
+    win64_home_canonical_veto(func_start, *pos) <--
+        win64_home_spill_candidate(first_addr, func_start, first_reg, pos),
+        win64_home_spill_candidate(other_addr, func_start, other_reg, pos),
+        if first_addr != other_addr || first_reg != other_reg;
+
+    // Node-keyed address evidence and function+slot escape evidence are
+    // intentionally not keyed by a raw stack displacement.  RTLPass::run
+    // filters these provisional rows to the cells it actually rewrites.
+    relation win64_home_address(Node, RTLReg);
+    win64_home_address(addr, slot) <--
+        win64_home_scalar_lea(addr, func_start, _, _, pos, _, _),
+        win64_home_storage(func_start, pos, slot);
+
+    relation win64_home_escaped(Address, RTLReg);
+    win64_home_escaped(func_start, slot) <--
+        win64_home_scalar_lea(_, func_start, _, _, pos, _, _),
+        win64_home_storage(func_start, pos, slot);
+
+    // Only a nonescaping, immutable home cell with proved reloads may collapse
+    // to the incoming SSA parameter. Unsafe cells fall through to the ordinary
+    // Lsetstack/Lgetstack local-storage rules.
+    relation win64_home_spill(Node, Address, Mreg, usize);
+    win64_home_spill(addr, func_start, *param_reg, *pos) <--
+        win64_home_spill_candidate(addr, func_start, param_reg, pos),
+        !win64_home_slot_unsafe(func_start, pos);
+
+    relation win64_home_reload(Node, Address, Mreg, usize);
+    win64_home_reload(addr, func_start, *param_reg, *pos) <--
+        win64_home_reload_cell(addr, func_start, param_reg, pos),
+        !win64_home_slot_unsafe(func_start, pos);
+
+    relation win64_home_arith_read(Node, Address, Mreg, usize);
+    win64_home_arith_read(addr, func_start, param_reg, pos) <--
+        win64_home_arith_read_candidate(addr, func_start, param_reg, pos),
+        !win64_home_slot_unsafe(func_start, pos);
 
     // BP-based arg detection requires an actual frame pointer: in frameless functions RBP is a callee-saved scratch (often a struct pointer), so a positive-offset BP load is a field deref, not an incoming arg. With a frame pointer, caller args start at BP+16 (BP+0=saved RBP, BP+8=return address).
-    #[local] relation func_sets_frame_pointer(Address);
-    func_sets_frame_pointer(func_start) <--
+    #[local] relation func_ever_sets_frame_pointer(Address);
+    func_ever_sets_frame_pointer(func_start) <--
         stack_base_move(addr, src, dst),
         if *src == "RSP" && *dst == "RBP",
         instr_in_function(addr, func_start);
+
+    // Enumerate concrete non-indexed memory operands so copied-SP aliases as
+    // well as literal SP/BP bases have a bound displacement. Consumers that
+    // infer incoming slots explicitly restrict this relation back to SP/BP.
+    #[local] relation direct_stack_operand(Node, Mreg, i64, usize);
+    direct_stack_operand(*addr, base, *disp, *mem_size) <--
+        instruction(addr, _, _, _, operand, _, _, _, _, _),
+        op_indirect(operand, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if is_valid_stack_operand_base_name(base_str),
+        let base = Mreg::x86(*base_str);
+    direct_stack_operand(*addr, base, *disp, *mem_size) <--
+        instruction(addr, _, _, _, _, operand, _, _, _, _),
+        op_indirect(operand, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if is_valid_stack_operand_base_name(base_str),
+        let base = Mreg::x86(*base_str);
+    direct_stack_operand(*addr, base, *disp, *mem_size) <--
+        instruction(addr, _, _, _, _, _, operand, _, _, _),
+        op_indirect(operand, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if is_valid_stack_operand_base_name(base_str),
+        let base = Mreg::x86(*base_str);
+    direct_stack_operand(*addr, base, *disp, *mem_size) <--
+        instruction(addr, _, _, _, _, _, _, operand, _, _),
+        op_indirect(operand, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if is_valid_stack_operand_base_name(base_str),
+        let base = Mreg::x86(*base_str);
+
+    #[local] relation indexed_stack_operand(Node, Mreg, i64, usize);
+    indexed_stack_operand(*addr, base, *disp, *mem_size) <--
+        instruction(addr, _, _, _, operand, _, _, _, _, _),
+        op_indirect(operand, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if is_valid_stack_operand_base_name(base_str),
+        let base = Mreg::x86(*base_str);
+    indexed_stack_operand(*addr, base, *disp, *mem_size) <--
+        instruction(addr, _, _, _, _, operand, _, _, _, _),
+        op_indirect(operand, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if is_valid_stack_operand_base_name(base_str),
+        let base = Mreg::x86(*base_str);
+    indexed_stack_operand(*addr, base, *disp, *mem_size) <--
+        instruction(addr, _, _, _, _, _, operand, _, _, _),
+        op_indirect(operand, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if is_valid_stack_operand_base_name(base_str),
+        let base = Mreg::x86(*base_str);
+    indexed_stack_operand(*addr, base, *disp, *mem_size) <--
+        instruction(addr, _, _, _, _, _, _, operand, _, _),
+        op_indirect(operand, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if is_valid_stack_operand_base_name(base_str),
+        let base = Mreg::x86(*base_str);
 
     // Normalize a raw SP displacement to its function-entry coordinate, then
     // compute the real ABI ordinal. A missing SP-state row or an unaligned
     // address conservatively produces no parameter claim.
     incoming_stack_slot(addr, func_start, Mreg::SP, *disp, ordinal) <--
+        direct_stack_operand(addr, Mreg::SP, disp, _),
         instr_in_function(addr, func_start),
         function_entry_count(func_start, addr, count),
         if *count < 512,
@@ -6511,19 +8040,111 @@ ascent_par! {
         abi_stack_slot_size(slot_size),
         let entry_disp = *disp + sp_ofs.0,
         if entry_disp >= *stack_base && (entry_disp - *stack_base) % *slot_size == 0,
-        let ordinal = ((entry_disp - *stack_base) / *slot_size) as usize;
+        let ordinal = ((entry_disp - *stack_base) / *slot_size) as usize,
+        if ordinal < 64;
 
-    // A positive BP displacement is an incoming slot only in a function that
-    // actually establishes BP as its frame pointer.
+    // A BP displacement is an incoming slot only when a dominating, reaching
+    // frame-pointer copy gives this use an entry-SP coordinate.
     incoming_stack_slot(addr, func_start, Mreg::BP, *disp, ordinal) <--
+        direct_stack_operand(addr, Mreg::BP, disp, _),
         instr_in_function(addr, func_start),
         function_entry_count(func_start, addr, count),
         if *count < 512,
-        func_sets_frame_pointer(func_start),
-        abi_incoming_bp_stack_base(stack_base),
+        bp_base_at(func_start, addr, bp_base),
+        abi_incoming_sp_stack_base(stack_base),
         abi_stack_slot_size(slot_size),
-        if *disp >= *stack_base && (*disp - *stack_base) % *slot_size == 0,
-        let ordinal = ((*disp - *stack_base) / *slot_size) as usize;
+        let entry_disp = *bp_base + *disp,
+        if entry_disp >= *stack_base && (entry_disp - *stack_base) % *slot_size == 0,
+        let ordinal = ((entry_disp - *stack_base) / *slot_size) as usize,
+        if ordinal < 64;
+
+    // stack_def_used is keyed by one raw displacement, so it misses partial
+    // writes such as a byte store at entry-SP+41 before a dword read at +40.
+    // Attach each decoded definition and incoming read to full byte ranges,
+    // normalized through the same proved SP/BP/copied-SP coordinate used by
+    // ABI recovery.
+    #[local] relation decoded_stack_write(Node, Mreg, i64, usize);
+    decoded_stack_write(addr, base, *disp, *mem_size) <--
+        decoded_memory_write_operand(addr, operand),
+        op_indirect(operand, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if is_x86_64_gp_register_name(base_str),
+        if *mem_size > 0,
+        let base = Mreg::x86(*base_str);
+
+    relation normalized_stack_write_range(Node, Address, Mreg, i64, i64, i64);
+    normalized_stack_write_range(addr, func_start, *base, *disp, range_start, range_end) <--
+        decoded_stack_write(addr, base, disp, mem_size),
+        sp_based_mem_at(addr, func_start, proven_base, base_ofs),
+        if *proven_base == *base,
+        let range_start = *base_ofs + *disp,
+        let range_end = range_start + *mem_size as i64;
+
+    // Exact control-flow witness exported for consumers that use a decoded
+    // stack write as object-initialization evidence.  Address order alone is
+    // insufficient across branches and loops.
+    relation stack_write_dominates_node(Address, Node, Node);
+    stack_write_dominates_node(*func_start, *write_node, *use_node) <--
+        normalized_stack_write_range(write_node, func_start, _, _, _, _),
+        real_addr_in_func(use_node, func_start),
+        reg_def_dominates_use(func_start, write_node, use_node);
+
+    #[local] relation stack_read_site(Node);
+    stack_read_site(addr) <-- ltl_inst(addr, ?LTLInst::Lload(_, _, _, _));
+    stack_read_site(addr) <-- ltl_inst(addr, ?LTLInst::Lgetstack(_, _, _, _));
+    stack_read_site(addr) <-- arith_load_op(addr, _, _, _, _, _);
+    stack_read_site(addr) <-- float_arith_stack_op(addr, _, _, _, _);
+    stack_read_site(addr) <-- stack_unary_load_op(addr, _, _, _, _);
+    stack_read_site(addr) <-- arith_store_reg(addr, _, _, _, _, _);
+    stack_read_site(addr) <-- arith_store_imm(addr, _, _, _, _);
+
+    #[local] relation incoming_stack_read_range(Node, Address, i64, i64);
+    incoming_stack_read_range(addr, func_start, range_start, range_end) <--
+        stack_read_site(addr),
+        incoming_stack_slot(addr, func_start, base, disp, _),
+        direct_stack_operand(addr, seen_base, seen_disp, mem_size),
+        if *seen_base == *base && *seen_disp == *disp && *mem_size > 0,
+        sp_based_mem_at(addr, func_start, proven_base, base_ofs),
+        if *proven_base == *base,
+        let range_start = *base_ofs + *disp,
+        let range_end = range_start + *mem_size as i64;
+
+    // May-reaching instruction predecessors are deliberately conservative:
+    // any executable path carrying a partially overlapping write makes
+    // pristine ABI parameter recovery unsound.
+    #[local] relation stack_cfg_step(Node, Node);
+    stack_cfg_step(src, dst) <--
+        next(src, dst),
+        code_in_block(src, block),
+        code_in_block(dst, block);
+    stack_cfg_step(src, dst) <--
+        ddisasm_cfg_edge(src, dst, edge_type),
+        if *edge_type != "call" && *edge_type != "indirect" && *edge_type != "indirect_call";
+
+    #[local] relation stack_read_predecessor(Node, Address, Node);
+    stack_read_predecessor(read_addr, func_start, pred) <--
+        incoming_stack_read_range(read_addr, func_start, _, _),
+        stack_cfg_step(pred, read_addr),
+        instr_in_function(pred, func_start);
+    stack_read_predecessor(read_addr, func_start, pred) <--
+        stack_read_predecessor(read_addr, func_start, cur),
+        stack_cfg_step(pred, cur),
+        instr_in_function(pred, func_start);
+
+    relation stack_param_partial_write(Node, Node);
+    stack_param_partial_write(read_addr, write_addr) <--
+        incoming_stack_read_range(read_addr, func_start, read_start, read_end),
+        stack_read_predecessor(read_addr, func_start, write_addr),
+        if *write_addr != *read_addr,
+        normalized_stack_write_range(write_addr, func_start, _, _, write_start, write_end),
+        if *write_start < *read_end && *read_start < *write_end,
+        // A same-start write that covers the complete read is already modeled
+        // by stack_def_used. Everything else is an unmodeled partial overlap.
+        if *write_start != *read_start || *write_end < *read_end;
+
+    unsupported_stack_address(*func_start, *read_addr, "unsupported-stack-address") <--
+        incoming_stack_read_range(read_addr, func_start, _, _),
+        stack_param_partial_write(read_addr, _);
 
     stack_param_access(addr, func_start, *disp, *ordinal) <--
         incoming_stack_slot(addr, func_start, base, disp, ordinal),
@@ -6531,25 +8152,58 @@ ascent_par! {
         if *ofs == *disp,
         for arg in args.iter(),
         if *arg == *base,
-        !stack_def_used(_, _, _, addr, _, disp);
+        !stack_def_used(_, _, _, addr, _, disp),
+        !stack_param_partial_write(addr, _);
 
     stack_param_access(addr, func_start, *disp, *ordinal) <--
         incoming_stack_slot(addr, func_start, base, disp, ordinal),
         arith_load_op(addr, _, _, op_base, ofs, _),
         if *op_base == *base && *ofs == *disp,
-        !stack_def_used(_, _, _, addr, _, disp);
+        !stack_def_used(_, _, _, addr, _, disp),
+        !stack_param_partial_write(addr, _);
 
     stack_param_access(addr, func_start, *disp, *ordinal) <--
         incoming_stack_slot(addr, func_start, base, disp, ordinal),
         float_arith_stack_op(addr, _, op_base, ofs, _),
         if *op_base == *base && *ofs == *disp,
-        !stack_def_used(_, _, _, addr, _, disp);
+        !stack_def_used(_, _, _, addr, _, disp),
+        !stack_param_partial_write(addr, _);
 
     stack_param_access(addr, func_start, *disp, *ordinal) <--
         incoming_stack_slot(addr, func_start, base, disp, ordinal),
         stack_unary_load_op(addr, _, op_base, ofs, _),
         if *op_base == *base && *ofs == *disp,
-        !stack_def_used(_, _, _, addr, _, disp);
+        !stack_def_used(_, _, _, addr, _, disp),
+        !stack_param_partial_write(addr, _);
+
+    // A memory-destination RMW is also a read of the incoming parameter when
+    // no earlier stack definition reaches it. Its lowering seeds a mutable
+    // local from this ABI-positioned parameter before applying the update.
+    stack_param_access(addr, func_start, *disp, *ordinal) <--
+        arith_store_reg_uses_stack_param(addr, func_start, disp, ordinal);
+    stack_param_access(addr, func_start, *disp, *ordinal) <--
+        arith_store_imm_uses_stack_param(addr, func_start, disp, ordinal);
+
+    #[local] relation stack_param_update_chunk(Address, usize, MemoryChunk);
+    stack_param_update_chunk(func_start, *ordinal, *chunk) <--
+        arith_store_reg_uses_stack_param(addr, func_start, _, ordinal),
+        arith_store_reg(addr, _, chunk, _, _, _);
+    stack_param_update_chunk(func_start, *ordinal, *chunk) <--
+        arith_store_imm_uses_stack_param(addr, func_start, _, ordinal),
+        arith_store_imm(addr, _, chunk, _, _);
+
+    emit_function_param_type_candidate(func_start, param_reg, xt) <--
+        stack_param_update_chunk(func_start, ordinal, chunk),
+        let param_reg = fresh_stack_param_reg(*func_start, *ordinal),
+        let xt = match chunk {
+            MemoryChunk::MInt32 => XType::Xint,
+            MemoryChunk::MInt64 => XType::Xlong,
+            MemoryChunk::MFloat64 => XType::Xfloat,
+            MemoryChunk::MFloat32 => XType::Xsingle,
+            MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned
+            | MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => XType::Xint,
+            _ => XType::Xany64,
+        };
 
     // Sign/zero-extending stack-arg loads bypass Lload, so the capstone operand
     // pins width and signedness. Plain MOV is included only for Win64, where
@@ -6564,9 +8218,10 @@ ascent_par! {
         op_indirect(src, _, base_str, idx_str, _, disp, msize),
         if *disp == *ofs,
         if *idx_str == "NONE" || idx_str.is_empty(),
-        if Mreg::x86(*base_str) == Mreg::SP,
+        if *base_str == "RSP",
         incoming_stack_slot(addr, func_start, Mreg::SP, disp, ordinal),
         !stack_def_used(_, _, _, addr, _, disp),
+        !stack_param_partial_write(addr, _),
         if let Some(mc) = extending_load_chunk(mnem, *msize);
 
     // A normal Win64 stack argument is read with plain MOV, not an extending load; entry-anchored offsets distinguish it from a local, and the reaching stack-def veto excludes an overwritten slot.
@@ -6579,9 +8234,10 @@ ascent_par! {
         op_indirect(src, _, base_str, idx_str, _, disp, _),
         if *disp == *ofs,
         if *idx_str == "NONE" || idx_str.is_empty(),
-        if Mreg::x86(*base_str) == Mreg::SP,
+        if *base_str == "RSP",
         incoming_stack_slot(addr, func_start, Mreg::SP, disp, ordinal),
         !stack_def_used(_, _, _, addr, _, disp),
+        !stack_param_partial_write(addr, _),
         let mc = typ_to_chunk(*typ);
 
     stack_param_load(addr, *func_start, *disp, *ordinal, mc) <--
@@ -6593,12 +8249,14 @@ ascent_par! {
         op_indirect(src, _, base_str, idx_str, _, disp, _),
         if *disp == *ofs,
         if *idx_str == "NONE" || idx_str.is_empty(),
-        if Mreg::x86(*base_str) == Mreg::BP,
+        if *base_str == "RBP",
         incoming_stack_slot(addr, func_start, Mreg::BP, disp, ordinal),
         !stack_def_used(_, _, _, addr, _, disp),
+        !stack_param_partial_write(addr, _),
         let mc = typ_to_chunk(*typ);
 
-    // BP-relative (framed): args at BP+16+; func_sets_frame_pointer is EXPLICIT so the rule cannot silently widen if lifting conditions change (frameless RBP is a callee-saved scratch, not a frame pointer).
+    // BP-relative extending load: incoming_stack_slot carries the explicit
+    // use-specific frame-pointer proof (frameless RBP remains ordinary data).
     stack_param_load(addr, *func_start, *disp, *ordinal, mc) <--
         instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lgetstack(_, ofs, _, _)),
@@ -6606,9 +8264,10 @@ ascent_par! {
         op_indirect(src, _, base_str, idx_str, _, disp, msize),
         if *disp == *ofs,
         if *idx_str == "NONE" || idx_str.is_empty(),
-        if Mreg::x86(*base_str) == Mreg::BP,
+        if *base_str == "RBP",
         incoming_stack_slot(addr, func_start, Mreg::BP, disp, ordinal),
         !stack_def_used(_, _, _, addr, _, disp),
+        !stack_param_partial_write(addr, _),
         if let Some(mc) = extending_load_chunk(mnem, *msize);
 
     stack_param_access(addr, func_start, *disp, *ordinal) <--
@@ -6635,7 +8294,7 @@ ascent_par! {
     emit_function_stack_param_count(func_start, count) <--
         stack_param_ordinal(func_start, _),
         agg max_ordinal = ascent::aggregators::max(ordinal) in stack_param_ordinal(func_start, ordinal),
-        let count = *max_ordinal + 1;
+        let count = max_ordinal + 1;
 
     emit_function_stack_param_count(func_start, 0) <--
         emit_function(func_start, _, _),
@@ -6748,6 +8407,12 @@ ascent_par! {
         func_arg_reg_used(func_start, Mreg::CX),
         abi_int_arg_position(?&Mreg::CX, pos),
         !cx_used_only_in_shift(func_start);
+    // A proved VS x64 /homeparams store is positive definition-side evidence
+    // even when the source parameter is otherwise unused.  Its highest shared
+    // ABI ordinal also proves all lower source positions exist.
+    func_gp_param_evidence(func_start, pos) <--
+        win64_home_spill_candidate(_, func_start, param_reg, pos),
+        abi_int_arg_position(param_reg, pos);
 
     func_has_param_evidence(func_start, pos) <--
         func_gp_param_evidence(func_start, pos);
@@ -6982,6 +8647,24 @@ ascent_par! {
         func_float_arg_used_undefined(func_start, v),
         xtl_canonical(v, canonical);
 
+    // VS2013 /homeparams is definition-side signature evidence even when the
+    // source never reads the parameter again.  Keeping the proved incoming
+    // register in the prototype lets the same compiler switch reproduce the
+    // otherwise-dead home store; the exact spill width below prevents an R8B
+    // parameter from being widened to a full R8 store.
+    emit_function_param_candidate(func_start, *canonical) <--
+        win64_home_spill_candidate(_, func_start, param_reg, _),
+        reg_xtl(func_start, *param_reg, raw_param),
+        xtl_canonical(raw_param, canonical);
+
+    emit_function_param_type_candidate(func_start, *canonical, xtype) <--
+        win64_home_spill_candidate(_, func_start, param_reg, pos),
+        win64_home_storage_signature(func_start, pos, move_class, width),
+        !win64_home_storage_signature_conflict(func_start, pos),
+        reg_xtl(func_start, *param_reg, raw_param),
+        xtl_canonical(raw_param, canonical),
+        if let Some(xtype) = home_move_xtype(*move_class, *width);
+
     emit_function_param_is_pointer_candidate(func_start, *canonical) <--
         emit_function_param_candidate(func_start, canonical),
         func_arg_used_undefined(func_start, raw_v),
@@ -6990,7 +8673,7 @@ ascent_par! {
         param_inferred_type_is_pointer(func_start, mreg);
 
 
-    relation function_return_point_reg(Address, Node, RTLReg);   
+    relation function_return_point_reg(Address, Node, RTLReg);
 
     // Gated !func_returns_float: a float return has no AX return value, so exclude the AX point entirely or a stale address def is selected as THE return reg and defeats the float candidate.
     function_return_point_reg(func_start, addr, rtl_reg) <--
@@ -7054,6 +8737,20 @@ ascent_par! {
     emit_function_return_type_xtype_candidate(func_start, xtype) <--
         emit_function_return(func_start, ret_rtl),
         emit_var_type_candidate(ret_rtl, xtype);
+
+    // A partial AX zero idiom carries return-width evidence that the generic
+    // Oxor -> integer-constant lowering intentionally loses.  This is the
+    // exact VS2013 BOOLEAN pattern (`xor al,al`) and is
+    // tied to a proved definition reaching RET, not merely to an instruction
+    // somewhere in the function.
+    emit_function_return_type_xtype_candidate(func_start, XType::Xint8unsigned) <--
+        abi_shared_arg_slots(true),
+        instr_in_function(ret_addr, func_start),
+        ltl_inst(ret_addr, ?LTLInst::Lreturn),
+        ax_value_addr(ret_addr, zero_addr),
+        instruction(zero_addr, _, _, "XOR", left, right, _, _, _, _),
+        op_register(left, "AL"),
+        op_register(right, "AL");
 
     // Emit Xlong for every 64-bit/pointer-typed return point, or an early-exit return 0 (Xint, priority 4) outranks a bare Xany64 (3) and truncates a genuine 64-bit return.
     emit_function_return_type_xtype_candidate(func_start, XType::Xlong) <--
@@ -7849,9 +9546,14 @@ pub(crate) const FUNC_ARG_DIST: i64 = 256;
 
 #[inline]
 fn is_shift_or_rotate_op(op: &Operation) -> bool {
-    matches!(op,
-        Operation::Oshl | Operation::Oshr | Operation::Oshru |
-        Operation::Oshll | Operation::Oshrl | Operation::Oshrlu
+    matches!(
+        op,
+        Operation::Oshl
+            | Operation::Oshr
+            | Operation::Oshru
+            | Operation::Oshll
+            | Operation::Oshrl
+            | Operation::Oshrlu
     )
 }
 
@@ -7867,7 +9569,11 @@ fn is_float_mreg(r: &Mreg) -> bool {
 #[inline]
 pub fn infer_signature_from_args(args: &[RTLReg], has_return: bool) -> Signature {
     let sig_args: Vec<XType> = args.iter().map(|_| XType::Xlong).collect();
-    let sig_res = if has_return { XType::Xint } else { XType::Xvoid };
+    let sig_res = if has_return {
+        XType::Xint
+    } else {
+        XType::Xvoid
+    };
     Signature {
         sig_args: Arc::new(sig_args),
         sig_res,
@@ -7880,15 +9586,40 @@ fn mreg_discriminant(reg: Mreg) -> u64 {
     match reg {
         Mreg::Unknown => 33,
         Mreg::X86(x) => match x {
-            X86Mreg::AX => 0, X86Mreg::BX => 1, X86Mreg::CX => 2, X86Mreg::DX => 3,
-            X86Mreg::SI => 4, X86Mreg::DI => 5, X86Mreg::BP => 6,
-            X86Mreg::R8 => 7, X86Mreg::R9 => 8, X86Mreg::R10 => 9, X86Mreg::R11 => 10,
-            X86Mreg::R12 => 11, X86Mreg::R13 => 12, X86Mreg::R14 => 13, X86Mreg::R15 => 14,
-            X86Mreg::X0 => 15, X86Mreg::X1 => 16, X86Mreg::X2 => 17, X86Mreg::X3 => 18,
-            X86Mreg::X4 => 19, X86Mreg::X5 => 20, X86Mreg::X6 => 21, X86Mreg::X7 => 22,
-            X86Mreg::X8 => 23, X86Mreg::X9 => 24, X86Mreg::X10 => 25, X86Mreg::X11 => 26,
-            X86Mreg::X12 => 27, X86Mreg::X13 => 28, X86Mreg::X14 => 29, X86Mreg::X15 => 30,
-            X86Mreg::FP0 => 31, X86Mreg::SP => 32, X86Mreg::Unknown => 33,
+            X86Mreg::AX => 0,
+            X86Mreg::BX => 1,
+            X86Mreg::CX => 2,
+            X86Mreg::DX => 3,
+            X86Mreg::SI => 4,
+            X86Mreg::DI => 5,
+            X86Mreg::BP => 6,
+            X86Mreg::R8 => 7,
+            X86Mreg::R9 => 8,
+            X86Mreg::R10 => 9,
+            X86Mreg::R11 => 10,
+            X86Mreg::R12 => 11,
+            X86Mreg::R13 => 12,
+            X86Mreg::R14 => 13,
+            X86Mreg::R15 => 14,
+            X86Mreg::X0 => 15,
+            X86Mreg::X1 => 16,
+            X86Mreg::X2 => 17,
+            X86Mreg::X3 => 18,
+            X86Mreg::X4 => 19,
+            X86Mreg::X5 => 20,
+            X86Mreg::X6 => 21,
+            X86Mreg::X7 => 22,
+            X86Mreg::X8 => 23,
+            X86Mreg::X9 => 24,
+            X86Mreg::X10 => 25,
+            X86Mreg::X11 => 26,
+            X86Mreg::X12 => 27,
+            X86Mreg::X13 => 28,
+            X86Mreg::X14 => 29,
+            X86Mreg::X15 => 30,
+            X86Mreg::FP0 => 31,
+            X86Mreg::SP => 32,
+            X86Mreg::Unknown => 33,
         },
         Mreg::A64(a) => 34 + a.index(),
     }
@@ -7914,13 +9645,56 @@ pub fn build_call_args<'a>(
 pub fn build_cmp_addrmode(base_str: &str, idx_str: &str, scale: i64, disp: i64) -> Addrmode {
     let has_base = base_str != "NONE" && !base_str.is_empty();
     let has_idx = idx_str != "NONE" && !idx_str.is_empty();
-    let base = if has_base { Some(Ireg::from(base_str)) } else { None };
-    let index = if has_idx { Some((Ireg::from(idx_str), scale)) } else { None };
+    let base = if has_base {
+        Some(Ireg::from(base_str))
+    } else {
+        None
+    };
+    let index = if has_idx {
+        Some((Ireg::from(idx_str), scale))
+    } else {
+        None
+    };
     Addrmode {
         base,
         index,
         disp: Displacement::from(disp),
     }
+}
+
+/// Translate a CMP operand already classified as generic pointer memory.
+///
+/// CompCert's ordinary reverse translator intentionally maps scalar RBP/RSP
+/// address modes to `Ainstack` with no register arguments.  That is correct
+/// only after a use-specific frame proof.  On the generic CMP route those
+/// same architectural registers are scratch pointers, so retaining the
+/// `Ainstack` shortcut would leave the cross-node JCC/SETcc consumer reading a
+/// temporary for which no pointer-based root load can be formed.  Addr32 keeps
+/// using the shared sized translator because its explicit zero-extension is
+/// part of the address semantics.
+pub fn transl_generic_cmp_addressing_rev_sized(
+    base_str: &str,
+    idx_str: &str,
+    scale: i64,
+    disp: i64,
+    address_size: u8,
+) -> Result<(Addressing, Vec<Mreg>), String> {
+    let has_index = idx_str != "NONE" && !idx_str.is_empty();
+    if address_size != 4
+        && !has_index
+        && matches!(base_str, "RBP" | "RSP")
+    {
+        return Ok((
+            Addressing::Aindexed(disp),
+            vec![Mreg::x86(base_str)],
+        ));
+    }
+
+    transl_addressing_rev_sized(
+        build_cmp_addrmode(base_str, idx_str, scale, disp),
+        None,
+        address_size,
+    )
 }
 
 // Width of the machine-register field in fresh_xtl_reg: 7, not 6, since AArch64 pushes the id range to 98; query.rs::is_fabricated_operand decodes it and must use the same width.
@@ -7935,27 +9709,42 @@ pub(crate) fn fresh_xtl_reg(node: Node, reg: Mreg) -> RTLReg {
 // SETcc mnemonic -> the TestCond it materializes as a 0/1 boolean, used by the CMP+SETcc memory-operand Ocmp fusion to recover the dropped boolean.
 pub(crate) fn setcc_mnem_testcond(mnem: &str) -> Option<TestCond> {
     Some(match mnem {
-        "SETE" | "SETZ"   => TestCond::CondE,
+        "SETE" | "SETZ" => TestCond::CondE,
         "SETNE" | "SETNZ" => TestCond::CondNe,
-        "SETL"            => TestCond::CondL,
-        "SETLE"           => TestCond::CondLe,
-        "SETG"            => TestCond::CondG,
-        "SETGE"           => TestCond::CondGe,
-        "SETB" | "SETC"   => TestCond::CondB,
-        "SETBE"           => TestCond::CondBe,
-        "SETA"            => TestCond::CondA,
+        "SETL" => TestCond::CondL,
+        "SETLE" => TestCond::CondLe,
+        "SETG" => TestCond::CondG,
+        "SETGE" => TestCond::CondGe,
+        "SETB" | "SETC" => TestCond::CondB,
+        "SETBE" => TestCond::CondBe,
+        "SETA" => TestCond::CondA,
         "SETAE" | "SETNC" => TestCond::CondAe,
         _ => return None,
     })
 }
 
-pub(crate) const FRESH_NS_STACK_SRC: u64 = 1 << 54;
-pub(crate) const FRESH_NS_REG_DST: u64   = 1 << 55;
-pub(crate) const FRESH_NS_SP_BASE: u64   = 1 << 56;
+pub(crate) const FRESH_NS_REG_DST: u64 = 1 << 55;
+pub(crate) const FRESH_NS_SP_BASE: u64 = 1 << 56;
 pub(crate) const FRESH_NS_STACK_PARAM: u64 = 1 << 57;
+pub(crate) const FRESH_NS_HOME_SLOT: u64 = 1 << 58;
+
+// Stack cells share the fresh-register node encoding so ownership and
+// statement-order consumers can still recover their originating node, but use
+// a reserved low tag rather than masquerading as a real BP value.  All real
+// x86/AArch64 mreg discriminants are <= 98, leaving 127 collision-free.
+const STACK_CELL_DISCRIMINANT: u64 = MREG_DISCRIMINANT_MASK;
+
+pub(crate) fn fresh_stack_cell_reg(node: Node) -> RTLReg {
+    (1u64 << 63) | (node << MREG_DISCRIMINANT_BITS) | STACK_CELL_DISCRIMINANT
+}
 
 pub(crate) fn fresh_stack_param_reg(func_addr: Node, stack_idx: usize) -> RTLReg {
     (1u64 << 63) | FRESH_NS_STACK_PARAM | (func_addr << 6) | ((stack_idx as u64) & 0x3F)
+}
+
+pub(crate) fn fresh_home_slot_reg(func_addr: Node, home_pos: usize) -> RTLReg {
+    debug_assert!(home_pos < 4);
+    (1u64 << 63) | FRESH_NS_HOME_SLOT | (func_addr << 2) | ((home_pos as u64) & 0x3)
 }
 
 pub fn convert_builtin_arg(
@@ -7964,9 +9753,12 @@ pub fn convert_builtin_arg(
     reg_rtl_map: &HashMap<(Node, Mreg), RTLReg>,
 ) -> BuiltinArg<RTLReg> {
     match arg {
-        BuiltinArg::BA(mreg) => {
-            BuiltinArg::BA(reg_rtl_map.get(&(node, *mreg)).copied().unwrap_or(DEFAULT_VAR as u64))
-        }
+        BuiltinArg::BA(mreg) => BuiltinArg::BA(
+            reg_rtl_map
+                .get(&(node, *mreg))
+                .copied()
+                .unwrap_or(DEFAULT_VAR as u64),
+        ),
         BuiltinArg::BAInt(z) => BuiltinArg::BAInt(*z),
         BuiltinArg::BALong(z) => BuiltinArg::BALong(*z),
         BuiltinArg::BAFloat(f) => BuiltinArg::BAFloat(*f),
@@ -8014,7 +9806,11 @@ pub fn collect_builtin_reg_pairs<'a>(
     for (m, r) in inp {
         groups
             .entry(*m)
-            .and_modify(|cur| if *r < *cur { *cur = *r; })
+            .and_modify(|cur| {
+                if *r < *cur {
+                    *cur = *r;
+                }
+            })
             .or_insert(*r);
     }
     let mut pairs: Vec<(Mreg, RTLReg)> = groups.into_iter().collect();
@@ -8086,7 +9882,6 @@ pub(crate) fn extract_builtin_arg_regs(arg: &BuiltinArg<Mreg>) -> Vec<Mreg> {
     }
 }
 
-
 pub fn is_rip(reg: &str) -> bool {
     reg.to_uppercase().ends_with("IP")
 }
@@ -8103,27 +9898,32 @@ pub fn typ_to_chunk(typ: Typ) -> MemoryChunk {
     }
 }
 
-
 #[inline]
 pub fn is_null_comparison_cond(cond: &Condition) -> bool {
-    matches!(cond,
-        Condition::Ccompimm(Comparison::Ceq, 0) | Condition::Ccompuimm(Comparison::Ceq, 0) |
-        Condition::Ccompimm(Comparison::Cne, 0) | Condition::Ccompuimm(Comparison::Cne, 0) |
-        Condition::Ccomplimm(Comparison::Ceq, 0) | Condition::Ccompluimm(Comparison::Ceq, 0) |
-        Condition::Ccomplimm(Comparison::Cne, 0) | Condition::Ccompluimm(Comparison::Cne, 0)
+    matches!(
+        cond,
+        Condition::Ccompimm(Comparison::Ceq, 0)
+            | Condition::Ccompuimm(Comparison::Ceq, 0)
+            | Condition::Ccompimm(Comparison::Cne, 0)
+            | Condition::Ccompuimm(Comparison::Cne, 0)
+            | Condition::Ccomplimm(Comparison::Ceq, 0)
+            | Condition::Ccompluimm(Comparison::Ceq, 0)
+            | Condition::Ccomplimm(Comparison::Cne, 0)
+            | Condition::Ccompluimm(Comparison::Cne, 0)
     )
 }
 
 pub fn is_null_comparison_op(op: &Operation) -> bool {
-    matches!(op,
-        Operation::Ocmp(Condition::Ccompimm(Comparison::Ceq, 0)) |
-        Operation::Ocmp(Condition::Ccompuimm(Comparison::Ceq, 0)) |
-        Operation::Ocmp(Condition::Ccompimm(Comparison::Cne, 0)) |
-        Operation::Ocmp(Condition::Ccompuimm(Comparison::Cne, 0)) |
-        Operation::Ocmp(Condition::Ccomplimm(Comparison::Ceq, 0)) |
-        Operation::Ocmp(Condition::Ccompluimm(Comparison::Ceq, 0)) |
-        Operation::Ocmp(Condition::Ccomplimm(Comparison::Cne, 0)) |
-        Operation::Ocmp(Condition::Ccompluimm(Comparison::Cne, 0))
+    matches!(
+        op,
+        Operation::Ocmp(Condition::Ccompimm(Comparison::Ceq, 0))
+            | Operation::Ocmp(Condition::Ccompuimm(Comparison::Ceq, 0))
+            | Operation::Ocmp(Condition::Ccompimm(Comparison::Cne, 0))
+            | Operation::Ocmp(Condition::Ccompuimm(Comparison::Cne, 0))
+            | Operation::Ocmp(Condition::Ccomplimm(Comparison::Ceq, 0))
+            | Operation::Ocmp(Condition::Ccompluimm(Comparison::Ceq, 0))
+            | Operation::Ocmp(Condition::Ccomplimm(Comparison::Cne, 0))
+            | Operation::Ocmp(Condition::Ccompluimm(Comparison::Cne, 0))
     )
 }
 
@@ -8133,7 +9933,7 @@ pub fn chunk_size_bits(chunk: &MemoryChunk) -> u8 {
         MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => 16,
         MemoryChunk::MInt32 | MemoryChunk::MAny32 | MemoryChunk::MFloat32 => 32,
         MemoryChunk::MInt64 | MemoryChunk::MAny64 | MemoryChunk::MFloat64 => 64,
-        MemoryChunk::Unknown => 64,  
+        MemoryChunk::Unknown => 64,
     }
 }
 
@@ -8157,13 +9957,2024 @@ pub(crate) fn build_xtype_vec<'a>(
     std::iter::once(Arc::new(args))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum UnsafeHomeShape {
+    Store {
+        base: Mreg,
+        raw_ofs: i64,
+        entry_ofs: i64,
+        peer: Mreg,
+        move_class: usize,
+        width: usize,
+    },
+    Load {
+        base: Mreg,
+        raw_ofs: i64,
+        entry_ofs: i64,
+        peer: Mreg,
+        move_class: usize,
+        width: usize,
+    },
+    Lea {
+        base: Mreg,
+        raw_ofs: i64,
+        entry_ofs: i64,
+        peer: Mreg,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnsafeHomeRewrite {
+    Store { source: RTLReg, slot: RTLReg },
+    Load { slot: RTLReg, destination: RTLReg },
+    Lea { entry_ofs: i64, destination: RTLReg },
+}
+
+fn home_move_xtype(move_class: usize, width: usize) -> Option<XType> {
+    match (move_class, width) {
+        (0, 1) => Some(XType::Xint8unsigned),
+        (0, 2) => Some(XType::Xint16unsigned),
+        (0, 4) => Some(XType::Xint),
+        (0, 8) => Some(XType::Xany64),
+        (1, 4) => Some(XType::Xsingle),
+        (2, 8) => Some(XType::Xfloat),
+        _ => None,
+    }
+}
+
+// Reassert exact canonical-home backing types after a type-producing pass.
+// These synthetic storage IDs are deliberately not value-web peers: copying a
+// source's narrower/pointer refinement onto the addressable cell changes its
+// width or class and can make final C declarations disagree with the rewritten
+// full-cell loads/stores.
+pub(crate) fn enforce_win64_home_slot_types(db: &mut DecompileDB) {
+    let locked: BTreeMap<RTLReg, XType> = db
+        .rel_iter::<(RTLReg, XType)>("win64_home_slot_type")
+        .map(|(reg, xtype)| (*reg, *xtype))
+        .collect();
+    if locked.is_empty() {
+        return;
+    }
+
+    let mut filtered: BTreeSet<(RTLReg, XType)> = db
+        .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+        .filter(|(reg, xtype)| locked.get(reg).map_or(true, |exact| *exact == *xtype))
+        .copied()
+        .collect();
+    filtered.extend(locked);
+    db.rel_set(
+        "emit_var_type_candidate",
+        filtered.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+}
+
+fn collect_builtin_uses(arg: &BuiltinArg<RTLReg>, used: &mut BTreeSet<RTLReg>) {
+    match arg {
+        BuiltinArg::BA(reg) => {
+            used.insert(*reg);
+        }
+        BuiltinArg::BASplitLong(left, right) | BuiltinArg::BAAddPtr(left, right) => {
+            collect_builtin_uses(left, used);
+            collect_builtin_uses(right, used);
+        }
+        _ => {}
+    }
+}
+
+fn collect_rtl_uses(inst: &RTLInst, used: &mut BTreeSet<RTLReg>) {
+    match inst {
+        RTLInst::Inop | RTLInst::Ibranch(_) => {}
+        RTLInst::Iop(_, args, _) | RTLInst::Iload(_, _, args, _) => {
+            used.extend(args.iter().copied());
+        }
+        RTLInst::Istore(_, _, args, source) => {
+            used.extend(args.iter().copied());
+            used.insert(*source);
+        }
+        RTLInst::Icall(_, callee, args, _, _) | RTLInst::Itailcall(_, callee, args) => {
+            if let Either::Left(reg) = callee {
+                used.insert(*reg);
+            }
+            used.extend(args.iter().copied());
+        }
+        RTLInst::Ibuiltin(_, args, _) => {
+            for arg in args {
+                collect_builtin_uses(arg, used);
+            }
+        }
+        RTLInst::Icond(_, args, _, _) => {
+            used.extend(args.iter().copied());
+        }
+        RTLInst::Ijumptable(reg, _) | RTLInst::Ireturn(reg) => {
+            used.insert(*reg);
+        }
+    }
+}
+
+const SYNTHETIC_NODE_MASK: u64 = (1u64 << 62) | (1u64 << 63);
+
+fn real_instruction_for_node(node: Node, address_sizes: &BTreeMap<Address, u8>) -> Option<Address> {
+    if address_sizes.contains_key(&node) {
+        return Some(node);
+    }
+    let real = node & !SYNTHETIC_NODE_MASK;
+    address_sizes.contains_key(&real).then_some(real)
+}
+
+fn normalize_addr32_addressing(addressing: &Addressing, args: &Args) -> Option<Addressing> {
+    let (inner, already_wrapped) = match addressing {
+        Addressing::Aaddr32(inner) => (inner.as_ref(), true),
+        other => (other, false),
+    };
+    let expected_args = match inner {
+        Addressing::Aindexed(_) | Addressing::Ascaled(_, _) => 1,
+        Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _) => 2,
+        // Stack, symbolic, unknown, and recursively wrapped modes have no
+        // sound 32-bit effective-address interpretation here.
+        Addressing::Aglobal(_, _)
+        | Addressing::Abased(_, _)
+        | Addressing::Abasedscaled(_, _, _)
+        | Addressing::Ainstack(_)
+        | Addressing::Aaddr32(_)
+        | Addressing::Unknown => return None,
+    };
+    if args.len() != expected_args {
+        return None;
+    }
+    Some(if already_wrapped {
+        addressing.clone()
+    } else {
+        Addressing::Aaddr32(Box::new(addressing.clone()))
+    })
+}
+
+// Final structural guard for every path which can materialize a memory
+// operation without passing through Mach (fused arithmetic/compare, immediate
+// stores, and memory-indirect calls). Synthetic nodes inherit the addr-size of
+// their real instruction only after the cleared address is proven to exist.
+fn normalize_addr32_rtl_outputs(db: &mut DecompileDB) {
+    if db.abi().arch != crate::abi::Arch::X86_64 {
+        return;
+    }
+    let address_sizes: BTreeMap<Address, u8> = db
+        .rel_iter::<(Address, u8)>("instruction_address_size")
+        .copied()
+        .collect();
+    if !address_sizes.values().any(|size| *size == 4) {
+        return;
+    }
+    let mnemonics: BTreeMap<Address, &'static str> = db
+        .rel_iter::<(
+            Address,
+            usize,
+            &'static str,
+            &'static str,
+            Symbol,
+            Symbol,
+            Symbol,
+            Symbol,
+            usize,
+            usize,
+        )>("instruction")
+        .map(|(addr, _, _, mnemonic, _, _, _, _, _, _)| (*addr, *mnemonic))
+        .collect();
+    let indirect_operands: BTreeSet<Symbol> = db
+        .rel_iter::<(
+            Symbol,
+            &'static str,
+            &'static str,
+            &'static str,
+            i64,
+            i64,
+            usize,
+        )>("op_indirect")
+        .map(|(operand, ..)| *operand)
+        .collect();
+    let addr32_memory_reals: BTreeSet<Address> = db
+        .rel_iter::<(
+            Address,
+            usize,
+            &'static str,
+            &'static str,
+            Symbol,
+            Symbol,
+            Symbol,
+            Symbol,
+            usize,
+            usize,
+        )>("instruction")
+        .filter_map(|(addr, _, _, mnemonic, op1, op2, op3, op4, _, _)| {
+            (address_sizes.get(addr) == Some(&4)
+                && *mnemonic != "NOP"
+                && [*op1, *op2, *op3, *op4]
+                    .iter()
+                    .any(|operand| indirect_operands.contains(operand)))
+            .then_some(*addr)
+        })
+        .collect();
+    let mut owners: BTreeMap<Address, BTreeSet<Address>> = BTreeMap::new();
+    for (node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        if let Some(real) = real_instruction_for_node(*node, &address_sizes) {
+            owners.entry(real).or_default().insert(*function);
+        }
+    }
+
+    let mut invalid_reals = BTreeSet::new();
+    let mut handled_reals = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate") {
+        let Some(real) = real_instruction_for_node(*node, &address_sizes) else {
+            candidates.push((*node, inst.clone()));
+            continue;
+        };
+        if address_sizes.get(&real) != Some(&4) {
+            candidates.push((*node, inst.clone()));
+            continue;
+        }
+
+        let mut address_bearing = false;
+        let normalized = match inst {
+            RTLInst::Iload(chunk, addressing, args, destination) => {
+                address_bearing = true;
+                normalize_addr32_addressing(addressing, args).map(|addressing| {
+                    RTLInst::Iload(*chunk, addressing, args.clone(), *destination)
+                })
+            }
+            RTLInst::Istore(chunk, addressing, args, source) => {
+                address_bearing = true;
+                normalize_addr32_addressing(addressing, args)
+                    .map(|addressing| RTLInst::Istore(*chunk, addressing, args.clone(), *source))
+            }
+            RTLInst::Iop(Operation::Olea(addressing), args, destination)
+                if mnemonics.get(&real) == Some(&"LEA") =>
+            {
+                address_bearing = true;
+                normalize_addr32_addressing(addressing, args).map(|addressing| {
+                    RTLInst::Iop(Operation::Olea(addressing), args.clone(), *destination)
+                })
+            }
+            RTLInst::Iop(Operation::Oleal(addressing), args, destination)
+                if mnemonics.get(&real) == Some(&"LEA") =>
+            {
+                address_bearing = true;
+                normalize_addr32_addressing(addressing, args).map(|addressing| {
+                    RTLInst::Iop(Operation::Oleal(addressing), args.clone(), *destination)
+                })
+            }
+            _ => Some(inst.clone()),
+        };
+        if let Some(inst) = normalized {
+            if address_bearing {
+                handled_reals.insert(real);
+            }
+            candidates.push((*node, inst));
+        } else {
+            invalid_reals.insert(real);
+        }
+    }
+    candidates.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
+    candidates.dedup();
+    db.rel_set(
+        "rtl_inst_candidate",
+        candidates.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    let mut indirect_loads = Vec::new();
+    for (node, target, chunk, addressing, args) in
+        db.rel_iter::<(Node, RTLReg, MemoryChunk, Addressing, Args)>("call_through_memory_load")
+    {
+        let Some(real) = real_instruction_for_node(*node, &address_sizes) else {
+            indirect_loads.push((*node, *target, *chunk, addressing.clone(), args.clone()));
+            continue;
+        };
+        if address_sizes.get(&real) != Some(&4) {
+            indirect_loads.push((*node, *target, *chunk, addressing.clone(), args.clone()));
+            continue;
+        }
+        if let Some(addressing) = normalize_addr32_addressing(addressing, args) {
+            handled_reals.insert(real);
+            indirect_loads.push((*node, *target, *chunk, addressing, args.clone()));
+        } else {
+            invalid_reals.insert(real);
+        }
+    }
+    indirect_loads.sort_by_cached_key(|row| format!("{row:?}"));
+    indirect_loads.dedup();
+    db.rel_set(
+        "call_through_memory_load",
+        indirect_loads
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    // A decoded addr32 memory operand must never disappear merely because no
+    // lowering rule recognized its mnemonic. Require one normalized
+    // address-bearing artifact or an already structured unsupported reason.
+    let existing_reasons: BTreeSet<(Address, Address, Symbol)> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .copied()
+        .collect();
+    for real in addr32_memory_reals {
+        if handled_reals.contains(&real) {
+            continue;
+        }
+        let fully_diagnosed = owners.get(&real).is_some_and(|functions| {
+            !functions.is_empty()
+                && functions.iter().all(|function| {
+                    existing_reasons
+                        .iter()
+                        .any(|(owner, access, _)| owner == function && *access == real)
+                })
+        });
+        if !fully_diagnosed {
+            invalid_reals.insert(real);
+        }
+    }
+
+    // RTL is a candidate relation: one decoded instruction can have several
+    // speculative lowerings.  A rejected alternative must not poison the
+    // whole instruction when another address-bearing candidate normalized
+    // successfully.  The final safety filter only needs a structured reason
+    // when no sound addr32 interpretation survived.
+    invalid_reals.retain(|real| !handled_reals.contains(real));
+
+    // Addr32 is an arithmetic address construction, not evidence that either
+    // input register is a native pointer/structure base.
+    let ptr_rows: ascent::boxcar::Vec<(Node, RTLReg)> = db
+        .rel_iter::<(Node, RTLReg)>("op_produces_ptr")
+        .filter(
+            |(node, _)| match real_instruction_for_node(*node, &address_sizes) {
+                Some(real) => {
+                    address_sizes.get(&real) != Some(&4) || mnemonics.get(&real) != Some(&"LEA")
+                }
+                None => true,
+            },
+        )
+        .copied()
+        .collect();
+    db.rel_set("op_produces_ptr", ptr_rows);
+
+    if !invalid_reals.is_empty() {
+        let mut reasons = existing_reasons;
+        for real in invalid_reals {
+            if let Some(functions) = owners.get(&real) {
+                for function in functions {
+                    reasons.insert((*function, real, "unsupported-addr32-address"));
+                }
+            }
+        }
+        db.rel_set(
+            "unsupported_stack_address",
+            reasons.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+    }
+}
+
+// The complete fused witness depends on register/dataflow facts, so negating
+// it inside the generic float-load rules would put call/parameter aggregates
+// in a recursive stratum.  Derive both positive alternatives, then choose the
+// stack-aware three-node form atomically after the fixed point.
+fn indexed_real_reaching_origins(
+    db: &DecompileDB,
+) -> BTreeMap<(Node, Mreg), BTreeSet<Node>> {
+    let abi_liveins: BTreeSet<(Address, Mreg, Address)> = db
+        .rel_iter::<(Address, Mreg, Address)>("abi_livein_reaches_use")
+        .copied()
+        .collect();
+    let mut origins: BTreeMap<(Node, Mreg), BTreeSet<Node>> = BTreeMap::new();
+    for (definition, mreg, usage) in
+        db.rel_iter::<(Address, Mreg, Address)>("reg_def_used")
+    {
+        // ABI pseudo-defs and a site's loop-carried self edge are two-address
+        // inputs, not independent real producers.  Do not infer ABI status
+        // from address equality: function-start can also be a real def.
+        if *definition == *usage
+            || abi_liveins.contains(&(*definition, *mreg, *usage))
+        {
+            continue;
+        }
+        origins
+            .entry((*usage, *mreg))
+            .or_default()
+            .insert(*definition);
+    }
+    origins
+}
+
+fn ambiguous_indexed_reaching_operands(db: &DecompileDB) -> BTreeSet<(Node, Mreg)> {
+    let origins = indexed_real_reaching_origins(db);
+    let dominating: BTreeSet<(Node, Node)> = db
+        .rel_iter::<(Address, Node, Node)>("reg_def_dominates_use")
+        .map(|(_, definition, usage)| (*definition, *usage))
+        .collect();
+    origins
+        .into_iter()
+        .filter_map(|(operand, definitions)| {
+            let ambiguous = definitions.len() > 1
+                || definitions.iter().next().is_some_and(|definition| {
+                    !dominating.contains(&(*definition, operand.0))
+                });
+            ambiguous.then_some(operand)
+        })
+        .collect()
+}
+
+fn final_xtl_canonical_map(db: &DecompileDB) -> BTreeMap<RTLReg, RTLReg> {
+    // xtl_canonical is the regular projection of a decreasing Dual lattice.
+    // Ascent retains every value emitted while that lattice converges, so a
+    // relation consumer can otherwise observe historical representatives as
+    // competing values.  Collapse each original RTL id to its own final
+    // (minimum) representative.  Do not collapse by (node, mreg): that would
+    // erase the original value-web identity.  CFG-join ambiguity is guarded
+    // separately by retained reaching-definition provenance below.
+    let mut final_canonical: BTreeMap<RTLReg, RTLReg> = BTreeMap::new();
+    for (id, canonical) in db.rel_iter::<(RTLReg, RTLReg)>("xtl_canonical") {
+        final_canonical
+            .entry(*id)
+            .and_modify(|current| *current = (*current).min(*canonical))
+            .or_insert(*canonical);
+    }
+    final_canonical
+}
+
+fn canonicalize_indexed_stack_rtl_values(db: &mut DecompileDB) {
+    let final_canonical = final_xtl_canonical_map(db);
+    let rewrite = |value: RTLReg| final_canonical.get(&value).copied().unwrap_or(value);
+
+    let mut reaching: Vec<(Node, Mreg, RTLReg)> = db
+        .rel_iter::<(Node, Mreg, RTLReg)>("reaching_use_rtl")
+        .map(|(node, mreg, value)| (*node, *mreg, rewrite(*value)))
+        .collect();
+    reaching.sort_unstable();
+    reaching.dedup();
+    db.rel_set(
+        "reaching_use_rtl",
+        reaching.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    let mut structural_sites: BTreeSet<Node> = BTreeSet::new();
+    for relation in [
+        "sp_indexed_load",
+        "sp_indexed_store",
+        "bp_indexed_load",
+        "bp_indexed_store",
+    ] {
+        structural_sites.extend(
+            db.rel_iter::<(Node,)>(relation)
+                .map(|(node,)| *node),
+        );
+    }
+    structural_sites.extend(
+        db.rel_iter::<(Node, Operation, MemoryChunk, i64, i64, Mreg, Mreg)>(
+            "sp_indexed_fused_load",
+        )
+        .map(|(node, ..)| *node),
+    );
+    if structural_sites.is_empty() {
+        return;
+    }
+
+    let rewrite_args = |args: &Arc<Vec<RTLReg>>| {
+        Arc::new(args.iter().map(|value| rewrite(*value)).collect::<Vec<_>>())
+    };
+    let mut candidates: Vec<(Node, RTLInst)> = db
+        .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+        .map(|(node, inst)| {
+            let rewritten = if structural_sites.contains(&(*node & !SYNTHETIC_NODE_MASK)) {
+                match inst {
+                    RTLInst::Iop(op, args, destination) => {
+                        RTLInst::Iop(op.clone(), rewrite_args(args), rewrite(*destination))
+                    }
+                    RTLInst::Iload(chunk, addressing, args, destination) => RTLInst::Iload(
+                        *chunk,
+                        addressing.clone(),
+                        rewrite_args(args),
+                        rewrite(*destination),
+                    ),
+                    RTLInst::Istore(chunk, addressing, args, source) => RTLInst::Istore(
+                        *chunk,
+                        addressing.clone(),
+                        rewrite_args(args),
+                        rewrite(*source),
+                    ),
+                    _ => inst.clone(),
+                }
+            } else {
+                inst.clone()
+            };
+            (*node, rewritten)
+        })
+        .collect();
+    candidates.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
+    candidates.dedup();
+    db.rel_set(
+        "rtl_inst_candidate",
+        candidates.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+}
+
+fn select_sp_indexed_fused_lowerings(db: &mut DecompileDB) {
+    let structural_rows: Vec<(Node, Mreg, Mreg)> = db
+        .rel_iter::<(Node, Operation, MemoryChunk, i64, i64, Mreg, Mreg)>(
+            "sp_indexed_fused_load",
+        )
+        .map(|(node, _, _, _, _, index, destination)| (*node, *index, *destination))
+        .collect();
+    let structural_sites: BTreeSet<Node> = structural_rows
+        .iter()
+        .map(|(node, _, _)| *node)
+        .collect();
+    if structural_sites.is_empty() {
+        return;
+    }
+    let final_canonical = final_xtl_canonical_map(db);
+    let fused_temp_for = |real: Node| {
+        let raw = fresh_xtl_reg(real, Mreg::x86("RTEMP"));
+        final_canonical.get(&raw).copied().unwrap_or(raw)
+    };
+    let witnessed_sites: BTreeSet<Node> = db
+        .rel_iter::<(Node,)>("sp_indexed_fused_complete")
+        .map(|(node,)| *node)
+        .collect();
+    let ambiguous_operands = ambiguous_indexed_reaching_operands(db);
+    // Canonical value webs deliberately alias branch definitions at their
+    // join.  Preserve the reaching-definition provenance independently so
+    // final-canonical candidate dedup cannot turn a MAY-join into a unique
+    // lowering.  ABI live-ins and self-loop edges were removed above because
+    // those are inputs to the same two-address web, not competing producers.
+    let ambiguous_reaching_sites: BTreeSet<Node> = structural_rows
+        .iter()
+        .filter_map(|(node, index, destination)| {
+            [*index, *destination]
+                .into_iter()
+                .any(|mreg| ambiguous_operands.contains(&(*node, mreg)))
+                .then_some(*node)
+        })
+        .collect();
+    let decoded_next: BTreeSet<(Node, Node)> = db
+        .rel_iter::<(Node, Node)>("next")
+        .copied()
+        .collect();
+
+    #[derive(Clone, Copy, Default)]
+    struct FusedShapeCounts {
+        expected: [usize; 3],
+        retained: [usize; 3],
+        unexpected_nodes: usize,
+    }
+
+    // Count the candidate set that the selector will actually retain, not
+    // merely the three expected shapes.  Known generic alternatives can add a
+    // root Iload, its exact decoded-fallthrough Ibranch, a synth1 Iop, or a
+    // non-RTEMP synth1 Iload; those are removed below only after the fused
+    // proof succeeds.  Every other extra candidate remains a veto so the
+    // supposedly atomic chain cannot become ambiguous.
+    let mut shape_counts: BTreeMap<Node, FusedShapeCounts> = BTreeMap::new();
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate") {
+        let real = *node & !SYNTHETIC_NODE_MASK;
+        if !structural_sites.contains(&real) {
+            continue;
+        }
+        let counts = shape_counts.entry(real).or_default();
+        let fused_temp = fused_temp_for(real);
+        let (slot, expected, retained) = if *node == real {
+            let exact_fallthrough_branch = matches!(
+                inst,
+                RTLInst::Ibranch(Either::Right(target))
+                    if decoded_next.contains(&(real, *target))
+            );
+            (
+                0,
+                matches!(
+                    inst,
+                    RTLInst::Iop(Operation::Olea(Addressing::Ainstack(_)), _, _)
+                ),
+                !matches!(inst, RTLInst::Iload(..)) && !exact_fallthrough_branch,
+            )
+        } else if *node == (real | (1u64 << 62)) {
+            (
+                1,
+                matches!(inst, RTLInst::Iload(_, _, _, destination)
+                    if *destination == fused_temp),
+                match inst {
+                    RTLInst::Iop(..) => false,
+                    RTLInst::Iload(_, _, _, destination) => *destination == fused_temp,
+                    _ => true,
+                },
+            )
+        } else if *node == (real | (1u64 << 63)) {
+            (
+                2,
+                matches!(inst, RTLInst::Iop(_, args, destination)
+                    if args.len() == 2
+                        && args[0] == *destination
+                        && args[1] == fused_temp),
+                true,
+            )
+        } else {
+            counts.unexpected_nodes += 1;
+            continue;
+        };
+        if expected {
+            counts.expected[slot] += 1;
+        }
+        if retained {
+            counts.retained[slot] += 1;
+        }
+    }
+    let sites: BTreeSet<Node> = structural_sites
+        .iter()
+        .filter(|site| {
+            let counts = shape_counts.get(site).copied().unwrap_or_default();
+            witnessed_sites.contains(site)
+                && !ambiguous_reaching_sites.contains(site)
+                && counts.expected == [1, 1, 1]
+                && counts.retained == [1, 1, 1]
+                && counts.unexpected_nodes == 0
+        })
+        .copied()
+        .collect();
+    let rejected: BTreeSet<Node> = structural_sites.difference(&sites).copied().collect();
+
+    db.rel_set(
+        "sp_indexed_fused_complete",
+        sites
+            .iter()
+            .copied()
+            .map(|node| (node,))
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    if !rejected.is_empty() {
+        let mut reasons: BTreeSet<(Address, Address, Symbol)> = db
+            .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+            .copied()
+            .collect();
+        for (node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+            if rejected.contains(node) {
+                reasons.insert((*function, *node, "unsupported-stack-address"));
+            }
+        }
+        db.rel_set(
+            "unsupported_stack_address",
+            reasons.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+    }
+    if sites.is_empty() {
+        return;
+    }
+
+    let mut candidates: Vec<(Node, RTLInst)> = db
+        .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+        .filter(|(node, inst)| {
+            let real = *node & !SYNTHETIC_NODE_MASK;
+            if !sites.contains(&real) {
+                return true;
+            }
+            if *node == real {
+                let exact_fallthrough_branch = matches!(
+                    inst,
+                    RTLInst::Ibranch(Either::Right(target))
+                        if decoded_next.contains(&(real, *target))
+                );
+                return !matches!(inst, RTLInst::Iload(..)) && !exact_fallthrough_branch;
+            }
+            if *node == (real | (1u64 << 62)) {
+                let fused_temp = fused_temp_for(real);
+                return match inst {
+                    RTLInst::Iop(..) => false,
+                    RTLInst::Iload(_, _, _, destination) => *destination == fused_temp,
+                    _ => true,
+                };
+            }
+            true
+        })
+        .map(|(node, inst)| (*node, inst.clone()))
+        .collect();
+    candidates.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
+    candidates.dedup();
+    db.rel_set(
+        "rtl_inst_candidate",
+        candidates.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    let mut edges: Vec<(Node, Node)> = db
+        .rel_iter::<(Node, Node)>("rtl_succ_candidate")
+        .filter(|(source, destination)| {
+            let real = *source & !SYNTHETIC_NODE_MASK;
+            !sites.contains(&real)
+                || *source != (real | (1u64 << 62))
+                || *destination == (real | (1u64 << 63))
+        })
+        .copied()
+        .collect();
+    edges.sort_unstable();
+    edges.dedup();
+    db.rel_set(
+        "rtl_succ_candidate",
+        edges.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+}
+
+// Synthetic membership feeds later passes, but keeping it out of the main
+// fixed point prevents the complete-lowering witness from becoming recursive
+// with function/call aggregates through instr_in_function.
+fn materialize_sp_indexed_fused_members(db: &mut DecompileDB) {
+    let mut rows: Vec<(Node, Address)> = db
+        .rel_iter::<(Node, Address)>("instr_in_function")
+        .copied()
+        .collect();
+    rows.extend(
+        db.rel_iter::<(Node, Address)>("sp_indexed_fused_member")
+            .copied(),
+    );
+    rows.sort_unstable();
+    rows.dedup();
+    db.rel_set(
+        "instr_in_function",
+        rows.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+}
+
+fn classify_indexed_stack_lowerings(db: &mut DecompileDB) {
+    // Candidate generation and register dataflow share a positive SCC.  Keep
+    // this completeness decision after its fixed point: driving CFG rules from
+    // a Datalog witness would pull the aggregated call/signature relations
+    // into that SCC.  A valid ordinary indexed expansion has exactly one
+    // candidate at its synthetic memory node, of the expected load/store kind.
+    let mut candidate_counts: BTreeMap<Node, (usize, usize, usize)> = BTreeMap::new();
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate") {
+        let counts = candidate_counts.entry(*node).or_default();
+        counts.0 += 1;
+        match inst {
+            RTLInst::Iload(..) => counts.1 += 1,
+            RTLInst::Istore(..) => counts.2 += 1,
+            _ => {}
+        }
+    }
+
+    // A load whose destination is also an address operand cannot represent a
+    // loop-carried self definition with one ordinary two-node lowering: the
+    // same RTL value would have to be both the pre-load index and post-load
+    // destination.  A literal-entry ABI collision and a loop-carried collision
+    // both appear as def==use here; neither has a distinct pre-load namespace,
+    // so reject both atomically.
+    let self_defs: BTreeSet<(Node, Mreg)> = db
+        .rel_iter::<(Address, Mreg, Address)>("reg_def_used")
+        .filter_map(|(definition, mreg, usage)| {
+            (*definition == *usage).then_some((*definition, *mreg))
+        })
+        .collect();
+    let recursive_load_collisions: BTreeSet<Node> = db
+        .rel_iter::<(Node, Mreg)>("load_overwrites_base")
+        .filter_map(|(node, mreg)| self_defs.contains(&(*node, *mreg)).then_some(*node))
+        .collect();
+
+    let ambiguous_operands = ambiguous_indexed_reaching_operands(db);
+    let ordinary_sites: BTreeSet<Node> = [
+        "sp_indexed_load",
+        "sp_indexed_store",
+        "bp_indexed_load",
+        "bp_indexed_store",
+    ]
+    .into_iter()
+    .flat_map(|relation| db.rel_iter::<(Node,)>(relation).map(|(node,)| *node))
+    .collect();
+    let mut ambiguous_reaching_sites = BTreeSet::new();
+    for (node, inst) in db.rel_iter::<(Node, LTLInst)>("ltl_inst") {
+        if !ordinary_sites.contains(node) {
+            continue;
+        }
+        let operands: Vec<Mreg> = match inst {
+            LTLInst::Lload(_, _, args, _) if args.len() > 1 => vec![args[1]],
+            LTLInst::Lstore(_, _, args, source) if args.len() > 1 => {
+                vec![args[1], *source]
+            }
+            _ => Vec::new(),
+        };
+        if operands
+            .into_iter()
+            .any(|mreg| ambiguous_operands.contains(&(*node, mreg)))
+        {
+            ambiguous_reaching_sites.insert(*node);
+        }
+    }
+
+    let mut incomplete = BTreeSet::new();
+    let accepted_fused: BTreeSet<Node> = db
+        .rel_iter::<(Node,)>("sp_indexed_fused_complete")
+        .map(|(node,)| *node)
+        .collect();
+    for (structural_relation, complete_relation, expect_load) in [
+        ("sp_indexed_load", "sp_indexed_load_complete", true),
+        ("sp_indexed_store", "sp_indexed_store_complete", false),
+        ("bp_indexed_load", "bp_indexed_load_complete", true),
+        ("bp_indexed_store", "bp_indexed_store_complete", false),
+    ] {
+        let structural: BTreeSet<Node> = db
+            .rel_iter::<(Node,)>(structural_relation)
+            .map(|(node,)| *node)
+            .collect();
+        let mut complete = BTreeSet::new();
+        for node in structural {
+            // The fused selector already proved and owns this RMW's complete
+            // three-node chain.  Its overlapping ordinary Lload relation is
+            // neither an independent success nor an ordinary failure.
+            if accepted_fused.contains(&node) {
+                continue;
+            }
+            let synth = node | (1u64 << 62);
+            let (total, loads, stores) = candidate_counts
+                .get(&synth)
+                .copied()
+                .unwrap_or_default();
+            let valid = !(expect_load && recursive_load_collisions.contains(&node))
+                && !ambiguous_reaching_sites.contains(&node)
+                && total == 1
+                && if expect_load {
+                    loads == 1 && stores == 0
+                } else {
+                    stores == 1 && loads == 0
+                };
+            if valid {
+                complete.insert((node,));
+            } else {
+                incomplete.insert(node);
+            }
+        }
+        db.rel_set(
+            complete_relation,
+            complete.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+    }
+    if incomplete.is_empty() {
+        return;
+    }
+
+    let mut diagnostics: BTreeSet<(Address, Address, Symbol)> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .copied()
+        .collect();
+    for (node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        if incomplete.contains(node) {
+            diagnostics.insert((*function, *node, "unsupported-stack-address"));
+        }
+    }
+    db.rel_set(
+        "unsupported_stack_address",
+        diagnostics
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+}
+
+fn unsupported_memory_site_for_node(
+    node: Node,
+    unsupported_sites: &BTreeSet<Address>,
+) -> Option<Address> {
+    if unsupported_sites.contains(&node) {
+        return Some(node);
+    }
+    let real = node & !SYNTHETIC_NODE_MASK;
+    (real != node && unsupported_sites.contains(&real)).then_some(real)
+}
+
+fn is_unsupported_synthetic_node(
+    node: Node,
+    unsupported_sites: &BTreeSet<Address>,
+) -> bool {
+    let real = node & !SYNTHETIC_NODE_MASK;
+    node != real && unsupported_sites.contains(&real)
+}
+
+// `unsupported_stack_address` is the final, structured safety boundary shared
+// by ordinary stack addressing and addr32.  Individual Asm rules deliberately
+// remain useful for proved frame and raw-pointer cases, but several legacy
+// producers bypass those common helpers (plain MOV BP fallbacks, immediate
+// stores, LEA, and fused load/op/store lowering).  Reject the whole decoded
+// instruction atomically: a synthetic arithmetic/store tail is no safer than
+// the rejected load feeding it.  Collapse it to one real-node Inop and bridge
+// the chain's external successors so rejected candidates, stack provenance,
+// memberships, or CFG rewrites cannot escape into later passes.
+fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
+    let unsupported_site_owners: BTreeSet<(Address, Address)> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .map(|(function, access, _)| (*function, *access))
+        .collect();
+    let unsupported_sites: BTreeSet<Address> = unsupported_site_owners
+        .iter()
+        .map(|(_, access)| *access)
+        .collect();
+    if unsupported_sites.is_empty() {
+        return;
+    }
+
+    // Diagnostics may outlive a function-membership row while passes are
+    // being inspected independently.  Such rows still veto unsafe lowering,
+    // but must not mint a phantom replacement instruction or CFG node.
+    let old_members: Vec<(Node, Address)> = db
+        .rel_iter::<(Node, Address)>("instr_in_function")
+        .copied()
+        .collect();
+    let mut node_owners: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for &(node, function) in &old_members {
+        node_owners.entry(node).or_default().insert(function);
+    }
+    let shares_owner = |left: Node, right: Node| {
+        node_owners
+            .get(&left)
+            .zip(node_owners.get(&right))
+            .is_some_and(|(left_owners, right_owners)| !left_owners.is_disjoint(right_owners))
+    };
+
+    // Synthetic membership is not sufficient ownership for minting a real
+    // replacement node.  In a partially inspected DB it may be the only stale
+    // remnant of a rejected chain; require the real instruction's own row.
+    let owned_sites: BTreeSet<Address> = old_members
+        .iter()
+        .filter_map(|(node, _)| unsupported_sites.contains(node).then_some(*node))
+        .collect();
+
+    let old_candidates: Vec<(Node, RTLInst)> = db
+        .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+        .map(|(node, inst)| (*node, inst.clone()))
+        .collect();
+    let old_candidate_nodes: BTreeSet<Node> =
+        old_candidates.iter().map(|(node, _)| *node).collect();
+
+    // A rejected memory CMP owns a temporary consumed at the following JCC
+    // or SETcc node.  Root-only filtering would leave that consumer reading a
+    // now-undefined value.  Authenticate each dependency against the exact
+    // structured diagnostic owner and both nodes' retained membership, then
+    // remove only candidates which actually use that exact temporary.
+    let mut rejected_cmp_dependencies: BTreeMap<Node, BTreeSet<(RTLReg, Address)>> =
+        BTreeMap::new();
+    let mut rejected_cmp_consumers: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    let mut rejected_cmp_consumers_by_root: BTreeMap<Address, BTreeSet<(Node, Address)>> =
+        BTreeMap::new();
+    for (root, consumer, temp, owner) in
+        db.rel_iter::<(Address, Address, RTLReg, Address)>("cmp_memory_temp_consumer")
+    {
+        if unsupported_site_owners.contains(&(*owner, *root))
+            && node_owners
+                .get(root)
+                .is_some_and(|owners| owners.contains(owner))
+            && node_owners
+                .get(consumer)
+                .is_some_and(|owners| owners.contains(owner))
+        {
+            rejected_cmp_dependencies
+                .entry(*consumer)
+                .or_default()
+                .insert((*temp, *owner));
+            rejected_cmp_consumers
+                .entry(*consumer)
+                .or_default()
+                .insert(*owner);
+            rejected_cmp_consumers_by_root
+                .entry(*root)
+                .or_default()
+                .insert((*consumer, *owner));
+        }
+    }
+
+    let mut removed_cmp_iconds: Vec<(Node, Node, Node, BTreeSet<Address>)> = Vec::new();
+    let mut candidates: Vec<(Node, RTLInst)> = old_candidates
+        .iter()
+        .filter_map(|(node, inst)| {
+            if unsupported_memory_site_for_node(*node, &unsupported_sites).is_some() {
+                return None;
+            }
+            let mut uses = BTreeSet::new();
+            collect_rtl_uses(inst, &mut uses);
+            let rejecting_owners: BTreeSet<Address> = rejected_cmp_dependencies
+                .get(node)
+                .into_iter()
+                .flat_map(|dependencies| dependencies.iter())
+                .filter_map(|(temp, owner)| uses.contains(temp).then_some(*owner))
+                .collect();
+            if !rejecting_owners.is_empty() {
+                rejected_cmp_consumers
+                    .entry(*node)
+                    .or_default()
+                    .extend(rejecting_owners.iter().copied());
+                if let RTLInst::Icond(
+                    _,
+                    _,
+                    Either::Right(true_target),
+                    Either::Right(false_target),
+                ) = inst
+                {
+                    removed_cmp_iconds.push((
+                        *node,
+                        *true_target,
+                        *false_target,
+                        rejecting_owners,
+                    ));
+                }
+                None
+            } else {
+                Some((*node, inst.clone()))
+            }
+        })
+        .collect();
+    candidates.extend(
+        owned_sites
+            .iter()
+            .copied()
+            .map(|real| (real, RTLInst::Inop)),
+    );
+    // A JCC/SETcc represented solely by the rejected CMP-dependent candidate
+    // still needs a real CFG anchor.  Insert it before computing surviving
+    // nodes so the root's decoded fallback can reconnect to this consumer.
+    let mut inserted_cmp_consumers: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for (consumer, rejecting_owners) in rejected_cmp_consumers {
+        if node_owners
+            .get(&consumer)
+            .is_some_and(|owners| !owners.is_disjoint(&rejecting_owners))
+            && !candidates.iter().any(|(node, _)| *node == consumer)
+        {
+            candidates.push((consumer, RTLInst::Inop));
+            inserted_cmp_consumers.insert(consumer, rejecting_owners);
+        }
+    }
+    candidates.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
+    candidates.dedup();
+    let surviving_candidate_nodes: BTreeSet<Node> =
+        candidates.iter().map(|(node, _)| *node).collect();
+    let surviving_explicit_branches: BTreeSet<(Node, Node)> = candidates
+        .iter()
+        .filter_map(|(node, inst)| match inst {
+            RTLInst::Ibranch(Either::Right(target)) => Some((*node, *target)),
+            _ => None,
+        })
+        .collect();
+    let mut surviving_control_edges = BTreeSet::new();
+    let mut surviving_control_nodes = BTreeSet::new();
+    for (node, inst) in &candidates {
+        match inst {
+            RTLInst::Icond(
+                _,
+                _,
+                Either::Right(true_target),
+                Either::Right(false_target),
+            ) => {
+                surviving_control_nodes.insert(*node);
+                surviving_control_edges.insert((*node, *true_target));
+                surviving_control_edges.insert((*node, *false_target));
+            }
+            RTLInst::Ibranch(Either::Right(target)) => {
+                surviving_control_nodes.insert(*node);
+                surviving_control_edges.insert((*node, *target));
+            }
+            RTLInst::Ijumptable(_, targets) => {
+                surviving_control_nodes.insert(*node);
+                surviving_control_edges.extend(targets.iter().map(|target| (*node, *target)));
+            }
+            _ => {}
+        }
+    }
+    db.rel_set(
+        "rtl_inst_candidate",
+        candidates.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    let old_edges: Vec<(Node, Node)> = db
+        .rel_iter::<(Node, Node)>("rtl_succ_candidate")
+        .copied()
+        .collect();
+    let raw_next: BTreeSet<(Node, Node)> = db
+        .rel_iter::<(Node, Node)>("rtl_next")
+        .copied()
+        .collect();
+    let raw_control_next: BTreeSet<(Node, Node)> = db
+        .rel_iter::<(Node, Node)>("next")
+        .copied()
+        .collect();
+
+    // Icond edges were materialized before this imperative filter.  Remove a
+    // rejected condition's taken edge unless a surviving control candidate at
+    // the same node explicitly claims it.  Its false edge is decoded
+    // fallthrough and remains valid for an inserted Inop or ordinary survivor;
+    // if another control candidate survives, that candidate owns the complete
+    // successor set instead.
+    let mut stale_cmp_control_edges = BTreeSet::new();
+    let mut safe_cmp_fallthrough_edges = BTreeSet::new();
+    for (consumer, true_target, false_target, rejecting_owners) in removed_cmp_iconds {
+        if !surviving_control_edges.contains(&(consumer, true_target))
+            && true_target != false_target
+        {
+            stale_cmp_control_edges.insert((consumer, true_target));
+        }
+        if surviving_control_nodes.contains(&consumer) {
+            if !surviving_control_edges.contains(&(consumer, false_target)) {
+                stale_cmp_control_edges.insert((consumer, false_target));
+            }
+        } else if node_owners
+            .get(&false_target)
+            .is_some_and(|owners| !owners.is_disjoint(&rejecting_owners))
+            && surviving_candidate_nodes.contains(&false_target)
+        {
+            safe_cmp_fallthrough_edges.insert((consumer, false_target));
+        } else {
+            stale_cmp_control_edges.insert((consumer, false_target));
+        }
+    }
+    // A SETcc may fail to materialize its dependent Ocmp candidate at all.
+    // Provenance still inserts an Inop anchor above; give only that anchor its
+    // exact decoded fallthrough, authenticated against the rejecting owner.
+    for (consumer, rejecting_owners) in &inserted_cmp_consumers {
+        for (_, destination) in raw_control_next
+            .iter()
+            .filter(|(source, _)| source == consumer)
+        {
+            if surviving_candidate_nodes.contains(destination)
+                && node_owners
+                    .get(destination)
+                    .is_some_and(|owners| !owners.is_disjoint(rejecting_owners))
+                && !is_unsupported_synthetic_node(*destination, &unsupported_sites)
+                && !(unsupported_sites.contains(destination)
+                    && !owned_sites.contains(destination))
+            {
+                safe_cmp_fallthrough_edges.insert((*consumer, *destination));
+            }
+        }
+    }
+
+    // Semantic LTL successors are authoritative, including deliberately
+    // interprocedural call/return edges.  Only retain destinations which will
+    // still be real CFG nodes after this rejection pass.
+    let mut replacement_raw_exits: BTreeMap<Address, BTreeSet<Node>> = BTreeMap::new();
+    for &(source, destination) in &raw_next {
+        if !owned_sites.contains(&source)
+            || !surviving_candidate_nodes.contains(&destination)
+            || !node_owners.contains_key(&destination)
+            || is_unsupported_synthetic_node(destination, &unsupported_sites)
+            || (unsupported_sites.contains(&destination)
+                && !owned_sites.contains(&destination))
+        {
+            continue;
+        }
+        // A memory CMP's semantic LTL successor can skip its non-LTL SETcc
+        // node.  Once that SETcc candidate is rejected and replaced with an
+        // Inop, prefer the exact decoded root->consumer path; otherwise the
+        // replacement anchor and its fallthrough are unreachable.
+        if rejected_cmp_consumers_by_root
+            .get(&source)
+            .is_some_and(|consumers| {
+                !consumers.iter().any(|(consumer, owner)| {
+                    *consumer == destination
+                        && node_owners
+                            .get(&destination)
+                            .is_some_and(|owners| owners.contains(owner))
+                })
+            })
+        {
+            continue;
+        }
+        replacement_raw_exits
+            .entry(source)
+            .or_default()
+            .insert(destination);
+    }
+
+    // A generic bridge may name both the one-synth and two-synth forms, and an
+    // intermediate node may have a speculative bypass edge.  Only a real
+    // candidate at the terminal synthetic node can supply a chain exit.
+    let internal_synthetic_sources: BTreeSet<Node> = old_edges
+        .iter()
+        .filter_map(|(source, destination)| {
+            let source_real = *source & !SYNTHETIC_NODE_MASK;
+            let destination_real = *destination & !SYNTHETIC_NODE_MASK;
+            (source_real == destination_real
+                && is_unsupported_synthetic_node(*source, &unsupported_sites)
+                && is_unsupported_synthetic_node(*destination, &unsupported_sites))
+            .then_some(*source)
+        })
+        .collect();
+
+    // Capture only live, same-function synthetic-tail exits.  A root's
+    // semantic rtl_next is authoritative whenever present; using both used to
+    // give the replacement Inop multiple successors after an unsafe chain was
+    // removed.
+    let mut synthetic_tail_exits: BTreeMap<Address, BTreeSet<Node>> = BTreeMap::new();
+    for &(source, destination) in &old_edges {
+        if !is_unsupported_synthetic_node(source, &unsupported_sites) {
+            continue;
+        }
+        let real = source & !SYNTHETIC_NODE_MASK;
+        if owned_sites.contains(&real)
+            && old_candidate_nodes.contains(&source)
+            && !internal_synthetic_sources.contains(&source)
+            && surviving_candidate_nodes.contains(&destination)
+            && shares_owner(real, source)
+            && shares_owner(real, destination)
+            && unsupported_memory_site_for_node(destination, &unsupported_sites) != Some(real)
+            && !is_unsupported_synthetic_node(destination, &unsupported_sites)
+        {
+            synthetic_tail_exits
+                .entry(real)
+                .or_default()
+                .insert(destination);
+        }
+    }
+
+    // If an earlier rewrite redirected pred -> real into pred -> synthetic,
+    // removing the synthetic endpoint must also un-negate the corresponding
+    // raw incoming edge.  This is deliberately exact, not a blanket removal
+    // of unrelated control-flow negations at the predecessor.
+    let mut restore_incoming: BTreeSet<(Node, Node)> = old_edges
+        .iter()
+        .filter_map(|(source, destination)| {
+            if !is_unsupported_synthetic_node(*destination, &unsupported_sites) {
+                return None;
+            }
+            let real = *destination & !SYNTHETIC_NODE_MASK;
+            if !owned_sites.contains(&real)
+                || !surviving_candidate_nodes.contains(source)
+                || !node_owners.contains_key(source)
+                || is_unsupported_synthetic_node(*source, &unsupported_sites)
+                || (unsupported_sites.contains(source) && !owned_sites.contains(source))
+            {
+                return None;
+            }
+            let semantic_edge = raw_next.contains(&(*source, real));
+            let same_function_adjacency = raw_control_next.contains(&(*source, real))
+                && shares_owner(*source, real);
+            (semantic_edge || same_function_adjacency).then_some((*source, real))
+        })
+        .collect();
+    for &(source, real) in &surviving_explicit_branches {
+        if !owned_sites.contains(&real)
+            || !surviving_candidate_nodes.contains(&source)
+            || !raw_control_next.contains(&(source, real))
+            || !shares_owner(source, real)
+        {
+            continue;
+        }
+        let has_other_surviving_exit = old_edges.iter().any(|(edge_source, destination)| {
+            *edge_source == source
+                && *destination != real
+                && !is_unsupported_synthetic_node(*edge_source, &unsupported_sites)
+                && !is_unsupported_synthetic_node(*destination, &unsupported_sites)
+                && !(unsupported_sites.contains(destination)
+                    && !owned_sites.contains(destination))
+                && surviving_candidate_nodes.contains(destination)
+        });
+        if !has_other_surviving_exit {
+            restore_incoming.insert((source, real));
+        }
+    }
+
+    // Instructions lowered only through a synthetic chain have no rtl_next:
+    // that relation intentionally contains LTL-to-LTL edges only.  If the
+    // rejected chain also failed to expose a synthetic tail exit, walk the
+    // same-function decoded byte adjacency to the nearest surviving RTL
+    // candidate and bridge the replacement Inop to it.  This is not a control
+    // flow relation, so it must never walk into an adjacent function; cycles
+    // are nevertheless bounded by `seen` for hand-built test databases.
+    let mut control_fallback_exits: BTreeMap<Address, BTreeSet<Node>> = BTreeMap::new();
+    for &real in &owned_sites {
+        if replacement_raw_exits
+            .get(&real)
+            .is_some_and(|exits| !exits.is_empty())
+            || synthetic_tail_exits
+                .get(&real)
+                .is_some_and(|exits| !exits.is_empty())
+        {
+            continue;
+        }
+        let mut pending: Vec<Node> = raw_control_next
+            .iter()
+            .filter_map(|(source, destination)| (*source == real).then_some(*destination))
+            .collect();
+        let mut seen = BTreeSet::new();
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node) || is_unsupported_synthetic_node(node, &unsupported_sites) {
+                continue;
+            }
+            if !shares_owner(real, node) {
+                continue;
+            }
+            if surviving_candidate_nodes.contains(&node) {
+                control_fallback_exits.entry(real).or_default().insert(node);
+                continue;
+            }
+            pending.extend(
+                raw_control_next
+                    .iter()
+                    .filter_map(|(source, destination)| (*source == node).then_some(*destination)),
+            );
+        }
+    }
+
+    // Finalize negations first.  The Ascent fixed point has already run, so
+    // mutating this relation alone would not re-fire rtl_next -> successor.
+    let mut negated: BTreeSet<(Node, Node)> = db
+        .rel_iter::<(Node, Node)>("rtl_edge_negated")
+        .filter(|(source, destination)| {
+            !is_unsupported_synthetic_node(*source, &unsupported_sites)
+                && !is_unsupported_synthetic_node(*destination, &unsupported_sites)
+        })
+        .copied()
+        .collect();
+    for (&source, destinations) in &replacement_raw_exits {
+        for &destination in destinations {
+            negated.remove(&(source, destination));
+        }
+    }
+    for edge in &restore_incoming {
+        negated.remove(edge);
+    }
+    for edge in &safe_cmp_fallthrough_edges {
+        negated.remove(edge);
+    }
+    for (&real, exits) in &synthetic_tail_exits {
+        if replacement_raw_exits
+            .get(&real)
+            .is_some_and(|raw_exits| !raw_exits.is_empty())
+        {
+            continue;
+        }
+        for &destination in exits {
+            negated.remove(&(real, destination));
+        }
+    }
+    for (&real, exits) in &control_fallback_exits {
+        for &destination in exits {
+            negated.remove(&(real, destination));
+        }
+    }
+    db.rel_set(
+        "rtl_edge_negated",
+        negated
+            .iter()
+            .copied()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    // Preserve non-rejected derived edges, then explicitly replay every safe
+    // raw edge against the final negation set.  Outgoing edges from a rejected
+    // real root are rebuilt below rather than inherited from its old chain.
+    let mut edges: BTreeSet<(Node, Node)> = old_edges
+        .into_iter()
+        .filter(|(source, destination)| {
+            if stale_cmp_control_edges.contains(&(*source, *destination))
+                || unsupported_sites.contains(source)
+                || is_unsupported_synthetic_node(*source, &unsupported_sites)
+                || is_unsupported_synthetic_node(*destination, &unsupported_sites)
+                || (unsupported_sites.contains(destination)
+                    && !owned_sites.contains(destination))
+            {
+                return false;
+            }
+            true
+        })
+        .collect();
+    for &(source, destination) in &raw_next {
+        if stale_cmp_control_edges.contains(&(source, destination))
+            || is_unsupported_synthetic_node(source, &unsupported_sites)
+            || is_unsupported_synthetic_node(destination, &unsupported_sites)
+            || (unsupported_sites.contains(&source) && !owned_sites.contains(&source))
+            || (unsupported_sites.contains(&destination)
+                && !owned_sites.contains(&destination))
+            || (owned_sites.contains(&source)
+                && !replacement_raw_exits
+                    .get(&source)
+                    .is_some_and(|exits| exits.contains(&destination)))
+            || negated.contains(&(source, destination))
+        {
+            continue;
+        }
+        edges.insert((source, destination));
+    }
+    edges.extend(
+        restore_incoming
+            .iter()
+            .copied()
+            .filter(|edge| !stale_cmp_control_edges.contains(edge)),
+    );
+    edges.extend(safe_cmp_fallthrough_edges);
+    for (&real, exits) in &synthetic_tail_exits {
+        if replacement_raw_exits
+            .get(&real)
+            .is_some_and(|raw_exits| !raw_exits.is_empty())
+        {
+            continue;
+        }
+        for &destination in exits {
+            edges.insert((real, destination));
+        }
+    }
+    for (real, exits) in control_fallback_exits {
+        for destination in exits {
+            edges.insert((real, destination));
+        }
+    }
+    db.rel_set(
+        "rtl_succ_candidate",
+        edges.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    let members: ascent::boxcar::Vec<(Node, Address)> = old_members
+        .into_iter()
+        .filter(|(node, _)| {
+            unsupported_memory_site_for_node(*node, &unsupported_sites)
+                .map_or(true, |real| *node == real)
+        })
+        .collect();
+    db.rel_set("instr_in_function", members);
+
+    let fused_members: ascent::boxcar::Vec<(Node, Address)> = db
+        .rel_iter::<(Node, Address)>("sp_indexed_fused_member")
+        .filter(|(node, _)| unsupported_memory_site_for_node(*node, &unsupported_sites).is_none())
+        .copied()
+        .collect();
+    db.rel_set("sp_indexed_fused_member", fused_members);
+
+    let synth_only: ascent::boxcar::Vec<(Node,)> = db
+        .rel_iter::<(Node,)>("synth_only_addr")
+        .filter(|(node,)| unsupported_memory_site_for_node(*node, &unsupported_sites).is_none())
+        .copied()
+        .collect();
+    db.rel_set("synth_only_addr", synth_only);
+
+    let mut indirect_loads: Vec<(Node, RTLReg, MemoryChunk, Addressing, Args)> = db
+        .rel_iter::<(Node, RTLReg, MemoryChunk, Addressing, Args)>("call_through_memory_load")
+        .filter(|(node, ..)| unsupported_memory_site_for_node(*node, &unsupported_sites).is_none())
+        .map(|(node, target, chunk, addressing, args)| {
+            (*node, *target, *chunk, addressing.clone(), args.clone())
+        })
+        .collect();
+    indirect_loads.sort_by_cached_key(|row| format!("{row:?}"));
+    indirect_loads.dedup();
+    db.rel_set(
+        "call_through_memory_load",
+        indirect_loads
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    let ptr_rows: ascent::boxcar::Vec<(Node, RTLReg)> = db
+        .rel_iter::<(Node, RTLReg)>("op_produces_ptr")
+        .filter(|(node, _)| unsupported_memory_site_for_node(*node, &unsupported_sites).is_none())
+        .copied()
+        .collect();
+    db.rel_set("op_produces_ptr", ptr_rows);
+
+    let escaped_origins: ascent::boxcar::Vec<(Address, Node, i64, RTLReg)> = db
+        .rel_iter::<(Address, Node, i64, RTLReg)>("slot_escaped_origin")
+        .filter(|(_, origin, _, _)| {
+            unsupported_memory_site_for_node(*origin, &unsupported_sites).is_none()
+        })
+        .copied()
+        .collect();
+    db.rel_set("slot_escaped_origin", escaped_origins);
+
+    for relation in ["stack_xtl", "stack_var"] {
+        let rows: ascent::boxcar::Vec<(Address, Node, i64, RTLReg)> = db
+            .rel_iter::<(Address, Node, i64, RTLReg)>(relation)
+            .filter(|(_, node, _, _)| {
+                unsupported_memory_site_for_node(*node, &unsupported_sites).is_none()
+            })
+            .copied()
+            .collect();
+        db.rel_set(relation, rows);
+    }
+
+    let normalized_bases: ascent::boxcar::Vec<(Address, Node, RTLReg, i64)> = db
+        .rel_iter::<(Address, Node, RTLReg, i64)>("normalized_stack_lea_base")
+        .filter(|(_, node, _, _)| {
+            unsupported_memory_site_for_node(*node, &unsupported_sites).is_none()
+        })
+        .copied()
+        .collect();
+    db.rel_set("normalized_stack_lea_base", normalized_bases);
+}
+
+// Materialize mutable Win64 home cells after RTLPassProgram reaches its fixed
+// point.  Keeping this selector imperative is intentional: a negated guard on
+// the generic RTL rules would make raw register escape facts recursive with
+// rtl_inst_candidate and the called-address aggregates.  All public relations
+// consumed by later passes are repaired together here, so the selector does
+// not leave the pre-rewrite stack/type/deadness view behind.
+fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
+    type Cell = (Address, usize);
+
+    let seeded_storage: BTreeMap<Cell, RTLReg> = db
+        .rel_iter::<(Address, usize, RTLReg)>("win64_home_storage")
+        .map(|(func, pos, slot)| ((*func, *pos), *slot))
+        .collect();
+    let vetoed: BTreeSet<Cell> = db
+        .rel_iter::<(Address, usize)>("win64_home_canonical_veto")
+        .copied()
+        .collect();
+    let unsafe_accesses: BTreeSet<(Node, Address, Mreg, i64, usize, i64)> = db
+        .rel_iter::<(Node, Address, Mreg, i64, usize, i64)>("win64_unsafe_home_access")
+        .copied()
+        .collect();
+    let spill_nodes: BTreeSet<(Address, usize, Node)> = db
+        .rel_iter::<(Node, Address, Mreg, usize)>("win64_home_spill_candidate")
+        .map(|(node, func, _, pos)| (*func, *pos, *node))
+        .collect();
+
+    let mut overlap_nodes: BTreeMap<Cell, BTreeSet<Node>> = BTreeMap::new();
+    for &(node, func, pos) in db.rel_iter::<(Node, Address, usize)>("win64_home_overlap") {
+        if seeded_storage.contains_key(&(func, pos)) {
+            overlap_nodes.entry((func, pos)).or_default().insert(node);
+        }
+    }
+
+    let mut shapes: BTreeMap<Cell, BTreeMap<Node, BTreeSet<UnsafeHomeShape>>> = BTreeMap::new();
+    for &(node, func, base, raw_ofs, pos, entry_ofs, peer, move_class, width) in
+        db.rel_iter::<(Node, Address, Mreg, i64, usize, i64, Mreg, usize, usize)>(
+            "win64_home_scalar_store",
+        )
+    {
+        shapes
+            .entry((func, pos))
+            .or_default()
+            .entry(node)
+            .or_default()
+            .insert(UnsafeHomeShape::Store {
+                base,
+                raw_ofs,
+                entry_ofs,
+                peer,
+                move_class,
+                width,
+            });
+    }
+    for &(node, func, base, raw_ofs, pos, entry_ofs, peer, move_class, width) in
+        db.rel_iter::<(Node, Address, Mreg, i64, usize, i64, Mreg, usize, usize)>(
+            "win64_home_scalar_load",
+        )
+    {
+        shapes
+            .entry((func, pos))
+            .or_default()
+            .entry(node)
+            .or_default()
+            .insert(UnsafeHomeShape::Load {
+                base,
+                raw_ofs,
+                entry_ofs,
+                peer,
+                move_class,
+                width,
+            });
+    }
+    for &(node, func, base, raw_ofs, pos, entry_ofs, peer) in
+        db.rel_iter::<(Node, Address, Mreg, i64, usize, i64, Mreg)>("win64_home_scalar_lea")
+    {
+        shapes
+            .entry((func, pos))
+            .or_default()
+            .entry(node)
+            .or_default()
+            .insert(UnsafeHomeShape::Lea {
+                base,
+                raw_ofs,
+                entry_ofs,
+                peer,
+            });
+    }
+
+    // RTL candidates and rewrite nodes are node-global, while the home facts
+    // above are function-scoped.  Shared/.cold ownership or two home-cell
+    // interpretations at one node therefore cannot be resolved by blindly
+    // inserting into a BTreeMap<Node, _>: one cell would overwrite another.
+    let mut node_functions: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for (node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        node_functions.entry(*node).or_default().insert(*func);
+    }
+    let mut shape_cells_by_node: BTreeMap<Node, BTreeSet<Cell>> = BTreeMap::new();
+    for (&cell, by_node) in &shapes {
+        for &node in by_node.keys() {
+            shape_cells_by_node.entry(node).or_default().insert(cell);
+        }
+    }
+    let colliding_shape_nodes: BTreeSet<Node> = shape_cells_by_node
+        .into_iter()
+        .filter_map(|(node, cells)| (cells.len() != 1).then_some(node))
+        .collect();
+
+    let mut candidates: Vec<(Node, RTLInst)> = db
+        .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+        .map(|(node, inst)| (*node, inst.clone()))
+        .collect();
+    candidates.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
+    candidates.dedup();
+    let mut candidates_at: BTreeMap<Node, Vec<&RTLInst>> = BTreeMap::new();
+    for (node, inst) in &candidates {
+        candidates_at.entry(*node).or_default().push(inst);
+    }
+    let mut reaching_reads: BTreeMap<(Node, Mreg), BTreeSet<RTLReg>> = BTreeMap::new();
+    for (node, mreg, value) in db.rel_iter::<(Node, Mreg, RTLReg)>("reaching_use_rtl") {
+        reaching_reads
+            .entry((*node, *mreg))
+            .or_default()
+            .insert(*value);
+    }
+
+    let mut storage = BTreeMap::new();
+    let mut rewrites = BTreeMap::new();
+    let mut home_addresses = BTreeSet::new();
+    let mut home_escaped = BTreeSet::new();
+    let mut cell_types = BTreeMap::new();
+
+    for (key @ (func, pos), slot) in seeded_storage {
+        if vetoed.contains(&key) {
+            continue;
+        }
+        let Some(cell_shapes) = shapes.get(&key) else {
+            continue;
+        };
+        let access_nodes: BTreeSet<Node> = unsafe_accesses
+            .iter()
+            .filter_map(|(node, access_func, _, _, access_pos, _)| {
+                (*access_func == func && *access_pos == pos).then_some(*node)
+            })
+            .collect();
+        let shape_nodes: BTreeSet<Node> = cell_shapes.keys().copied().collect();
+        if access_nodes != shape_nodes
+            || overlap_nodes
+                .get(&key)
+                .is_some_and(|nodes| !nodes.is_subset(&shape_nodes))
+            || cell_shapes.values().any(|rows| rows.len() != 1)
+        {
+            continue;
+        }
+
+        let has_storage_reason = cell_shapes.iter().any(|(node, rows)| {
+            match rows.iter().next().expect("one checked home shape") {
+                UnsafeHomeShape::Store { .. } => !spill_nodes.contains(&(func, pos, *node)),
+                UnsafeHomeShape::Lea { .. } => true,
+                UnsafeHomeShape::Load {
+                    raw_ofs, entry_ofs, ..
+                } => raw_ofs != entry_ofs,
+            }
+        });
+        if !has_storage_reason {
+            continue;
+        }
+
+        let mut cell_rewrites = BTreeMap::new();
+        let mut cell_addresses = BTreeSet::new();
+        let mut signature: Option<(usize, usize)> = None;
+        let mut complete = true;
+
+        for (&node, rows) in cell_shapes {
+            let shape = *rows.iter().next().expect("one checked home shape");
+            let node_candidates = candidates_at.get(&node).map(Vec::as_slice).unwrap_or(&[]);
+            match shape {
+                UnsafeHomeShape::Store {
+                    raw_ofs,
+                    peer,
+                    move_class,
+                    width,
+                    ..
+                } => {
+                    if signature.is_some_and(|seen| seen != (move_class, width)) {
+                        complete = false;
+                        break;
+                    }
+                    signature = Some((move_class, width));
+                    let candidate_peers: BTreeSet<RTLReg> = node_candidates
+                        .iter()
+                        .filter_map(|inst| match inst {
+                            RTLInst::Iop(Operation::Omove, args, _) if args.len() == 1 => {
+                                Some(args[0])
+                            }
+                            RTLInst::Istore(_, Addressing::Aindexed(ofs), _, source)
+                            | RTLInst::Istore(_, Addressing::Ainstack(ofs), _, source)
+                                if *ofs == raw_ofs =>
+                            {
+                                Some(*source)
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    // Source registers are reads.  reg_rtl also retains a
+                    // node-local placeholder at some copied-base stores, so
+                    // prefer the unique value proved to reach this use.  If
+                    // reaching evidence is absent or ambiguous, retain the
+                    // candidate-derived set and let the existing uniqueness
+                    // check conservatively reject the rewrite.
+                    let peers = reaching_reads
+                        .get(&(node, peer))
+                        .filter(|values| values.len() == 1)
+                        .unwrap_or(&candidate_peers);
+                    if peers.len() != 1 {
+                        complete = false;
+                        break;
+                    }
+                    let source = *peers.iter().next().unwrap();
+                    cell_rewrites.insert(node, UnsafeHomeRewrite::Store { source, slot });
+                }
+                UnsafeHomeShape::Load {
+                    raw_ofs,
+                    move_class,
+                    width,
+                    ..
+                } => {
+                    if signature.is_some_and(|seen| seen != (move_class, width)) {
+                        complete = false;
+                        break;
+                    }
+                    signature = Some((move_class, width));
+                    let peers: BTreeSet<RTLReg> = node_candidates
+                        .iter()
+                        .filter_map(|inst| match inst {
+                            RTLInst::Iop(Operation::Omove, args, destination)
+                                if args.len() == 1 =>
+                            {
+                                Some(*destination)
+                            }
+                            RTLInst::Iload(_, Addressing::Aindexed(ofs), _, destination)
+                            | RTLInst::Iload(_, Addressing::Ainstack(ofs), _, destination)
+                                if *ofs == raw_ofs =>
+                            {
+                                Some(*destination)
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if peers.len() != 1 {
+                        complete = false;
+                        break;
+                    }
+                    let destination = *peers.iter().next().unwrap();
+                    cell_rewrites.insert(node, UnsafeHomeRewrite::Load { slot, destination });
+                }
+                UnsafeHomeShape::Lea {
+                    raw_ofs, entry_ofs, ..
+                } => {
+                    let peers: BTreeSet<RTLReg> = node_candidates
+                        .iter()
+                        .filter_map(|inst| match inst {
+                            RTLInst::Iop(
+                                Operation::Olea(Addressing::Aindexed(ofs))
+                                | Operation::Olea(Addressing::Ainstack(ofs))
+                                | Operation::Oleal(Addressing::Aindexed(ofs))
+                                | Operation::Oleal(Addressing::Ainstack(ofs)),
+                                _,
+                                destination,
+                            ) if *ofs == raw_ofs => Some(*destination),
+                            _ => None,
+                        })
+                        .collect();
+                    if peers.len() != 1 {
+                        complete = false;
+                        break;
+                    }
+                    let destination = *peers.iter().next().unwrap();
+                    cell_rewrites.insert(
+                        node,
+                        UnsafeHomeRewrite::Lea {
+                            entry_ofs,
+                            destination,
+                        },
+                    );
+                    cell_addresses.insert((node, slot));
+                }
+            }
+        }
+
+        let Some((move_class, width)) = signature else {
+            continue;
+        };
+        let Some(primary_type) = home_move_xtype(move_class, width) else {
+            continue;
+        };
+        if !complete || cell_rewrites.len() != cell_shapes.len() {
+            continue;
+        }
+        if cell_rewrites.keys().any(|node| {
+            colliding_shape_nodes.contains(node)
+                || match node_functions.get(node) {
+                    Some(owners) => owners.len() != 1 || !owners.contains(&func),
+                    None => true,
+                }
+        }) {
+            continue;
+        }
+
+        storage.insert(key, slot);
+        cell_types.insert(slot, primary_type);
+        if !cell_addresses.is_empty() {
+            home_addresses.extend(cell_addresses);
+            home_escaped.insert((func, slot));
+        }
+        rewrites.extend(cell_rewrites);
+    }
+
+    db.rel_set(
+        "win64_home_storage",
+        storage
+            .iter()
+            .map(|((func, pos), slot)| (*func, *pos, *slot))
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "win64_home_address",
+        home_addresses
+            .iter()
+            .copied()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "win64_home_escaped",
+        home_escaped
+            .iter()
+            .copied()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "win64_home_slot_type",
+        cell_types
+            .iter()
+            .map(|(slot, xtype)| (*slot, *xtype))
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    if rewrites.is_empty() {
+        return;
+    }
+
+    let rewritten_nodes: BTreeSet<Node> = rewrites.keys().copied().collect();
+
+    // Remove stale raw evidence owned by rewritten nodes, but never insert a
+    // normalized entry coordinate or the reserved home ID into a raw-offset
+    // relation. This keeps a post-prologue [rsp+raw] local independent.
+    for relation in ["stack_xtl", "stack_var"] {
+        let rows: ascent::boxcar::Vec<(Address, Address, i64, RTLReg)> = db
+            .rel_iter::<(Address, Address, i64, RTLReg)>(relation)
+            .filter(|(_, node, _, _)| !rewritten_nodes.contains(node))
+            .copied()
+            .collect();
+        db.rel_set(relation, rows);
+    }
+
+    let mut stack_chunks = BTreeSet::new();
+    for (node, inst) in db.rel_iter::<(Node, LTLInst)>("ltl_inst") {
+        if rewritten_nodes.contains(node) {
+            continue;
+        }
+        let Some(functions) = node_functions.get(node) else {
+            continue;
+        };
+        let row = match inst {
+            LTLInst::Lload(chunk, Addressing::Ainstack(ofs), _, _)
+            | LTLInst::Lstore(chunk, Addressing::Ainstack(ofs), _, _) => Some((*ofs, *chunk)),
+            LTLInst::Lgetstack(_, ofs, typ, _) | LTLInst::Lsetstack(_, _, ofs, typ) => {
+                Some((*ofs, typ_to_chunk(*typ)))
+            }
+            _ => None,
+        };
+        if let Some((ofs, chunk)) = row {
+            for func in functions {
+                stack_chunks.insert((*func, ofs, chunk));
+            }
+        }
+    }
+    for (node, ofs, _, typ) in db.rel_iter::<(Node, i64, i64, Typ)>("mach_imm_stack_init") {
+        if !rewritten_nodes.contains(node) {
+            if let Some(functions) = node_functions.get(node) {
+                for func in functions {
+                    stack_chunks.insert((*func, *ofs, typ_to_chunk(*typ)));
+                }
+            }
+        }
+    }
+    db.rel_set(
+        "stack_var_chunk",
+        stack_chunks.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    // Rebuild the ordinary escaped-slot aggregate from origin-keyed evidence.
+    // Suppress only a LEA node that was itself rewritten as a canonical home
+    // address; a distinct post-prologue local at the same raw offset remains.
+    let rewritten_address_nodes: BTreeSet<Node> =
+        home_addresses.iter().map(|(node, _)| *node).collect();
+    let mut escaped_by_offset: BTreeMap<(Address, i64), RTLReg> = BTreeMap::new();
+    for (func, origin, ofs, reg) in
+        db.rel_iter::<(Address, Node, i64, RTLReg)>("slot_escaped_origin")
+    {
+        if rewritten_address_nodes.contains(origin) {
+            continue;
+        }
+        escaped_by_offset
+            .entry((*func, *ofs))
+            .and_modify(|current| *current = (*current).min(*reg))
+            .or_insert(*reg);
+    }
+    db.rel_set(
+        "slot_escaped_canonical",
+        escaped_by_offset
+            .into_iter()
+            .map(|((func, ofs), reg)| (func, ofs, reg))
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    // A canonical cell's type is the full supported access signature.  Peer
+    // registers may carry narrower or pointer refinements for unrelated uses;
+    // copying those candidates lets refinement priority silently change the
+    // backing cell's width/class.
+    enforce_win64_home_slot_types(db);
+
+    // candidates_at borrows candidates. The unique peers have already been
+    // proved; selection never chooses an arbitrary minimum RTL ID.
+    drop(candidates_at);
+    let mut selected: Vec<(Node, RTLInst)> = candidates
+        .into_iter()
+        .filter(|(node, _)| !rewritten_nodes.contains(node))
+        .collect();
+    for (node, rewrite) in rewrites {
+        let inst = match rewrite {
+            UnsafeHomeRewrite::Store { source, slot } => {
+                RTLInst::Iop(Operation::Omove, Arc::new(vec![source]), slot)
+            }
+            UnsafeHomeRewrite::Load { slot, destination } => {
+                RTLInst::Iop(Operation::Omove, Arc::new(vec![slot]), destination)
+            }
+            UnsafeHomeRewrite::Lea {
+                entry_ofs,
+                destination,
+            } => RTLInst::Iop(
+                Operation::Oleal(Addressing::Ainstack(entry_ofs)),
+                Arc::new(vec![]),
+                destination,
+            ),
+        };
+        selected.push((node, inst));
+    }
+    selected.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
+    selected.dedup();
+
+    let mut used = BTreeSet::new();
+    let mut call_results = BTreeSet::new();
+    let mut constants = Vec::new();
+    for (_, inst) in &selected {
+        collect_rtl_uses(inst, &mut used);
+        if let RTLInst::Icall(_, _, _, Some(destination), _) = inst {
+            call_results.insert(*destination);
+        }
+        if let RTLInst::Iop(op, args, destination) = inst {
+            if args.is_empty() {
+                if let Some(constant) =
+                    crate::decompile::passes::cminor_pass::constant_from_operation(op)
+                {
+                    constants.push((*destination, constant));
+                }
+            }
+        }
+    }
+    constants.sort_by_cached_key(|(reg, constant)| (*reg, format!("{constant:?}")));
+    constants.dedup();
+    db.rel_set(
+        "dead_def",
+        call_results
+            .into_iter()
+            .filter(|reg| !used.contains(reg))
+            .map(|reg| (reg,))
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "single_def_const",
+        constants.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "rtl_inst_candidate",
+        selected.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+}
+
 pub struct RTLPass;
 
 impl IRPass for RTLPass {
-    fn name(&self) -> &'static str { "rtl" }
+    fn name(&self) -> &'static str {
+        "rtl"
+    }
 
     fn run(&self, db: &mut DecompileDB) {
+        // Public diagnostics are rebuilt from Asm's immutable seed plus any
+        // imperative RTL normalization failures on every run.
+        db.rel_set(
+            "unsupported_stack_address",
+            ascent::boxcar::Vec::<(Address, Address, Symbol)>::new(),
+        );
         run_pass!(db, RTLPassProgram);
+        canonicalize_indexed_stack_rtl_values(db);
+        select_sp_indexed_fused_lowerings(db);
+        materialize_sp_indexed_fused_members(db);
+        normalize_addr32_rtl_outputs(db);
+        classify_indexed_stack_lowerings(db);
+        // Filter before home-cell selection so its peer/type/deadness repair is
+        // computed from the safe candidate set, then reassert the invariant at
+        // the public pass boundary in case a canonical rewrite was produced.
+        suppress_unsupported_address_candidates(db);
+        select_canonical_unsafe_home_rewrites(db);
+        suppress_unsupported_address_candidates(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -8172,5 +11983,534 @@ impl IRPass for RTLPass {
 
     fn outputs(&self) -> &'static [&'static str] {
         RTLPassProgram::rule_outputs()
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    use super::*;
+    use crate::aarch64::mach::A64Mreg;
+
+    fn seed_rejected_site(db: &mut DecompileDB, function: Address, real: Node) {
+        db.rel_push(
+            "unsupported_stack_address",
+            (function, real, "test-unsupported-address"),
+        );
+        db.rel_push("instr_in_function", (real, function));
+        db.rel_push("rtl_inst_candidate", (real, RTLInst::Inop));
+    }
+
+    fn outgoing(db: &DecompileDB, source: Node) -> BTreeSet<Node> {
+        db.rel_iter::<(Node, Node)>("rtl_succ_candidate")
+            .filter_map(|(edge_source, destination)| {
+                (*edge_source == source).then_some(*destination)
+            })
+            .collect()
+    }
+
+    fn candidate_uses(db: &DecompileDB, node: Node, value: RTLReg) -> bool {
+        db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .filter(|(candidate_node, _)| *candidate_node == node)
+            .any(|(_, inst)| {
+                let mut uses = BTreeSet::new();
+                collect_rtl_uses(inst, &mut uses);
+                uses.contains(&value)
+            })
+    }
+
+    #[derive(Clone, Copy)]
+    enum CmpConsumerKind {
+        Jcc,
+        Setcc,
+    }
+
+    fn cmp_consumer_rejection_db(
+        reason: Option<&'static str>,
+        kind: CmpConsumerKind,
+        independent_candidate: bool,
+    ) -> (DecompileDB, Node, Node, Node, Node, RTLReg, RTLInst) {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x7000;
+        let root: Node = 0x7010;
+        let consumer: Node = 0x7020;
+        let fallthrough: Node = 0x7030;
+        let taken: Node = 0x7040;
+        let temp: RTLReg = 0x7050;
+        let independent = RTLInst::Iop(Operation::Ointconst(7), Arc::new(vec![]), 0x7060);
+
+        for node in [root, consumer, fallthrough, taken] {
+            db.rel_push("instr_in_function", (node, function));
+        }
+        if let Some(reason) = reason {
+            db.rel_push("unsupported_stack_address", (function, root, reason));
+        }
+        db.rel_push(
+            "cmp_memory_temp_consumer",
+            (root, consumer, temp, function),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                root,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed(40),
+                    Arc::new(vec![0x7001]),
+                    temp,
+                ),
+            ),
+        );
+        match kind {
+            CmpConsumerKind::Jcc => {
+                db.rel_push(
+                    "rtl_inst_candidate",
+                    (
+                        consumer,
+                        RTLInst::Icond(
+                            Condition::Ccomp(Comparison::Ceq),
+                            Arc::new(vec![temp]),
+                            Either::Right(taken),
+                            Either::Right(fallthrough),
+                        ),
+                    ),
+                );
+                db.rel_push("rtl_succ_candidate", (consumer, taken));
+                db.rel_push("rtl_succ_candidate", (consumer, fallthrough));
+            }
+            CmpConsumerKind::Setcc => {
+                db.rel_push(
+                    "rtl_inst_candidate",
+                    (
+                        consumer,
+                        RTLInst::Iop(
+                            Operation::Ocmp(Condition::Ccomp(Comparison::Ceq)),
+                            Arc::new(vec![temp]),
+                            0x7021,
+                        ),
+                    ),
+                );
+                db.rel_push("rtl_succ_candidate", (consumer, fallthrough));
+                // SETcc has no LTL node, so the semantic stream bypasses it.
+                // Suppression must prefer the exact decoded CMP->SETcc path.
+                db.rel_push("rtl_next", (root, fallthrough));
+                db.rel_push("rtl_succ_candidate", (root, fallthrough));
+            }
+        }
+        if independent_candidate {
+            db.rel_push("rtl_inst_candidate", (consumer, independent.clone()));
+        }
+        db.rel_push("rtl_inst_candidate", (fallthrough, RTLInst::Inop));
+        db.rel_push("rtl_inst_candidate", (taken, RTLInst::Inop));
+        db.rel_push("rtl_succ_candidate", (root, consumer));
+        db.rel_push("next", (root, consumer));
+        db.rel_push("next", (consumer, fallthrough));
+        db.rel_push("rtl_next", (consumer, fallthrough));
+
+        (
+            db,
+            root,
+            consumer,
+            fallthrough,
+            taken,
+            temp,
+            independent,
+        )
+    }
+
+    #[test]
+    fn rejected_rsp_cmp_jcc_removes_cross_node_temp_and_taken_edge() {
+        let (mut db, root, consumer, fallthrough, taken, temp, _) =
+            cmp_consumer_rejection_db(
+                Some("unsupported-stack-address"),
+                CmpConsumerKind::Jcc,
+                false,
+            );
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert!(!candidate_uses(&db, consumer, temp));
+        assert_eq!(outgoing(&db, root), BTreeSet::from([consumer]));
+        assert_eq!(outgoing(&db, consumer), BTreeSet::from([fallthrough]));
+        assert!(!outgoing(&db, consumer).contains(&taken));
+        assert_eq!(
+            db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+                .filter(|(node, _)| *node == consumer)
+                .map(|(_, inst)| inst.clone())
+                .collect::<Vec<_>>(),
+            vec![RTLInst::Inop]
+        );
+    }
+
+    #[test]
+    fn rejected_rsp_cmp_setcc_removes_cross_node_temp_and_keeps_fallthrough() {
+        let (mut db, root, consumer, fallthrough, _, temp, _) = cmp_consumer_rejection_db(
+            Some("unsupported-stack-address"),
+            CmpConsumerKind::Setcc,
+            false,
+        );
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert!(!candidate_uses(&db, consumer, temp));
+        assert_eq!(outgoing(&db, root), BTreeSet::from([consumer]));
+        assert_eq!(outgoing(&db, consumer), BTreeSet::from([fallthrough]));
+    }
+
+    #[test]
+    fn rejected_cmp_provenance_anchors_missing_setcc_candidate() {
+        let (mut db, root, consumer, fallthrough, _, temp, _) = cmp_consumer_rejection_db(
+            Some("unsupported-stack-address"),
+            CmpConsumerKind::Setcc,
+            false,
+        );
+        let candidates: ascent::boxcar::Vec<(Node, RTLInst)> = db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .filter(|(node, _)| *node != consumer)
+            .map(|(node, inst)| (*node, inst.clone()))
+            .collect();
+        db.rel_set("rtl_inst_candidate", candidates);
+        let edges: ascent::boxcar::Vec<(Node, Node)> = db
+            .rel_iter::<(Node, Node)>("rtl_succ_candidate")
+            .filter(|(source, _)| *source != consumer)
+            .copied()
+            .collect();
+        db.rel_set("rtl_succ_candidate", edges);
+        let semantic: ascent::boxcar::Vec<(Node, Node)> = db
+            .rel_iter::<(Node, Node)>("rtl_next")
+            .filter(|(source, _)| *source != consumer)
+            .copied()
+            .collect();
+        db.rel_set("rtl_next", semantic);
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert!(!candidate_uses(&db, consumer, temp));
+        assert!(db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .any(|(node, inst)| *node == consumer && *inst == RTLInst::Inop));
+        assert_eq!(outgoing(&db, root), BTreeSet::from([consumer]));
+        assert_eq!(outgoing(&db, consumer), BTreeSet::from([fallthrough]));
+    }
+
+    #[test]
+    fn rejected_addr32_cmp_jcc_obeys_the_same_cross_node_boundary() {
+        let (mut db, _, consumer, fallthrough, taken, temp, _) =
+            cmp_consumer_rejection_db(
+                Some("unsupported-addr32-address"),
+                CmpConsumerKind::Jcc,
+                false,
+            );
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert!(!candidate_uses(&db, consumer, temp));
+        assert_eq!(outgoing(&db, consumer), BTreeSet::from([fallthrough]));
+        assert!(!outgoing(&db, consumer).contains(&taken));
+    }
+
+    #[test]
+    fn safe_generic_pointer_cmp_keeps_its_cross_node_consumer() {
+        let (mut db, root, consumer, _, taken, temp, _) =
+            cmp_consumer_rejection_db(None, CmpConsumerKind::Jcc, false);
+        // Force the suppression pass to run for an unrelated owner; the safe
+        // CMP must not be swept merely because it has retained provenance.
+        seed_rejected_site(&mut db, 0x8000, 0x8010);
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert!(candidate_uses(&db, consumer, temp));
+        assert!(db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .any(|(node, inst)| *node == root && matches!(inst, RTLInst::Iload(..))));
+        assert!(outgoing(&db, consumer).contains(&taken));
+    }
+
+    #[test]
+    fn mixed_cmp_consumer_retains_only_independent_same_node_candidate() {
+        let (mut db, _, consumer, fallthrough, taken, temp, independent) =
+            cmp_consumer_rejection_db(
+                Some("unsupported-stack-address"),
+                CmpConsumerKind::Jcc,
+                true,
+            );
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert!(!candidate_uses(&db, consumer, temp));
+        let survivors: Vec<_> = db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .filter_map(|(node, inst)| (*node == consumer).then_some(inst.clone()))
+            .collect();
+        assert_eq!(survivors, vec![independent]);
+        assert_eq!(outgoing(&db, consumer), BTreeSet::from([fallthrough]));
+        assert!(!outgoing(&db, consumer).contains(&taken));
+    }
+
+    #[test]
+    fn mixed_cmp_consumer_defers_edges_to_independent_control_candidate() {
+        let (mut db, _, consumer, fallthrough, taken, temp, _) =
+            cmp_consumer_rejection_db(
+                Some("unsupported-stack-address"),
+                CmpConsumerKind::Jcc,
+                false,
+            );
+        let independent = RTLInst::Ibranch(Either::Right(taken));
+        db.rel_push("rtl_inst_candidate", (consumer, independent.clone()));
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert!(!candidate_uses(&db, consumer, temp));
+        assert!(db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .any(|(node, inst)| *node == consumer && *inst == independent));
+        assert_eq!(outgoing(&db, consumer), BTreeSet::from([taken]));
+        assert!(!outgoing(&db, consumer).contains(&fallthrough));
+    }
+
+    #[test]
+    fn rejected_cmp_does_not_bridge_fallthrough_across_owners() {
+        let (mut db, _, consumer, fallthrough, _, temp, _) = cmp_consumer_rejection_db(
+            Some("unsupported-stack-address"),
+            CmpConsumerKind::Jcc,
+            false,
+        );
+        let mut members: Vec<(Node, Address)> = db
+            .rel_iter::<(Node, Address)>("instr_in_function")
+            .filter(|(node, _)| *node != fallthrough)
+            .copied()
+            .collect();
+        members.push((fallthrough, 0x9000));
+        db.rel_set(
+            "instr_in_function",
+            members.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert!(!candidate_uses(&db, consumer, temp));
+        assert!(outgoing(&db, consumer).is_empty());
+    }
+
+    #[test]
+    fn stack_cell_tag_is_disjoint_and_preserves_node_order() {
+        let node = 0x1000;
+        let cell = fresh_stack_cell_reg(node);
+        assert_eq!(cell & MREG_DISCRIMINANT_MASK, STACK_CELL_DISCRIMINANT);
+
+        // The directly constructed AArch64 Unknown is the largest current
+        // machine-register discriminator (normal constructors collapse it to
+        // Mreg::Unknown).  Leave an explicit gap below the reserved cell tag.
+        let max_mreg = mreg_discriminant(Mreg::A64(A64Mreg::Unknown));
+        assert_eq!(max_mreg, 99);
+        assert!(max_mreg < STACK_CELL_DISCRIMINANT);
+
+        for reg in [Mreg::AX, Mreg::BP, Mreg::SP, Mreg::Unknown] {
+            assert_ne!(cell, fresh_xtl_reg(node, reg));
+        }
+        assert!(cell < fresh_xtl_reg(node + 1, Mreg::AX));
+    }
+
+    #[test]
+    fn synthetic_membership_does_not_own_rejected_real() {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x1000;
+        let predecessor: Node = 0x1010;
+        let real: Node = 0x1020;
+        let synthetic = real | (1u64 << 62);
+
+        db.rel_push(
+            "unsupported_stack_address",
+            (function, real, "test-unsupported-address"),
+        );
+        db.rel_push("instr_in_function", (predecessor, function));
+        db.rel_push("instr_in_function", (synthetic, function));
+        db.rel_push("rtl_inst_candidate", (predecessor, RTLInst::Inop));
+        db.rel_push("rtl_inst_candidate", (synthetic, RTLInst::Inop));
+        db.rel_push("rtl_succ_candidate", (predecessor, synthetic));
+        db.rel_push("next", (predecessor, real));
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert!(!db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .any(|(node, _)| (*node & !SYNTHETIC_NODE_MASK) == real));
+        assert!(!db
+            .rel_iter::<(Node, Node)>("rtl_succ_candidate")
+            .any(|(source, destination)| *source == real || *destination == real));
+    }
+
+    #[test]
+    fn dead_synthetic_exit_falls_back_to_live_same_function_candidate() {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x2000;
+        let real: Node = 0x2010;
+        let synthetic = real | (1u64 << 62);
+        let dead: Node = 0x2020;
+        let live: Node = 0x2030;
+
+        seed_rejected_site(&mut db, function, real);
+        for node in [synthetic, dead, live] {
+            db.rel_push("instr_in_function", (node, function));
+        }
+        db.rel_push("rtl_inst_candidate", (synthetic, RTLInst::Inop));
+        db.rel_push("rtl_inst_candidate", (live, RTLInst::Inop));
+        db.rel_push("rtl_succ_candidate", (real, synthetic));
+        db.rel_push("rtl_succ_candidate", (synthetic, dead));
+        db.rel_push("next", (real, dead));
+        db.rel_push("next", (dead, live));
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert_eq!(outgoing(&db, real), BTreeSet::from([live]));
+    }
+
+    #[test]
+    fn intermediate_synthetic_bypass_is_not_a_tail_exit() {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x3000;
+        let real: Node = 0x3010;
+        let synth1 = real | (1u64 << 62);
+        let synth2 = real | (1u64 << 63);
+        let bypass: Node = 0x3020;
+        let true_exit: Node = 0x3030;
+
+        seed_rejected_site(&mut db, function, real);
+        for node in [synth1, synth2, bypass, true_exit] {
+            db.rel_push("instr_in_function", (node, function));
+            db.rel_push("rtl_inst_candidate", (node, RTLInst::Inop));
+        }
+        for edge in [
+            (real, synth1),
+            (synth1, synth2),
+            (synth1, bypass),
+            (synth2, true_exit),
+        ] {
+            db.rel_push("rtl_succ_candidate", edge);
+        }
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert_eq!(outgoing(&db, real), BTreeSet::from([true_exit]));
+    }
+
+    fn cross_function_rejection_db(with_semantic_edge: bool) -> (DecompileDB, Node, Node) {
+        let mut db = DecompileDB::default();
+        let source_function: Address = 0x4000;
+        let destination_function: Address = 0x5000;
+        let real: Node = 0x4010;
+        let synthetic = real | (1u64 << 62);
+        let destination: Node = 0x5010;
+
+        seed_rejected_site(&mut db, source_function, real);
+        db.rel_push("instr_in_function", (synthetic, source_function));
+        db.rel_push(
+            "instr_in_function",
+            (destination, destination_function),
+        );
+        db.rel_push("rtl_inst_candidate", (synthetic, RTLInst::Inop));
+        db.rel_push("rtl_inst_candidate", (destination, RTLInst::Inop));
+        db.rel_push("rtl_succ_candidate", (real, synthetic));
+        db.rel_push("rtl_succ_candidate", (synthetic, destination));
+        db.rel_push("next", (real, destination));
+        if with_semantic_edge {
+            db.rel_push("rtl_next", (real, destination));
+            db.rel_push("rtl_edge_negated", (real, destination));
+        }
+        (db, real, destination)
+    }
+
+    #[test]
+    fn decoded_fallback_does_not_cross_function_boundary() {
+        let (mut db, real, destination) = cross_function_rejection_db(false);
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert!(!outgoing(&db, real).contains(&destination));
+    }
+
+    #[test]
+    fn semantic_rtl_next_may_cross_function_boundary() {
+        let (mut db, real, destination) = cross_function_rejection_db(true);
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert_eq!(outgoing(&db, real), BTreeSet::from([destination]));
+        assert!(!db
+            .rel_iter::<(Node, Node)>("rtl_edge_negated")
+            .any(|edge| *edge == (real, destination)));
+    }
+
+    fn fused_selector_db(extra_node: Node) -> (DecompileDB, Node) {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x6000;
+        let real: Node = 0x6010;
+        let synth1 = real | (1u64 << 62);
+        let synth2 = real | (1u64 << 63);
+
+        db.rel_push(
+            "sp_indexed_fused_load",
+            (
+                real,
+                Operation::Oadd,
+                MemoryChunk::MInt32,
+                4i64,
+                8i64,
+                Mreg::AX,
+                Mreg::CX,
+            ),
+        );
+        db.rel_push("sp_indexed_fused_complete", (real,));
+        db.rel_push("instr_in_function", (real, function));
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                real,
+                RTLInst::Iop(
+                    Operation::Olea(Addressing::Ainstack(8)),
+                    Arc::new(vec![]),
+                    1,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                synth1,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2scaled(4, 0),
+                    Arc::new(vec![1, 2]),
+                    3,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                synth2,
+                RTLInst::Iop(Operation::Oadd, Arc::new(vec![4, 3]), 4),
+            ),
+        );
+        db.rel_push("rtl_inst_candidate", (extra_node, RTLInst::Inop));
+        (db, real)
+    }
+
+    #[test]
+    fn fused_selector_rejects_every_retained_extra_candidate() {
+        let real: Node = 0x6010;
+        for extra_node in [real, real | (1u64 << 62), real | (1u64 << 63)] {
+            let (mut db, site) = fused_selector_db(extra_node);
+
+            select_sp_indexed_fused_lowerings(&mut db);
+
+            assert!(!db
+                .rel_iter::<(Node,)>("sp_indexed_fused_complete")
+                .any(|(node,)| *node == site));
+            assert!(db
+                .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+                .any(|(_, access, reason)| {
+                    *access == site && *reason == "unsupported-stack-address"
+                }));
+        }
     }
 }

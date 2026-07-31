@@ -1,22 +1,30 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use manifold::abi::BinaryFormat;
 use manifold::decompile::analysis::canary_vla_pass::CanaryVlaPass;
 use manifold::decompile::analysis::stack_pass::StackAnalysisPass;
+use manifold::decompile::analysis::type_pass::TypePass;
 use manifold::decompile::elevator::DecompileDB;
 use manifold::decompile::passes::abi_pass::AbiPass;
 use manifold::decompile::passes::asm_pass::AsmPass;
+use manifold::decompile::passes::c_pass::types::{CType, IntSize, Signedness, TopLevelDecl};
 use manifold::decompile::passes::linear_pass::LinearPass;
 use manifold::decompile::passes::mach_pass::MachPass;
 use manifold::decompile::passes::pass::IRPass;
+use manifold::decompile::passes::rtl_optimize_pass::RTLOptimizePass;
 use manifold::decompile::passes::rtl_pass::RTLPass;
 use manifold::mreg::Mreg;
 use manifold::x86::op::{Addressing, Operation};
-use manifold::x86::types::{Address, LTLInst, MachInst, MemoryChunk, RTLInst, Symbol, Typ, XType};
+use manifold::x86::types::{
+    Address, CsharpminorExpr, CsharpminorStmt, LTLInst, MachInst, MemoryChunk, RTLInst, Symbol,
+    RTLReg, Typ, XType,
+};
 
 const SYNTH1: Address = 1u64 << 62;
+const SYNTHETIC_NODE_MASK: Address = (1u64 << 62) | (1u64 << 63);
 
 fn command_exists(name: &str) -> bool {
     Command::new(name)
@@ -26,17 +34,12 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn build_fixture() -> Option<PathBuf> {
-    if !command_exists("clang") {
-        eprintln!("skipping stack/home relation test: clang unavailable");
-        return None;
-    }
-
+fn build_fixture() -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "manifold_stack_home_fixture_{}",
         std::process::id()
     ));
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(&dir).expect("failed to create stack/home fixture directory");
     let source = dir.join("fixture.s");
     let object = dir.join("fixture.obj");
 
@@ -44,7 +47,6 @@ fn build_fixture() -> Option<PathBuf> {
         &source,
         r#"
         .text
-
         .globl sp_indexed_alias_collision
         .def sp_indexed_alias_collision; .scl 2; .type 32; .endef
 sp_indexed_alias_collision:
@@ -53,6 +55,52 @@ sp_indexed_alias_collision:
         movl %ecx, %eax
         movl %eax, 8(%rsp,%rax,4)
         movl 8(%rsp,%rax,4), %eax
+        addq $40, %rsp
+        retq
+
+        .globl sp_indexed_ambiguous_reaching
+        .def sp_indexed_ambiguous_reaching; .scl 2; .type 32; .endef
+sp_indexed_ambiguous_reaching:
+        subq $40, %rsp
+        testl %ecx, %ecx
+        je sp_indexed_ambiguous_reaching_right
+        movl %edx, %eax
+        jmp sp_indexed_ambiguous_reaching_join
+sp_indexed_ambiguous_reaching_right:
+        movl %r8d, %eax
+sp_indexed_ambiguous_reaching_join:
+        movl 8(%rsp,%rax,4), %edx
+        movl %edx, %eax
+        addq $40, %rsp
+        retq
+
+        .globl sp_indexed_fused_ambiguous
+        .def sp_indexed_fused_ambiguous; .scl 2; .type 32; .endef
+sp_indexed_fused_ambiguous:
+        subq $40, %rsp
+        testl %ecx, %ecx
+        je sp_indexed_fused_ambiguous_right
+        movl %edx, %eax
+        jmp sp_indexed_fused_ambiguous_join
+sp_indexed_fused_ambiguous_right:
+        movl %r8d, %eax
+sp_indexed_fused_ambiguous_join:
+        addl 8(%rsp,%rax,4), %r9d
+        movl %r9d, %eax
+        addq $40, %rsp
+        retq
+
+        .globl sp_indexed_fused_partial_def
+        .def sp_indexed_fused_partial_def; .scl 2; .type 32; .endef
+sp_indexed_fused_partial_def:
+        subq $40, %rsp
+        movl %r8d, 8(%rsp)
+        testl %edx, %edx
+        je sp_indexed_fused_partial_def_join
+        movl %r8d, %ecx
+sp_indexed_fused_partial_def_join:
+        addl 8(%rsp,%rcx,4), %r9d
+        movl %r9d, %eax
         addq $40, %rsp
         retq
 
@@ -101,6 +149,108 @@ sp_immediate_rmw:
         addq $32, %rsp
         retq
 
+        .globl sp_indexed_fused_arith
+        .def sp_indexed_fused_arith; .scl 2; .type 32; .endef
+sp_indexed_fused_arith:
+        subq $40, %rsp
+        movl %r8d, 8(%rsp)
+        movl %ecx, %eax
+        addl 8(%rsp,%rdx,4), %eax
+        subl 8(%rsp,%rdx,4), %eax
+        andl 8(%rsp,%rdx,4), %eax
+        orl 8(%rsp,%rdx,4), %eax
+        xorl 8(%rsp,%rdx,4), %eax
+        addq $40, %rsp
+        retq
+
+        .globl sp_indexed_fused_add_collision
+        .def sp_indexed_fused_add_collision; .scl 2; .type 32; .endef
+sp_indexed_fused_add_collision:
+        subq $40, %rsp
+        movl %edx, 8(%rsp)
+        movl %ecx, %eax
+        addl 8(%rsp,%rax,4), %eax
+        addq $40, %rsp
+        retq
+
+        .globl sp_indexed_fused_field
+        .def sp_indexed_fused_field; .scl 2; .type 32; .endef
+sp_indexed_fused_field:
+        subq $40, %rsp
+        movq %r8, 8(%rsp)
+        movl %ecx, %eax
+        addl 12(%rsp,%rdx,8), %eax
+        addq $40, %rsp
+        retq
+
+        .globl sp_indexed_fused_misaligned_field
+        .def sp_indexed_fused_misaligned_field; .scl 2; .type 32; .endef
+sp_indexed_fused_misaligned_field:
+        subq $40, %rsp
+        movq %r9, 0(%rsp)
+        movq %r8, 4(%rsp)
+        movl %ecx, %eax
+        addl 8(%rsp,%rdx,8), %eax
+        addq $40, %rsp
+        retq
+
+        .globl sp_indexed_fused_param_rmw
+        .def sp_indexed_fused_param_rmw; .scl 2; .type 32; .endef
+sp_indexed_fused_param_rmw:
+        subq $40, %rsp
+        movq %rdx, 8(%rsp)
+        addl 8(%rsp,%rcx,4), %ecx
+        movl %ecx, %eax
+        addq $40, %rsp
+        retq
+
+        .globl sp_indexed_fused_entry_collision
+        .def sp_indexed_fused_entry_collision; .scl 2; .type 32; .endef
+sp_indexed_fused_entry_collision:
+        addl 40(%rsp,%rcx,4), %ecx
+        movl %ecx, %eax
+        retq
+
+        .globl sp_indexed_fused_loop_collision
+        .def sp_indexed_fused_loop_collision; .scl 2; .type 32; .endef
+sp_indexed_fused_loop_collision:
+        nop
+.Lsp_indexed_fused_loop_collision:
+        addl 40(%rsp,%rcx,4), %ecx
+        decl %edx
+        jne .Lsp_indexed_fused_loop_collision
+        movl %ecx, %eax
+        retq
+
+        .globl sp_indexed_load_entry_collision
+        .def sp_indexed_load_entry_collision; .scl 2; .type 32; .endef
+sp_indexed_load_entry_collision:
+        movl 40(%rsp,%rcx,4), %ecx
+        movl %ecx, %eax
+        retq
+
+        .globl sp_indexed_load_loop_collision
+        .def sp_indexed_load_loop_collision; .scl 2; .type 32; .endef
+sp_indexed_load_loop_collision:
+        movl %ecx, %eax
+.Lsp_indexed_load_loop_collision:
+        movl 40(%rsp,%rax,4), %eax
+        decl %edx
+        jne .Lsp_indexed_load_loop_collision
+        retq
+
+        .globl sp_indexed_fused_gap
+        .def sp_indexed_fused_gap; .scl 2; .type 32; .endef
+sp_indexed_fused_gap:
+        subq $40, %rsp
+        movq %r8, 8(%rsp)
+        movl %ecx, %eax
+        addl 8(%rsp,%rdx,4), %eax
+        nop
+        subl 8(%rsp,%rdx,4), %eax
+        addq $40, %rsp
+        retq
+
         .globl fifth_imul
         .def fifth_imul; .scl 2; .type 32; .endef
 fifth_imul:
@@ -128,9 +278,514 @@ caller_home_vs_outgoing:
 callee_eighth:
         movl 64(%rsp), %eax
         retq
+
+        .globl home_escape_mutated
+        .def home_escape_mutated; .scl 2; .type 32; .endef
+home_escape_mutated:
+        movq %rcx, 8(%rsp)
+        leaq 8(%rsp), %rcx
+        subq $40, %rsp
+        callq mutate_slot
+        addq $40, %rsp
+        movq 8(%rsp), %rax
+        retq
+
+        .globl mutate_slot
+        .def mutate_slot; .scl 2; .type 32; .endef
+mutate_slot:
+        movq $99, (%rcx)
+        retq
+
+        .globl mutate_slot_plus8
+        .def mutate_slot_plus8; .scl 2; .type 32; .endef
+mutate_slot_plus8:
+        movq $99, 8(%rcx)
+        retq
+
+        .globl home_mixed_base_clobber
+        .def home_mixed_base_clobber; .scl 2; .type 32; .endef
+home_mixed_base_clobber:
+        movq %rsp, %r10
+        movq %rcx, 8(%r10)
+        movq %rdx, 8(%rsp)
+        movq 8(%r10), %rax
+        retq
+
+        .globl home_disjoint_branch
+        .def home_disjoint_branch; .scl 2; .type 32; .endef
+home_disjoint_branch:
+        testl %edx, %edx
+        je 1f
+        movq %rcx, 8(%rsp)
+1:
+        movq 8(%rsp), %rax
+        retq
+
+        .globl home_vs_postsub_indexed
+        .def home_vs_postsub_indexed; .scl 2; .type 32; .endef
+home_vs_postsub_indexed:
+        movq %rcx, 8(%rsp)
+        subq $40, %rsp
+        movl %edx, 8(%rsp)
+        movl %r8d, 8(%rsp,%rdx,4)
+        addq $40, %rsp
+        movq 8(%rsp), %rax
+        retq
+
+        .globl two_sp_depths
+        .def two_sp_depths; .scl 2; .type 32; .endef
+two_sp_depths:
+        subq $32, %rsp
+        movl %edx, 8(%rsp)
+        addq $32, %rsp
+        subq $64, %rsp
+        movl %r8d, 8(%rsp,%rdx,4)
+        addq $64, %rsp
+        retq
+
+        .globl dynamic_sp_unknown
+        .def dynamic_sp_unknown; .scl 2; .type 32; .endef
+dynamic_sp_unknown:
+        subq %rax, %rsp
+        movl 40(%rsp), %eax
+        addq %rax, %rsp
+        retq
+
+        .globl branch_stack_unknown
+        .def branch_stack_unknown; .scl 2; .type 32; .endef
+branch_stack_unknown:
+        testl %ecx, %ecx
+        je 2f
+        subq $16, %rsp
+2:
+        movl 40(%rsp), %eax
+        testl %ecx, %ecx
+        je 3f
+        addq $16, %rsp
+3:
+        retq
+
+        .globl fifth_inc
+        .def fifth_inc; .scl 2; .type 32; .endef
+fifth_inc:
+        addl $1, 40(%rsp)
+        movl 40(%rsp), %eax
+        retq
+
+        .globl fifth_add_reg
+        .def fifth_add_reg; .scl 2; .type 32; .endef
+fifth_add_reg:
+        addl %ecx, 40(%rsp)
+        movl 40(%rsp), %eax
+        retq
+
+        .globl alias_partial_before_fifth_inc
+        .def alias_partial_before_fifth_inc; .scl 2; .type 32; .endef
+alias_partial_before_fifth_inc:
+        movq %rsp, %r10
+        movb $7, 41(%r10)
+        addl $1, 40(%rsp)
+        movl 40(%rsp), %eax
+        retq
+
+        .globl outgoing_reuses_home_coordinate
+        .def outgoing_reuses_home_coordinate; .scl 2; .type 32; .endef
+outgoing_reuses_home_coordinate:
+        subq $40, %rsp
+        movq %rcx, 48(%rsp)
+        callq callee_seventh
+        addq $40, %rsp
+        retq
+
+        .globl callee_seventh
+        .def callee_seventh; .scl 2; .type 32; .endef
+callee_seventh:
+        movq 56(%rsp), %rax
+        retq
+
+        .globl high_stack_offset
+        .def high_stack_offset; .scl 2; .type 32; .endef
+high_stack_offset:
+        movl 552(%rsp), %eax
+        retq
+
+        .globl boundary_stack_offset
+        .def boundary_stack_offset; .scl 2; .type 32; .endef
+boundary_stack_offset:
+        movl 544(%rsp), %eax
+        retq
+
+        .globl bp_fifth
+        .def bp_fifth; .scl 2; .type 32; .endef
+bp_fifth:
+        pushq %rbp
+        movq %rsp, %rbp
+        movl 48(%rbp), %eax
+        popq %rbp
+        retq
+
+        .globl postprologue_fifth
+        .def postprologue_fifth; .scl 2; .type 32; .endef
+postprologue_fifth:
+        subq $40, %rsp
+        movl 80(%rsp), %eax
+        addq $40, %rsp
+        retq
+
+        .globl xmm_home_roundtrip
+        .def xmm_home_roundtrip; .scl 2; .type 32; .endef
+xmm_home_roundtrip:
+        movsd %xmm0, 8(%rsp)
+        movsd 8(%rsp), %xmm0
+        retq
+
+        .globl bp_postalloc_fifth
+        .def bp_postalloc_fifth; .scl 2; .type 32; .endef
+bp_postalloc_fifth:
+        subq $40, %rsp
+        movq %rsp, %rbp
+        movl 80(%rbp), %eax
+        addq $40, %rsp
+        retq
+
+        .globl bp_conditional_pointer
+        .def bp_conditional_pointer; .scl 2; .type 32; .endef
+bp_conditional_pointer:
+        testl %ecx, %ecx
+        je 3f
+        movq %rsp, %rbp
+3:
+        movl %edx, 40(%rbp)
+        movl 40(%rbp), %eax
+        retq
+
+        .globl bp_conditional_indexed_pointer
+        .def bp_conditional_indexed_pointer; .scl 2; .type 32; .endef
+bp_conditional_indexed_pointer:
+        testl %ecx, %ecx
+        je 4f
+        movq %rsp, %rbp
+4:
+        movl 40(%rbp,%rdx,4), %eax
+        retq
+
+        .globl bp_conditional_clobber
+        .def bp_conditional_clobber; .scl 2; .type 32; .endef
+bp_conditional_clobber:
+        movq %rsp, %rbp
+        testl %ecx, %ecx
+        je 5f
+        movq %r8, %rbp
+5:
+        movl 40(%rbp), %eax
+        retq
+
+        .globl bp_conditional_lea
+        .def bp_conditional_lea; .scl 2; .type 32; .endef
+bp_conditional_lea:
+        testl %ecx, %ecx
+        je .Lbp_conditional_lea_join
+        movq %rsp, %rbp
+.Lbp_conditional_lea_join:
+        leaq 40(%rbp), %rax
+        retq
+
+        .globl bp_clobbered_lea
+        .def bp_clobbered_lea; .scl 2; .type 32; .endef
+bp_clobbered_lea:
+        movq %rsp, %rbp
+        testl %ecx, %ecx
+        je .Lbp_clobbered_lea_join
+        movq %r8, %rbp
+.Lbp_clobbered_lea_join:
+        leaq 40(%rbp), %rax
+        retq
+
+        .globl bp_conditional_rmw
+        .def bp_conditional_rmw; .scl 2; .type 32; .endef
+bp_conditional_rmw:
+        testl %ecx, %ecx
+        je .Lbp_conditional_rmw_join
+        movq %rsp, %rbp
+.Lbp_conditional_rmw_join:
+        addl $1, 40(%rbp)
+        movl 40(%rbp), %eax
+        retq
+
+        .globl bp_clobbered_rmw
+        .def bp_clobbered_rmw; .scl 2; .type 32; .endef
+bp_clobbered_rmw:
+        movq %rsp, %rbp
+        testl %ecx, %ecx
+        je .Lbp_clobbered_rmw_join
+        movq %r8, %rbp
+.Lbp_clobbered_rmw_join:
+        subl $1, 40(%rbp)
+        movl 40(%rbp), %eax
+        retq
+
+        .globl narrow_ebp_pointer
+        .def narrow_ebp_pointer; .scl 2; .type 32; .endef
+narrow_ebp_pointer:
+        movq %rsp, %rbp
+        movl 40(%ebp), %eax
+        retq
+
+        .globl narrow_esp_pointer
+        .def narrow_esp_pointer; .scl 2; .type 32; .endef
+narrow_esp_pointer:
+        movl 40(%esp), %eax
+        retq
+
+        .globl narrow_eax_stack_alias
+        .def narrow_eax_stack_alias; .scl 2; .type 32; .endef
+narrow_eax_stack_alias:
+        movq %rsp, %rax
+        movl %edx, 16(%eax)
+        movl 16(%eax), %eax
+        retq
+
+        .globl pop_rsp_unknown
+        .def pop_rsp_unknown; .scl 2; .type 32; .endef
+pop_rsp_unknown:
+        movq %rsp, %r11
+        popq %rsp
+        movl 40(%rsp), %eax
+        movq %r11, %rsp
+        retq
+
+        .globl home_unknown_indexed_bp
+        .def home_unknown_indexed_bp; .scl 2; .type 32; .endef
+home_unknown_indexed_bp:
+        movq %rcx, 8(%rsp)
+        testl %edx, %edx
+        je 6f
+        movq %rsp, %rbp
+6:
+        movq 8(%rbp,%rdx,1), %rax
+        movq 8(%rsp), %rax
+        retq
+
+        .globl home_alias_call_escape
+        .def home_alias_call_escape; .scl 2; .type 32; .endef
+home_alias_call_escape:
+        pushq %r12
+        leaq 8(%rsp), %r12
+        movq %rcx, 8(%r12)
+        leaq 8(%r12), %rcx
+        subq $32, %rsp
+        callq mutate_slot
+        addq $32, %rsp
+        movq 8(%r12), %rax
+        popq %r12
+        retq
+
+        .globl home_escape_numeric_use
+        .def home_escape_numeric_use; .scl 2; .type 32; .endef
+home_escape_numeric_use:
+        movq %rcx, 8(%rsp)
+        leaq 8(%rsp), %r10
+        movq %r10, %rcx
+        addq $1, %r10
+        subq $40, %rsp
+        callq mutate_slot
+        addq $40, %rsp
+        movq 8(%rsp), %rax
+        retq
+
+        .globl home_ambiguous_alias_call_escape
+        .def home_ambiguous_alias_call_escape; .scl 2; .type 32; .endef
+home_ambiguous_alias_call_escape:
+        movq %rcx, 8(%rsp)
+        testl %edx, %edx
+        je .Lhome_alias_unrelated
+        movq %rsp, %r10
+        jmp .Lhome_alias_join
+.Lhome_alias_unrelated:
+        movq %r8, %r10
+.Lhome_alias_join:
+        movq %r10, %rcx
+        subq $40, %rsp
+        callq mutate_slot_plus8
+        addq $40, %rsp
+        movq 8(%rsp), %rax
+        retq
+
+        .globl home_direct_alias_call_escape
+        .def home_direct_alias_call_escape; .scl 2; .type 32; .endef
+home_direct_alias_call_escape:
+        movq %rcx, 8(%rsp)
+        movq %rsp, %rcx
+        subq $40, %rsp
+        callq mutate_slot_plus8
+        addq $40, %rsp
+        movq 8(%rsp), %rax
+        retq
+
+        .globl home_direct_alias_return
+        .def home_direct_alias_return; .scl 2; .type 32; .endef
+home_direct_alias_return:
+        movq %rcx, 8(%rsp)
+        movq %rsp, %rax
+        retq
+
+        .globl home_cross_class_reload
+        .def home_cross_class_reload; .scl 2; .type 32; .endef
+home_cross_class_reload:
+        movl %ecx, 8(%rsp)
+        movss 8(%rsp), %xmm0
+        retq
+
+        .globl home_xmm_mutation
+        .def home_xmm_mutation; .scl 2; .type 32; .endef
+home_xmm_mutation:
+        movsd %xmm0, 8(%rsp)
+        movss %xmm1, 8(%rsp)
+        movsd 8(%rsp), %xmm0
+        retq
+
+        .globl home_partial_reload
+        .def home_partial_reload; .scl 2; .type 32; .endef
+home_partial_reload:
+        movq %rcx, 8(%rsp)
+        movzbl 8(%rsp), %eax
+        retq
+
+        .globl home_xchg_mutation
+        .def home_xchg_mutation; .scl 2; .type 32; .endef
+home_xchg_mutation:
+        movq %rcx, 8(%rsp)
+        xchgq %rdx, 8(%rsp)
+        movq 8(%rsp), %rax
+        retq
+
+        .globl home_alias_arith_clobber
+        .def home_alias_arith_clobber; .scl 2; .type 32; .endef
+home_alias_arith_clobber:
+        movq %rsp, %r10
+        movq %rcx, 8(%r10)
+        addq $8, %r10
+        movq (%r10), %rax
+        retq
+
+        .globl home_postsub_raw_collision
+        .def home_postsub_raw_collision; .scl 2; .type 32; .endef
+home_postsub_raw_collision:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        subq $40, %rsp
+        movq %r8, 8(%rsp)
+        movq 8(%rsp), %r9
+        addq $40, %rsp
+        movq 8(%rsp), %rax
+        retq
+
+        .globl home_postsub_escaped_collision
+        .def home_postsub_escaped_collision; .scl 2; .type 32; .endef
+home_postsub_escaped_collision:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        leaq 8(%rsp), %rcx
+        subq $40, %rsp
+        callq mutate_slot
+        movq %rsp, %rbp
+        movq %r9, 8(%rbp)
+        leaq 8(%rbp), %rdx
+        callq mutate_slot_second
+        addq $40, %rsp
+        movq 8(%rsp), %rax
+        retq
+
+        .globl mutate_slot_second
+        .def mutate_slot_second; .scl 2; .type 32; .endef
+mutate_slot_second:
+        movq $77, (%rdx)
+        retq
+
+        .globl home_volatile_alias_after_call
+        .def home_volatile_alias_after_call; .scl 2; .type 32; .endef
+home_volatile_alias_after_call:
+        movq %rsp, %r10
+        movq %rcx, 8(%r10)
+        subq $40, %rsp
+        callq preserve_probe
+        addq $40, %rsp
+        addq $8, %r10
+        movq (%r10), %rax
+        retq
+
+        .globl home_nonvolatile_alias_after_call
+        .def home_nonvolatile_alias_after_call; .scl 2; .type 32; .endef
+home_nonvolatile_alias_after_call:
+        movq %rsp, %r12
+        movq %r12, %r13
+        movq %rcx, 8(%r13)
+        subq $40, %rsp
+        callq preserve_probe
+        addq $40, %rsp
+        addq $8, %r13
+        movq (%r13), %rax
+        retq
+
+        .globl preserve_probe
+        .def preserve_probe; .scl 2; .type 32; .endef
+preserve_probe:
+        retq
+
+        .globl alias_mov_vs_lea_coordinates
+        .def alias_mov_vs_lea_coordinates; .scl 2; .type 32; .endef
+alias_mov_vs_lea_coordinates:
+        subq $40, %rsp
+        movq %rsp, %r10
+        leaq 8(%rsp), %r11
+        movl 48(%r10), %eax
+        movl 40(%r11), %eax
+        addq $40, %rsp
+        retq
+
+        .globl alias_two_hop_lea
+        .def alias_two_hop_lea; .scl 2; .type 32; .endef
+alias_two_hop_lea:
+        movq %rsp, %r10
+        leaq 8(%r10), %r11
+        movq (%r11), %rax
+        retq
+
+        .globl home_conditional_spill_reload
+        .def home_conditional_spill_reload; .scl 2; .type 32; .endef
+home_conditional_spill_reload:
+        testl %edx, %edx
+        je 7f
+        movq %rcx, 8(%rsp)
+7:
+        movq 8(%rsp), %rax
+        retq
+
+        .globl unknown_sp_indexed
+        .def unknown_sp_indexed; .scl 2; .type 32; .endef
+unknown_sp_indexed:
+        testl %ecx, %ecx
+        je 8f
+        subq $16, %rsp
+8:
+        movl %edx, 8(%rsp,%r9,4)
+        movl 8(%rsp,%r9,4), %eax
+        testl %ecx, %ecx
+        je 9f
+        addq $16, %rsp
+9:
+        retq
+
+        .globl home_wide_overlap
+        .def home_wide_overlap; .scl 2; .type 32; .endef
+home_wide_overlap:
+        movq %rcx, 8(%rsp)
+        movdqu 4(%rsp), %xmm1
+        movq 8(%rsp), %rax
+        retq
 "#,
     )
-    .ok()?;
+    .expect("failed to write stack/home fixture assembly");
 
     let status = Command::new("clang")
         .args(["--target=x86_64-pc-windows-msvc", "-c"])
@@ -138,14 +793,14 @@ callee_eighth:
         .arg("-o")
         .arg(&object)
         .status()
-        .ok()?;
+        .expect("failed to run clang over stack/home fixture");
     assert!(status.success(), "stack/home fixture assembly failed");
-    Some(object)
+    object
 }
 
-fn fixture() -> Option<&'static Path> {
-    static FIXTURE: OnceLock<Option<PathBuf>> = OnceLock::new();
-    FIXTURE.get_or_init(build_fixture).as_deref()
+fn fixture() -> &'static Path {
+    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+    FIXTURE.get_or_init(build_fixture).as_path()
 }
 
 fn load_rtl_relations(object: &Path) -> DecompileDB {
@@ -163,9 +818,19 @@ fn load_rtl_relations(object: &Path) -> DecompileDB {
 }
 
 fn function_span(db: &DecompileDB, name: &str) -> (Address, Address) {
+    let coff_name = format!("coff_fn_{name}");
     db.rel_iter::<(Symbol, Address, Address)>("func_span")
-        .find_map(|(symbol, start, end)| (*symbol == name).then_some((*start, *end)))
-        .unwrap_or_else(|| panic!("missing fixture function {name}"))
+        .find_map(|(symbol, start, end)| {
+            (*symbol == name || *symbol == coff_name).then_some((*start, *end))
+        })
+        .unwrap_or_else(|| {
+            let mut available: Vec<_> = db
+                .rel_iter::<(Symbol, Address, Address)>("func_span")
+                .map(|(symbol, start, end)| (*symbol, *start, *end))
+                .collect();
+            available.sort_by_key(|(_, start, _)| *start);
+            panic!("missing fixture function {name}; available={available:#x?}")
+        })
 }
 
 fn in_span(address: Address, span: (Address, Address)) -> bool {
@@ -175,6 +840,21 @@ fn in_span(address: Address, span: (Address, Address)) -> bool {
 fn rtl_candidates(db: &DecompileDB, address: Address) -> Vec<RTLInst> {
     db.rel_iter::<(Address, RTLInst)>("rtl_inst_candidate")
         .filter_map(|(row_address, inst)| (*row_address == address).then_some(inst.clone()))
+        .collect()
+}
+
+fn address_bearing_candidates(db: &DecompileDB, address: Address) -> Vec<RTLInst> {
+    db.rel_iter::<(Address, RTLInst)>("rtl_inst_candidate")
+        .filter_map(|(node, inst)| {
+            ((*node & !SYNTHETIC_NODE_MASK) == address
+                && matches!(
+                    inst,
+                    RTLInst::Iload(..)
+                        | RTLInst::Istore(..)
+                        | RTLInst::Iop(Operation::Olea(_) | Operation::Oleal(_), _, _)
+                ))
+            .then_some(inst.clone())
+        })
         .collect()
 }
 
@@ -227,15 +907,42 @@ fn assert_sp_indexed_relations(db: &DecompileDB) {
 
     let store_addr = indexed_stores[0].0;
     let load_addr = indexed_loads[0].0;
+    for address in [store_addr, load_addr] {
+        assert!(
+            !db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+                .any(|(func, access, reason)| {
+                    (*func, *access, *reason) == (span.0, address, "unsupported-stack-address")
+                }),
+            "proved indexed RSP access was marked unsupported at {address:#x}"
+        );
+    }
+
     let store_candidates = rtl_candidates(db, store_addr | SYNTH1);
     let load_candidates = rtl_candidates(db, load_addr | SYNTH1);
+    let store_reg_rtls: Vec<_> = db
+        .rel_iter::<(Address, Mreg, RTLReg)>("reg_rtl")
+        .filter(|(address, _, _)| *address == store_addr)
+        .copied()
+        .collect();
+    let store_reg_xtls: Vec<_> = db
+        .rel_iter::<(Address, Mreg, RTLReg)>("reg_xtl")
+        .filter(|(address, _, _)| *address == store_addr)
+        .copied()
+        .collect();
+    let store_reaching_defs: Vec<_> = db
+        .rel_iter::<(Address, Mreg, Address)>("reg_def_used")
+        .filter(|(_, _, use_address)| *use_address == store_addr)
+        .copied()
+        .collect();
     assert_eq!(
         store_candidates
             .iter()
             .filter(|inst| matches!(inst, RTLInst::Istore(..)))
             .count(),
         1,
-        "SP indexed store must have one synthetic Istore: {store_candidates:#x?}"
+        "SP indexed store must have one synthetic Istore: {store_candidates:#x?}; \
+         reg_rtl={store_reg_rtls:#x?}; reg_xtl={store_reg_xtls:#x?}; \
+         reaching={store_reaching_defs:#x?}"
     );
     assert!(store_candidates.iter().any(|inst| {
         matches!(
@@ -281,12 +988,692 @@ fn assert_sp_indexed_relations(db: &DecompileDB) {
         .collect();
     assert!(
         !scalar_vars.is_disjoint(&indexed_vars),
-        "synthetic SP base must alias the same-offset scalar local: scalar={scalar_vars:#x?}, indexed={indexed_vars:#x?}"
+        "synthetic SP base must alias the same coordinate as the scalar local: \
+         scalar={scalar_vars:#x?}, indexed={indexed_vars:#x?}"
     );
+}
+
+fn assert_incomplete_indexed_stack_lowering_is_atomic(db: &DecompileDB) {
+    let span = function_span(db, "sp_indexed_ambiguous_reaching");
+    let access = db
+        .rel_iter::<(Address, MachInst)>("mach_inst")
+        .find_map(|(address, inst)| {
+            (in_span(*address, span)
+                && matches!(inst,
+                    MachInst::Mload(
+                        MemoryChunk::MInt32,
+                        Addressing::Aindexed2scaled(4, 8),
+                        args,
+                        Mreg::DX
+                    ) if args.as_ref() == &[Mreg::SP, Mreg::AX]))
+            .then_some(*address)
+        })
+        .expect("missing unresolved indexed-stack load fixture");
+    assert!(
+        db.rel_iter::<(Address,)>("sp_indexed_load")
+            .any(|(address,)| *address == access),
+        "structural indexed load missing at {access:#x}: ltl={:#x?}, indexed={:#x?}, rsp={:#x?}",
+        db.rel_iter::<(Address, LTLInst)>("ltl_inst")
+            .filter(|(address, _)| *address == access)
+            .collect::<Vec<_>>(),
+        db.rel_iter::<(Address, Mreg, i64, usize)>("indexed_stack_operand")
+            .filter(|(address, _, _, _)| *address == access)
+            .collect::<Vec<_>>(),
+        db.rel_iter::<(Address, Address)>("rsp_frame_at")
+            .filter(|(address, _)| *address == access)
+            .collect::<Vec<_>>()
+    );
+    assert!(!db
+        .rel_iter::<(Address,)>("sp_indexed_load_complete")
+        .any(|(address,)| *address == access));
+    assert!(db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .any(|(func, address, reason)| {
+            (*func, *address, *reason)
+                == (span.0, access, "unsupported-stack-address")
+        }));
+
+    let rooted: Vec<_> = db
+        .rel_iter::<(Address, RTLInst)>("rtl_inst_candidate")
+        .filter(|(node, _)| (*node & !SYNTHETIC_NODE_MASK) == access)
+        .map(|(node, inst)| (*node, inst.clone()))
+        .collect();
+    assert_eq!(
+        rooted,
+        vec![(access, RTLInst::Inop)],
+        "incomplete indexed lowering was not collapsed atomically"
+    );
+    assert!(!db
+        .rel_iter::<(Address, Address)>("instr_in_function")
+        .any(|(node, _)| *node != access && (*node & !SYNTHETIC_NODE_MASK) == access));
+    assert!(!db
+        .rel_iter::<(Address, Address)>("rtl_succ_candidate")
+        .any(|(source, destination)| {
+            (*source != access && (*source & !SYNTHETIC_NODE_MASK) == access)
+                || (*destination != access
+                    && (*destination & !SYNTHETIC_NODE_MASK) == access)
+        }));
+    for relation in ["stack_xtl", "stack_var"] {
+        assert!(!db
+            .rel_iter::<(Address, Address, i64, RTLReg)>(relation)
+            .any(|(_, node, _, _)| (*node & !SYNTHETIC_NODE_MASK) == access));
+    }
+    assert!(!db
+        .rel_iter::<(Address, Address, RTLReg, i64)>("normalized_stack_lea_base")
+        .any(|(_, node, _, _)| (*node & !SYNTHETIC_NODE_MASK) == access));
+    let raw_exits: Vec<_> = db
+        .rel_iter::<(Address, Address)>("rtl_next")
+        .filter(|(source, _)| *source == access)
+        .copied()
+        .collect();
+    let restored_exits: Vec<_> = db
+        .rel_iter::<(Address, Address)>("rtl_succ_candidate")
+        .filter(|(source, _)| *source == access)
+        .copied()
+        .collect();
+    assert!(
+        !restored_exits.is_empty(),
+        "rejected indexed lowering left the replacement Inop as a dead end"
+    );
+    assert!(restored_exits.iter().all(|(_, destination)| {
+        *destination == (*destination & !SYNTHETIC_NODE_MASK)
+    }));
+    for edge in raw_exits {
+        assert!(db
+            .rel_iter::<(Address, Address)>("rtl_succ_candidate")
+            .any(|candidate| *candidate == edge));
+        assert!(!db
+            .rel_iter::<(Address, Address)>("rtl_edge_negated")
+            .any(|negated| *negated == edge));
+    }
+}
+
+fn assert_ambiguous_fused_indexed_lowering_is_atomic(db: &DecompileDB) {
+    let span = function_span(db, "sp_indexed_fused_ambiguous");
+    let access = db
+        .rel_iter::<(Address, Operation, MemoryChunk, i64, i64, Mreg, Mreg)>(
+            "sp_indexed_fused_load",
+        )
+        .find_map(|(address, op, chunk, scale, displacement, index, destination)| {
+            (in_span(*address, span)
+                && *op == Operation::Oadd
+                && *chunk == MemoryChunk::MInt32
+                && (*scale, *displacement, *index, *destination)
+                    == (4, 8, Mreg::AX, Mreg::R9))
+            .then_some(*address)
+        })
+        .expect("missing ambiguous fused indexed-stack fixture");
+    assert!(!db
+        .rel_iter::<(Address,)>("sp_indexed_fused_complete")
+        .any(|(address,)| *address == access));
+    assert!(db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .any(|(func, address, reason)| {
+            (*func, *address, *reason)
+                == (span.0, access, "unsupported-stack-address")
+        }));
+
+    let rooted: Vec<_> = db
+        .rel_iter::<(Address, RTLInst)>("rtl_inst_candidate")
+        .filter(|(node, _)| (*node & !SYNTHETIC_NODE_MASK) == access)
+        .map(|(node, inst)| (*node, inst.clone()))
+        .collect();
+    assert_eq!(rooted, vec![(access, RTLInst::Inop)]);
+    assert!(!db
+        .rel_iter::<(Address, Address)>("sp_indexed_fused_member")
+        .any(|(node, _)| (*node & !SYNTHETIC_NODE_MASK) == access));
+    assert!(!db
+        .rel_iter::<(Address, Address)>("rtl_succ_candidate")
+        .any(|(source, destination)| {
+            (*source != access && (*source & !SYNTHETIC_NODE_MASK) == access)
+                || (*destination != access
+                    && (*destination & !SYNTHETIC_NODE_MASK) == access)
+        }));
+
+    let partial_span = function_span(db, "sp_indexed_fused_partial_def");
+    let partial = db
+        .rel_iter::<(Address, Operation, MemoryChunk, i64, i64, Mreg, Mreg)>(
+            "sp_indexed_fused_load",
+        )
+        .find_map(|(address, op, chunk, scale, displacement, index, destination)| {
+            (in_span(*address, partial_span)
+                && *op == Operation::Oadd
+                && *chunk == MemoryChunk::MInt32
+                && (*scale, *displacement, *index, *destination)
+                    == (4, 8, Mreg::CX, Mreg::R9))
+            .then_some(*address)
+        })
+        .expect("missing one-arm-defined fused indexed-stack fixture");
+    assert!(!db
+        .rel_iter::<(Address, Mreg, Address)>("abi_livein_reaches_use")
+        .any(|row| *row == (partial_span.0, Mreg::CX, partial)));
+    let real_origins: HashSet<_> = db
+        .rel_iter::<(Address, Mreg, Address)>("reg_def_used")
+        .filter_map(|(definition, mreg, usage)| {
+            (*usage == partial && *mreg == Mreg::CX && *definition != partial)
+                .then_some(*definition)
+        })
+        .collect();
+    assert_eq!(
+        real_origins.len(),
+        1,
+        "partial-def fixture needs exactly one real reaching origin: {real_origins:#x?}"
+    );
+    let definition = *real_origins.iter().next().unwrap();
+    assert!(!db
+        .rel_iter::<(Address, Address, Address)>("reg_def_dominates_use")
+        .any(|row| *row == (partial_span.0, definition, partial)));
+    assert!(!db
+        .rel_iter::<(Address,)>("sp_indexed_fused_complete")
+        .any(|(address,)| *address == partial));
+    assert!(db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .any(|(func, address, reason)| {
+            (*func, *address, *reason)
+                == (partial_span.0, partial, "unsupported-stack-address")
+        }));
+    let partial_rooted: Vec<_> = db
+        .rel_iter::<(Address, RTLInst)>("rtl_inst_candidate")
+        .filter(|(node, _)| (*node & !SYNTHETIC_NODE_MASK) == partial)
+        .map(|(node, inst)| (*node, inst.clone()))
+        .collect();
+    assert_eq!(partial_rooted, vec![(partial, RTLInst::Inop)]);
+}
+
+fn assert_sp_indexed_fused_arithmetic(db: &DecompileDB) {
+    type FusedRow = (
+        Address,
+        Operation,
+        MemoryChunk,
+        Addressing,
+        Arc<Vec<Mreg>>,
+        Mreg,
+        bool,
+    );
+
+    let span = function_span(db, "sp_indexed_fused_arith");
+    let rows: Vec<_> = db
+        .rel_iter::<FusedRow>("float_load_op")
+        .filter(|(address, _, _, addressing, args, dst, unary)| {
+            in_span(*address, span)
+                && *addressing == Addressing::Aindexed2scaled(4, 8)
+                && args.as_ref() == &[Mreg::SP, Mreg::DX]
+                && *dst == Mreg::AX
+                && !*unary
+        })
+        .cloned()
+        .collect();
+    assert_eq!(rows.len(), 5, "missing indexed-RSP fused rows: {rows:#x?}");
+
+    for expected_op in [
+        Operation::Oadd,
+        Operation::Osub,
+        Operation::Oand,
+        Operation::Oor,
+        Operation::Oxor,
+    ] {
+        let (address, _, chunk, _, _, _, _) = rows
+            .iter()
+            .find(|(_, op, _, _, _, _, _)| *op == expected_op)
+            .unwrap_or_else(|| panic!("missing {expected_op:?}: {rows:#x?}"));
+        assert_eq!(*chunk, MemoryChunk::MInt32);
+        assert!(
+            !db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+                .any(|(func, access, _)| (*func, *access) == (span.0, *address)),
+            "proved indexed-RSP fused op was rejected at {address:#x}: index_reaching={:#x?}, dst_reaching={:#x?}, dst_defs={:#x?}, dst_xtl={:#x?}, local_defs={:#x?}",
+            db.rel_iter::<(Address, Mreg, RTLReg)>("reaching_use_rtl")
+                .filter(|(node, mreg, _)| *node == *address && *mreg == Mreg::DX)
+                .collect::<Vec<_>>(),
+            db.rel_iter::<(Address, Mreg, RTLReg)>("reaching_use_rtl")
+                .filter(|(node, mreg, _)| *node == *address && *mreg == Mreg::AX)
+                .collect::<Vec<_>>(),
+            db.rel_iter::<(Address, Mreg, Address)>("reg_def_used")
+                .filter(|(_, mreg, use_node)| *use_node == *address && *mreg == Mreg::AX)
+                .collect::<Vec<_>>(),
+            db.rel_iter::<(Address, Mreg, RTLReg)>("reg_xtl")
+                .filter(|(node, mreg, _)| *node <= *address && *mreg == Mreg::AX)
+                .collect::<Vec<_>>(),
+            db.rel_iter::<(Address, RTLReg)>("is_def")
+                .filter(|(node, _)| *node <= *address)
+                .collect::<Vec<_>>()
+        );
+        let exact_dst_reaching: HashSet<_> = db
+            .rel_iter::<(Address, Mreg, RTLReg)>("reaching_use_rtl")
+            .filter_map(|(node, mreg, value)| {
+                (*node == *address && *mreg == Mreg::AX).then_some(*value)
+            })
+            .collect();
+        assert_eq!(
+            exact_dst_reaching.len(),
+            1,
+            "exact prior AX definition retained historical canonicals at {address:#x}: \
+             {exact_dst_reaching:#x?}"
+        );
+
+        let real = rtl_candidates(db, *address);
+        let sp_base = real
+            .iter()
+            .find_map(|inst| match inst {
+                RTLInst::Iop(Operation::Olea(Addressing::Ainstack(8)), args, dst)
+                    if args.is_empty() =>
+                {
+                    Some(*dst)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing synthetic stack base at {address:#x}: {real:#x?}"));
+
+        let synth1 = *address | SYNTH1;
+        let load_candidates = rtl_candidates(db, synth1);
+        let (index, temp) = load_candidates
+            .iter()
+            .find_map(|inst| match inst {
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2scaled(4, 0),
+                    args,
+                    dst,
+                ) if args.len() == 2 && args[0] == sp_base => Some((args[1], *dst)),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("missing indexed stack load at {synth1:#x}: {load_candidates:#x?}")
+            });
+        assert_ne!(index, temp, "indexed load overwrote its address input");
+
+        let synth2 = *address | (1u64 << 63);
+        let op_candidates = rtl_candidates(db, synth2);
+        assert!(op_candidates.iter().any(|inst| {
+            matches!(inst, RTLInst::Iop(op, args, dst)
+                if *op == expected_op && args.len() == 2
+                    && args[0] == *dst && args[1] == temp)
+        }), "missing fused arithmetic at {synth2:#x}: {op_candidates:#x?}");
+
+        let next = db
+            .rel_iter::<(Address, Address)>("next")
+            .find_map(|(source, target)| (*source == *address).then_some(*target))
+            .expect("fused instruction has no linear successor");
+        let edges: HashSet<_> = db
+            .rel_iter::<(Address, Address)>("rtl_succ_candidate")
+            .copied()
+            .collect();
+        assert!(edges.contains(&(*address, synth1)));
+        assert!(edges.contains(&(synth1, synth2)));
+        assert!(edges.contains(&(synth2, next)));
+        assert!(
+            !edges.contains(&(*address, next)),
+            "fused operation retained a direct skip edge"
+        );
+        assert!(db
+            .rel_iter::<(Address, Address)>("rtl_edge_negated")
+            .any(|row| *row == (*address, next)));
+        assert!(db
+            .rel_iter::<(Address, Address)>("instr_in_function")
+            .any(|row| *row == (synth1, span.0)));
+        assert!(db
+            .rel_iter::<(Address, Address)>("instr_in_function")
+            .any(|row| *row == (synth2, span.0)));
+    }
+
+    let collision = function_span(db, "sp_indexed_fused_add_collision");
+    let collision_row = db
+        .rel_iter::<FusedRow>("float_load_op")
+        .find(|(address, op, _, addressing, args, dst, unary)| {
+            in_span(*address, collision)
+                && *op == Operation::Oadd
+                && *addressing == Addressing::Aindexed2scaled(4, 8)
+                && args.as_ref() == &[Mreg::SP, Mreg::AX]
+                && *dst == Mreg::AX
+                && !*unary
+        })
+        .expect("missing destination/index collision row");
+    assert!(
+        !db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+            .any(|(func, access, _)| (*func, *access) == (collision.0, collision_row.0))
+    );
+    let collision_loads = rtl_candidates(db, collision_row.0 | SYNTH1);
+    let collision_ops = rtl_candidates(db, collision_row.0 | (1u64 << 63));
+    let (index, temp) = collision_loads
+        .iter()
+        .find_map(|inst| match inst {
+            RTLInst::Iload(_, Addressing::Aindexed2scaled(4, 0), args, dst)
+                if args.len() == 2 =>
+            {
+                Some((args[1], *dst))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("collision load vanished: {collision_loads:#x?}"));
+    assert!(collision_ops.iter().any(|inst| {
+        matches!(inst, RTLInst::Iop(Operation::Oadd, args, dst)
+            if args.as_ref() == &[index, temp] && *dst == index)
+    }), "destination/index collision lost its incoming value: {collision_ops:#x?}");
+
+    let field_span = function_span(db, "sp_indexed_fused_field");
+    let field_addr = db
+        .rel_iter::<FusedRow>("float_load_op")
+        .find_map(|(address, op, _, addressing, args, dst, unary)| {
+            (in_span(*address, field_span)
+                && *op == Operation::Oadd
+                && *addressing == Addressing::Aindexed2scaled(8, 12)
+                && args.as_ref() == &[Mreg::SP, Mreg::DX]
+                && *dst == Mreg::AX
+                && !*unary)
+                .then_some(*address)
+        })
+        .expect("missing field-displacement fused row");
+    let field_real = rtl_candidates(db, field_addr);
+    let field_load = rtl_candidates(db, field_addr | SYNTH1);
+    let field_op = rtl_candidates(db, field_addr | (1u64 << 63));
+    assert_eq!(field_real.len(), 1, "field access retained competing root candidates: {field_real:#x?}");
+    assert_eq!(field_load.len(), 1, "field access retained competing loads: {field_load:#x?}");
+    assert_eq!(field_op.len(), 1, "field access retained competing operations: {field_op:#x?}");
+    assert!(field_real.iter().any(|inst| {
+        matches!(inst,
+            RTLInst::Iop(Operation::Olea(Addressing::Ainstack(8)), args, _)
+                if args.is_empty())
+    }), "field access did not canonicalize to its stride base");
+    assert!(field_load.iter().any(|inst| {
+        matches!(inst,
+            RTLInst::Iload(MemoryChunk::MInt32, Addressing::Aindexed2scaled(8, 4), args, _)
+                if args.len() == 2)
+    }), "field access did not preserve its inner displacement");
+    let mut field_members: Vec<_> = db
+        .rel_iter::<(Address, Address)>("sp_indexed_fused_member")
+        .filter(|(node, func)| {
+            *func == field_span.0 && (*node & !SYNTHETIC_NODE_MASK) == field_addr
+        })
+        .copied()
+        .collect();
+    field_members.sort_unstable();
+    field_members.dedup();
+    assert_eq!(field_members.len(), 2,
+               "field chain must own exactly two synthetic members: {field_members:#x?}");
+
+    let misaligned_span = function_span(db, "sp_indexed_fused_misaligned_field");
+    let misaligned_addr = db
+        .rel_iter::<FusedRow>("float_load_op")
+        .find_map(|(address, op, _, addressing, args, dst, unary)| {
+            (in_span(*address, misaligned_span)
+                && *op == Operation::Oadd
+                && *addressing == Addressing::Aindexed2scaled(8, 8)
+                && args.as_ref() == &[Mreg::SP, Mreg::DX]
+                && *dst == Mreg::AX
+                && !*unary)
+                .then_some(*address)
+        })
+        .expect("missing misaligned field-displacement fused row");
+    let misaligned_real = rtl_candidates(db, misaligned_addr);
+    assert!(misaligned_real.iter().any(|inst| {
+        matches!(inst,
+            RTLInst::Iop(Operation::Olea(Addressing::Ainstack(4)), args, _)
+                if args.is_empty())
+    }), "misaligned aggregate did not retain its evidenced phase: {misaligned_real:#x?}");
+    assert!(!misaligned_real.iter().any(|inst| {
+        matches!(inst,
+            RTLInst::Iop(Operation::Olea(Addressing::Ainstack(0)), _, _))
+    }), "misaligned aggregate was falsely rebased onto the adjacent scalar");
+    assert!(rtl_candidates(db, misaligned_addr | SYNTH1).iter().any(|inst| {
+        matches!(inst,
+            RTLInst::Iload(MemoryChunk::MInt32, Addressing::Aindexed2scaled(8, 4), args, _)
+                if args.len() == 2)
+    }), "misaligned aggregate field lost its exact effective address");
+
+    let param_span = function_span(db, "sp_indexed_fused_param_rmw");
+    let param_addr = db
+        .rel_iter::<FusedRow>("float_load_op")
+        .find_map(|(address, op, _, _, args, dst, unary)| {
+            (in_span(*address, param_span)
+                && *op == Operation::Oadd
+                && args.as_ref() == &[Mreg::SP, Mreg::CX]
+                && *dst == Mreg::CX
+                && !*unary)
+                .then_some(*address)
+        })
+        .expect("missing direct parameter RMW fused row");
+    let param_loads = rtl_candidates(db, param_addr | SYNTH1);
+    let param_ops = rtl_candidates(db, param_addr | (1u64 << 63));
+    assert_eq!(param_loads.len(), 1,
+               "direct integer parameter RMW retained competing loads: {param_loads:#x?}");
+    assert_eq!(param_ops.len(), 1,
+               "direct integer parameter RMW retained competing value webs: {param_ops:#x?}");
+    let (param_index, param_temp) = match &param_loads[0] {
+        RTLInst::Iload(_, Addressing::Aindexed2scaled(4, 0), args, temp)
+            if args.len() == 2 => (args[1], *temp),
+        other => panic!("unexpected direct parameter RMW load: {other:#x?}"),
+    };
+    assert!(matches!(&param_ops[0],
+        RTLInst::Iop(Operation::Oadd, args, dst)
+            if args.as_ref() == &[param_index, param_temp] && *dst == param_index),
+        "direct integer parameter RMW did not update its incoming web: {param_ops:#x?}");
+
+    let gap_span = function_span(db, "sp_indexed_fused_gap");
+    let mut gap_ops: Vec<_> = db
+        .rel_iter::<FusedRow>("float_load_op")
+        .filter_map(|(address, op, _, _, args, dst, unary)| {
+            (in_span(*address, gap_span)
+                && matches!(op, Operation::Oadd | Operation::Osub)
+                && args.as_ref() == &[Mreg::SP, Mreg::DX]
+                && *dst == Mreg::AX
+                && !*unary)
+                .then_some(*address)
+        })
+        .collect();
+    gap_ops.sort_unstable();
+    assert_eq!(gap_ops.len(), 2, "missing adjacent fused operations: {gap_ops:#x?}");
+    let gap_edges: HashSet<_> = db
+        .rel_iter::<(Address, Address)>("rtl_succ_candidate")
+        .copied()
+        .collect();
+    assert!(gap_edges.contains(&(gap_ops[0] | (1u64 << 63), gap_ops[1])),
+            "tail bridge skipped the next fused operation: {gap_edges:#x?}");
+}
+
+fn assert_indexed_entry_and_loop_collision_matrix(db: &DecompileDB) {
+    type FusedShape = (
+        Address,
+        Operation,
+        MemoryChunk,
+        i64,
+        i64,
+        Mreg,
+        Mreg,
+    );
+
+    for (name, expect_back_edge) in [
+        ("sp_indexed_fused_entry_collision", false),
+        ("sp_indexed_fused_loop_collision", true),
+    ] {
+        let span = function_span(db, name);
+        let access = db
+            .rel_iter::<FusedShape>("sp_indexed_fused_load")
+            .find_map(|(node, op, chunk, scale, displacement, index, destination)| {
+                (in_span(*node, span)
+                    && *op == Operation::Oadd
+                    && *chunk == MemoryChunk::MInt32
+                    && (*scale, *displacement, *index, *destination)
+                        == (4, 40, Mreg::CX, Mreg::CX))
+                .then_some(*node)
+            })
+            .unwrap_or_else(|| panic!("missing {name} fused collision"));
+        if expect_back_edge {
+            assert_ne!(access, span.0, "{name} needs a distinct loop header");
+        } else {
+            assert_eq!(access, span.0, "{name} must exercise a literal entry node");
+        }
+        assert!(
+            db.rel_iter::<(Address, Mreg, Address)>("abi_livein_reaches_use")
+                .any(|row| *row == (span.0, Mreg::CX, access)),
+            "{name} lost its ABI CX input: validated={:#x?}, live={:#x?}, uses={:#x?}, defs={:#x?}",
+            db.rel_iter::<(Address, Mreg)>("func_param_validated")
+                .filter(|(function, mreg)| *function == span.0 && *mreg == Mreg::CX)
+                .collect::<Vec<_>>(),
+            db.rel_iter::<(Address, Address, Mreg)>("arg_reg_param_live_at")
+                .filter(|(function, node, mreg)| {
+                    *function == span.0 && *node == access && *mreg == Mreg::CX
+                })
+                .collect::<Vec<_>>(),
+            db.rel_iter::<(Address, Mreg)>("reg_use")
+                .filter(|(node, mreg)| *node == access && *mreg == Mreg::CX)
+                .collect::<Vec<_>>(),
+            db.rel_iter::<(Address, Mreg)>("reg_def")
+                .filter(|(node, mreg)| *node == access && *mreg == Mreg::CX)
+                .collect::<Vec<_>>()
+        );
+        assert!(db
+            .rel_iter::<(Address, Mreg, Address)>("reg_def_used")
+            .any(|row| *row == (span.0, Mreg::CX, access)));
+        if expect_back_edge {
+            assert!(db
+                .rel_iter::<(Address, Mreg, Address)>("reg_def_used")
+                .any(|row| *row == (access, Mreg::CX, access)));
+        }
+        assert!(
+            db.rel_iter::<(Address,)>("sp_indexed_fused_complete")
+                .any(|(node,)| *node == access),
+            "{name} fused collision was not complete: reaching={:#x?}, origins={:#x?}, candidates={:#x?}, seeds={:#x?}, unsupported={:#x?}",
+            db.rel_iter::<(Address, Mreg, RTLReg)>("reaching_use_rtl")
+                .filter(|(node, mreg, _)| *node == access && *mreg == Mreg::CX)
+                .collect::<Vec<_>>(),
+            db.rel_iter::<(Address, Mreg, Address)>("reg_def_used")
+                .filter(|(_, mreg, usage)| *usage == access && *mreg == Mreg::CX)
+                .collect::<Vec<_>>(),
+            db.rel_iter::<(Address, RTLInst)>("rtl_inst_candidate")
+                .filter(|(node, _)| (*node & !SYNTHETIC_NODE_MASK) == access)
+                .collect::<Vec<_>>(),
+            db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address_seed")
+                .filter(|(_, node, _)| *node == access)
+                .collect::<Vec<_>>(),
+            db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+                .filter(|(_, node, _)| *node == access)
+                .collect::<Vec<_>>()
+        );
+        assert!(!db
+            .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+            .any(|(func, node, _)| (*func, *node) == (span.0, access)));
+        assert!(!db
+            .rel_iter::<(Address,)>("sp_indexed_load_complete")
+            .any(|(node,)| *node == access));
+
+        let reaching: HashSet<_> = db
+            .rel_iter::<(Address, Mreg, RTLReg)>("reaching_use_rtl")
+            .filter_map(|(node, mreg, value)| {
+                (*node == access && *mreg == Mreg::CX).then_some(*value)
+            })
+            .collect();
+        assert_eq!(
+            reaching.len(),
+            1,
+            "{name} retained historical entry/self representatives: {reaching:#x?}"
+        );
+        assert_eq!(rtl_candidates(db, access).len(), 1);
+        let loads = rtl_candidates(db, access | SYNTH1);
+        assert_eq!(loads.len(), 1, "{name} retained competing fused loads");
+        let temp = match &loads[0] {
+            RTLInst::Iload(_, _, args, destination) if args.len() == 2 => {
+                assert_ne!(args[1], *destination);
+                *destination
+            }
+            other => panic!("{name} has the wrong fused load: {other:#x?}"),
+        };
+        let operations = rtl_candidates(db, access | (1u64 << 63));
+        assert_eq!(
+            operations.len(),
+            1,
+            "{name} retained competing fused operations"
+        );
+        assert!(matches!(
+            &operations[0],
+            RTLInst::Iop(Operation::Oadd, args, destination)
+                if args.len() == 2
+                    && args[0] == *destination
+                    && args[1] == temp
+        ));
+        let has_back_edge = db
+            .rel_iter::<(Address, Address)>("rtl_next")
+            .any(|(source, destination)| *source != access && *destination == access);
+        assert_eq!(has_back_edge, expect_back_edge, "{name} CFG shape changed");
+    }
+
+    for (name, mreg, expect_back_edge) in [
+        ("sp_indexed_load_entry_collision", Mreg::CX, false),
+        ("sp_indexed_load_loop_collision", Mreg::AX, true),
+    ] {
+        let span = function_span(db, name);
+        let access = db
+            .rel_iter::<(Address,)>("sp_indexed_load")
+            .find_map(|(node,)| in_span(*node, span).then_some(*node))
+            .unwrap_or_else(|| panic!("missing {name} ordinary indexed load"));
+        if expect_back_edge {
+            assert_ne!(access, span.0, "{name} needs a distinct loop header");
+        } else {
+            assert_eq!(access, span.0, "{name} must exercise a literal entry node");
+        }
+        assert!(db
+            .rel_iter::<(Address, Mreg)>("load_overwrites_base")
+            .any(|row| *row == (access, mreg)));
+        assert!(db
+            .rel_iter::<(Address, Mreg, Address)>("reg_def_used")
+            .any(|row| *row == (access, mreg, access)));
+        if expect_back_edge {
+            assert!(db
+                .rel_iter::<(Address, Mreg, Address)>("reg_def_used")
+                .any(|row| *row == (span.0, Mreg::AX, access)));
+        }
+        assert!(!db
+            .rel_iter::<(Address,)>("sp_indexed_load_complete")
+            .any(|(node,)| *node == access));
+        assert!(db
+            .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+            .any(|(func, node, reason)| {
+                (*func, *node, *reason)
+                    == (span.0, access, "unsupported-stack-address")
+            }));
+        let rooted: Vec<_> = db
+            .rel_iter::<(Address, RTLInst)>("rtl_inst_candidate")
+            .filter(|(node, _)| (*node & !SYNTHETIC_NODE_MASK) == access)
+            .map(|(node, inst)| (*node, inst.clone()))
+            .collect();
+        assert_eq!(rooted, vec![(access, RTLInst::Inop)]);
+        let has_back_edge = db
+            .rel_iter::<(Address, Address)>("rtl_next")
+            .any(|(source, destination)| *source != access && *destination == access);
+        assert_eq!(has_back_edge, expect_back_edge, "{name} CFG shape changed");
+    }
 }
 
 fn assert_home_relations(db: &DecompileDB) {
     let span = function_span(db, "home_alias_roundtrip");
+    let spill_candidates: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill_candidate")
+        .filter(|(_, func, _, _)| *func == span.0)
+        .copied()
+        .collect();
+    let reload_cells: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_reload_cell")
+        .filter(|(_, func, _, _)| *func == span.0)
+        .copied()
+        .collect();
+    let moves: Vec<_> = db
+        .rel_iter::<(Address, Symbol, Symbol)>("pmov")
+        .filter(|(address, _, _)| in_span(*address, span))
+        .copied()
+        .collect();
+    let aliases: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, i64)>("sp_base_alias_at")
+        .filter(|(func, _, _, _)| *func == span.0)
+        .copied()
+        .collect();
+    let live_args: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg)>("arg_reg_param_live_at")
+        .filter(|(func, _, _)| *func == span.0)
+        .copied()
+        .collect();
+    let ltl: Vec<_> = db
+        .rel_iter::<(Address, LTLInst)>("ltl_inst")
+        .filter(|(address, _)| in_span(*address, span))
+        .cloned()
+        .collect();
     let spills: Vec<_> = db
         .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill")
         .filter(|(_, func, _, _)| *func == span.0)
@@ -295,7 +1682,7 @@ fn assert_home_relations(db: &DecompileDB) {
     assert_eq!(
         spills.len(),
         1,
-        "expected one exact /homeparams spill: {spills:#x?}"
+        "expected one exact /homeparams spill: spills={spills:#x?}, candidates={spill_candidates:#x?}, reload_cells={reload_cells:#x?}, moves={moves:#x?}, aliases={aliases:#x?}, live_args={live_args:#x?}, ltl={ltl:#x?}"
     );
     let (spill_addr, _, source, position) = spills[0];
     assert_eq!((source, position), (Mreg::DX, 1));
@@ -313,6 +1700,11 @@ fn assert_home_relations(db: &DecompileDB) {
     assert_eq!(reloads.len(), 1, "expected one home reload: {reloads:#x?}");
     let (reload_addr, _, reload_source, reload_pos) = reloads[0];
     assert_eq!((reload_source, reload_pos), (Mreg::DX, 1));
+    assert!(
+        !db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+            .any(|(func, _, _)| *func == span.0),
+        "a safe immutable /homeparams spill/reload was rejected as unsupported"
+    );
 
     let spill_candidates = rtl_candidates(db, spill_addr);
     assert!(spill_candidates.contains(&RTLInst::Inop));
@@ -347,10 +1739,13 @@ fn assert_home_relations(db: &DecompileDB) {
 
     let reassigned = function_span(db, "home_reassigned");
     assert!(db
-        .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill")
+        .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill_candidate")
         .any(|(_, func, source, position)| {
             (*func, *source, *position) == (reassigned.0, Mreg::CX, 0)
         }));
+    assert!(!db
+        .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill")
+        .any(|(_, func, _, _)| *func == reassigned.0));
     assert!(!db
         .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_reload")
         .any(|(_, func, _, _)| *func == reassigned.0));
@@ -498,13 +1893,18 @@ fn assert_stack_param_and_rmw_relations(db: &DecompileDB) {
         .rel_iter::<(Address, usize)>("stack_param_ordinal")
         .any(|(func, _)| *func == rmw.0));
 
-    let (load_addr, load_op) = db
+    let load_rows: Vec<_> = db
         .rel_iter::<(Address, Operation, MemoryChunk, Mreg, i64, Mreg)>("arith_load_op")
+        .filter(|(address, _, _, _, _, _)| in_span(*address, rmw))
+        .cloned()
+        .collect();
+    let (load_addr, load_op) = load_rows
+        .iter()
         .find_map(|(address, op, _, base, disp, _)| {
             (in_span(*address, rmw) && *base == Mreg::SP && *disp == 12 && *op == Operation::Osub)
                 .then_some((*address, op.clone()))
         })
-        .expect("missing SP local memory-source RMW");
+        .unwrap_or_else(|| panic!("missing SP local memory-source RMW: {load_rows:#x?}"));
     let (store_addr, store_op) = db
         .rel_iter::<(Address, Operation, MemoryChunk, Mreg, i64)>("arith_store_imm")
         .find_map(|(address, op, _, base, disp)| {
@@ -557,6 +1957,31 @@ fn assert_stack_param_and_rmw_relations(db: &DecompileDB) {
         .rel_iter::<(Address, usize)>("emit_function_param_count_candidate")
         .any(|(func, count)| (*func, *count) == (sixth.0, 6)));
 
+    let boundary = function_span(db, "boundary_stack_offset");
+    let boundary_access = db
+        .rel_iter::<(Address, Address, i64, usize)>("stack_param_access")
+        .find(|(_, func, disp, ordinal)| (*func, *disp, *ordinal) == (boundary.0, 544, 63))
+        .copied()
+        .expect("ordinal 63 must remain inside the stack-parameter cap");
+    assert!(db
+        .rel_iter::<(Address, usize)>("emit_function_stack_param_count")
+        .any(|(func, count)| (*func, *count) == (boundary.0, 64)));
+    assert!(db
+        .rel_iter::<(Address, usize)>("emit_function_param_count_candidate")
+        .any(|(func, count)| (*func, *count) == (boundary.0, 68)));
+    let boundary_param = rtl_candidates(db, boundary_access.0)
+        .iter()
+        .find_map(|inst| match inst {
+            RTLInst::Iop(Operation::Omove, args, _) if args.len() == 1 => Some(args[0]),
+            _ => None,
+        })
+        .expect("ordinal-63 load did not consume its synthetic parameter");
+    assert!(db
+        .rel_iter::<(Address, u64, XType)>("emit_function_param_type_candidate")
+        .any(|(func, reg, ty)| {
+            (*func, *reg, *ty) == (boundary.0, boundary_param, XType::Xint)
+        }));
+
     for (access, expected_op, expected_type) in [
         (fifth_access, Operation::Omulimm(7), XType::Xint),
         (sixth_access, Operation::Ofloatofint, XType::Xint),
@@ -604,20 +2029,1580 @@ fn assert_home_store_is_not_outgoing(db: &DecompileDB) {
     );
 }
 
+fn entry_regs(db: &DecompileDB, function: Address, reg: Mreg) -> HashSet<u64> {
+    db.rel_iter::<(Address, Mreg, u64)>("reg_xtl")
+        .filter_map(|(address, candidate, id)| {
+            (*address == function && *candidate == reg).then_some(*id)
+        })
+        .collect()
+}
+
+fn translated_regs_at(db: &DecompileDB, address: Address, reg: Mreg) -> HashSet<u64> {
+    db.rel_iter::<(Address, Mreg, u64)>("reg_xtl")
+        .filter_map(|(candidate, candidate_reg, id)| {
+            (*candidate == address && *candidate_reg == reg).then_some(*id)
+        })
+        .collect()
+}
+
+fn assert_unsafe_home_cells_remain_storage(db: &DecompileDB) {
+    for (name, expected_param) in [
+        ("home_reassigned", Mreg::CX),
+        ("home_escape_mutated", Mreg::CX),
+        ("home_mixed_base_clobber", Mreg::CX),
+    ] {
+        let span = function_span(db, name);
+        let candidates: Vec<_> = db
+            .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill_candidate")
+            .filter(|(_, func, _, _)| *func == span.0)
+            .copied()
+            .collect();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "{name} must have one positive home-spill candidate: {candidates:#x?}"
+        );
+        assert_eq!((candidates[0].2, candidates[0].3), (expected_param, 0));
+        assert!(
+            !db.rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill")
+                .any(|(_, func, _, _)| *func == span.0),
+            "{name} must retain mutable local storage"
+        );
+        assert!(
+            !db.rel_iter::<(Address, Address, Mreg, usize)>("win64_home_reload")
+                .any(|(_, func, _, _)| *func == span.0),
+            "{name} reload must not fold to the entry parameter"
+        );
+
+        let spill_rtl = rtl_candidates(db, candidates[0].0);
+        let entry = entry_regs(db, span.0, expected_param);
+        assert!(
+            spill_rtl.iter().any(|inst| {
+                matches!(inst,
+                    RTLInst::Iop(Operation::Omove, args, _)
+                        if args.len() == 1 && entry.contains(&args[0])
+                ) || matches!(inst,
+                    RTLInst::Istore(_, _, _, src) if entry.contains(src)
+                )
+            }),
+            "{name} must retain a real write of the entry parameter: {spill_rtl:#x?}"
+        );
+        assert!(
+            !spill_rtl.contains(&RTLInst::Inop),
+            "{name} home initialization must not disappear: {spill_rtl:#x?}"
+        );
+
+        for (reload, func, _, _) in db
+            .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_reload_cell")
+            .filter(|(_, func, _, _)| *func == span.0)
+        {
+            assert_eq!(*func, span.0);
+            let reload_rtl = rtl_candidates(db, *reload);
+            assert!(
+                !reload_rtl.iter().any(|inst| {
+                    matches!(inst, RTLInst::Iop(Operation::Omove, args, _) if args.len() == 1 && entry.contains(&args[0]))
+                }),
+                "{name} reload incorrectly reused the entry parameter: {reload_rtl:#x?}"
+            );
+            assert!(
+                !reload_rtl.iter().any(|inst| matches!(
+                    inst,
+                    RTLInst::Iop(Operation::Olea(Addressing::Ainstack(_)), args, _)
+                        if args.is_empty()
+                )),
+                "{name} reload retained the competing address interpretation: {reload_rtl:#x?}"
+            );
+        }
+    }
+
+    let disjoint = function_span(db, "home_disjoint_branch");
+    assert!(!db
+        .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill")
+        .any(|(_, func, _, _)| *func == disjoint.0));
+    assert!(!db
+        .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_reload")
+        .any(|(_, func, _, _)| *func == disjoint.0));
+}
+
+fn canonical_home_storage(db: &DecompileDB, name: &str) -> ((Address, Address), u64) {
+    let span = function_span(db, name);
+    let storage: Vec<_> = db
+        .rel_iter::<(Address, usize, u64)>("win64_home_storage")
+        .filter_map(|(func, pos, slot)| (*func == span.0).then_some((*pos, *slot)))
+        .collect();
+    let vetoes: Vec<_> = db
+        .rel_iter::<(Address, usize)>("win64_home_canonical_veto")
+        .filter(|(func, _)| *func == span.0)
+        .copied()
+        .collect();
+    let accesses: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, i64, usize, i64)>("win64_unsafe_home_access")
+        .filter(|(_, func, _, _, _, _)| *func == span.0)
+        .copied()
+        .collect();
+    let stores: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, i64, usize, i64, Mreg, usize, usize)>(
+            "win64_home_scalar_store",
+        )
+        .filter(|(_, func, _, _, _, _, _, _, _)| *func == span.0)
+        .copied()
+        .collect();
+    let loads: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, i64, usize, i64, Mreg, usize, usize)>(
+            "win64_home_scalar_load",
+        )
+        .filter(|(_, func, _, _, _, _, _, _, _)| *func == span.0)
+        .copied()
+        .collect();
+    let candidate_rows: Vec<_> = accesses
+        .iter()
+        .map(|(node, ..)| (*node, rtl_candidates(db, *node)))
+        .collect();
+    assert_eq!(
+        storage.len(),
+        1,
+        "{name} must have one canonical mutable home cell: {storage:#x?}; \
+         vetoes={vetoes:#x?}; accesses={accesses:#x?}; stores={stores:#x?}; \
+         loads={loads:#x?}; candidates={candidate_rows:#x?}"
+    );
+    assert_eq!(storage[0].0, 0, "{name} used the wrong home ordinal");
+    assert!(
+        !db.rel_iter::<(Address, Address, i64, u64)>("stack_var")
+            .any(|(func, _, _, reg)| *func == span.0 && *reg == storage[0].1),
+        "{name} reused a raw-offset stack identity as canonical storage"
+    );
+    let types: HashSet<_> = db
+        .rel_iter::<(u64, XType)>("emit_var_type_candidate")
+        .filter_map(|(reg, xtype)| (*reg == storage[0].1).then_some(*xtype))
+        .collect();
+    assert_eq!(
+        types,
+        HashSet::from([XType::Xany64]),
+        "{name} canonical qword cell inherited a narrow/incompatible peer type"
+    );
+    (span, storage[0].1)
+}
+
+fn assert_home_accesses_use_slot(
+    db: &DecompileDB,
+    name: &str,
+    span: (Address, Address),
+    slot: u64,
+) {
+    let accesses: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, i64, usize, i64)>("win64_unsafe_home_access")
+        .filter(|(_, func, _, _, _, _)| *func == span.0)
+        .copied()
+        .collect();
+    assert!(
+        !accesses.is_empty(),
+        "{name} lost unsafe-home access evidence"
+    );
+    for (address, _, _, _, pos, entry_offset) in accesses {
+        assert_eq!(pos, 0, "{name} access used the wrong home ordinal");
+        assert_eq!(
+            entry_offset, 8,
+            "{name} access was not normalized to entry-SP coordinates"
+        );
+        let rtl = rtl_candidates(db, address);
+        assert_eq!(
+            rtl.len(),
+            1,
+            "{name} access kept competing RTL candidates: {rtl:#x?}"
+        );
+        let uses_slot = match &rtl[0] {
+            RTLInst::Iop(Operation::Omove, args, destination) => {
+                *destination == slot || args.as_ref() == &[slot]
+            }
+            RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(8)), args, _) => {
+                args.is_empty()
+                    && db
+                        .rel_iter::<(Address, u64)>("win64_home_address")
+                        .any(|(node, candidate)| (*node, *candidate) == (address, slot))
+            }
+            _ => false,
+        };
+        assert!(
+            uses_slot,
+            "{name} access did not use its canonical home cell: {rtl:#x?}"
+        );
+        assert!(
+            !db.rel_iter::<(Address, Address, i64, u64)>("stack_var")
+                .any(|(func, node, _, _)| (*func, *node) == (span.0, address)),
+            "{name} retained stale raw stack_var evidence at rewritten node {address:#x}"
+        );
+    }
+}
+
+fn assert_canonical_unsafe_home_storage(db: &DecompileDB) {
+    let (reassigned, reassigned_slot) = canonical_home_storage(db, "home_reassigned");
+    assert_home_accesses_use_slot(db, "home_reassigned", reassigned, reassigned_slot);
+
+    let (literal_escape, literal_escape_slot) = canonical_home_storage(db, "home_escape_mutated");
+    assert_home_accesses_use_slot(
+        db,
+        "home_escape_mutated",
+        literal_escape,
+        literal_escape_slot,
+    );
+
+    let (mixed, mixed_slot) = canonical_home_storage(db, "home_mixed_base_clobber");
+    let mixed_stores: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, i64, usize, i64, Mreg, usize, usize)>(
+            "win64_home_scalar_store",
+        )
+        .filter(|(_, func, base, _, _, _, _, _, _)| {
+            *func == mixed.0 && *base != Mreg::SP && *base != Mreg::BP
+        })
+        .cloned()
+        .collect();
+    let mixed_loads: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, i64, usize, i64, Mreg, usize, usize)>(
+            "win64_home_scalar_load",
+        )
+        .filter(|(_, func, base, _, _, _, _, _, _)| {
+            *func == mixed.0 && *base != Mreg::SP && *base != Mreg::BP
+        })
+        .cloned()
+        .collect();
+    assert_eq!(mixed_stores.len(), 1, "mixed-base copied store shape lost");
+    assert_eq!(mixed_loads.len(), 1, "mixed-base copied load shape lost");
+    let (store, _, base, raw_offset, pos, entry_offset, _, move_class, width) =
+        mixed_stores[0];
+    assert_eq!(
+        (base, raw_offset, pos, entry_offset, move_class, width),
+        (Mreg::R10, 8, 0, 8, 0, 8)
+    );
+    let store_rtl = rtl_candidates(db, store);
+    assert!(
+        store_rtl.iter().any(|inst| {
+            matches!(inst, RTLInst::Iop(Operation::Omove, args, destination)
+            if args.len() == 1 && *destination == mixed_slot)
+        }),
+        "copied home store did not write the canonical cell: {store_rtl:#x?}"
+    );
+    assert!(
+        !store_rtl
+            .iter()
+            .any(|inst| matches!(inst, RTLInst::Istore(..))),
+        "copied home store retained generic pointer memory: {store_rtl:#x?}"
+    );
+
+    let (load, _, base, raw_offset, pos, entry_offset, destination, move_class, width) =
+        mixed_loads[0];
+    assert_eq!(
+        (base, raw_offset, pos, entry_offset, move_class, width),
+        (Mreg::R10, 8, 0, 8, 0, 8)
+    );
+    let load_rtl = rtl_candidates(db, load);
+    let destinations = translated_regs_at(db, load, destination);
+    assert!(
+        load_rtl.iter().any(|inst| {
+            matches!(inst, RTLInst::Iop(Operation::Omove, args, candidate_destination)
+            if args.as_ref() == &[mixed_slot] && destinations.contains(candidate_destination))
+        }),
+        "copied home load did not read the canonical cell: {load_rtl:#x?}"
+    );
+    assert!(
+        !load_rtl
+            .iter()
+            .any(|inst| matches!(inst, RTLInst::Iload(..))),
+        "copied home load retained generic pointer memory: {load_rtl:#x?}"
+    );
+
+    let literal_clobber = db
+        .rel_iter::<(Address, Address, Mreg, i64, usize, i64)>("win64_unsafe_home_access")
+        .find_map(|(address, func, base, raw, pos, entry)| {
+            (*func == mixed.0 && *base == Mreg::SP).then_some((*address, *raw, *pos, *entry))
+        })
+        .expect("mixed-base fixture lost its literal-SP clobber");
+    assert_eq!(
+        (literal_clobber.1, literal_clobber.2, literal_clobber.3),
+        (8, 0, 8)
+    );
+    let literal_rtl = rtl_candidates(db, literal_clobber.0);
+    assert!(
+        literal_rtl.iter().any(|inst| {
+            matches!(inst, RTLInst::Iop(Operation::Omove, args, destination)
+            if args.len() == 1 && *destination == mixed_slot)
+        }),
+        "literal and copied stores did not share storage: {literal_rtl:#x?}"
+    );
+    assert_home_accesses_use_slot(db, "home_mixed_base_clobber", mixed, mixed_slot);
+
+    let (escaped, escaped_slot) = canonical_home_storage(db, "home_alias_call_escape");
+    let escaped_store = db
+        .rel_iter::<(Address, Address, Mreg, i64, usize, i64, Mreg, usize, usize)>(
+            "win64_home_scalar_store",
+        )
+        .find(|(_, func, base, _, _, _, _, _, _)| {
+            *func == escaped.0 && *base != Mreg::SP && *base != Mreg::BP
+        })
+        .cloned()
+        .expect("alias-call fixture lost its copied store");
+    let escaped_load = db
+        .rel_iter::<(Address, Address, Mreg, i64, usize, i64, Mreg, usize, usize)>(
+            "win64_home_scalar_load",
+        )
+        .find(|(_, func, base, _, _, _, _, _, _)| {
+            *func == escaped.0 && *base != Mreg::SP && *base != Mreg::BP
+        })
+        .cloned()
+        .expect("alias-call fixture lost its copied load");
+    let escaped_lea = db
+        .rel_iter::<(Address, Address, Mreg, i64, usize, i64, Mreg)>("win64_home_scalar_lea")
+        .find(|(_, func, base, _, _, _, _)| {
+            *func == escaped.0 && *base != Mreg::SP && *base != Mreg::BP
+        })
+        .copied()
+        .expect("alias-call fixture lost its copied LEA");
+    let store_rtl = rtl_candidates(db, escaped_store.0);
+    assert!(
+        store_rtl.iter().any(|inst| {
+            matches!(inst, RTLInst::Iop(Operation::Omove, _, destination)
+            if *destination == escaped_slot)
+        }),
+        "escaped copied store did not write canonical storage: {store_rtl:#x?}"
+    );
+    let load_rtl = rtl_candidates(db, escaped_load.0);
+    let load_destinations = translated_regs_at(db, escaped_load.0, escaped_load.6);
+    assert!(
+        load_rtl.iter().any(|inst| {
+            matches!(inst, RTLInst::Iop(Operation::Omove, args, destination)
+            if args.as_ref() == &[escaped_slot] && load_destinations.contains(destination))
+        }),
+        "escaped copied load did not read canonical storage: {load_rtl:#x?}"
+    );
+    let lea_rtl = rtl_candidates(db, escaped_lea.0);
+    let lea_destinations = translated_regs_at(db, escaped_lea.0, escaped_lea.6);
+    assert!(
+        lea_rtl.iter().any(|inst| {
+            matches!(inst,
+            RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(8)), args, destination)
+                if args.is_empty() && lea_destinations.contains(destination))
+        }),
+        "escaped copied LEA did not use canonical entry-SP coordinates: {lea_rtl:#x?}"
+    );
+    assert!(
+        !lea_rtl.iter().any(|inst| {
+            matches!(
+                inst,
+                RTLInst::Iop(Operation::Olea(Addressing::Aindexed(_)), _, _)
+            )
+        }),
+        "escaped copied LEA retained the copied-base coordinate: {lea_rtl:#x?}"
+    );
+    assert!(
+        db.rel_iter::<(Address, u64)>("win64_home_escaped")
+            .any(|(func, slot)| (*func, *slot) == (escaped.0, escaped_slot)),
+        "address-taken home cell was not protected from dead-store elimination"
+    );
+    assert_home_accesses_use_slot(db, "home_alias_call_escape", escaped, escaped_slot);
+
+    let (affine, affine_slot) = canonical_home_storage(db, "home_alias_arith_clobber");
+    let affine_load = db
+        .rel_iter::<(Address, Address, Mreg, i64, usize, i64, Mreg, usize, usize)>(
+            "win64_home_scalar_load",
+        )
+        .find(|(_, func, base, raw, _, entry, _, _, _)| {
+            *func == affine.0 && *base == Mreg::R10 && *raw == 0 && *entry == 8
+        })
+        .cloned()
+        .expect("affine alias load did not retain entry-SP coordinate 8");
+    assert!(
+        db.rel_iter::<(Address, Address, Mreg, i64)>("sp_base_alias_at")
+            .any(|(func, address, reg, offset)| {
+                (*func, *address, *reg, *offset) == (affine.0, affine_load.0, Mreg::R10, 8)
+            }),
+        "in-place ADD alias did not propagate to the final load"
+    );
+    let affine_rtl = rtl_candidates(db, affine_load.0);
+    let affine_destinations = translated_regs_at(db, affine_load.0, affine_load.6);
+    assert!(
+        affine_rtl.iter().any(|inst| {
+            matches!(inst, RTLInst::Iop(Operation::Omove, args, destination)
+            if args.as_ref() == &[affine_slot] && affine_destinations.contains(destination))
+        }),
+        "affine copied load did not read canonical storage: {affine_rtl:#x?}"
+    );
+    assert!(
+        !affine_rtl
+            .iter()
+            .any(|inst| matches!(inst, RTLInst::Iload(..))),
+        "affine copied load retained generic pointer memory: {affine_rtl:#x?}"
+    );
+    assert_home_accesses_use_slot(db, "home_alias_arith_clobber", affine, affine_slot);
+
+    let (nonvolatile, nonvolatile_slot) =
+        canonical_home_storage(db, "home_nonvolatile_alias_after_call");
+    assert_home_accesses_use_slot(
+        db,
+        "home_nonvolatile_alias_after_call",
+        nonvolatile,
+        nonvolatile_slot,
+    );
+}
+
+fn assert_postsub_raw_offset_does_not_alias_home(db: &DecompileDB) {
+    let (span, slot) = canonical_home_storage(db, "home_postsub_raw_collision");
+    let home_nodes: HashSet<_> = db
+        .rel_iter::<(Address, Address, Mreg, i64, usize, i64)>("win64_unsafe_home_access")
+        .filter_map(|(node, func, _, _, _, _)| (*func == span.0).then_some(*node))
+        .collect();
+    assert_home_accesses_use_slot(db, "home_postsub_raw_collision", span, slot);
+
+    let postsub_nodes: Vec<_> = db
+        .rel_iter::<(Address, LTLInst)>("ltl_inst")
+        .filter_map(|(node, inst)| {
+            (in_span(*node, span)
+                && !home_nodes.contains(node)
+                && matches!(
+                    inst,
+                    LTLInst::Lsetstack(_, _, 8, _) | LTLInst::Lgetstack(_, 8, _, _)
+                ))
+            .then_some(*node)
+        })
+        .collect();
+    assert!(
+        postsub_nodes.len() >= 2,
+        "missing post-sub raw-offset accesses"
+    );
+    for node in postsub_nodes {
+        let rtl = rtl_candidates(db, node);
+        assert!(
+            !rtl.iter().any(|inst| match inst {
+                RTLInst::Iop(Operation::Omove, args, destination) => {
+                    *destination == slot || args.as_ref() == &[slot]
+                }
+                _ => false,
+            }),
+            "post-sub [rsp+8] collided with entry home storage: {rtl:#x?}"
+        );
+        assert!(
+            db.rel_iter::<(Address, Address, i64, u64)>("stack_var")
+                .any(|(func, candidate, ofs, reg)| {
+                    (*func, *candidate, *ofs) == (span.0, node, 8) && *reg != slot
+                }),
+            "post-sub raw local lost its independent stack identity"
+        );
+    }
+}
+
+fn assert_postsub_escaped_offset_keeps_ordinary_origin(db: &DecompileDB) {
+    let (span, home_slot) = canonical_home_storage(db, "home_postsub_escaped_collision");
+    assert_home_accesses_use_slot(db, "home_postsub_escaped_collision", span, home_slot);
+
+    let home_address_nodes: HashSet<_> = db
+        .rel_iter::<(Address, u64)>("win64_home_address")
+        .filter_map(|(node, slot)| (*slot == home_slot).then_some(*node))
+        .collect();
+    assert_eq!(
+        home_address_nodes.len(),
+        1,
+        "missing canonical home LEA origin"
+    );
+
+    let ordinary_origins: Vec<_> = db
+        .rel_iter::<(Address, Address, i64, u64)>("slot_escaped_origin")
+        .filter_map(|(func, origin, ofs, reg)| {
+            (*func == span.0 && *ofs == 8 && !home_address_nodes.contains(origin))
+                .then_some((*origin, *reg))
+        })
+        .collect();
+    assert_eq!(
+        ordinary_origins.len(),
+        1,
+        "same-raw-offset post-prologue escaped LEA origin was lost: {ordinary_origins:#x?}"
+    );
+    let (ordinary_origin, ordinary_reg) = ordinary_origins[0];
+    assert_ne!(
+        ordinary_reg, home_slot,
+        "ordinary local reused canonical home storage"
+    );
+    assert!(
+        db.rel_iter::<(Address, Address, i64, u64)>("stack_var")
+            .any(|(func, node, ofs, reg)| {
+                (*func, *node, *ofs, *reg) == (span.0, ordinary_origin, 8, ordinary_reg)
+            }),
+        "ordinary escaped LEA lost its node-local stack identity"
+    );
+    assert!(
+        db.rel_iter::<(Address, i64, u64)>("slot_escaped_canonical")
+            .any(|(func, ofs, reg)| { (*func, *ofs, *reg) == (span.0, 8, ordinary_reg) }),
+        "home-origin filtering deleted the unrelated escaped local protection"
+    );
+}
+
+fn assert_optimized_canonical_homes(db: &DecompileDB) {
+    for name in [
+        "home_reassigned",
+        "home_mixed_base_clobber",
+        "home_alias_call_escape",
+        "home_alias_arith_clobber",
+    ] {
+        let span = function_span(db, name);
+        let slot = db
+            .rel_iter::<(Address, usize, u64)>("win64_home_storage")
+            .find_map(|(func, pos, slot)| (*func == span.0 && *pos == 0).then_some(*slot))
+            .unwrap_or_else(|| panic!("{name} lost canonical storage after RTLOptimize"));
+        let types: HashSet<_> = db
+            .rel_iter::<(u64, XType)>("emit_var_type_candidate")
+            .filter_map(|(reg, xtype)| (*reg == slot).then_some(*xtype))
+            .collect();
+        assert_eq!(
+            types,
+            HashSet::from([XType::Xany64]),
+            "{name} optimizer observed a non-signature canonical-slot type"
+        );
+        let access_nodes: HashSet<_> = db
+            .rel_iter::<(Address, Address, Mreg, i64, usize, i64)>("win64_unsafe_home_access")
+            .filter_map(|(node, func, _, _, _, _)| (*func == span.0).then_some(*node))
+            .collect();
+        for (node, inst) in db
+            .rel_iter::<(Address, RTLInst)>("rtl_inst")
+            .filter(|(node, _)| access_nodes.contains(node))
+        {
+            assert!(
+                matches!(inst, RTLInst::Inop)
+                    || matches!(inst,
+                        RTLInst::Iop(Operation::Omove, args, destination)
+                            if *destination == slot || args.as_ref() == &[slot])
+                    || matches!(inst,
+                        RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(8)), args, _)
+                            if args.is_empty()),
+                "{name} reintroduced split/raw storage at {node:#x}: {inst:#x?}"
+            );
+        }
+    }
+
+    let escaped = function_span(db, "home_alias_call_escape");
+    let slot = db
+        .rel_iter::<(Address, usize, u64)>("win64_home_storage")
+        .find_map(|(func, pos, slot)| (*func == escaped.0 && *pos == 0).then_some(*slot))
+        .unwrap();
+    let optimized: Vec<_> = db
+        .rel_iter::<(Address, RTLInst)>("rtl_inst")
+        .filter(|(node, _)| in_span(*node, escaped))
+        .cloned()
+        .collect();
+    assert!(
+        optimized.iter().any(|(_, inst)| {
+            matches!(inst, RTLInst::Iop(Operation::Omove, _, destination) if *destination == slot)
+        }),
+        "escaped home initialization was optimized away: {optimized:#x?}"
+    );
+    assert!(
+        optimized.iter().any(|(_, inst)| {
+            matches!(inst, RTLInst::Iop(Operation::Omove, args, _) if args.as_ref() == &[slot])
+        }),
+        "escaped home read was optimized across its call: {optimized:#x?}"
+    );
+
+    let collision = function_span(db, "home_postsub_escaped_collision");
+    let ordinary_slot = db
+        .rel_iter::<(Address, i64, u64)>("slot_escaped_canonical")
+        .find_map(|(func, ofs, reg)| (*func == collision.0 && *ofs == 8).then_some(*reg))
+        .expect("ordinary escaped collision slot lost after RTLOptimize");
+    assert!(
+        db.rel_iter::<(Address, RTLInst)>("rtl_inst")
+            .any(|(node, inst)| {
+                in_span(*node, collision)
+                    && matches!(inst, RTLInst::Iop(Operation::Omove, _, destination)
+                    if *destination == ordinary_slot)
+            }),
+        "ordinary escaped collision-slot store was dead-store-eliminated"
+    );
+}
+
+fn assert_post_type_canonical_homes(db: &DecompileDB) {
+    let selected: Vec<_> = db
+        .rel_iter::<(Address, usize, u64)>("win64_home_storage")
+        .copied()
+        .collect();
+    assert!(
+        !selected.is_empty(),
+        "TypePass lost all canonical home storage"
+    );
+    for (_, _, slot) in selected {
+        let locked: Vec<_> = db
+            .rel_iter::<(u64, XType)>("win64_home_slot_type")
+            .filter_map(|(reg, xtype)| (*reg == slot).then_some(*xtype))
+            .collect();
+        assert_eq!(locked, vec![XType::Xany64], "wrong qword home type lock");
+        let candidates: HashSet<_> = db
+            .rel_iter::<(u64, XType)>("emit_var_type_candidate")
+            .filter_map(|(reg, xtype)| (*reg == slot).then_some(*xtype))
+            .collect();
+        assert_eq!(
+            candidates,
+            HashSet::from([XType::Xany64]),
+            "TypePass Omove propagation contaminated canonical home slot {slot:#x}"
+        );
+    }
+}
+
+fn stack_vars_at(
+    db: &DecompileDB,
+    function: Address,
+    address: Address,
+    offset: i64,
+) -> HashSet<u64> {
+    db.rel_iter::<(Address, Address, i64, u64)>("stack_var")
+        .filter_map(|(func, candidate, ofs, reg)| {
+            (*func == function && *candidate == address && *ofs == offset).then_some(*reg)
+        })
+        .collect()
+}
+
+fn indexed_store_at(db: &DecompileDB, span: (Address, Address)) -> Address {
+    db.rel_iter::<(Address, MachInst)>("mach_inst")
+        .find_map(|(address, inst)| {
+            (in_span(*address, span)
+                && matches!(
+                    inst,
+                    MachInst::Mstore(MemoryChunk::MInt32, Addressing::Aindexed2scaled(4, 8), _, _)
+                ))
+            .then_some(*address)
+        })
+        .unwrap_or_else(|| panic!("missing indexed store in {span:#x?}"))
+}
+
+fn assert_indexed_stack_cells_use_normalized_coordinates(db: &DecompileDB) {
+    let home = function_span(db, "home_vs_postsub_indexed");
+    let home_spill = db
+        .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill_candidate")
+        .find_map(|(addr, func, _, pos)| (*func == home.0 && *pos == 0).then_some(*addr))
+        .expect("missing pre-prologue home spill");
+    let indexed = indexed_store_at(db, home);
+    let home_vars = stack_vars_at(db, home.0, home_spill, 8);
+    let indexed_vars = stack_vars_at(db, home.0, indexed, 8);
+    assert!(!home_vars.is_empty() && !indexed_vars.is_empty());
+    assert!(
+        home_vars.is_disjoint(&indexed_vars),
+        "pre-sub home and post-sub indexed local share only a raw displacement: home={home_vars:#x?}, indexed={indexed_vars:#x?}"
+    );
+    let postsub_scalar = db
+        .rel_iter::<(Address, LTLInst)>("ltl_inst")
+        .find_map(|(addr, inst)| {
+            (in_span(*addr, home)
+                && *addr != home_spill
+                && matches!(inst, LTLInst::Lsetstack(_, _, 8, _)))
+            .then_some(*addr)
+        })
+        .expect("missing post-sub scalar slot beside indexed local");
+    let postsub_scalar_vars = stack_vars_at(db, home.0, postsub_scalar, 8);
+    assert!(
+        !postsub_scalar_vars.is_disjoint(&indexed_vars),
+        "same-depth scalar and indexed stack cells did not alias: scalar={postsub_scalar_vars:#x?}, indexed={indexed_vars:#x?}"
+    );
+
+    let depths = function_span(db, "two_sp_depths");
+    let first_scalar = db
+        .rel_iter::<(Address, LTLInst)>("ltl_inst")
+        .find_map(|(addr, inst)| {
+            (in_span(*addr, depths) && matches!(inst, LTLInst::Lsetstack(_, _, 8, _)))
+                .then_some(*addr)
+        })
+        .expect("missing first-depth scalar slot");
+    let second_indexed = indexed_store_at(db, depths);
+    let first_vars = stack_vars_at(db, depths.0, first_scalar, 8);
+    let second_vars = stack_vars_at(db, depths.0, second_indexed, 8);
+    assert!(!first_vars.is_empty() && !second_vars.is_empty());
+    assert!(
+        first_vars.is_disjoint(&second_vars),
+        "equal raw offsets at distinct SP depths must not alias: first={first_vars:#x?}, second={second_vars:#x?}"
+    );
+}
+
+fn assert_stack_address_destinations_are_not_storage(db: &DecompileDB) {
+    let mut checked = 0usize;
+    for (node, inst) in db.rel_iter::<(Address, RTLInst)>("rtl_inst_candidate") {
+        let destination = match inst {
+            RTLInst::Iop(
+                Operation::Olea(Addressing::Ainstack(_))
+                | Operation::Oleal(Addressing::Ainstack(_)),
+                _,
+                destination,
+            ) => *destination,
+            _ => continue,
+        };
+        let cells: Vec<_> = db
+            .rel_iter::<(Address, Address, i64, u64)>("stack_var")
+            .filter_map(|(_, candidate, _, cell)| (*candidate == *node).then_some(*cell))
+            .collect();
+        if cells.is_empty() {
+            continue;
+        }
+        checked += 1;
+        assert!(
+            !cells.contains(&destination),
+            "stack address destination aliases its own storage at {node:#x}: destination={destination:#x}, cells={cells:#x?}"
+        );
+    }
+    assert!(
+        checked > 0,
+        "fixture did not exercise a named stack address"
+    );
+}
+
+fn assert_unknown_sp_and_high_offsets_do_not_infer_params(db: &DecompileDB) {
+    for name in [
+        "dynamic_sp_unknown",
+        "branch_stack_unknown",
+        "high_stack_offset",
+    ] {
+        let span = function_span(db, name);
+        assert!(
+            !db.rel_iter::<(Address, usize)>("stack_param_ordinal")
+                .any(|(func, _)| *func == span.0),
+            "{name} fabricated a stack parameter"
+        );
+        assert!(
+            !db.rel_iter::<(Address, Address, i64, usize)>("stack_param_access")
+                .any(|(_, func, _, _)| *func == span.0),
+            "{name} fabricated a concrete stack-parameter access"
+        );
+    }
+}
+
+fn assert_incoming_stack_rmw_is_initialized_and_survives(db: &DecompileDB) {
+    for name in ["fifth_inc", "fifth_add_reg"] {
+        let span = function_span(db, name);
+        let access = db
+            .rel_iter::<(Address, Address, i64, usize)>("stack_param_access")
+            .find(|(_, func, disp, ordinal)| *func == span.0 && *disp == 40 && *ordinal == 0)
+            .copied()
+            .unwrap_or_else(|| panic!("{name} lost its fifth-parameter RMW"));
+        assert!(db
+            .rel_iter::<(Address, usize)>("emit_function_param_count_candidate")
+            .any(|(func, count)| (*func, *count) == (span.0, 5)));
+
+        let local = stack_vars_at(db, span.0, access.0, 40);
+        assert!(
+            !local.is_empty(),
+            "{name} did not materialize mutable storage"
+        );
+        let init = rtl_candidates(db, access.0);
+        assert!(init.iter().any(|inst| {
+            matches!(inst, RTLInst::Iop(Operation::Omove, args, dst) if args.len() == 1 && local.contains(dst))
+        }), "{name} did not initialize the mutable local: {init:#x?}");
+        let update = rtl_candidates(db, access.0 | SYNTH1);
+        assert!(update.iter().any(|inst| {
+            matches!(inst, RTLInst::Iop(op, args, dst) if *op != Operation::Omove && !args.is_empty() && local.contains(dst))
+        }), "{name} RMW update disappeared: {update:#x?}");
+    }
+
+    let overlap = function_span(db, "alias_partial_before_fifth_inc");
+    let rmw = db
+        .rel_iter::<(Address, Operation, MemoryChunk, Mreg, i64)>("arith_store_imm")
+        .find_map(|(address, _, chunk, base, disp)| {
+            (in_span(*address, overlap)
+                && *chunk == MemoryChunk::MInt32
+                && *base == Mreg::SP
+                && *disp == 40)
+                .then_some(*address)
+        })
+        .expect("missing copied-alias overlap fixture RMW");
+    let prior = db
+        .rel_iter::<(Address, Address)>("stack_param_partial_write")
+        .find_map(|(candidate, write)| (*candidate == rmw).then_some(*write))
+        .expect("copied-SP byte write did not veto pristine fifth-parameter seeding");
+    assert!(
+        db.rel_iter::<(Address, Address, Mreg, i64, i64, i64)>("normalized_stack_write_range",)
+            .any(|(node, func, base, disp, start, end)| {
+                (*node, *func, *base, *disp, *start, *end)
+                    == (prior, overlap.0, Mreg::R10, 41, 41, 42)
+            }),
+        "copied-SP prior write lost its exact normalized byte range"
+    );
+    assert!(
+        !db.rel_iter::<(Address, Address, i64, usize)>("stack_param_access")
+            .any(|(node, func, disp, _)| { (*node, *func, *disp) == (rmw, overlap.0, 40) }),
+        "overlapped RMW was initialized again from the pristine ABI parameter"
+    );
+    assert!(db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .any(|(func, access, reason)| {
+            (*func, *access, *reason) == (overlap.0, rmw, "unsupported-stack-address")
+        }));
+    let candidates = address_bearing_candidates(db, rmw);
+    assert!(
+        candidates.is_empty(),
+        "overlapped copied-SP RMW retained address-bearing RTL: {candidates:#x?}"
+    );
+}
+
+fn assert_outgoing_home_coordinate_is_not_suppressed(db: &DecompileDB) {
+    let caller = function_span(db, "outgoing_reuses_home_coordinate");
+    assert!(!db
+        .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill_candidate")
+        .any(|(_, func, _, _)| *func == caller.0));
+    let call = db
+        .rel_iter::<(Address, Address)>("call_target_func")
+        .find_map(|(site, target)| {
+            let callee = function_span(db, "callee_seventh");
+            (in_span(*site, caller) && *target == callee.0).then_some(*site)
+        })
+        .expect("missing outgoing-coordinate fixture call");
+    assert!(
+        db.rel_iter::<(Address, usize)>("call_has_arg_evidence")
+            .any(|(site, position)| (*site, *position) == (call, 6)),
+        "outgoing seventh argument was suppressed as a home spill"
+    );
+}
+
+fn assert_bp_postprologue_and_xmm_forms(db: &DecompileDB) {
+    for name in ["bp_fifth", "postprologue_fifth", "bp_postalloc_fifth"] {
+        let span = function_span(db, name);
+        assert!(db
+            .rel_iter::<(Address, Address, i64, usize)>("stack_param_access")
+            .any(|(_, func, _, ordinal)| *func == span.0 && *ordinal == 0));
+        assert!(db
+            .rel_iter::<(Address, usize)>("emit_function_param_count_candidate")
+            .any(|(func, count)| (*func, *count) == (span.0, 5)));
+    }
+
+    let xmm = function_span(db, "xmm_home_roundtrip");
+    assert!(db
+        .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill")
+        .any(|(_, func, reg, pos)| (*func, *reg, *pos) == (xmm.0, Mreg::X0, 0)));
+    assert!(db
+        .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_reload")
+        .any(|(_, func, reg, pos)| (*func, *reg, *pos) == (xmm.0, Mreg::X0, 0)));
+}
+
+fn assert_bp_provenance_preserves_pointer_memory(db: &DecompileDB) {
+    let direct = function_span(db, "bp_conditional_pointer");
+    let direct_mach: Vec<_> = db
+        .rel_iter::<(Address, MachInst)>("mach_inst")
+        .filter(|(address, _)| in_span(*address, direct))
+        .cloned()
+        .collect();
+    assert!(
+        direct_mach.iter().any(|(_, inst)| {
+            matches!(inst,
+                MachInst::Mstore(MemoryChunk::MInt32, Addressing::Aindexed(40), args, Mreg::DX)
+                    if args.as_ref() == &[Mreg::BP]
+            )
+        }),
+        "conditional BP store was fabricated as a frame slot: {direct_mach:#x?}"
+    );
+    assert!(
+        direct_mach.iter().any(|(_, inst)| {
+            matches!(inst,
+                MachInst::Mload(MemoryChunk::MInt32, Addressing::Aindexed(40), args, Mreg::AX)
+                    if args.as_ref() == &[Mreg::BP]
+            )
+        }),
+        "conditional BP load was fabricated as a frame slot: {direct_mach:#x?}"
+    );
+    assert!(
+        !direct_mach.iter().any(|(_, inst)| {
+            matches!(
+                inst,
+                MachInst::Mgetstack(40, _, _) | MachInst::Msetstack(_, 40, _)
+            )
+        }),
+        "conditional BP accesses must remain pointer memory: {direct_mach:#x?}"
+    );
+
+    let indexed = function_span(db, "bp_conditional_indexed_pointer");
+    let indexed_mach: Vec<_> = db
+        .rel_iter::<(Address, MachInst)>("mach_inst")
+        .filter(|(address, _)| in_span(*address, indexed))
+        .cloned()
+        .collect();
+    assert!(
+        indexed_mach.iter().any(|(_, inst)| {
+            matches!(inst,
+                MachInst::Mload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2scaled(4, 40),
+                    args,
+                    Mreg::AX
+                ) if args.as_ref() == &[Mreg::BP, Mreg::DX]
+            )
+        }),
+        "conditional indexed BP load lost pointer semantics: {indexed_mach:#x?}"
+    );
+    let indexed_access = indexed_mach
+        .iter()
+        .find_map(|(address, inst)| {
+            matches!(inst,
+                MachInst::Mload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2scaled(4, 40),
+                    args,
+                    Mreg::AX
+                ) if args.as_ref() == &[Mreg::BP, Mreg::DX]
+            )
+            .then_some(*address)
+        })
+        .expect("missing conditional indexed BP load address");
+    let indexed_rtl = address_bearing_candidates(db, indexed_access);
+    assert!(
+        indexed_rtl.iter().any(|inst| {
+            matches!(inst,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2scaled(4, 40),
+                    args,
+                    _
+                ) if args.len() == 2
+            )
+        }),
+        "conditional indexed BP load did not use generic pointer RTL: {indexed_rtl:#x?}"
+    );
+    assert!(
+        !indexed_rtl.iter().any(|inst| {
+            matches!(
+                inst,
+                RTLInst::Iop(
+                    Operation::Olea(Addressing::Ainstack(_))
+                        | Operation::Oleal(Addressing::Ainstack(_)),
+                    _,
+                    _
+                )
+            )
+        }),
+        "conditional indexed BP load fabricated a stack base: {indexed_rtl:#x?}"
+    );
+
+    let clobber = function_span(db, "bp_conditional_clobber");
+    let clobber_mach: Vec<_> = db
+        .rel_iter::<(Address, MachInst)>("mach_inst")
+        .filter(|(address, _)| in_span(*address, clobber))
+        .cloned()
+        .collect();
+    assert!(
+        clobber_mach.iter().any(|(_, inst)| {
+            matches!(inst,
+                MachInst::Mload(MemoryChunk::MInt32, Addressing::Aindexed(40), args, Mreg::AX)
+                    if args.as_ref() == &[Mreg::BP]
+            )
+        }),
+        "conditionally clobbered BP load became a frame slot: {clobber_mach:#x?}"
+    );
+
+    for span in [direct, indexed, clobber] {
+        assert!(!db
+            .rel_iter::<(Address, Address)>("bp_frame_at")
+            .any(|(access, func)| *func == span.0 && in_span(*access, span)));
+        assert!(!db
+            .rel_iter::<(Address, Address, i64, usize)>("stack_param_access")
+            .any(|(_, func, _, _)| *func == span.0));
+    }
+
+    let postalloc = function_span(db, "bp_postalloc_fifth");
+    assert!(db
+        .rel_iter::<(Address, Address)>("bp_frame_at")
+        .any(|(access, func)| *func == postalloc.0 && in_span(*access, postalloc)));
+}
+
+fn assert_bp_shortcuts_and_narrow_bases_stay_pointer_memory(db: &DecompileDB) {
+    for name in ["bp_conditional_lea", "bp_clobbered_lea"] {
+        let span = function_span(db, name);
+        let mach: Vec<_> = db
+            .rel_iter::<(Address, MachInst)>("mach_inst")
+            .filter(|(address, _)| in_span(*address, span))
+            .cloned()
+            .collect();
+        assert!(
+            mach.iter().any(|(_, inst)| {
+                matches!(
+                    inst,
+                    MachInst::Mop(Operation::Olea(Addressing::Aindexed(40)), args, Mreg::AX)
+                        if args.as_ref() == &[Mreg::BP]
+                )
+            }),
+            "{name} lost its generic RBP pointer LEA: {mach:#x?}"
+        );
+        assert!(
+            !mach.iter().any(|(_, inst)| {
+                matches!(
+                    inst,
+                    MachInst::Mop(
+                        Operation::Olea(Addressing::Ainstack(40))
+                            | Operation::Oleal(Addressing::Ainstack(40)),
+                        _,
+                        _
+                    )
+                )
+            }),
+            "{name} fabricated a stack-slot address: {mach:#x?}"
+        );
+        assert!(!db
+            .rel_iter::<(Address, Address, i64)>("bp_base_at")
+            .any(|(func, access, _)| *func == span.0 && in_span(*access, span)));
+    }
+
+    for (name, expected_op) in [
+        ("bp_conditional_rmw", Operation::Oaddimm(1)),
+        ("bp_clobbered_rmw", Operation::Oaddimm(-1)),
+    ] {
+        let span = function_span(db, name);
+        let rmw_addr = db
+            .rel_iter::<(Address, Operation, MemoryChunk, Mreg, i64)>("arith_store_imm")
+            .find_map(|(address, op, chunk, base, disp)| {
+                (in_span(*address, span)
+                    && *op == expected_op
+                    && *chunk == MemoryChunk::MInt32
+                    && *base == Mreg::BP
+                    && *disp == 40)
+                    .then_some(*address)
+            })
+            .unwrap_or_else(|| panic!("{name} lost its pointer RMW relation"));
+        assert!(!db
+            .rel_iter::<(Address, i64, i64, usize)>("stack_mem_add_imm")
+            .any(|(address, _, _, _)| in_span(*address, span)));
+        assert!(!db
+            .rel_iter::<(Address, i64, i64, usize)>("stack_mem_sub_imm")
+            .any(|(address, _, _, _)| in_span(*address, span)));
+        assert!(!db
+            .rel_iter::<(Address, Address, i64)>("bp_base_at")
+            .any(|(func, access, _)| (*func, *access) == (span.0, rmw_addr)));
+        let load = rtl_candidates(db, rmw_addr);
+        assert!(
+            load.iter().any(|inst| {
+                matches!(
+                    inst,
+                    RTLInst::Iload(MemoryChunk::MInt32, Addressing::Aindexed(40), args, _)
+                        if args.len() == 1
+                )
+            }),
+            "{name} collapsed its pointer RMW into a stack variable: {load:#x?}"
+        );
+        let store = rtl_candidates(db, rmw_addr | (1u64 << 63));
+        assert!(
+            store.iter().any(|inst| {
+                matches!(
+                    inst,
+                    RTLInst::Istore(MemoryChunk::MInt32, Addressing::Aindexed(40), args, _)
+                        if args.len() == 1
+                )
+            }),
+            "{name} lost the generic pointer store: {store:#x?}"
+        );
+    }
+
+    for (name, base) in [("narrow_ebp_pointer", Mreg::BP)] {
+        let span = function_span(db, name);
+        let mach: Vec<_> = db
+            .rel_iter::<(Address, MachInst)>("mach_inst")
+            .filter(|(address, _)| in_span(*address, span))
+            .cloned()
+            .collect();
+        assert!(
+            mach.iter().any(|(_, inst)| {
+                matches!(
+                    inst,
+                    MachInst::Mload(
+                        MemoryChunk::MInt32,
+                        Addressing::Aaddr32(inner),
+                        args,
+                        Mreg::AX
+                    ) if matches!(inner.as_ref(), Addressing::Aindexed(40))
+                        && args.as_ref() == &[base]
+                )
+            }),
+            "{name} lost its address-size-overridden pointer load: {mach:#x?}"
+        );
+        assert!(!mach
+            .iter()
+            .any(|(_, inst)| matches!(inst, MachInst::Mgetstack(40, _, _))));
+        assert!(!db
+            .rel_iter::<(Address, Mreg, i64, usize)>("direct_stack_operand")
+            .any(|(address, seen_base, _, _)| { in_span(*address, span) && *seen_base == base }));
+        assert!(!db
+            .rel_iter::<(Address, Address, i64, usize)>("stack_param_access")
+            .any(|(_, func, _, _)| *func == span.0));
+    }
+
+    let narrow_esp = function_span(db, "narrow_esp_pointer");
+    let narrow_esp_mach: Vec<_> = db
+        .rel_iter::<(Address, MachInst)>("mach_inst")
+        .filter(|(address, _)| in_span(*address, narrow_esp))
+        .cloned()
+        .collect();
+    assert!(
+        narrow_esp_mach
+            .iter()
+            .all(|(_, inst)| !matches!(inst, MachInst::Mload(..) | MachInst::Mgetstack(..))),
+        "addr32 ESP access was mis-lowered as an ordinary stack/pointer load: {narrow_esp_mach:#x?}"
+    );
+    assert!(
+        db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address_seed")
+            .any(|(func, address, reason)| {
+                *func == narrow_esp.0
+                    && in_span(*address, narrow_esp)
+                    && *reason == "unsupported-addr32-address"
+            }),
+        "addr32 ESP access lacks its structured unsupported diagnostic"
+    );
+    assert!(!db
+        .rel_iter::<(Address, Mreg, i64, usize)>("direct_stack_operand")
+        .any(|(address, base, _, _)| { in_span(*address, narrow_esp) && *base == Mreg::SP }));
+    assert!(!db
+        .rel_iter::<(Address, Address, i64, usize)>("stack_param_access")
+        .any(|(_, func, _, _)| *func == narrow_esp.0));
+
+    let narrow_alias = function_span(db, "narrow_eax_stack_alias");
+    assert!(
+        !db.rel_iter::<(Address, Mreg, i64, usize)>("direct_stack_operand")
+            .any(|(address, base, _, _)| { in_span(*address, narrow_alias) && *base == Mreg::AX }),
+        "[eax] was accepted as a 64-bit copied-stack operand"
+    );
+    assert!(
+        !db.rel_iter::<(Address, Address, Mreg, i64, usize)>("win64_home_cell")
+            .any(|(_, func, _, _, _)| *func == narrow_alias.0),
+        "[eax] fabricated a Win64 home-cell access"
+    );
+    assert!(
+        !db.rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill")
+            .any(|(_, func, _, _)| *func == narrow_alias.0),
+        "[eax] fabricated a Win64 home spill"
+    );
+    assert!(
+        !db.rel_iter::<(Address, usize, u64)>("win64_home_storage")
+            .any(|(func, _, _)| *func == narrow_alias.0),
+        "[eax] fabricated canonical home storage"
+    );
+
+    let pop = function_span(db, "pop_rsp_unknown");
+    assert!(!db
+        .rel_iter::<(Address, Address, Mreg, i64, usize)>("incoming_stack_slot")
+        .any(|(_, func, _, _, _)| *func == pop.0));
+    assert!(!db
+        .rel_iter::<(Address, Address, i64, usize)>("stack_param_access")
+        .any(|(_, func, _, _)| *func == pop.0));
+}
+
+fn assert_home_safety_vetoes(db: &DecompileDB) {
+    for (name, expected_reg) in [
+        ("home_unknown_indexed_bp", Mreg::CX),
+        ("home_ambiguous_alias_call_escape", Mreg::CX),
+        ("home_direct_alias_call_escape", Mreg::CX),
+        ("home_direct_alias_return", Mreg::CX),
+        ("home_cross_class_reload", Mreg::CX),
+        ("home_xmm_mutation", Mreg::X0),
+        ("home_partial_reload", Mreg::CX),
+        ("home_xchg_mutation", Mreg::CX),
+        ("home_conditional_spill_reload", Mreg::CX),
+        ("home_wide_overlap", Mreg::CX),
+        ("home_escape_numeric_use", Mreg::CX),
+    ] {
+        let span = function_span(db, name);
+        assert!(
+            db.rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill_candidate")
+                .any(|(_, func, reg, pos)| { (*func, *reg, *pos) == (span.0, expected_reg, 0) }),
+            "{name} lost its positive initial-spill evidence"
+        );
+        assert!(
+            !db.rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill")
+                .any(|(_, func, _, _)| *func == span.0),
+            "{name} unsafely folded its home spill"
+        );
+        assert!(
+            !db.rel_iter::<(Address, Address, Mreg, usize)>("win64_home_reload")
+                .any(|(_, func, _, _)| *func == span.0),
+            "{name} unsafely folded a reload"
+        );
+        assert!(
+            !db.rel_iter::<(Address, usize, u64)>("win64_home_storage")
+                .any(|(func, _, _)| *func == span.0),
+            "{name} received canonical storage despite an unsupported access"
+        );
+    }
+
+    for name in [
+        "home_cross_class_reload",
+        "home_xmm_mutation",
+        "home_partial_reload",
+        "home_xchg_mutation",
+        "home_wide_overlap",
+    ] {
+        let span = function_span(db, name);
+        let unsafe_overlaps: Vec<_> = db
+            .rel_iter::<(Address, Address, usize)>("win64_home_overlap")
+            .filter_map(|(access, func, _)| {
+                ((*func == span.0)
+                    && db
+                        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+                        .any(|(unsupported_func, unsupported_access, reason)| {
+                            (*unsupported_func, *unsupported_access, *reason)
+                                == (span.0, *access, "unsupported-stack-address")
+                        }))
+                .then_some(*access)
+            })
+            .collect();
+        assert!(
+            !unsafe_overlaps.is_empty(),
+            "{name} lost structured rejection for its non-scalar home overlap"
+        );
+        for access in unsafe_overlaps {
+            let candidates = address_bearing_candidates(db, access);
+            assert!(
+                candidates.is_empty(),
+                "{name} retained address-bearing RTL at rejected home access {access:#x}: {candidates:#x?}"
+            );
+        }
+    }
+
+    for name in [
+        "home_ambiguous_alias_call_escape",
+        "home_direct_alias_call_escape",
+    ] {
+        let span = function_span(db, name);
+        let overlaps = db
+            .rel_iter::<(Address, Address, usize)>("win64_home_overlap")
+            .filter(|(_, func, pos)| (*func, *pos) == (span.0, 0))
+            .count();
+        assert_eq!(
+            overlaps, 2,
+            "{name} must be vetoed by alias escape, not an extra overlapping access"
+        );
+    }
+
+    let mixed_use = function_span(db, "home_escape_numeric_use");
+    assert!(
+        db.rel_iter::<(Address, usize)>("win64_home_canonical_veto")
+            .any(|(func, pos)| (*func, *pos) == (mixed_use.0, 0)),
+        "an exact home-address web used by both a call and ADD was canonicalized"
+    );
+    assert!(
+        db.rel_iter::<(Address, Address, Mreg, i64, usize, i64, Mreg)>("win64_home_scalar_lea",)
+            .any(|(_, func, _, _, pos, _, _)| (*func, *pos) == (mixed_use.0, 0)),
+        "mixed-use regression never reached the exact scalar-LEA selector path"
+    );
+
+    // A call kills volatile R10. Its post-call arithmetic/load must therefore
+    // be ordinary unknown-pointer work, not a function-wide remembered stack
+    // alias that prevents the otherwise safe /homeparams fold.
+    let killed_alias = function_span(db, "home_volatile_alias_after_call");
+    assert!(db
+        .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill")
+        .any(|(_, func, reg, pos)| { (*func, *reg, *pos) == (killed_alias.0, Mreg::CX, 0) }));
+    assert!(!db
+        .rel_iter::<(Address, usize, u64)>("win64_home_storage")
+        .any(|(func, _, _)| *func == killed_alias.0));
+    let killed_call = db
+        .rel_iter::<(Address, Address)>("call_target_func")
+        .find_map(|(address, _)| in_span(*address, killed_alias).then_some(*address))
+        .expect("volatile-alias fixture lost its direct call");
+    assert!(!db
+        .rel_iter::<(Address, Address, Mreg, i64)>("sp_base_alias_at")
+        .any(|(func, access, reg, _)| {
+            *func == killed_alias.0 && *access > killed_call && *reg == Mreg::R10
+        }));
+
+    for name in [
+        "wrong_home_source",
+        "home_disjoint_branch",
+        "home_vs_postsub_indexed",
+    ] {
+        let span = function_span(db, name);
+        assert!(
+            !db.rel_iter::<(Address, usize, u64)>("win64_home_storage")
+                .any(|(func, _, _)| *func == span.0),
+            "{name} unexpectedly received canonical home storage"
+        );
+    }
+}
+
+fn assert_alias_coordinate_provenance(db: &DecompileDB) {
+    let mov_lea = function_span(db, "alias_mov_vs_lea_coordinates");
+    let rows: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, i64)>("sp_base_alias_at")
+        .filter(|(func, _, _, _)| *func == mov_lea.0)
+        .copied()
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|(_, _, reg, offset)| { (*reg, *offset) == (Mreg::R10, -40) }),
+        "post-allocation MOV RSP alias lost its coordinate: {rows:#x?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(_, _, reg, offset)| { (*reg, *offset) == (Mreg::R11, -32) }),
+        "post-allocation LEA RSP alias reused MOV identity: {rows:#x?}"
+    );
+
+    let two_hop = function_span(db, "alias_two_hop_lea");
+    let two_hop_rows: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, i64)>("sp_base_alias_at")
+        .filter(|(func, _, _, _)| *func == two_hop.0)
+        .copied()
+        .collect();
+    assert!(
+        two_hop_rows
+            .iter()
+            .any(|(_, _, reg, offset)| { (*reg, *offset) == (Mreg::R11, 8) }),
+        "LEA-of-copied-SP provenance did not compose: {two_hop_rows:#x?}"
+    );
+}
+
+fn assert_unknown_sp_indexed_accesses_are_rejected(db: &DecompileDB) {
+    let span = function_span(db, "unknown_sp_indexed");
+    let accesses: Vec<_> = db
+        .rel_iter::<(Address, MachInst)>("mach_inst")
+        .filter_map(|(address, inst)| {
+            if !in_span(*address, span) {
+                return None;
+            }
+            let kind = match inst {
+                MachInst::Mstore(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2scaled(4, 8),
+                    args,
+                    Mreg::DX,
+                ) if args.as_ref() == &[Mreg::SP, Mreg::R9] => 0,
+                MachInst::Mload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2scaled(4, 8),
+                    args,
+                    Mreg::AX,
+                ) if args.as_ref() == &[Mreg::SP, Mreg::R9] => 1,
+                _ => return None,
+            };
+            Some((*address, kind))
+        })
+        .collect();
+    assert_eq!(accesses.len(), 2, "missing unknown-SP indexed accesses");
+
+    for (address, _) in accesses {
+        assert!(
+            db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+                .any(|(func, access, reason)| {
+                    (*func, *access, *reason) == (span.0, address, "unsupported-stack-address")
+                }),
+            "unknown-SP indexed access lacks a structured rejection at {address:#x}"
+        );
+        let original = address_bearing_candidates(db, address);
+        assert!(
+            original.is_empty(),
+            "unknown-SP indexed access retained unsound RTL: {original:#x?}"
+        );
+    }
+    assert!(!db
+        .rel_iter::<(Address, Address, i64, usize)>("stack_param_access")
+        .any(|(_, func, _, _)| *func == span.0));
+}
+
+fn assert_final_output_compiles(object: &Path) {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .stack_size(64 * 1024 * 1024)
+        .build()
+        .expect("failed to build stack/home pipeline thread pool");
+    let mut db = DecompileDB::default();
+    manifold::decompile::disassembly::load_from_binary(&mut db, object);
+    manifold::decompile::disassembly::load_preset(&mut db);
+    pool.install(|| db.run_pipeline(object, false, false));
+
+    let tu = db
+        .cast_optimized_translation_unit
+        .as_ref()
+        .expect("stack/home pipeline must emit an optimized translation unit");
+
+    // This path uses the dependency scheduler (Asm runs in a parallel stage on
+    // x86).  The decoder snapshot must be an Asm output, not an input-only
+    // wrapper mutation that the stage merge silently drops before RTL.
+    let mixed_use = function_span(&db, "home_escape_numeric_use");
+    assert!(
+        db.rel_iter::<(Address, Mreg)>("asm_reg_use")
+            .any(|(node, reg)| in_span(*node, mixed_use) && *reg == Mreg::R10),
+        "scheduled pipeline dropped Asm's immutable decoded-use snapshot"
+    );
+    assert!(
+        db.rel_iter::<(Address, Mreg)>("asm_reg_def")
+            .any(|(node, reg)| in_span(*node, mixed_use) && *reg == Mreg::R10),
+        "scheduled pipeline dropped Asm's immutable decoded-def snapshot"
+    );
+
+    // The aliased home address escapes to an opaque call.  Its initialization
+    // and post-call read therefore have memory semantics and must survive RTL
+    // copy propagation; otherwise the generated function can incorrectly
+    // return the original entry parameter after the callee mutates the slot.
+    let escaped = function_span(&db, "home_alias_call_escape");
+    let escaped_slot = db
+        .rel_iter::<(Address, usize, u64)>("win64_home_storage")
+        .find_map(|(func, pos, slot)| (*func == escaped.0 && *pos == 0).then_some(*slot))
+        .expect("escaped home fixture lost its canonical slot");
+    assert!(
+        db.rel_iter::<(Address, u64)>("win64_home_escaped")
+            .any(|row| *row == (escaped.0, escaped_slot)),
+        "scheduled pipeline lost the escaped-home propagation barrier"
+    );
+    let optimized_escaped: Vec<_> = db
+        .rel_iter::<(Address, RTLInst)>("rtl_inst")
+        .filter(|(address, _)| in_span(*address, escaped))
+        .cloned()
+        .collect();
+    assert!(
+        optimized_escaped.iter().any(|(_, inst)| {
+            matches!(inst,
+                RTLInst::Iop(Operation::Omove, args, destination)
+                    if args.len() == 1 && *destination == escaped_slot)
+        }),
+        "escaped home initialization was propagated away: {optimized_escaped:#x?}"
+    );
+    assert!(
+        optimized_escaped.iter().any(|(_, inst)| {
+            matches!(inst,
+                RTLInst::Iop(Operation::Omove, args, _)
+                    if args.as_ref() == &[escaped_slot])
+        }),
+        "escaped home post-call read was propagated away: {optimized_escaped:#x?}"
+    );
+
+    let escaped_ident = manifold::decompile::passes::csh_pass::ident_from_reg(escaped_slot);
+    let escaped_definition = tu
+        .decls
+        .iter()
+        .find_map(|decl| match decl {
+            TopLevelDecl::FuncDef(function)
+                if function.name == "home_alias_call_escape"
+                    || function.name == "coff_fn_home_alias_call_escape" =>
+            {
+                Some(function)
+            }
+            _ => None,
+        })
+        .expect("final TU lost home_alias_call_escape");
+    let escaped_locals: Vec<_> = escaped_definition
+        .local_vars
+        .iter()
+        .filter(|local| local.ty == CType::Int(IntSize::Long, Signedness::Signed))
+        .collect();
+    assert!(
+        !escaped_locals.is_empty(),
+        "final emission lost the canonical qword local after variable coalescing: {:#?}",
+        escaped_definition.local_vars
+    );
+    let structured_escaped: Vec<_> = db
+        .rel_iter::<(Address, CsharpminorStmt)>("csharp_stmt")
+        .filter(|(node, _)| in_span(*node & !((1u64 << 62) | (1u64 << 63)), escaped))
+        .cloned()
+        .collect();
+    let escaped_candidates: Vec<_> = db
+        .rel_iter::<(Address, CsharpminorStmt)>("csharp_stmt_candidate")
+        .filter(|(node, _)| in_span(*node & !SYNTHETIC_NODE_MASK, escaped))
+        .cloned()
+        .collect();
+    assert!(
+        structured_escaped.iter().any(|(_, stmt)| {
+            matches!(stmt,
+            CsharpminorStmt::Sset(destination, CsharpminorExpr::Evar(_))
+                if *destination == escaped_slot)
+        }),
+        "Structuring propagated away escaped home initialization: {structured_escaped:#x?}"
+    );
+    assert!(
+        structured_escaped.iter().any(|(_, stmt)| {
+            matches!(stmt,
+            CsharpminorStmt::Sset(_, CsharpminorExpr::Evar(source))
+                if *source == escaped_slot)
+        }),
+        "Structuring propagated escaped home read across call: structured={structured_escaped:#x?}, candidates={escaped_candidates:#x?}"
+    );
+    assert!(
+        structured_escaped.iter().any(|(_, stmt)| {
+            matches!(stmt,
+            CsharpminorStmt::Scall(_, _, _, args)
+                if args.iter().any(|arg| matches!(arg,
+                    CsharpminorExpr::Eaddrof(ident) if *ident == escaped_ident)))
+        }),
+        "canonical home address did not lower to &slot: {structured_escaped:#x?}"
+    );
+
+    let text = manifold::decompile::passes::c_pass::print_translation_unit_for_format(
+        tu,
+        BinaryFormat::Coff,
+    );
+    for function in [
+        "home_escape_mutated",
+        "fifth_inc",
+        "outgoing_reuses_home_coordinate",
+        "sp_indexed_fused_arith",
+        "sp_indexed_fused_add_collision",
+        "sp_indexed_fused_field",
+        "sp_indexed_fused_misaligned_field",
+        "sp_indexed_fused_param_rmw",
+        "sp_indexed_fused_gap",
+    ] {
+        let coff_name = format!("coff_fn_{function}");
+        assert!(
+            tu.decls.iter().any(|decl| {
+                matches!(decl, TopLevelDecl::FuncDef(f)
+                    if f.name == function || f.name == coff_name)
+            }),
+            "final translation unit lost the definition of {function}:\n{text}"
+        );
+    }
+
+    let output = object.with_extension("generated.cpp");
+    std::fs::write(&output, &text).expect("failed to write stack/home generated C++");
+    let compiled = Command::new("clang++")
+        .args([
+            "--target=x86_64-pc-windows-msvc",
+            "-fms-extensions",
+            "-Wno-everything",
+            "-x",
+            "c++",
+            "-fsyntax-only",
+        ])
+        .arg(&output)
+        .output()
+        .expect("failed to run clang++ over stack/home output");
+    assert!(
+        compiled.status.success(),
+        "stack/home final TU does not compile as C++:\n{}\n{text}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+}
+
 #[test]
 fn coff_stack_and_home_relations_preserve_values_and_abi_ordinals() {
-    let Some(object) = fixture() else { return };
-    let object = object.to_path_buf();
+    if !command_exists("clang") || !command_exists("clang++") {
+        eprintln!("skipping stack/home relation test: clang or clang++ unavailable");
+        return;
+    }
+    let object = fixture().to_path_buf();
     std::thread::Builder::new()
         .name("stack-home-relations".to_string())
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
-            let db = load_rtl_relations(&object);
+            let mut db = load_rtl_relations(&object);
             assert_sp_indexed_relations(&db);
+            assert_incomplete_indexed_stack_lowering_is_atomic(&db);
+            assert_ambiguous_fused_indexed_lowering_is_atomic(&db);
+            assert_sp_indexed_fused_arithmetic(&db);
+            assert_indexed_entry_and_loop_collision_matrix(&db);
             assert_home_relations(&db);
             assert_home_pointer_reload_beats_shadow_address(&db);
             assert_stack_param_and_rmw_relations(&db);
             assert_home_store_is_not_outgoing(&db);
+            assert_unsafe_home_cells_remain_storage(&db);
+            assert_canonical_unsafe_home_storage(&db);
+            assert_postsub_raw_offset_does_not_alias_home(&db);
+            assert_postsub_escaped_offset_keeps_ordinary_origin(&db);
+            assert_indexed_stack_cells_use_normalized_coordinates(&db);
+            assert_stack_address_destinations_are_not_storage(&db);
+            assert_unknown_sp_and_high_offsets_do_not_infer_params(&db);
+            assert_incoming_stack_rmw_is_initialized_and_survives(&db);
+            assert_outgoing_home_coordinate_is_not_suppressed(&db);
+            assert_bp_postprologue_and_xmm_forms(&db);
+            assert_bp_provenance_preserves_pointer_memory(&db);
+            assert_bp_shortcuts_and_narrow_bases_stay_pointer_memory(&db);
+            assert_home_safety_vetoes(&db);
+            assert_alias_coordinate_provenance(&db);
+            assert_unknown_sp_indexed_accesses_are_rejected(&db);
+            RTLOptimizePass.run(&mut db);
+            assert_optimized_canonical_homes(&db);
+            TypePass.run(&mut db);
+            assert_post_type_canonical_homes(&db);
+            drop(db);
+            assert_final_output_compiles(&object);
         })
         .expect("failed to spawn stack/home relation test thread")
         .join()

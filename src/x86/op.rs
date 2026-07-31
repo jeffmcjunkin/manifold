@@ -1,4 +1,3 @@
-
 use crate::x86::types::{Ident, Typ, Z};
 use std::ops::{Add, Div, Mul, Sub};
 
@@ -47,6 +46,9 @@ pub enum Addressing {
     Abased(Ident, Ptrofs),
     Abasedscaled(Z, Ident, Ptrofs),
     Ainstack(Ptrofs),
+    /// An x86-64 address-size-overridden effective address. The wrapped
+    /// addressing expression is evaluated modulo 2^32 and then zero-extended.
+    Aaddr32(Box<Addressing>),
     #[allow(dead_code)]
     Unknown,
 }

@@ -4,6 +4,8 @@ use std::sync::OnceLock;
 
 use manifold::abi::BinaryFormat;
 use manifold::decompile::elevator::DecompileDB;
+use manifold::mreg::Mreg;
+use manifold::x86::types::{Address, Symbol};
 
 fn command_exists(name: &str) -> bool {
     Command::new(name)
@@ -27,9 +29,12 @@ fn build_fixture() -> Option<PathBuf> {
     let source = dir.join("fixture.s");
     let object = dir.join("fixture.obj");
 
-    // VS2013-style Win64 parameter spills followed by indexed loads.  Across
-    // this TU, decl-solve recognizes stack slot +8 as a pointer field even
-    // though the initial recovered layout represents it as an integer.
+    // VS2013-style Win64 parameter spills followed by indexed loads and direct
+    // arithmetic reads from immutable home slots.  A separate function stores
+    // an integer-valued argument into a genuine aggregate field and dereferences
+    // that field, forcing final-TU selection to resolve the field as a pointer.
+    // The whole TU must survive selection, consume home reads as entry
+    // parameters, and apply final selected field types to both emitted TUs.
     std::fs::write(
         &source,
         r#"
@@ -89,6 +94,20 @@ final_tu_scale:
         imull $11, (%rcx,%rdx,4), %eax
         addl 24(%rsp), %eax
         retq
+
+        .globl final_tu_store_ptr
+        .def final_tu_store_ptr; .scl 2; .type 32; .endef
+final_tu_store_ptr:
+        movq %rdx, 8(%rcx)
+        imulq $13, %rdx, %rax
+        retq
+
+        .globl final_tu_load_ptr
+        .def final_tu_load_ptr; .scl 2; .type 32; .endef
+final_tu_load_ptr:
+        movq 8(%rcx), %rax
+        movl (%rax), %eax
+        retq
 "#,
     )
     .ok()?;
@@ -112,7 +131,7 @@ fn fixture() -> Option<&'static Path> {
     FIXTURE.get_or_init(build_fixture).as_deref()
 }
 
-fn assert_selected_field_types_drive_assignment_casts(object: &Path) {
+fn assert_selected_field_types_and_home_arithmetic_compile(object: &Path) {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(4)
         .stack_size(64 * 1024 * 1024)
@@ -140,21 +159,58 @@ fn assert_selected_field_types_drive_assignment_casts(object: &Path) {
         BinaryFormat::Coff,
     );
 
+    let unsupported: Vec<_> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .copied()
+        .collect();
+    assert!(
+        unsupported.is_empty(),
+        "valid home-slot arithmetic rejected fixture functions: {unsupported:#x?}"
+    );
+    let home_arithmetic_reads = db
+        .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_arith_read")
+        .count();
+    assert_eq!(
+        home_arithmetic_reads, 2,
+        "expected the XOR and ADD home-slot reads to consume entry parameters"
+    );
+    for name in [
+        "coff_fn_final_tu_blend",
+        "coff_fn_final_tu_indexed_imul",
+        "coff_fn_final_tu_indexed_or",
+        "coff_fn_final_tu_scale",
+        "coff_fn_final_tu_store_ptr",
+        "coff_fn_final_tu_load_ptr",
+    ] {
+        assert!(text.contains(name), "selected TU lost {name}:\n{text}");
+    }
+    assert!(
+        text.contains(" ^ p2"),
+        "homed XOR operand was lost:\n{text}"
+    );
+    assert!(
+        text.contains(" + p2"),
+        "homed ADD operand was lost:\n{text}"
+    );
     assert!(
         text.contains("void *ofs_8;"),
-        "fixture must exercise decl-solve's final pointer field selection:\n{text}"
+        "fixture must exercise decl-solve's exact pointer field selection:\n{text}"
     );
     assert!(
-        text.contains("->ofs_8 = (void *)p0;"),
-        "integer Win64 parameter must be cast to the final pointer field type:\n{text}"
+        text.contains("->ofs_8 = (void *)p1;"),
+        "stored integer argument must be cast to the selected pointer field:\n{text}"
     );
     assert!(
-        raw_text.contains("->ofs_8 = (void *)p0;"),
-        "raw TU wrapper must consume the same selected field types:\n{raw_text}"
+        raw_text.contains("->ofs_8 = (void *)p1;"),
+        "raw TU wrapper must consume the same selected field type:\n{raw_text}"
     );
     assert!(
-        !text.contains("->ofs_8 = p0;"),
+        !text.contains("->ofs_8 = p1;"),
         "no assignment may retain the pre-selection integer field type:\n{text}"
+    );
+    assert!(
+        raw_text.contains(" ^ p2") && raw_text.contains(" + p2"),
+        "raw TU lost a recovered home-slot arithmetic operand:\n{raw_text}"
     );
 
     let output = object.with_extension("generated.cpp");
@@ -179,13 +235,13 @@ fn assert_selected_field_types_drive_assignment_casts(object: &Path) {
 }
 
 #[test]
-fn selected_struct_field_types_compile_through_the_real_coff_pipeline() {
+fn selected_struct_fields_and_home_arithmetic_compile_through_real_coff() {
     let Some(object) = fixture() else { return };
     let object = object.to_path_buf();
     std::thread::Builder::new()
         .name("final-tu-struct-field-output".to_string())
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || assert_selected_field_types_drive_assignment_casts(&object))
+        .spawn(move || assert_selected_field_types_and_home_arithmetic_compile(&object))
         .expect("failed to spawn final-TU test thread")
         .join()
         .expect("final-TU test thread panicked");

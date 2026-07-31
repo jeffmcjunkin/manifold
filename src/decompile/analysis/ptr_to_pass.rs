@@ -1,15 +1,13 @@
-
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
 use crate::run_pass;
 
-use std::collections::{HashMap, HashSet};
 use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-
 
 // Pointer provenance analysis: tracks how each pointer base was derived
 ascent_par! {
@@ -147,12 +145,20 @@ ascent_par! {
 
 // A genuine 32-bit comparison that is not the compare-against-0 NULL check; such an operand is an integer, never a pointer.
 fn is_hard_int_cmp_cond(cond: &Condition) -> bool {
-    let is32 = matches!(cond,
-        Condition::Ccomp(_) | Condition::Ccompu(_) |
-        Condition::Ccompimm(_, _) | Condition::Ccompuimm(_, _));
-    let is_null = matches!(cond,
-        Condition::Ccompimm(Comparison::Ceq, 0) | Condition::Ccompuimm(Comparison::Ceq, 0) |
-        Condition::Ccompimm(Comparison::Cne, 0) | Condition::Ccompuimm(Comparison::Cne, 0));
+    let is32 = matches!(
+        cond,
+        Condition::Ccomp(_)
+            | Condition::Ccompu(_)
+            | Condition::Ccompimm(_, _)
+            | Condition::Ccompuimm(_, _)
+    );
+    let is_null = matches!(
+        cond,
+        Condition::Ccompimm(Comparison::Ceq, 0)
+            | Condition::Ccompuimm(Comparison::Ceq, 0)
+            | Condition::Ccompimm(Comparison::Cne, 0)
+            | Condition::Ccompuimm(Comparison::Cne, 0)
+    );
     is32 && !is_null
 }
 
@@ -165,21 +171,47 @@ pub fn compute_provenance_id(func: Address, reg: RTLReg) -> u64 {
 }
 
 const ALLOC_FUNCTIONS: &[&str] = &[
-    "malloc", "calloc", "realloc", "reallocarray", "aligned_alloc",
-    "xmalloc", "xcalloc", "xrealloc", "xreallocarray",
-    "ximalloc", "xirealloc", "xicalloc", "xireallocarray",
-    "xzalloc", "xizalloc", "xcharalloc",
-    "xnmalloc", "xinmalloc", "xnrealloc",
-    "x2realloc", "x2nrealloc", "xpalloc",
-    "imalloc", "irealloc", "icalloc", "ireallocarray",
-    "strdup", "strndup", "xstrdup", "xstrndup",
-    "xmemdup", "ximemdup", "ximemdup0",
+    "malloc",
+    "calloc",
+    "realloc",
+    "reallocarray",
+    "aligned_alloc",
+    "xmalloc",
+    "xcalloc",
+    "xrealloc",
+    "xreallocarray",
+    "ximalloc",
+    "xirealloc",
+    "xicalloc",
+    "xireallocarray",
+    "xzalloc",
+    "xizalloc",
+    "xcharalloc",
+    "xnmalloc",
+    "xinmalloc",
+    "xnrealloc",
+    "x2realloc",
+    "x2nrealloc",
+    "xpalloc",
+    "imalloc",
+    "irealloc",
+    "icalloc",
+    "ireallocarray",
+    "strdup",
+    "strndup",
+    "xstrdup",
+    "xstrndup",
+    "xmemdup",
+    "ximemdup",
+    "ximemdup0",
 ];
 
 pub struct PtrToPass;
 
 impl IRPass for PtrToPass {
-    fn name(&self) -> &'static str { "ptr_to" }
+    fn name(&self) -> &'static str {
+        "ptr_to"
+    }
 
     fn run(&self, db: &mut DecompileDB) {
         let alloc_set: HashSet<&str> = ALLOC_FUNCTIONS.iter().copied().collect();
@@ -205,21 +237,28 @@ impl IRPass for PtrToPass {
 
         run_pass!(db, PtrToPassProgram);
         emit_provenance_ptr_types(db);
+        crate::decompile::passes::rtl_pass::enforce_win64_home_slot_types(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
         static INPUTS: &[&str] = &[
-            "rtl_inst", "instr_in_function",
-            "emit_function_param_candidate", "allocation_site",
-            "call_site", "call_return_reg",
+            "rtl_inst",
+            "instr_in_function",
+            "emit_function_param_candidate",
+            "allocation_site",
+            "call_site",
+            "call_return_reg",
+            "win64_home_slot_type",
         ];
         INPUTS
     }
 
     fn outputs(&self) -> &'static [&'static str] {
         static OUTPUTS: &[&str] = &[
-            "allocation_site", "emit_var_type_candidate",
-            "provenance_root", "provenance_edge",
+            "allocation_site",
+            "emit_var_type_candidate",
+            "provenance_root",
+            "provenance_edge",
             "provenance_chain",
         ];
         OUTPUTS
@@ -233,14 +272,16 @@ fn emit_provenance_ptr_types(db: &mut DecompileDB) {
         .map(|&(func, reg, _, _, _, _)| (func, reg))
         .collect();
 
-    if chains.is_empty() { return; }
+    if chains.is_empty() {
+        return;
+    }
 
     let tracked: HashSet<(Address, RTLReg)> = chains.into_iter().collect();
 
     // Map each tracked register to its provenance root(s) at acc-offset 0; only Assign-only chains let a deref pin the ROOT's pointee type, preserving PT-4's struct caveat.
     let mut reg_roots: HashMap<(Address, RTLReg), Vec<RTLReg>> = HashMap::new();
-    for &(func, reg, root, _prov, acc_ofs, _depth) in db
-        .rel_iter::<(Address, RTLReg, RTLReg, u64, i64, usize)>("provenance_chain")
+    for &(func, reg, root, _prov, acc_ofs, _depth) in
+        db.rel_iter::<(Address, RTLReg, RTLReg, u64, i64, usize)>("provenance_chain")
     {
         if acc_ofs == 0 && root != reg {
             reg_roots.entry((func, reg)).or_default().push(root);
@@ -272,7 +313,10 @@ fn emit_provenance_ptr_types(db: &mut DecompileDB) {
                 reg_deref_chunks.entry(base_reg).or_default().push(chunk);
                 if let Some(roots) = reg_roots.get(&(func, base_reg)) {
                     for &root in roots {
-                        root_deref_chunks.entry((func, root)).or_default().push(chunk);
+                        root_deref_chunks
+                            .entry((func, root))
+                            .or_default()
+                            .push(chunk);
                     }
                 }
             }
@@ -291,13 +335,17 @@ fn emit_provenance_ptr_types(db: &mut DecompileDB) {
     };
 
     for (reg, chunks) in &reg_deref_chunks {
-        if chunks.is_empty() { continue; }
+        if chunks.is_empty() {
+            continue;
+        }
         db.rel_push("emit_var_type_candidate", (*reg, chunks_to_xtype(chunks)));
     }
 
     // Root element type from the union of zero-offset deref widths, restricted to CHAR: a wider element would rescale byte displacements into element units and walk off the object.
     for ((_func, root), chunks) in &root_deref_chunks {
-        if chunks.is_empty() { continue; }
+        if chunks.is_empty() {
+            continue;
+        }
         let xt = chunks_to_xtype(chunks);
         if xt == XType::Xcharptr {
             db.rel_push("emit_var_type_candidate", (*root, xt));
@@ -308,7 +356,9 @@ fn emit_provenance_ptr_types(db: &mut DecompileDB) {
 // Pointee type implied by a single deref chunk width/class.
 fn pointee_xtype_for_chunk(chunk: MemoryChunk) -> XType {
     match chunk {
-        MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned | MemoryChunk::MBool => XType::Xcharptr,
+        MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned | MemoryChunk::MBool => {
+            XType::Xcharptr
+        }
         MemoryChunk::MInt32 | MemoryChunk::MAny32 => XType::Xintptr,
         MemoryChunk::MFloat64 => XType::Xfloatptr,
         MemoryChunk::MFloat32 => XType::Xsingleptr,

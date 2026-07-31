@@ -1,19 +1,17 @@
-
-
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
 use crate::{declare_io_from, run_pass};
 
+use crate::decompile::passes::cminor_pass::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::decompile::passes::cminor_pass::*;
 
 use crate::mreg::Mreg;
 use crate::x86::op::{Addressing, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
-use ascent::Dual;
 use ascent::lattice::set::Set;
+use ascent::Dual;
 
 // Helper: add node n to a Set<Node>, returning new Set
 fn dom_set_with_self(strict: &Set<Node>, n: Node) -> Set<Node> {
@@ -26,27 +24,32 @@ fn dom_set_with_self(strict: &Set<Node>, n: Node) -> Set<Node> {
 fn cond_subst_var_in_expr(expr: &CsharpminorExpr, old: RTLReg, new: RTLReg) -> CsharpminorExpr {
     match expr {
         CsharpminorExpr::Evar(r) if *r == old => CsharpminorExpr::Evar(new),
-        CsharpminorExpr::Eunop(op, inner) =>
-            CsharpminorExpr::Eunop(op.clone(), Box::new(cond_subst_var_in_expr(inner, old, new))),
-        CsharpminorExpr::Ebinop(op, l, r) =>
-            CsharpminorExpr::Ebinop(op.clone(),
-                Box::new(cond_subst_var_in_expr(l, old, new)),
-                Box::new(cond_subst_var_in_expr(r, old, new))),
-        CsharpminorExpr::Eload(chunk, addr) =>
-            CsharpminorExpr::Eload(*chunk, Box::new(cond_subst_var_in_expr(addr, old, new))),
-        CsharpminorExpr::Econdition(c, t, f) =>
-            CsharpminorExpr::Econdition(
-                Box::new(cond_subst_var_in_expr(c, old, new)),
-                Box::new(cond_subst_var_in_expr(t, old, new)),
-                Box::new(cond_subst_var_in_expr(f, old, new))),
+        CsharpminorExpr::Eunop(op, inner) => CsharpminorExpr::Eunop(
+            op.clone(),
+            Box::new(cond_subst_var_in_expr(inner, old, new)),
+        ),
+        CsharpminorExpr::Ebinop(op, l, r) => CsharpminorExpr::Ebinop(
+            op.clone(),
+            Box::new(cond_subst_var_in_expr(l, old, new)),
+            Box::new(cond_subst_var_in_expr(r, old, new)),
+        ),
+        CsharpminorExpr::Eload(chunk, addr) => {
+            CsharpminorExpr::Eload(*chunk, Box::new(cond_subst_var_in_expr(addr, old, new)))
+        }
+        CsharpminorExpr::Econdition(c, t, f) => CsharpminorExpr::Econdition(
+            Box::new(cond_subst_var_in_expr(c, old, new)),
+            Box::new(cond_subst_var_in_expr(t, old, new)),
+            Box::new(cond_subst_var_in_expr(f, old, new)),
+        ),
         _ => expr.clone(),
     }
 }
 
 fn cond_subst_exprs(args: &[CsharpminorExpr], old: RTLReg, new: RTLReg) -> Vec<CsharpminorExpr> {
-    args.iter().map(|e| cond_subst_var_in_expr(e, old, new)).collect()
+    args.iter()
+        .map(|e| cond_subst_var_in_expr(e, old, new))
+        .collect()
 }
-
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Copy)]
 pub enum LoopType {
@@ -56,7 +59,6 @@ pub enum LoopType {
     Infinite,
 }
 use either::Either;
-
 
 ascent_par! {
     #![measure_rule_times]
@@ -86,6 +88,9 @@ ascent_par! {
     relation emit_var_type_candidate(RTLReg, XType);
     relation idom(Address, Node, Node);
     relation stack_var(Address, Address, i64, RTLReg);
+    // rtl_pass export: node-keyed proof that this stack-address expression is
+    // &one canonical Win64 home slot.  It intentionally carries no raw offset.
+    relation win64_home_address(Node, RTLReg);
     // rtl_pass export: the single escaped canonical local per (func, offset), used to resolve synthetic-only stack loads that have no per-node stack_var.
     relation slot_escaped_canonical(Address, i64, RTLReg);
     // Noreturn recognition inputs: the always-noreturn symbol set, single-def constants for resolving an error-family status arg, and function_noreturn for user-defined wrappers.
@@ -274,11 +279,29 @@ ascent_par! {
     #[local] relation stack_local_at(Address, i64, RTLReg);
     stack_local_at(func, ofs, reg) <-- stack_var(func, _, ofs, reg);
 
+    // Canonical home addresses bypass raw-offset stack_var lookup entirely,
+    // so a post-prologue local with the same literal displacement cannot be
+    // selected.  RTL preserves the 64-bit operation as Oleal.
+    csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eop(op, args))),
+        if let Operation::Oleal(Addressing::Ainstack(_)) = op,
+        if args.is_empty(),
+        win64_home_address(node, stack_rtl),
+        let var_ident = ident_from_reg(*stack_rtl),
+        let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Eaddrof(var_ident));
+
+    csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Econst(Constant::Oaddrstack(_)))),
+        win64_home_address(node, stack_rtl),
+        let var_ident = ident_from_reg(*stack_rtl),
+        let stmt = CsharpminorStmt::Sset(*dst, CsharpminorExpr::Eaddrof(var_ident));
+
     // Resolve Eop(Olea(Ainstack(ofs)), []) -> Eaddrof(var_ident) when stack_var maps the offset.
     csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eop(op, args))),
         if let Operation::Olea(Addressing::Ainstack(ofs)) = op,
         if args.is_empty(),
+        !win64_home_address(node, _),
         instr_in_function(node, func_start),
         stack_var(func_start, node, *ofs, stack_rtl),
         let var_ident = ident_from_reg(*stack_rtl),
@@ -289,6 +312,7 @@ ascent_par! {
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Eop(op, args))),
         if let Operation::Oleal(Addressing::Ainstack(ofs)) = op,
         if args.is_empty(),
+        !win64_home_address(node, _),
         instr_in_function(node, func_start),
         stack_var(func_start, node, *ofs, stack_rtl),
         let var_ident = ident_from_reg(*stack_rtl),
@@ -297,6 +321,7 @@ ascent_par! {
     // Resolve Econst(Oaddrstack(ofs)) -> Eaddrof(var_ident) when stack_var maps the offset. This handles the case where cminor_pass already converted Olea(Ainstack) to Oaddrstack.
     csharp_stmt_candidate(node, stmt), stack_addr_resolved(node) <--
         active_cminor_stmt(node, ?CminorStmt::Sassign(dst, CminorExpr::Econst(Constant::Oaddrstack(ofs)))),
+        !win64_home_address(node, _),
         instr_in_function(node, func_start),
         stack_var(func_start, node, *ofs, stack_rtl),
         let var_ident = ident_from_reg(*stack_rtl),
@@ -932,7 +957,11 @@ pub struct CshminorPass;
 
 impl CshminorPass {
     fn prepare_jump_tables(db: &mut DecompileDB) {
-        if db.rel_iter::<(Node, usize, Node)>("jump_table_target").next().is_none() {
+        if db
+            .rel_iter::<(Node, usize, Node)>("jump_table_target")
+            .next()
+            .is_none()
+        {
             return;
         }
 
@@ -967,7 +996,9 @@ impl CshminorPass {
                 Some(&e) => e,
                 None => continue,
             };
-            let impl_set_local: std::collections::HashSet<Node> = impl_nodes.iter().copied()
+            let impl_set_local: std::collections::HashSet<Node> = impl_nodes
+                .iter()
+                .copied()
                 .chain(std::iter::once(jmp_node))
                 .collect();
 
@@ -1003,7 +1034,9 @@ impl CshminorPass {
                 for &cmp_addr in &cmp_addrs {
                     for &idx_name in &index_regs {
                         let mreg = Mreg::x86(idx_name);
-                        for &(addr, ref reg, rtl_reg) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl") {
+                        for &(addr, ref reg, rtl_reg) in
+                            db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl")
+                        {
                             if addr == cmp_addr && *reg == mreg {
                                 candidates.push(rtl_reg);
                             }
@@ -1019,7 +1052,13 @@ impl CshminorPass {
                 None => continue,
             };
 
-            db.rel_push("cminor_stmt", (entry, CminorStmt::Sjumptable(reg, Arc::new(ordered_targets))));
+            db.rel_push(
+                "cminor_stmt",
+                (
+                    entry,
+                    CminorStmt::Sjumptable(reg, Arc::new(ordered_targets)),
+                ),
+            );
         }
 
         let mut impl_nodes_sorted: Vec<Node> = impl_set.into_iter().collect();
@@ -1031,7 +1070,9 @@ impl CshminorPass {
 }
 
 impl IRPass for CshminorPass {
-    fn name(&self) -> &'static str { "cshminor" }
+    fn name(&self) -> &'static str {
+        "cshminor"
+    }
 
     fn run(&self, db: &mut DecompileDB) {
         Self::prepare_jump_tables(db);
@@ -1041,8 +1082,10 @@ impl IRPass for CshminorPass {
 
     fn extra_reads(&self) -> &'static [&'static str] {
         &[
-            "jump_table_target", "jump_table_impl",
-            "jump_table_cmp", "jump_table_index_reg",
+            "jump_table_target",
+            "jump_table_impl",
+            "jump_table_cmp",
+            "jump_table_index_reg",
             "reg_rtl",
         ]
     }

@@ -798,6 +798,34 @@ impl Printer {
             self.newline();
         }
 
+        // MSVC exposes these privileged instructions only as compiler
+        // intrinsics. Emit their exact VS2013 declarations only when a body
+        // actually calls them; a same-named local definition remains an
+        // ordinary function and must not be rewritten as an intrinsic.
+        let invoked_names = collect_invoked_names(tu);
+        let has_local_definition = |name: &str| {
+            tu.decls.iter().any(|decl| {
+                matches!(decl, TopLevelDecl::FuncDef(f) if f.name == name)
+            })
+        };
+        let emit_readcr8 = self.config.integer_model == IntegerModel::MsvcLlp64
+            && invoked_names.contains("__readcr8")
+            && !has_local_definition("__readcr8");
+        let emit_int2c = self.config.integer_model == IntegerModel::MsvcLlp64
+            && invoked_names.contains("__int2c")
+            && !has_local_definition("__int2c");
+        if emit_readcr8 {
+            self.writeln("unsigned __int64 __readcr8(void);");
+            self.writeln("#pragma intrinsic(__readcr8)");
+        }
+        if emit_int2c {
+            self.writeln("void __int2c(void);");
+            self.writeln("#pragma intrinsic(__int2c)");
+        }
+        if emit_readcr8 || emit_int2c {
+            self.newline();
+        }
+
         // Print in C declaration order: types, globals, forward decls, definitions. This avoids sorting tu.decls (which would invalidate tu.symbols indices).
         let order = |d: &TopLevelDecl| -> u8 {
             match d {
@@ -826,6 +854,12 @@ impl Printer {
         let mut first = true;
         for i in indices {
             let decl = &tu.decls[i];
+            if matches!(decl, TopLevelDecl::FuncDecl(f)
+                if (emit_readcr8 && f.name == "__readcr8")
+                    || (emit_int2c && f.name == "__int2c"))
+            {
+                continue;
+            }
             if let TopLevelDecl::FuncDef(f) = decl {
                 if is_effectively_empty_body(&f.body) && f.local_vars.is_empty() {
                     continue;
@@ -1122,6 +1156,16 @@ fn collect_called_names(tu: &TranslationUnit) -> std::collections::HashSet<Strin
     names
 }
 
+fn collect_invoked_names(tu: &TranslationUnit) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for decl in &tu.decls {
+        if let TopLevelDecl::FuncDef(f) = decl {
+            collect_called_names_stmt(&f.body, &mut names);
+        }
+    }
+    names
+}
+
 fn collect_called_names_stmt(stmt: &CStmt, names: &mut std::collections::HashSet<String>) {
     match stmt {
         CStmt::Expr(e) | CStmt::Return(Some(e)) => collect_called_names_expr(e, names),
@@ -1209,6 +1253,27 @@ fn collect_needed_includes(tu: &TranslationUnit) -> Vec<&'static str> {
 mod tests {
     use super::*;
 
+    fn translation_unit_calling(names: &[&str]) -> TranslationUnit {
+        let calls = names
+            .iter()
+            .map(|name| {
+                CBlockItem::Stmt(CStmt::Expr(CExpr::call(CExpr::var(*name), vec![])))
+            })
+            .collect();
+        let mut tu = TranslationUnit::new();
+        tu.add_function(FuncDef {
+            name: "caller".to_string(),
+            return_type: CType::Void,
+            params: vec![],
+            is_variadic: false,
+            storage_class: StorageClass::Auto,
+            body: CStmt::Block(calls),
+            local_vars: vec![],
+            loc: SourceLoc::unknown(),
+        });
+        tu
+    }
+
     #[test]
     fn msvc_llp64_spells_clight_long_as_explicit_64_bit_type() {
         assert_eq!(
@@ -1258,5 +1323,38 @@ mod tests {
             base: IntLiteralBase::Hex,
         }));
         assert_eq!(printer.into_string(), "0x100000000LL");
+    }
+
+    #[test]
+    fn coff_emits_only_the_privileged_intrinsics_that_are_called() {
+        let output = print_translation_unit_for_format(
+            &translation_unit_calling(&["__int2c"]),
+            crate::abi::BinaryFormat::Coff,
+        );
+        assert!(output.contains("void __int2c(void);\n#pragma intrinsic(__int2c)\n"));
+        assert!(!output.contains("__readcr8"));
+    }
+
+    #[test]
+    fn coff_emits_exact_cr8_and_int2c_intrinsic_preamble_once() {
+        let output = print_translation_unit_for_format(
+            &translation_unit_calling(&["__readcr8", "__int2c"]),
+            crate::abi::BinaryFormat::Coff,
+        );
+        assert_eq!(output.matches("unsigned __int64 __readcr8(void);").count(), 1);
+        assert_eq!(output.matches("#pragma intrinsic(__readcr8)").count(), 1);
+        assert_eq!(output.matches("void __int2c(void);").count(), 1);
+        assert_eq!(output.matches("#pragma intrinsic(__int2c)").count(), 1);
+    }
+
+    #[test]
+    fn privileged_intrinsic_preamble_is_msvc_only() {
+        let output = print_translation_unit_for_format(
+            &translation_unit_calling(&["__readcr8", "__int2c"]),
+            crate::abi::BinaryFormat::Elf,
+        );
+        assert!(!output.contains("#pragma intrinsic"));
+        assert!(!output.contains("unsigned __int64 __readcr8(void);"));
+        assert!(!output.contains("void __int2c(void);"));
     }
 }

@@ -1080,12 +1080,17 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         }
     }
 
-    if prototypes.is_empty() {
-        return;
+    if !prototypes.is_empty() {
+        log::info!(
+            "SignatureReconciliation: patching {} function prototypes",
+            prototypes.len()
+        );
     }
 
-    log::info!("SignatureReconciliation: patching {} function prototypes", prototypes.len());
-
+    // Final relations are distinct from the candidate relations even when no
+    // prototype changed.  Running patch_db for the empty-delta case publishes
+    // the already-correct definition signature instead of leaving the final
+    // emitter with an empty relation and an accidental `void` fallback.
     patch_db(db, &prototypes);
 }
 
@@ -1313,30 +1318,54 @@ fn patch_db(
     }
 
     {
-        let mut new_ret: Vec<(Address, XType)> = db.rel_iter::<(Address, XType)>("emit_function_return_type_xtype_candidate")
-            .filter(|&&(addr, _)| !proto_map.contains_key(&addr))
-            .cloned()
-            .collect();
+        let mut final_ret: HashMap<Address, XType> = HashMap::new();
+        for (addr, xtype) in
+            db.rel_iter::<(Address, XType)>("emit_function_return_type_xtype_candidate")
+        {
+            if proto_map.contains_key(addr) {
+                continue;
+            }
+            final_ret
+                .entry(*addr)
+                .and_modify(|current| {
+                    if (
+                        crate::decompile::passes::clight_pass::xtype_refine_priority(xtype),
+                        *xtype,
+                    ) > (
+                        crate::decompile::passes::clight_pass::xtype_refine_priority(current),
+                        *current,
+                    ) {
+                        *current = *xtype;
+                    }
+                })
+                .or_insert(*xtype);
+        }
         for proto in prototypes {
             if proto.return_type != XType::Xvoid {
-                new_ret.push((proto.address, proto.return_type.clone()));
+                final_ret.insert(proto.address, proto.return_type);
             }
         }
-        db.rel_set("emit_function_return_type_xtype", new_ret.into_iter().collect::<ascent::boxcar::Vec<_>>());
+        let mut new_ret: Vec<_> = final_ret.into_iter().collect();
+        new_ret.sort_by_key(|(addr, xtype)| (*addr, *xtype));
+        db.rel_set(
+            "emit_function_return_type_xtype",
+            new_ret.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
     }
 
     {
         use crate::decompile::passes::csh_pass::clight_type_from_xtype;
-        let mut new_ret_ct: Vec<(Address, crate::x86::types::ClightType)> = db.rel_iter::<(Address, ClightType)>("emit_function_return_type_candidate")
-            .filter(|&&(addr, _)| !proto_map.contains_key(&addr))
-            .cloned()
+        let mut new_ret_ct: Vec<_> = db
+            .rel_iter::<(Address, XType)>("emit_function_return_type_xtype")
+            .map(|(addr, xtype)| (*addr, clight_type_from_xtype(xtype)))
             .collect();
-        for proto in prototypes {
-            if proto.return_type != XType::Xvoid {
-                new_ret_ct.push((proto.address, clight_type_from_xtype(&proto.return_type)));
-            }
-        }
-        db.rel_set("emit_function_return_type", new_ret_ct.into_iter().collect::<ascent::boxcar::Vec<_>>());
+        // The XType relation above has exactly one deterministic row per
+        // address, so address order is sufficient here (ClightType is not Ord).
+        new_ret_ct.sort_by_key(|(addr, _)| *addr);
+        db.rel_set(
+            "emit_function_return_type",
+            new_ret_ct.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
     }
 
     {

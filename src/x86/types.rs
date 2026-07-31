@@ -1,15 +1,14 @@
-
 pub type Address = u64;
 pub type Size = usize;
 pub type Symbol = &'static str;
-use crate::x86::asm::{Ireg, TestCond};
+pub use crate::decompile::passes::csh_pass::*;
 use crate::mreg::Mreg;
+use crate::x86::asm::{Ireg, TestCond};
 use crate::x86::op::{Addressing, Comparison, Condition, Operation, Ptrofs, F32, F64};
 use either::Either;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use strum_macros::EnumString;
-pub use crate::decompile::passes::csh_pass::*;
 pub type Ident = usize;
 
 pub type MregArgs = Arc<Vec<Mreg>>;
@@ -148,19 +147,23 @@ impl FieldType {
             FieldType::Pointer(_) | FieldType::StructPointer(_) => pointer_size,
             FieldType::EmbeddedStruct(_) => pointer_size,
             FieldType::Array(elem, count) => elem.size(pointer_size) * count,
-            FieldType::Union(variants) => variants.iter().map(|v| v.size(pointer_size)).max().unwrap_or(4),
+            FieldType::Union(variants) => variants
+                .iter()
+                .map(|v| v.size(pointer_size))
+                .max()
+                .unwrap_or(4),
             FieldType::OpaqueBlob(size) => *size,
             FieldType::Unknown => 4,
         }
     }
-    
+
     pub fn to_type_string(&self) -> String {
         match self {
             FieldType::Scalar(chunk) => match chunk {
                 MemoryChunk::MBool => "int_IBool".to_string(),
                 MemoryChunk::MInt8Signed => "int_I8".to_string(),
                 MemoryChunk::MInt8Unsigned => "int_I8_unsigned".to_string(),
-                MemoryChunk::MInt16Signed => "int_I16".to_string(), 
+                MemoryChunk::MInt16Signed => "int_I16".to_string(),
                 MemoryChunk::MInt16Unsigned => "int_I16_unsigned".to_string(),
                 MemoryChunk::MInt32 | MemoryChunk::MAny32 => "int_I32".to_string(),
                 MemoryChunk::MInt64 | MemoryChunk::MAny64 => "int_I64".to_string(),
@@ -172,9 +175,10 @@ impl FieldType {
             FieldType::StructPointer(struct_id) => format!("ptr_struct_{:x}", struct_id),
             FieldType::EmbeddedStruct(struct_id) => format!("struct_{:x}", struct_id),
             FieldType::Array(elem, _) => format!("arr_{}", elem.to_type_string()),
-            FieldType::Union(variants) => {
-                variants.first().map(|v| v.to_type_string()).unwrap_or_else(|| "int_I32".to_string())
-            }
+            FieldType::Union(variants) => variants
+                .first()
+                .map(|v| v.to_type_string())
+                .unwrap_or_else(|| "int_I32".to_string()),
             FieldType::OpaqueBlob(size) => format!("blob_{}", size),
             FieldType::Unknown => "int_I32".to_string(),
         }
@@ -305,34 +309,74 @@ pub fn condition_for_testcond(test: TestCond) -> Condition {
 pub fn condition_for_testcond_sized(test: TestCond, is_64bit: bool) -> Condition {
     match test {
         TestCond::CondE => {
-            if is_64bit { Condition::Ccompl(Comparison::Ceq) } else { Condition::Ccomp(Comparison::Ceq) }
+            if is_64bit {
+                Condition::Ccompl(Comparison::Ceq)
+            } else {
+                Condition::Ccomp(Comparison::Ceq)
+            }
         }
         TestCond::CondNe => {
-            if is_64bit { Condition::Ccompl(Comparison::Cne) } else { Condition::Ccomp(Comparison::Cne) }
+            if is_64bit {
+                Condition::Ccompl(Comparison::Cne)
+            } else {
+                Condition::Ccomp(Comparison::Cne)
+            }
         }
         TestCond::CondB => {
-            if is_64bit { Condition::Ccomplu(Comparison::Clt) } else { Condition::Ccompu(Comparison::Clt) }
+            if is_64bit {
+                Condition::Ccomplu(Comparison::Clt)
+            } else {
+                Condition::Ccompu(Comparison::Clt)
+            }
         }
         TestCond::CondBe => {
-            if is_64bit { Condition::Ccomplu(Comparison::Cle) } else { Condition::Ccompu(Comparison::Cle) }
+            if is_64bit {
+                Condition::Ccomplu(Comparison::Cle)
+            } else {
+                Condition::Ccompu(Comparison::Cle)
+            }
         }
         TestCond::CondA => {
-            if is_64bit { Condition::Ccomplu(Comparison::Cgt) } else { Condition::Ccompu(Comparison::Cgt) }
+            if is_64bit {
+                Condition::Ccomplu(Comparison::Cgt)
+            } else {
+                Condition::Ccompu(Comparison::Cgt)
+            }
         }
         TestCond::CondAe => {
-            if is_64bit { Condition::Ccomplu(Comparison::Cge) } else { Condition::Ccompu(Comparison::Cge) }
+            if is_64bit {
+                Condition::Ccomplu(Comparison::Cge)
+            } else {
+                Condition::Ccompu(Comparison::Cge)
+            }
         }
         TestCond::CondL => {
-            if is_64bit { Condition::Ccompl(Comparison::Clt) } else { Condition::Ccomp(Comparison::Clt) }
+            if is_64bit {
+                Condition::Ccompl(Comparison::Clt)
+            } else {
+                Condition::Ccomp(Comparison::Clt)
+            }
         }
         TestCond::CondLe => {
-            if is_64bit { Condition::Ccompl(Comparison::Cle) } else { Condition::Ccomp(Comparison::Cle) }
+            if is_64bit {
+                Condition::Ccompl(Comparison::Cle)
+            } else {
+                Condition::Ccomp(Comparison::Cle)
+            }
         }
         TestCond::CondG => {
-            if is_64bit { Condition::Ccompl(Comparison::Cgt) } else { Condition::Ccomp(Comparison::Cgt) }
+            if is_64bit {
+                Condition::Ccompl(Comparison::Cgt)
+            } else {
+                Condition::Ccomp(Comparison::Cgt)
+            }
         }
         TestCond::CondGe => {
-            if is_64bit { Condition::Ccompl(Comparison::Cge) } else { Condition::Ccomp(Comparison::Cge) }
+            if is_64bit {
+                Condition::Ccompl(Comparison::Cge)
+            } else {
+                Condition::Ccomp(Comparison::Cge)
+            }
         }
         TestCond::CondNp => Condition::Cmasknotzero(0),
         TestCond::CondP => Condition::Cmaskzero(0),
@@ -345,19 +389,19 @@ pub fn condition_for_testcond_sized(test: TestCond, is_64bit: bool) -> Condition
 
 pub fn negate_testcond(c: TestCond) -> TestCond {
     match c {
-        TestCond::CondE  => TestCond::CondNe,
+        TestCond::CondE => TestCond::CondNe,
         TestCond::CondNe => TestCond::CondE,
-        TestCond::CondB  => TestCond::CondAe,
+        TestCond::CondB => TestCond::CondAe,
         TestCond::CondBe => TestCond::CondA,
         TestCond::CondAe => TestCond::CondB,
-        TestCond::CondA  => TestCond::CondBe,
-        TestCond::CondL  => TestCond::CondGe,
+        TestCond::CondA => TestCond::CondBe,
+        TestCond::CondL => TestCond::CondGe,
         TestCond::CondLe => TestCond::CondG,
         TestCond::CondGe => TestCond::CondL,
-        TestCond::CondG  => TestCond::CondLe,
-        TestCond::CondP  => TestCond::CondNp,
+        TestCond::CondG => TestCond::CondLe,
+        TestCond::CondP => TestCond::CondNp,
         TestCond::CondNp => TestCond::CondP,
-        TestCond::CondO  => TestCond::CondNo,
+        TestCond::CondO => TestCond::CondNo,
         TestCond::CondNo => TestCond::CondO,
         TestCond::Unknown => TestCond::Unknown,
     }
@@ -370,7 +414,6 @@ pub enum Slot {
     #[allow(dead_code)]
     Outgoing,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LinearInst {
@@ -403,7 +446,12 @@ pub enum LTLInst {
     Ltailcall(Either<Mreg, Either<u64, Symbol>>),
     Lbuiltin(String, Vec<BuiltinArg<Mreg>>, BuiltinArg<Mreg>),
     Lbranch(Either<Symbol, Node>),
-    Lcond(Condition, MregArgs, Either<Symbol, Node>, Either<Symbol, Node>),
+    Lcond(
+        Condition,
+        MregArgs,
+        Either<Symbol, Node>,
+        Either<Symbol, Node>,
+    ),
     Ljumptable(Mreg, Vec<Node>),
     Lreturn,
 }
@@ -420,7 +468,13 @@ pub enum RTLInst {
     Iop(Operation, Args, RTLReg),
     Iload(MemoryChunk, Addressing, Args, RTLReg),
     Istore(MemoryChunk, Addressing, Args, RTLReg),
-    Icall(Option<Signature>, Either<RTLReg, Either<u64, Symbol>>, Args, Option<RTLReg>, Node),
+    Icall(
+        Option<Signature>,
+        Either<RTLReg, Either<u64, Symbol>>,
+        Args,
+        Option<RTLReg>,
+        Node,
+    ),
     Itailcall(Option<Signature>, Either<RTLReg, Either<u64, Symbol>>, Args),
     Ibuiltin(String, Vec<BuiltinArg<RTLReg>>, BuiltinArg<RTLReg>),
     Icond(Condition, Args, Either<Symbol, Node>, Either<Symbol, Node>),
@@ -465,6 +519,7 @@ pub enum CminorUnop {
     Onegl,
     Onotl,
     Ointoflong,
+    Ointuoflong,
     Olongofint,
     Olongofintu,
     Olongoffloat,
@@ -551,11 +606,7 @@ pub enum CminorStmt {
         Either<RTLReg, Either<u64, Symbol>>,
         Args,
     ),
-    Stailcall(
-        Option<Signature>,
-        Either<RTLReg, Either<u64, Symbol>>,
-        Args,
-    ),
+    Stailcall(Option<Signature>, Either<RTLReg, Either<u64, Symbol>>, Args),
     Sbuiltin(
         Option<RTLReg>,
         String,
@@ -580,7 +631,11 @@ pub enum CsharpminorExpr {
     Eunop(CminorUnop, Box<CsharpminorExpr>),
     Ebinop(CminorBinop, Box<CsharpminorExpr>, Box<CsharpminorExpr>),
     Eload(MemoryChunk, Box<CsharpminorExpr>),
-    Econdition(Box<CsharpminorExpr>, Box<CsharpminorExpr>, Box<CsharpminorExpr>),
+    Econdition(
+        Box<CsharpminorExpr>,
+        Box<CsharpminorExpr>,
+        Box<CsharpminorExpr>,
+    ),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -613,7 +668,12 @@ pub enum CsharpminorStmt {
     Sseq(Vec<CsharpminorStmt>),
     Snop,
     // Structured control flow (matching CompCert Csharpminor)
-    Sifthenelse(Condition, Vec<CsharpminorExpr>, Box<CsharpminorStmt>, Box<CsharpminorStmt>),
+    Sifthenelse(
+        Condition,
+        Vec<CsharpminorExpr>,
+        Box<CsharpminorStmt>,
+        Box<CsharpminorStmt>,
+    ),
     Sloop(Box<CsharpminorStmt>),
     Sbreak,
     Scontinue,
@@ -670,7 +730,6 @@ pub enum ClightType {
     #[allow(dead_code)]
     Tunion(Ident, ClightAttr),
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClightUnaryOp {
@@ -777,7 +836,12 @@ pub enum ClightExpr {
     Esizeof(ClightType, ClightType),
     #[allow(dead_code)]
     Ealignof(ClightType, ClightType),
-    Econdition(Box<ClightExpr>, Box<ClightExpr>, Box<ClightExpr>, ClightType),
+    Econdition(
+        Box<ClightExpr>,
+        Box<ClightExpr>,
+        Box<ClightExpr>,
+        ClightType,
+    ),
 }
 
 pub type ClightLabeledStatements = Vec<(Option<Z>, ClightStmt)>;

@@ -1,15 +1,13 @@
-
+use crate::declare_io_from;
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
-use crate::declare_io_from;
 
-use std::sync::Arc;
 use crate::mreg::Mreg;
 use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use either::Either;
-
+use std::sync::Arc;
 
 /// Map a memory chunk to the XType of the value loaded/stored.
 fn chunk_xtype(chunk: &MemoryChunk) -> XType {
@@ -33,42 +31,34 @@ fn op_output_xtype(op: &Operation) -> Option<XType> {
     use Operation::*;
     match op {
         // Signed 32-bit
-        Odiv | Omod | Oshr | Oshrimm(_) | Oshrximm(_) |
-        Odivimm(_) | Omodimm(_) |
-        Ocast32signed | Omulhs => Some(XType::Xint),
+        Odiv | Omod | Oshr | Oshrimm(_) | Oshrximm(_) | Odivimm(_) | Omodimm(_) | Ocast32signed
+        | Omulhs => Some(XType::Xint),
 
         // Unsigned 32-bit
-        Odivu | Omodu | Oshru | Oshruimm(_) |
-        Odivuimm(_) | Omoduimm(_) |
-        Ocast32unsigned | Omulhu => Some(XType::Xintunsigned),
+        Odivu | Omodu | Oshru | Oshruimm(_) | Odivuimm(_) | Omoduimm(_) | Ocast32unsigned
+        | Omulhu => Some(XType::Xintunsigned),
 
         // Ambiguous 32-bit (add/sub/mul/logic, same for signed and unsigned)
-        Oadd | Osub | Omul | Oaddimm(_) | Omulimm(_) |
-        Oand | Oor | Oxor | Onot | Oneg |
-        Oandimm(_) | Oorimm(_) | Oxorimm(_) |
-        Oshl | Oshlimm(_) | Olowlong |
-        Ointconst(_) | Ointoffloat | Ointofsingle => Some(XType::Xint),
+        Oadd | Osub | Omul | Oaddimm(_) | Omulimm(_) | Oand | Oor | Oxor | Onot | Oneg
+        | Oandimm(_) | Oorimm(_) | Oxorimm(_) | Oshl | Oshlimm(_) | Olowlong | Ointconst(_)
+        | Ointoffloat | Ointofsingle => Some(XType::Xint),
 
         // 64-bit LEA gets an integer-width floor (Xlong) only: gcc emits lea for plain integer arithmetic too, so forcing Xptr broke branchless selects; use-based is_ptr supplies Xptr in section 7.
         Oleal(_) => Some(XType::Xlong),
 
         // Signed 64-bit
-        Odivl | Omodl | Oshrl | Oshrlimm(_) | Oshrxlimm(_) |
-        Odivlimm(_) | Omodlimm(_) |
-        Omullhs => Some(XType::Xlong),
+        Odivl | Omodl | Oshrl | Oshrlimm(_) | Oshrxlimm(_) | Odivlimm(_) | Omodlimm(_)
+        | Omullhs => Some(XType::Xlong),
 
         // Unsigned 64-bit
-        Odivlu | Omodlu | Oshrlu | Oshrluimm(_) |
-        Odivluimm(_) | Omodluimm(_) |
-        Omullhu => Some(XType::Xlongunsigned),
+        Odivlu | Omodlu | Oshrlu | Oshrluimm(_) | Odivluimm(_) | Omodluimm(_) | Omullhu => {
+            Some(XType::Xlongunsigned)
+        }
 
         // Ambiguous 64-bit
-        Oaddl | Osubl | Omull | Oaddlimm(_) | Omullimm(_) |
-        Oandl | Oorl | Oxorl | Onotl | Onegl |
-        Oandlimm(_) | Oorlimm(_) | Oxorlimm(_) |
-        Oshll | Oshllimm(_) |
-        Olongconst(_) |
-        Olongoffloat | Olongofsingle => Some(XType::Xlong),
+        Oaddl | Osubl | Omull | Oaddlimm(_) | Omullimm(_) | Oandl | Oorl | Oxorl | Onotl
+        | Onegl | Oandlimm(_) | Oorlimm(_) | Oxorlimm(_) | Oshll | Oshllimm(_) | Olongconst(_)
+        | Olongoffloat | Olongofsingle => Some(XType::Xlong),
 
         // 32-bit LEA gets an integer-width floor (Xint) only, for the same reason as Oleal; pointerness is decided by use-based is_ptr evidence in section 7.
         Olea(_) => Some(XType::Xint),
@@ -83,14 +73,12 @@ fn op_output_xtype(op: &Operation) -> Option<XType> {
         Ocast16unsigned => Some(XType::Xint16unsigned),
 
         // Float (double precision). Ofloatofsingle is CVTSS2SD (f32->f64) per asm_pass; the previous grouping had single<->double conversions swapped.
-        Onegf | Oabsf | Oaddf | Osubf | Omulf | Odivf | Omaxf | Ominf |
-        Ofloatofint | Ofloatoflong |
-        Ofloatofsingle => Some(XType::Xfloat),
+        Onegf | Oabsf | Oaddf | Osubf | Omulf | Odivf | Omaxf | Ominf | Ofloatofint
+        | Ofloatoflong | Ofloatofsingle => Some(XType::Xfloat),
 
         // Float (single precision). Osingleoffloat is CVTSD2SS (f64 -> f32).
-        Onegfs | Oabsfs | Oaddfs | Osubfs | Omulfs | Odivfs |
-        Osingleofint | Osingleoflong |
-        Osingleoffloat => Some(XType::Xsingle),
+        Onegfs | Oabsfs | Oaddfs | Osubfs | Omulfs | Odivfs | Osingleofint | Osingleoflong
+        | Osingleoffloat => Some(XType::Xsingle),
 
         // Comparison result (boolean)
         Ocmp(_) => Some(XType::Xbool),
@@ -108,7 +96,7 @@ fn cond_operand_xtype(cond: &Condition) -> Option<XType> {
         Condition::Ccompu(_) | Condition::Ccompuimm(_, _) => Some(XType::Xintunsigned),
         // Signed 64-bit comparison
         Condition::Ccompl(_) => Some(XType::Xlong),
-        Condition::Ccomplimm(_, 0) => Some(XType::Xany64),  // possible NULL check
+        Condition::Ccomplimm(_, 0) => Some(XType::Xany64), // possible NULL check
         Condition::Ccomplimm(_, _) => Some(XType::Xlong),
         // Unsigned 64-bit comparison
         Condition::Ccomplu(_) => Some(XType::Xlongunsigned),
@@ -125,9 +113,19 @@ fn cond_operand_xtype(cond: &Condition) -> Option<XType> {
 /// Returns true if the operation CONSUMES f64 operands; direction-aware: Ointoffloat/Olongoffloat/Osingleoffloat have f64 args but non-f64 dsts, while int->float and single-precision ops must be excluded.
 fn op_consumes_f64(op: &Operation) -> bool {
     use Operation::*;
-    matches!(op,
-        Onegf | Oabsf | Oaddf | Osubf | Omulf | Odivf | Omaxf | Ominf |
-        Ointoffloat | Olongoffloat | Osingleoffloat
+    matches!(
+        op,
+        Onegf
+            | Oabsf
+            | Oaddf
+            | Osubf
+            | Omulf
+            | Odivf
+            | Omaxf
+            | Ominf
+            | Ointoffloat
+            | Olongoffloat
+            | Osingleoffloat
     )
 }
 
@@ -138,26 +136,40 @@ fn is_f64_cond(cond: &Condition) -> bool {
 
 /// True for a 32-bit integer comparison, positive counter-evidence that a value is an int rather than a pointer; the 64-bit forms are excluded since they apply to pointers too.
 fn is_int_cmp_cond(cond: &Condition) -> bool {
-    matches!(cond,
-        Condition::Ccomp(_) | Condition::Ccompu(_) |
-        Condition::Ccompimm(_, _) | Condition::Ccompuimm(_, _)
+    matches!(
+        cond,
+        Condition::Ccomp(_)
+            | Condition::Ccompu(_)
+            | Condition::Ccompimm(_, _)
+            | Condition::Ccompuimm(_, _)
     )
 }
 
 // A compare-against-zero, excluded from hard-int evidence because a 32-bit cmp reg,0 could be a NULL check on a truncated value.
 fn is_null_cmp_cond(cond: &Condition) -> bool {
-    matches!(cond,
-        Condition::Ccompimm(Comparison::Ceq, 0) | Condition::Ccompuimm(Comparison::Ceq, 0) |
-        Condition::Ccompimm(Comparison::Cne, 0) | Condition::Ccompuimm(Comparison::Cne, 0)
+    matches!(
+        cond,
+        Condition::Ccompimm(Comparison::Ceq, 0)
+            | Condition::Ccompuimm(Comparison::Ceq, 0)
+            | Condition::Ccompimm(Comparison::Cne, 0)
+            | Condition::Ccompuimm(Comparison::Cne, 0)
     )
 }
 
 // Any pointer-flavored XType, used to single out candidates that must not forward across a register-reuse move into a hard-int destination.
 fn is_pointer_xtype(xt: &XType) -> bool {
-    matches!(xt, XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr
-        | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_))
+    matches!(
+        xt,
+        XType::Xptr
+            | XType::Xcharptr
+            | XType::Xcharptrptr
+            | XType::Xintptr
+            | XType::Xfloatptr
+            | XType::Xsingleptr
+            | XType::Xfuncptr
+            | XType::XstructPtr(_)
+    )
 }
-
 
 ascent_par! {
     #![measure_rule_times]
@@ -168,6 +180,7 @@ ascent_par! {
     // Input relations (swapped from DecompileDB)
 
     relation emit_var_type_candidate(RTLReg, XType);
+    relation win64_home_slot_type(RTLReg, XType);
     relation alias_edge(RTLReg, RTLReg);
     relation stack_var_chunk(Address, i64, MemoryChunk);
     relation stack_var(Address, Address, i64, RTLReg);
@@ -265,7 +278,11 @@ ascent_par! {
         if args.len() == 1,
         let src = args[0],
         emit_var_type_candidate(src, xt),
-        if !is_pointer_xtype(xt);
+        if !is_pointer_xtype(xt),
+        // Canonical Win64 home cells have an exact access-signature type.
+        // In particular, do not recursively copy a narrower peer candidate
+        // back through a rewritten spill Omove into the backing cell.
+        !win64_home_slot_type(*dst, _);
 
     // Forward a POINTER candidate across a move only when the destination is not hard 32-bit-int, or the integer half of a reused register gets mistyped void* and its arithmetic corrupted.
     emit_var_type_candidate(*dst, xt.clone()) <--
@@ -274,7 +291,8 @@ ascent_par! {
         let src = args[0],
         emit_var_type_candidate(src, xt),
         if is_pointer_xtype(xt),
-        !hard_int32(*dst);
+        !hard_int32(*dst),
+        !win64_home_slot_type(*dst, _);
 
     // Operand positions that consume an f64 value.
     #[local] relation f64_use_reg(RTLReg);
@@ -1025,7 +1043,9 @@ ascent_par! {
 pub struct TypePass;
 
 impl IRPass for TypePass {
-    fn name(&self) -> &'static str { "type" }
+    fn name(&self) -> &'static str {
+        "type"
+    }
 
     fn run(&self, db: &mut DecompileDB) {
         let mut prog = TypePassProgram::default();
@@ -1034,6 +1054,7 @@ impl IRPass for TypePass {
         prog.run();
 
         prog.swap_db_fields(db);
+        crate::decompile::passes::rtl_pass::enforce_win64_home_slot_types(db);
     }
 
     declare_io_from!(TypePassProgram);

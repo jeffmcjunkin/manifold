@@ -1,17 +1,14 @@
-
-
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
 use crate::{declare_io_from, run_pass};
 
-use std::sync::Arc;
-use std::convert::TryFrom;
 use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use either::Either;
 use log::warn;
-
+use std::convert::TryFrom;
+use std::sync::Arc;
 
 ascent_par! {
     #![measure_rule_times]
@@ -161,7 +158,9 @@ ascent_par! {
 pub struct CminorPass;
 
 impl IRPass for CminorPass {
-    fn name(&self) -> &'static str { "cminor" }
+    fn name(&self) -> &'static str {
+        "cminor"
+    }
 
     fn run(&self, db: &mut DecompileDB) {
         run_pass!(db, CminorPassProgram);
@@ -169,8 +168,6 @@ impl IRPass for CminorPass {
 
     declare_io_from!(CminorPassProgram);
 }
-
-
 
 pub(crate) fn immediate_from_operation(op: &Operation) -> Option<i64> {
     match op {
@@ -434,18 +431,13 @@ fn ocmp_imm_from_operation(op: &Operation) -> Option<(CminorBinop, i64, bool)> {
             Condition::Ccompuimm(cmp, n) => Some((CminorBinop::Ocmpu(*cmp), *n, false)),
             Condition::Ccomplimm(cmp, n) => Some((CminorBinop::Ocmpl(*cmp), *n, true)),
             Condition::Ccompluimm(cmp, n) => Some((CminorBinop::Ocmplu(*cmp), *n, true)),
-            Condition::Cmaskzero(n) => {
-                Some((CminorBinop::Oand, *n, false))
-            }
-            Condition::Cmasknotzero(n) => {
-                Some((CminorBinop::Oand, *n, false))
-            }
+            Condition::Cmaskzero(n) => Some((CminorBinop::Oand, *n, false)),
+            Condition::Cmasknotzero(n) => Some((CminorBinop::Oand, *n, false)),
             _ => None,
         },
         _ => None,
     }
 }
-
 
 fn is_long_binop(op: &CminorBinop) -> bool {
     matches!(
@@ -482,7 +474,11 @@ fn add_offset_sized(expr: CsharpminorExpr, ofs: i64, is_64bit: bool) -> Csharpmi
     if ofs == 0 {
         expr
     } else {
-        let add_op = if is_64bit { CminorBinop::Oaddl } else { CminorBinop::Oadd };
+        let add_op = if is_64bit {
+            CminorBinop::Oaddl
+        } else {
+            CminorBinop::Oadd
+        };
         let imm = if is_64bit {
             CsharpminorExpr::Econst(Constant::Olongconst(ofs))
         } else {
@@ -490,6 +486,69 @@ fn add_offset_sized(expr: CsharpminorExpr, ofs: i64, is_64bit: bool) -> Csharpmi
         };
         binop_expr(add_op, expr, imm)
     }
+}
+
+fn addressing_to_csharp_addr32(
+    addressing: &Addressing,
+    args: &[RTLReg],
+) -> Option<CsharpminorExpr> {
+    let narrow_arg = |reg: RTLReg| {
+        CsharpminorExpr::Eunop(
+            CminorUnop::Ointuoflong,
+            Box::new(CsharpminorExpr::Evar(reg)),
+        )
+    };
+    let add_offset = |expr: CsharpminorExpr, ofs: i64| {
+        if ofs == 0 {
+            expr
+        } else {
+            // Preserve the displacement's low 32-bit pattern. With an
+            // unsigned-int left operand, C's usual conversions make this a
+            // modulo-2^32 addition even when the literal prints negative.
+            binop_expr(
+                CminorBinop::Oadd,
+                expr,
+                csharp_int_const((ofs as u32) as i32 as i64),
+            )
+        }
+    };
+    let scaled = |expr: CsharpminorExpr, scale: i64| {
+        if scale == 1 {
+            expr
+        } else {
+            binop_expr(CminorBinop::Omul, expr, csharp_int_const(scale))
+        }
+    };
+
+    let low = match addressing {
+        Addressing::Aindexed(ofs) => add_offset(narrow_arg(*args.first()?), *ofs),
+        Addressing::Aindexed2(ofs) => {
+            let base = narrow_arg(*args.first()?);
+            let index = narrow_arg(*args.get(1)?);
+            add_offset(binop_expr(CminorBinop::Oadd, base, index), *ofs)
+        }
+        Addressing::Ascaled(scale, ofs) => {
+            add_offset(scaled(narrow_arg(*args.first()?), *scale), *ofs)
+        }
+        Addressing::Aindexed2scaled(scale, ofs) => {
+            let base = narrow_arg(*args.first()?);
+            let index = scaled(narrow_arg(*args.get(1)?), *scale);
+            add_offset(binop_expr(CminorBinop::Oadd, base, index), *ofs)
+        }
+        // Symbolic, stack-relative, unknown, and recursively wrapped modes
+        // require provenance that an addr32 relocation cannot safely provide.
+        Addressing::Aglobal(_, _)
+        | Addressing::Abased(_, _)
+        | Addressing::Abasedscaled(_, _, _)
+        | Addressing::Ainstack(_)
+        | Addressing::Aaddr32(_)
+        | Addressing::Unknown => return None,
+    };
+
+    Some(CsharpminorExpr::Eunop(
+        CminorUnop::Olongofintu,
+        Box::new(low),
+    ))
 }
 
 pub(crate) fn addressing_to_csharp_expr(
@@ -504,8 +563,16 @@ pub(crate) fn addressing_to_csharp_expr_sized(
     args: &[RTLReg],
     is_64bit: bool,
 ) -> Option<CsharpminorExpr> {
-    let add_op = if is_64bit { CminorBinop::Oaddl } else { CminorBinop::Oadd };
-    let mul_op = if is_64bit { CminorBinop::Omull } else { CminorBinop::Omul };
+    let add_op = if is_64bit {
+        CminorBinop::Oaddl
+    } else {
+        CminorBinop::Oadd
+    };
+    let mul_op = if is_64bit {
+        CminorBinop::Omull
+    } else {
+        CminorBinop::Omul
+    };
     let make_int = |v: i64| -> CsharpminorExpr {
         if is_64bit {
             CsharpminorExpr::Econst(Constant::Olongconst(v))
@@ -514,13 +581,12 @@ pub(crate) fn addressing_to_csharp_expr_sized(
         }
     };
     match addressing {
+        Addressing::Aaddr32(inner) => addressing_to_csharp_addr32(inner, args),
         Addressing::Aindexed(ofs) => {
             let base = args.first().copied().map(CsharpminorExpr::Evar);
             match base {
                 Some(expr) => Some(add_offset_sized(expr, *ofs, is_64bit)),
-                None => {
-                    None
-                }
+                None => None,
             }
         }
         Addressing::Aindexed2(ofs) => {
@@ -621,7 +687,9 @@ pub(crate) fn cast_call_args_to_signature_with_node(
         if i < expected_types.len() {
             let expected = expected_types[i].clone();
             // &sym is intrinsically a pointer: never narrow to a sub-64-bit int param, which would truncate the address.
-            if matches!(&arg, ClightExpr::Eaddrof(_, _)) && matches!(&expected, ClightType::Tint(_, _, _)) {
+            if matches!(&arg, ClightExpr::Eaddrof(_, _))
+                && matches!(&expected, ClightType::Tint(_, _, _))
+            {
                 result.push(arg);
             } else {
                 result.push(crate::x86::types::cast_expr_to_type(arg, expected));
@@ -671,166 +739,163 @@ pub(crate) fn csharp_expr_from_cminor_sized(
                 }
             }
             match args.len() {
-            0 => {
-                if let Some(cst) = constant_from_operation(op) {
-                    Some(CsharpminorExpr::Econst(cst))
-                } else {
-                    match op {
-                        Operation::Olea(addr) => {
-                            addressing_to_csharp_expr_sized(addr, args, false)
-                        }
-                        Operation::Oleal(addr) => {
-                            addressing_to_csharp_expr_sized(addr, args, true)
-                        }
-                        _ => {
-                            if let Some(imm) = immediate_from_operation(op) {
-                                Some(csharp_int_const(imm))
-                            } else {
-                                None
+                0 => {
+                    if let Some(cst) = constant_from_operation(op) {
+                        Some(CsharpminorExpr::Econst(cst))
+                    } else {
+                        match op {
+                            Operation::Olea(addr) => {
+                                addressing_to_csharp_expr_sized(addr, args, false)
+                            }
+                            Operation::Oleal(addr) => {
+                                addressing_to_csharp_expr_sized(addr, args, true)
+                            }
+                            _ => {
+                                if let Some(imm) = immediate_from_operation(op) {
+                                    Some(csharp_int_const(imm))
+                                } else {
+                                    None
+                                }
                             }
                         }
                     }
                 }
-            }
-            1 => {
-                let arg = CsharpminorExpr::Evar(args[0]);
-                if *op == Operation::Omove {
-                    Some(arg)
-                } else if let Some(unop) = unop_from_operation(op) {
-                    Some(CsharpminorExpr::Eunop(unop, Box::new(arg)))
-                } else if let Some((binop, imm)) = binop_imm_from_operation(op) {
-                    let imm_expr = if is_long_binop(&binop) {
-                        CsharpminorExpr::Econst(Constant::Olongconst(imm))
-                    } else {
-                        CsharpminorExpr::Econst(Constant::Ointconst(imm))
-                    };
-                    Some(CsharpminorExpr::Ebinop(
-                        binop,
-                        Box::new(arg),
-                        Box::new(imm_expr),
-                    ))
-                } else if let Some((binop, imm, is_long)) = ocmp_imm_from_operation(op) {
-                    use crate::x86::op::Condition;
-                    let imm_expr = if is_long {
-                        CsharpminorExpr::Econst(Constant::Olongconst(imm))
-                    } else {
-                        CsharpminorExpr::Econst(Constant::Ointconst(imm))
-                    };
-                    if let Operation::Ocmp(Condition::Cmaskzero(_)) = op {
-                        let and_expr = CsharpminorExpr::Ebinop(
-                            binop, Box::new(arg), Box::new(imm_expr),
-                        );
-                        Some(CsharpminorExpr::Ebinop(
-                            CminorBinop::Ocmpu(Comparison::Ceq),
-                            Box::new(and_expr),
-                            Box::new(csharp_int_const(0)),
-                        ))
-                    } else if let Operation::Ocmp(Condition::Cmasknotzero(_)) = op {
-                        let and_expr = CsharpminorExpr::Ebinop(
-                            binop, Box::new(arg), Box::new(imm_expr),
-                        );
-                        Some(CsharpminorExpr::Ebinop(
-                            CminorBinop::Ocmpu(Comparison::Cne),
-                            Box::new(and_expr),
-                            Box::new(csharp_int_const(0)),
-                        ))
-                    } else {
+                1 => {
+                    let arg = CsharpminorExpr::Evar(args[0]);
+                    if *op == Operation::Omove {
+                        Some(arg)
+                    } else if let Some(unop) = unop_from_operation(op) {
+                        Some(CsharpminorExpr::Eunop(unop, Box::new(arg)))
+                    } else if let Some((binop, imm)) = binop_imm_from_operation(op) {
+                        let imm_expr = if is_long_binop(&binop) {
+                            CsharpminorExpr::Econst(Constant::Olongconst(imm))
+                        } else {
+                            CsharpminorExpr::Econst(Constant::Ointconst(imm))
+                        };
                         Some(CsharpminorExpr::Ebinop(
                             binop,
                             Box::new(arg),
                             Box::new(imm_expr),
                         ))
-                    }
-                } else {
-                    match op {
-                        Operation::Olea(addr) => {
-                            addressing_to_csharp_expr_sized(addr, args, false)
-                        }
-                        Operation::Oleal(addr) => {
-                            addressing_to_csharp_expr_sized(addr, args, true)
-                        }
-                        // Rotate right: (x >> n) | (x << (width - n))
-                        Operation::Ororimm(n) => {
-                            let n = *n;
+                    } else if let Some((binop, imm, is_long)) = ocmp_imm_from_operation(op) {
+                        use crate::x86::op::Condition;
+                        let imm_expr = if is_long {
+                            CsharpminorExpr::Econst(Constant::Olongconst(imm))
+                        } else {
+                            CsharpminorExpr::Econst(Constant::Ointconst(imm))
+                        };
+                        if let Operation::Ocmp(Condition::Cmaskzero(_)) = op {
+                            let and_expr =
+                                CsharpminorExpr::Ebinop(binop, Box::new(arg), Box::new(imm_expr));
                             Some(CsharpminorExpr::Ebinop(
-                                CminorBinop::Oor,
-                                Box::new(CsharpminorExpr::Ebinop(
-                                    CminorBinop::Oshru,
-                                    Box::new(arg.clone()),
-                                    Box::new(csharp_int_const(n)),
-                                )),
-                                Box::new(CsharpminorExpr::Ebinop(
-                                    CminorBinop::Oshl,
-                                    Box::new(arg),
-                                    Box::new(csharp_int_const(32 - n)),
-                                )),
+                                CminorBinop::Ocmpu(Comparison::Ceq),
+                                Box::new(and_expr),
+                                Box::new(csharp_int_const(0)),
+                            ))
+                        } else if let Operation::Ocmp(Condition::Cmasknotzero(_)) = op {
+                            let and_expr =
+                                CsharpminorExpr::Ebinop(binop, Box::new(arg), Box::new(imm_expr));
+                            Some(CsharpminorExpr::Ebinop(
+                                CminorBinop::Ocmpu(Comparison::Cne),
+                                Box::new(and_expr),
+                                Box::new(csharp_int_const(0)),
+                            ))
+                        } else {
+                            Some(CsharpminorExpr::Ebinop(
+                                binop,
+                                Box::new(arg),
+                                Box::new(imm_expr),
                             ))
                         }
-                        Operation::Ororlimm(n) => {
-                            let n = *n;
-                            Some(CsharpminorExpr::Ebinop(
-                                CminorBinop::Oorl,
-                                Box::new(CsharpminorExpr::Ebinop(
-                                    CminorBinop::Oshrlu,
-                                    Box::new(arg.clone()),
-                                    Box::new(CsharpminorExpr::Econst(Constant::Olongconst(n))),
-                                )),
-                                Box::new(CsharpminorExpr::Ebinop(
-                                    CminorBinop::Oshll,
-                                    Box::new(arg),
-                                    Box::new(CsharpminorExpr::Econst(Constant::Olongconst(64 - n))),
-                                )),
-                            ))
-                        }
-                        _ => {
-                            warn!(
+                    } else {
+                        match op {
+                            Operation::Olea(addr) => {
+                                addressing_to_csharp_expr_sized(addr, args, false)
+                            }
+                            Operation::Oleal(addr) => {
+                                addressing_to_csharp_expr_sized(addr, args, true)
+                            }
+                            // Rotate right: (x >> n) | (x << (width - n))
+                            Operation::Ororimm(n) => {
+                                let n = *n;
+                                Some(CsharpminorExpr::Ebinop(
+                                    CminorBinop::Oor,
+                                    Box::new(CsharpminorExpr::Ebinop(
+                                        CminorBinop::Oshru,
+                                        Box::new(arg.clone()),
+                                        Box::new(csharp_int_const(n)),
+                                    )),
+                                    Box::new(CsharpminorExpr::Ebinop(
+                                        CminorBinop::Oshl,
+                                        Box::new(arg),
+                                        Box::new(csharp_int_const(32 - n)),
+                                    )),
+                                ))
+                            }
+                            Operation::Ororlimm(n) => {
+                                let n = *n;
+                                Some(CsharpminorExpr::Ebinop(
+                                    CminorBinop::Oorl,
+                                    Box::new(CsharpminorExpr::Ebinop(
+                                        CminorBinop::Oshrlu,
+                                        Box::new(arg.clone()),
+                                        Box::new(CsharpminorExpr::Econst(Constant::Olongconst(n))),
+                                    )),
+                                    Box::new(CsharpminorExpr::Ebinop(
+                                        CminorBinop::Oshll,
+                                        Box::new(arg),
+                                        Box::new(CsharpminorExpr::Econst(Constant::Olongconst(
+                                            64 - n,
+                                        ))),
+                                    )),
+                                ))
+                            }
+                            _ => {
+                                warn!(
                                 "[ERROR] csharp_expr_from_cminor: unhandled 1-arg operation {:?} -- expression dropped",
                                 op
                             );
-                            None
+                                None
+                            }
                         }
                     }
                 }
-            }
-            2 => {
-                let lhs = CsharpminorExpr::Evar(args[0]);
-                let rhs = CsharpminorExpr::Evar(args[1]);
-                if let Some(binop) = binop_from_operation(op) {
-                    Some(CsharpminorExpr::Ebinop(binop, Box::new(lhs), Box::new(rhs)))
-                } else {
-                    match op {
-                        Operation::Olea(addr) => {
-                            addressing_to_csharp_expr_sized(addr, args, false)
-                        }
-                        Operation::Oleal(addr) => {
-                            addressing_to_csharp_expr_sized(addr, args, true)
-                        }
-                        _ => {
-                            warn!(
+                2 => {
+                    let lhs = CsharpminorExpr::Evar(args[0]);
+                    let rhs = CsharpminorExpr::Evar(args[1]);
+                    if let Some(binop) = binop_from_operation(op) {
+                        Some(CsharpminorExpr::Ebinop(binop, Box::new(lhs), Box::new(rhs)))
+                    } else {
+                        match op {
+                            Operation::Olea(addr) => {
+                                addressing_to_csharp_expr_sized(addr, args, false)
+                            }
+                            Operation::Oleal(addr) => {
+                                addressing_to_csharp_expr_sized(addr, args, true)
+                            }
+                            _ => {
+                                warn!(
                                 "[ERROR] csharp_expr_from_cminor: unhandled 2-arg operation {:?} -- expression dropped",
                                 op
                             );
-                            None
+                                None
+                            }
                         }
                     }
                 }
-            }
-            _ => match op {
-                Operation::Olea(addr) => {
-                    addressing_to_csharp_expr_sized(addr, args, false)
-                }
-                Operation::Oleal(addr) => {
-                    addressing_to_csharp_expr_sized(addr, args, true)
-                }
-                _ => {
-                    warn!(
+                _ => match op {
+                    Operation::Olea(addr) => addressing_to_csharp_expr_sized(addr, args, false),
+                    Operation::Oleal(addr) => addressing_to_csharp_expr_sized(addr, args, true),
+                    _ => {
+                        warn!(
                         "[ERROR] csharp_expr_from_cminor: unhandled {}-arg operation {:?} -- expression dropped",
                         args.len(), op
                     );
-                    None
-                }
-            },
-        }}
+                        None
+                    }
+                },
+            }
+        }
         CminorExpr::Eload(chunk, addr, args) => {
             let addr_expr = addressing_to_csharp_expr_sized(addr, args, load_addr_64bit)?;
             Some(CsharpminorExpr::Eload(chunk.clone(), Box::new(addr_expr)))

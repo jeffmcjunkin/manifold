@@ -40,6 +40,13 @@ fn regression_nested_loop_break_continue() {
 fn regression_struct_pointer_alias() {
     assert!(has_field_access(&OUTPUT, "test_struct_pointer_alias", "left"),
             "expected field access to 'left'");
+    assert!(has_binop(&OUTPUT, "test_struct_pointer_alias", BinaryOp::Add),
+            "expected the fused indexed-memory addition to survive");
+    let func = func_def(&OUTPUT, "test_struct_pointer_alias");
+    assert_ne!(func.return_type, CType::Void,
+               "fused AX result must not make the function void");
+    assert!(stmt_has(&func.body, &|stmt| matches!(stmt, CStmt::Return(Some(_)))),
+            "expected a value-bearing return");
 }
 
 #[test]

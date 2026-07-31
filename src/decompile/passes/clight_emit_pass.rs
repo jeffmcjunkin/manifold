@@ -1,15 +1,14 @@
 use crate::decompile::elevator::DecompileDB;
-use crate::decompile::passes::pass::IRPass;
 use crate::decompile::passes::c_pass::helpers::{
     build_string_literal_map, collect_goto_label_targets, convert_param_type_from_param,
-    inline_string_literals, is_terminal_cstmt,
-    param_name_for_reg, xtype_string_to_ctype,
+    inline_string_literals, is_terminal_cstmt, param_name_for_reg, xtype_string_to_ctype,
 };
 use crate::decompile::passes::c_pass::types::{
-    CExpr, CStmt, CType, TopLevelDecl, TypeQualifiers,
+    CExpr, CStmt, CType, StructField, TopLevelDecl, TypeQualifiers,
 };
+use crate::decompile::passes::pass::IRPass;
 use crate::x86::types::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Known libc functions that take opaque struct pointer parameters; maps function_name -> Vec<(param_position, typedef_name)>.
@@ -17,24 +16,58 @@ fn known_opaque_struct_params() -> HashMap<&'static str, Vec<(usize, &'static st
     let mut m: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
     // FILE* at position 0
     for &func in &[
-        "fclose", "fflush", "fgetc",
-        "fseek", "fseeko", "ftell", "ftello", "rewind", "feof",
-        "ferror", "clearerr", "fileno", "setbuf", "setvbuf",
-        "fprintf", "fscanf", "vfprintf",
+        "fclose",
+        "fflush",
+        "fgetc",
+        "fseek",
+        "fseeko",
+        "ftell",
+        "ftello",
+        "rewind",
+        "feof",
+        "ferror",
+        "clearerr",
+        "fileno",
+        "setbuf",
+        "setvbuf",
+        "fprintf",
+        "fscanf",
+        "vfprintf",
         "clearerr_unlocked",
-        "feof_unlocked", "ferror_unlocked", "fileno_unlocked",
-        "fgetc_unlocked", "getc_unlocked",
-        "__freading", "__fpending", "__fwriting",
-        "__freadable", "__fwritable", "__fsetlocking",
-        "__overflow", "__uflow", "fclose_nothrow",
+        "feof_unlocked",
+        "ferror_unlocked",
+        "fileno_unlocked",
+        "fgetc_unlocked",
+        "getc_unlocked",
+        "__freading",
+        "__fpending",
+        "__fwriting",
+        "__freadable",
+        "__fwritable",
+        "__fsetlocking",
+        "__overflow",
+        "__uflow",
+        "fclose_nothrow",
         "fflush_unlocked",
-        "rpl_fclose", "rpl_fflush", "rpl_fseek", "rpl_fseeko",
-        "rpl_ftell", "rpl_ftello", "rpl_fopen", "rpl_freopen",
+        "rpl_fclose",
+        "rpl_fflush",
+        "rpl_fseek",
+        "rpl_fseeko",
+        "rpl_ftell",
+        "rpl_ftello",
+        "rpl_fopen",
+        "rpl_freopen",
     ] {
         m.entry(func).or_default().push((0, "FILE"));
     }
     // FILE* at position 1: int fputc(int, FILE*), int fputs(const char*, FILE*), etc.
-    for &func in &["fputc", "fputs", "fputc_unlocked", "fputs_unlocked", "putc_unlocked"] {
+    for &func in &[
+        "fputc",
+        "fputs",
+        "fputc_unlocked",
+        "fputs_unlocked",
+        "putc_unlocked",
+    ] {
         m.entry(func).or_default().push((1, "FILE"));
     }
     // FILE* at position 2: char* fgets(char*, int, FILE*)
@@ -46,7 +79,14 @@ fn known_opaque_struct_params() -> HashMap<&'static str, Vec<(usize, &'static st
         m.entry(func).or_default().push((3, "FILE"));
     }
     // DIR* at position 0
-    for &func in &["closedir", "readdir", "readdir_r", "rewinddir", "seekdir", "telldir"] {
+    for &func in &[
+        "closedir",
+        "readdir",
+        "readdir_r",
+        "rewinddir",
+        "seekdir",
+        "telldir",
+    ] {
         m.entry(func).or_default().push((0, "DIR"));
     }
     m
@@ -115,7 +155,10 @@ fn collect_struct_types_in_expr(
     match expr {
         CExpr::Cast(CType::Pointer(inner, _), inner_expr) => {
             if let CType::Struct(name) = inner.as_ref() {
-                result.entry(name.clone()).or_default().insert(typedef_name.to_string());
+                result
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(typedef_name.to_string());
             }
             // Also recurse into the inner expression for nested casts
             collect_struct_types_in_expr(inner_expr, typedef_name, result);
@@ -150,7 +193,9 @@ fn collect_struct_names_from_stmt(
         CStmt::If(c, t, e) => {
             collect_struct_names_from_expr(c, opaque_params, result);
             collect_struct_names_from_stmt(t, opaque_params, result);
-            if let Some(e) = e { collect_struct_names_from_stmt(e, opaque_params, result); }
+            if let Some(e) = e {
+                collect_struct_names_from_stmt(e, opaque_params, result);
+            }
         }
         CStmt::Switch(e, body) => {
             collect_struct_names_from_expr(e, opaque_params, result);
@@ -161,14 +206,20 @@ fn collect_struct_names_from_stmt(
             collect_struct_names_from_stmt(body, opaque_params, result);
         }
         CStmt::For(_, cond, update, body) => {
-            if let Some(c) = cond { collect_struct_names_from_expr(c, opaque_params, result); }
-            if let Some(u) = update { collect_struct_names_from_expr(u, opaque_params, result); }
+            if let Some(c) = cond {
+                collect_struct_names_from_expr(c, opaque_params, result);
+            }
+            if let Some(u) = update {
+                collect_struct_names_from_expr(u, opaque_params, result);
+            }
             collect_struct_names_from_stmt(body, opaque_params, result);
         }
         CStmt::Return(Some(e)) => collect_struct_names_from_expr(e, opaque_params, result),
         CStmt::Labeled(_, body) => collect_struct_names_from_stmt(body, opaque_params, result),
         CStmt::Sequence(stmts) => {
-            for s in stmts { collect_struct_names_from_stmt(s, opaque_params, result); }
+            for s in stmts {
+                collect_struct_names_from_stmt(s, opaque_params, result);
+            }
         }
         _ => {}
     }
@@ -247,7 +298,10 @@ fn rewrite_ctype(ty: &CType, opaque_map: &HashMap<String, String>) -> CType {
         }
         CType::Function(ret, params, variadic, unprototyped) => {
             let new_ret = rewrite_ctype(ret, opaque_map);
-            let new_params: Vec<CType> = params.iter().map(|p| rewrite_ctype(p, opaque_map)).collect();
+            let new_params: Vec<CType> = params
+                .iter()
+                .map(|p| rewrite_ctype(p, opaque_map))
+                .collect();
             CType::Function(Box::new(new_ret), new_params, *variadic, *unprototyped)
         }
         CType::Qualified(inner, quals) => {
@@ -279,7 +333,9 @@ fn rewrite_ctype_in_expr(expr: &mut CExpr, opaque_map: &HashMap<String, String>)
         }
         CExpr::Call(f, args) => {
             rewrite_ctype_in_expr(f, opaque_map);
-            for a in args { rewrite_ctype_in_expr(a, opaque_map); }
+            for a in args {
+                rewrite_ctype_in_expr(a, opaque_map);
+            }
         }
         CExpr::Member(inner, _) | CExpr::MemberPtr(inner, _) => {
             rewrite_ctype_in_expr(inner, opaque_map);
@@ -308,7 +364,9 @@ fn rewrite_ctype_in_stmt(stmt: &mut CStmt, opaque_map: &HashMap<String, String>)
                         rewrite_ctype_in_stmt(s, opaque_map);
                     }
                     crate::decompile::passes::c_pass::types::CBlockItem::Decl(decls) => {
-                        for d in decls { d.ty = rewrite_ctype(&d.ty, opaque_map); }
+                        for d in decls {
+                            d.ty = rewrite_ctype(&d.ty, opaque_map);
+                        }
                     }
                 }
             }
@@ -316,7 +374,9 @@ fn rewrite_ctype_in_stmt(stmt: &mut CStmt, opaque_map: &HashMap<String, String>)
         CStmt::If(c, t, e) => {
             rewrite_ctype_in_expr(c, opaque_map);
             rewrite_ctype_in_stmt(t, opaque_map);
-            if let Some(e) = e { rewrite_ctype_in_stmt(e, opaque_map); }
+            if let Some(e) = e {
+                rewrite_ctype_in_stmt(e, opaque_map);
+            }
         }
         CStmt::Switch(e, body) => {
             rewrite_ctype_in_expr(e, opaque_map);
@@ -337,12 +397,18 @@ fn rewrite_ctype_in_stmt(stmt: &mut CStmt, opaque_map: &HashMap<String, String>)
                         rewrite_ctype_in_expr(e, opaque_map);
                     }
                     crate::decompile::passes::c_pass::types::ForInit::Decl(decls) => {
-                        for d in decls { d.ty = rewrite_ctype(&d.ty, opaque_map); }
+                        for d in decls {
+                            d.ty = rewrite_ctype(&d.ty, opaque_map);
+                        }
                     }
                 }
             }
-            if let Some(c) = cond { rewrite_ctype_in_expr(c, opaque_map); }
-            if let Some(u) = update { rewrite_ctype_in_expr(u, opaque_map); }
+            if let Some(c) = cond {
+                rewrite_ctype_in_expr(c, opaque_map);
+            }
+            if let Some(u) = update {
+                rewrite_ctype_in_expr(u, opaque_map);
+            }
             rewrite_ctype_in_stmt(body, opaque_map);
         }
         CStmt::Return(Some(e)) => rewrite_ctype_in_expr(e, opaque_map),
@@ -353,10 +419,14 @@ fn rewrite_ctype_in_stmt(stmt: &mut CStmt, opaque_map: &HashMap<String, String>)
             rewrite_ctype_in_stmt(body, opaque_map);
         }
         CStmt::Decl(decls) => {
-            for d in decls { d.ty = rewrite_ctype(&d.ty, opaque_map); }
+            for d in decls {
+                d.ty = rewrite_ctype(&d.ty, opaque_map);
+            }
         }
         CStmt::Sequence(stmts) => {
-            for s in stmts { rewrite_ctype_in_stmt(s, opaque_map); }
+            for s in stmts {
+                rewrite_ctype_in_stmt(s, opaque_map);
+            }
         }
         _ => {}
     }
@@ -374,13 +444,19 @@ fn rewrite_opaque_types_in_tu(
         match decl {
             TopLevelDecl::FuncDef(f) => {
                 f.return_type = rewrite_ctype(&f.return_type, opaque_map);
-                for p in &mut f.params { p.ty = rewrite_ctype(&p.ty, opaque_map); }
-                for v in &mut f.local_vars { v.ty = rewrite_ctype(&v.ty, opaque_map); }
+                for p in &mut f.params {
+                    p.ty = rewrite_ctype(&p.ty, opaque_map);
+                }
+                for v in &mut f.local_vars {
+                    v.ty = rewrite_ctype(&v.ty, opaque_map);
+                }
                 rewrite_ctype_in_stmt(&mut f.body, opaque_map);
             }
             TopLevelDecl::FuncDecl(f) => {
                 f.return_type = rewrite_ctype(&f.return_type, opaque_map);
-                for p in &mut f.params { p.ty = rewrite_ctype(&p.ty, opaque_map); }
+                for p in &mut f.params {
+                    p.ty = rewrite_ctype(&p.ty, opaque_map);
+                }
             }
             TopLevelDecl::VarDecl(v) => {
                 v.ty = rewrite_ctype(&v.ty, opaque_map);
@@ -664,11 +740,16 @@ fn layout_walk_expr(expr: &CExpr, env: &LayoutEnv, ev: &mut StructLayoutEvidence
     };
     match expr {
         CExpr::IntLit(l) => {
-            let wide = !matches!(l.suffix, crate::decompile::passes::c_pass::types::IntLiteralSuffix::None
-                | crate::decompile::passes::c_pass::types::IntLiteralSuffix::U)
-                || l.value < i32::MIN as i128
+            let wide = !matches!(
+                l.suffix,
+                crate::decompile::passes::c_pass::types::IntLiteralSuffix::None
+                    | crate::decompile::passes::c_pass::types::IntLiteralSuffix::U
+            ) || l.value < i32::MIN as i128
                 || l.value > u32::MAX as i128;
-            Some(CType::Int(if wide { IntSize::Long } else { IntSize::Int }, Signedness::Signed))
+            Some(CType::Int(
+                if wide { IntSize::Long } else { IntSize::Int },
+                Signedness::Signed,
+            ))
         }
         CExpr::FloatLit(l) => Some(CType::Float(if matches!(l.suffix, FloatLiteralSuffix::F) {
             FloatSize::Float
@@ -736,11 +817,23 @@ fn layout_walk_expr(expr: &CExpr, env: &LayoutEnv, ev: &mut StructLayoutEvidence
             let lt = layout_walk_expr(l, env, ev);
             let rt = layout_walk_expr(r, env, ev);
             match op {
-                BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt
-                | BinaryOp::Ge | BinaryOp::And | BinaryOp::Or => Some(CType::int()),
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+                | BinaryOp::And
+                | BinaryOp::Or => Some(CType::int()),
                 BinaryOp::Add | BinaryOp::Sub => {
-                    let l_is_ptr = matches!(lt.as_ref().map(strip_quals), Some(CType::Pointer(_, _) | CType::Array(_, _)));
-                    let r_is_ptr = matches!(rt.as_ref().map(strip_quals), Some(CType::Pointer(_, _) | CType::Array(_, _)));
+                    let l_is_ptr = matches!(
+                        lt.as_ref().map(strip_quals),
+                        Some(CType::Pointer(_, _) | CType::Array(_, _))
+                    );
+                    let r_is_ptr = matches!(
+                        rt.as_ref().map(strip_quals),
+                        Some(CType::Pointer(_, _) | CType::Array(_, _))
+                    );
                     if l_is_ptr {
                         note_pointee_complete(lt.as_ref().unwrap(), ev);
                     }
@@ -772,7 +865,10 @@ fn layout_walk_expr(expr: &CExpr, env: &LayoutEnv, ev: &mut StructLayoutEvidence
         CExpr::Assign(op, l, r) => {
             let lt = layout_walk_expr(l, env, ev);
             layout_walk_expr(r, env, ev);
-            if !matches!(op, crate::decompile::passes::c_pass::types::AssignOp::Assign) {
+            if !matches!(
+                op,
+                crate::decompile::passes::c_pass::types::AssignOp::Assign
+            ) {
                 // Compound assignment on a pointer (p += n) is pointer arithmetic.
                 match lt.as_ref().map(strip_quals) {
                     Some(t @ CType::Pointer(_, _)) => note_pointee_complete(t, ev),
@@ -1028,7 +1124,9 @@ fn collect_struct_layout_evidence(
                 callee_ret.insert(f.name.clone(), f.return_type.clone());
             }
             TopLevelDecl::FuncDecl(d) => {
-                callee_ret.entry(d.name.clone()).or_insert_with(|| d.return_type.clone());
+                callee_ret
+                    .entry(d.name.clone())
+                    .or_insert_with(|| d.return_type.clone());
             }
             TopLevelDecl::VarDecl(v) => {
                 globals.insert(v.name.clone(), v.ty.clone());
@@ -1132,12 +1230,16 @@ fn collect_all_referenced_structs(
     // Collect ALL struct names referenced in types (both by-value and via pointers)
     fn collect_struct_refs(ty: &CType, result: &mut HashSet<String>) {
         match ty {
-            CType::Struct(name) => { result.insert(name.clone()); }
+            CType::Struct(name) => {
+                result.insert(name.clone());
+            }
             CType::Pointer(inner, _) => collect_struct_refs(inner, result),
             CType::Array(inner, _) => collect_struct_refs(inner, result),
             CType::Function(ret, params, _, _) => {
                 collect_struct_refs(ret, result);
-                for p in params { collect_struct_refs(p, result); }
+                for p in params {
+                    collect_struct_refs(p, result);
+                }
             }
             CType::Qualified(inner, _) => collect_struct_refs(inner, result),
             _ => {}
@@ -1148,14 +1250,20 @@ fn collect_all_referenced_structs(
         match decl {
             TopLevelDecl::FuncDef(f) => {
                 collect_struct_refs(&f.return_type, &mut referenced);
-                for p in &f.params { collect_struct_refs(&p.ty, &mut referenced); }
-                for v in &f.local_vars { collect_struct_refs(&v.ty, &mut referenced); }
+                for p in &f.params {
+                    collect_struct_refs(&p.ty, &mut referenced);
+                }
+                for v in &f.local_vars {
+                    collect_struct_refs(&v.ty, &mut referenced);
+                }
                 // A struct may only appear inside a cast in the body (e.g. ((struct_1 *)p)->ofs_8 when p is typed as a generic pointer). Walk the body so such structs are not mistaken for unreferenced and suppressed to void; mirrors rewrite_ctype_in_stmt which would otherwise rewrite those casts.
                 collect_referenced_structs_in_stmt(&f.body, &mut referenced);
             }
             TopLevelDecl::FuncDecl(f) => {
                 collect_struct_refs(&f.return_type, &mut referenced);
-                for p in &f.params { collect_struct_refs(&p.ty, &mut referenced); }
+                for p in &f.params {
+                    collect_struct_refs(&p.ty, &mut referenced);
+                }
             }
             TopLevelDecl::VarDecl(v) => {
                 collect_struct_refs(&v.ty, &mut referenced);
@@ -1171,12 +1279,16 @@ fn collect_all_referenced_structs(
 fn collect_referenced_structs_in_expr(expr: &CExpr, result: &mut HashSet<String>) {
     fn collect_struct_refs(ty: &CType, result: &mut HashSet<String>) {
         match ty {
-            CType::Struct(name) => { result.insert(name.clone()); }
+            CType::Struct(name) => {
+                result.insert(name.clone());
+            }
             CType::Pointer(inner, _) => collect_struct_refs(inner, result),
             CType::Array(inner, _) => collect_struct_refs(inner, result),
             CType::Function(ret, params, _, _) => {
                 collect_struct_refs(ret, result);
-                for p in params { collect_struct_refs(p, result); }
+                for p in params {
+                    collect_struct_refs(p, result);
+                }
             }
             CType::Qualified(inner, _) => collect_struct_refs(inner, result),
             _ => {}
@@ -1201,7 +1313,9 @@ fn collect_referenced_structs_in_expr(expr: &CExpr, result: &mut HashSet<String>
         }
         CExpr::Call(f, args) => {
             collect_referenced_structs_in_expr(f, result);
-            for a in args { collect_referenced_structs_in_expr(a, result); }
+            for a in args {
+                collect_referenced_structs_in_expr(a, result);
+            }
         }
         CExpr::Member(inner, _) | CExpr::MemberPtr(inner, _) => {
             collect_referenced_structs_in_expr(inner, result);
@@ -1221,12 +1335,16 @@ fn collect_referenced_structs_in_expr(expr: &CExpr, result: &mut HashSet<String>
 fn collect_referenced_structs_in_stmt(stmt: &CStmt, result: &mut HashSet<String>) {
     fn collect_struct_refs(ty: &CType, result: &mut HashSet<String>) {
         match ty {
-            CType::Struct(name) => { result.insert(name.clone()); }
+            CType::Struct(name) => {
+                result.insert(name.clone());
+            }
             CType::Pointer(inner, _) => collect_struct_refs(inner, result),
             CType::Array(inner, _) => collect_struct_refs(inner, result),
             CType::Function(ret, params, _, _) => {
                 collect_struct_refs(ret, result);
-                for p in params { collect_struct_refs(p, result); }
+                for p in params {
+                    collect_struct_refs(p, result);
+                }
             }
             CType::Qualified(inner, _) => collect_struct_refs(inner, result),
             _ => {}
@@ -1241,7 +1359,9 @@ fn collect_referenced_structs_in_stmt(stmt: &CStmt, result: &mut HashSet<String>
                         collect_referenced_structs_in_stmt(s, result);
                     }
                     crate::decompile::passes::c_pass::types::CBlockItem::Decl(decls) => {
-                        for d in decls { collect_struct_refs(&d.ty, result); }
+                        for d in decls {
+                            collect_struct_refs(&d.ty, result);
+                        }
                     }
                 }
             }
@@ -1249,7 +1369,9 @@ fn collect_referenced_structs_in_stmt(stmt: &CStmt, result: &mut HashSet<String>
         CStmt::If(c, t, e) => {
             collect_referenced_structs_in_expr(c, result);
             collect_referenced_structs_in_stmt(t, result);
-            if let Some(e) = e { collect_referenced_structs_in_stmt(e, result); }
+            if let Some(e) = e {
+                collect_referenced_structs_in_stmt(e, result);
+            }
         }
         CStmt::Switch(e, body) => {
             collect_referenced_structs_in_expr(e, result);
@@ -1270,12 +1392,18 @@ fn collect_referenced_structs_in_stmt(stmt: &CStmt, result: &mut HashSet<String>
                         collect_referenced_structs_in_expr(e, result);
                     }
                     crate::decompile::passes::c_pass::types::ForInit::Decl(decls) => {
-                        for d in decls { collect_struct_refs(&d.ty, result); }
+                        for d in decls {
+                            collect_struct_refs(&d.ty, result);
+                        }
                     }
                 }
             }
-            if let Some(c) = cond { collect_referenced_structs_in_expr(c, result); }
-            if let Some(u) = update { collect_referenced_structs_in_expr(u, result); }
+            if let Some(c) = cond {
+                collect_referenced_structs_in_expr(c, result);
+            }
+            if let Some(u) = update {
+                collect_referenced_structs_in_expr(u, result);
+            }
             collect_referenced_structs_in_stmt(body, result);
         }
         CStmt::Return(Some(e)) => collect_referenced_structs_in_expr(e, result),
@@ -1286,15 +1414,18 @@ fn collect_referenced_structs_in_stmt(stmt: &CStmt, result: &mut HashSet<String>
             collect_referenced_structs_in_stmt(body, result);
         }
         CStmt::Decl(decls) => {
-            for d in decls { collect_struct_refs(&d.ty, result); }
+            for d in decls {
+                collect_struct_refs(&d.ty, result);
+            }
         }
         CStmt::Sequence(stmts) => {
-            for s in stmts { collect_referenced_structs_in_stmt(s, result); }
+            for s in stmts {
+                collect_referenced_structs_in_stmt(s, result);
+            }
         }
         _ => {}
     }
 }
-
 
 // Shared read set for the select/emit split; the full set keeps both halves ordered after their producers, with clight_selected_functions the typed-tree handoff.
 const CLIGHT_EMIT_INPUTS: &[&str] = &[
@@ -1366,7 +1497,73 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "rtl_reg_used_in_func",
     "struct_id_to_canonical",
     "unknown_extern",
+    "unsupported_stack_address",
 ];
+
+/// Build the identifier names used by normal C emission.
+///
+/// `emit_function` is the provider relation: its name must win over aliases
+/// for both emitted definitions and direct `Evar` references.  Resolve every
+/// provider, including functions omitted from `selected_functions`, because a
+/// selected sibling can still call an omitted function.  Anonymous `FUN_`
+/// providers retain the same deterministic alias fallback as query
+/// extraction.
+fn build_emission_name_map(db: &DecompileDB) -> Result<HashMap<usize, String>, String> {
+    use crate::decompile::passes::clight_select::query::insert_preferred_symbol_name;
+
+    let mut id_to_name = HashMap::new();
+    for (id, name) in db.rel_iter::<(Ident, Symbol)>("ident_to_symbol") {
+        insert_preferred_symbol_name(&mut id_to_name, *id, name);
+    }
+
+    // Object symbols are authoritative over ident_to_symbol, but aliases at
+    // one address still need a stable shortest/lexicographic winner.
+    let mut symbol_names = HashMap::new();
+    for (address, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
+        insert_preferred_symbol_name(&mut symbol_names, *address as usize, name);
+    }
+    for (id, name) in symbol_names {
+        id_to_name.insert(id, name);
+    }
+
+    // Match extract_functions exactly: provider identity includes both the
+    // final name and entry node, and contradictory rows are an error rather
+    // than a relation-order-dependent last write.
+    let mut providers: BTreeMap<Address, (String, Node)> = BTreeMap::new();
+    for (address, name, entry_node) in
+        db.rel_iter::<(Address, Symbol, Node)>("emit_function")
+    {
+        let final_name = if name.starts_with("FUN_") {
+            id_to_name
+                .get(&(*address as usize))
+                .cloned()
+                .unwrap_or_else(|| name.to_string())
+        } else {
+            name.to_string()
+        };
+
+        match providers.entry(*address) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((final_name, *entry_node));
+            }
+            std::collections::btree_map::Entry::Occupied(entry)
+                if entry.get() != &(final_name.clone(), *entry_node) =>
+            {
+                return Err(format!(
+                    "emit_function gives address 0x{address:x} conflicting provider identity: {:?} versus {:?}",
+                    entry.get(),
+                    (final_name, *entry_node)
+                ));
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+
+    for (address, (name, _)) in providers {
+        id_to_name.insert(address as usize, name);
+    }
+    Ok(id_to_name)
+}
 
 // Front half of codegen: CEGAR selection + tree assembly, kept separate so goto-reduction can rewrite the typed trees before emission with types frozen.
 pub struct ClightSelectPass;
@@ -1422,55 +1619,36 @@ impl IRPass for ClightEmitPass {
 
         // Take the typed per-function trees produced by ClightSelectPass.
         let selected_functions = std::mem::take(&mut db.clight_selected_functions);
-        eprintln!("[clight-emit] selected functions: {}", selected_functions.len());
+        eprintln!(
+            "[clight-emit] selected functions: {}",
+            selected_functions.len()
+        );
 
-        let mut id_to_name: HashMap<usize, String> = HashMap::new();
-        // ident_to_symbol iteration order is non-deterministic; when several symbols share an id, prefer the shortest name with a lex tiebreak so the choice is stable.
-        for (id, name) in db.rel_iter::<(Ident, Symbol)>("ident_to_symbol") {
-            let name_str = name.to_string();
-            id_to_name
-                .entry(*id)
-                .and_modify(|existing| {
-                    let take = name_str.len() < existing.len()
-                        || (name_str.len() == existing.len() && name_str.as_str() < existing.as_str());
-                    if take {
-                        *existing = name_str.clone();
-                    }
-                })
-                .or_insert_with(|| name_str);
-        }
-        // For symbol aliases at one address, deterministically keep the lex-smallest name.
-        let mut sym_tuples: Vec<(Address, Symbol)> = db
-            .rel_iter::<(Address, Symbol, Symbol)>("symbols")
-            .map(|(a, n, _)| (*a, *n))
-            .collect();
-        sym_tuples.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        for (addr, name) in sym_tuples {
-            let id = addr as usize;
-            // Keep the lex-smallest name across aliases rather than relying on last-write.
-            id_to_name
-                .entry(id)
-                .and_modify(|existing| {
-                    let candidate = name.to_string();
-                    if candidate.as_str() < existing.as_str() {
-                        *existing = candidate;
-                    }
-                })
-                .or_insert_with(|| name.to_string());
-        }
+        let mut id_to_name = match build_emission_name_map(db) {
+            Ok(names) => names,
+            Err(error) => {
+                log::warn!("ClightEmitPass: failed to resolve function providers: {error}");
+                return;
+            }
+        };
+        // Selected functions normally already have an emit_function entry.
+        // Keep this fallback for synthetic/test-selected functions without
+        // weakening provider authority for real functions.
         for func in &selected_functions {
             id_to_name
                 .entry(func.address as usize)
                 .or_insert_with(|| func.name.clone());
         }
 
-        let globals = match crate::decompile::passes::clight_select::query::extract_globals(db, &binary_path) {
-            Ok(g) => g,
-            Err(e) => {
-                log::warn!("ClightEmitPass: failed to extract globals: {}", e);
-                return;
-            }
-        };
+        let globals =
+            match crate::decompile::passes::clight_select::query::extract_globals(db, &binary_path)
+            {
+                Ok(g) => g,
+                Err(e) => {
+                    log::warn!("ClightEmitPass: failed to extract globals: {}", e);
+                    return;
+                }
+            };
         for g in &globals {
             id_to_name.entry(g.id).or_insert_with(|| g.name.clone());
         }
@@ -1478,8 +1656,9 @@ impl IRPass for ClightEmitPass {
         // Resolve auto-gen L_XXXX labels from linker-fragmented funcs (multiple func_stacksz entries); rename only those fragments to their containing function. Disassembler-created internal jump targets stay so internal gotos don't collide.
         {
             let is_generated_label = |n: &str| -> bool {
-                n.strip_prefix("L_")
-                    .map_or(false, |h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+                n.strip_prefix("L_").map_or(false, |h| {
+                    !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit())
+                })
             };
 
             let mut raw: Vec<(u64, u64, String)> = db
@@ -1528,7 +1707,9 @@ impl IRPass for ClightEmitPass {
                     .or_insert(*elem_size);
             }
             let mut array_elem_sizes: HashMap<usize, usize> = HashMap::new();
-            for (ident, elem_size, _count) in db.rel_iter::<(Ident, usize, usize)>("is_global_array") {
+            for (ident, elem_size, _count) in
+                db.rel_iter::<(Ident, usize, usize)>("is_global_array")
+            {
                 array_elem_sizes
                     .entry(*ident)
                     .and_modify(|e| *e = (*e).min(*elem_size))
@@ -1564,7 +1745,9 @@ impl IRPass for ClightEmitPass {
                 // Min-sid per ident mirrors from_relations' winner; merge field offsets of every row carrying that sid.
                 let mut chosen_sid: HashMap<usize, usize> = HashMap::new();
                 for (ident, sid, _fields) in db
-                    .rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_global_struct_fields")
+                    .rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>(
+                        "emit_global_struct_fields",
+                    )
                 {
                     if !catalog_ids.contains(sid) || !declared_global_ids.contains(ident) {
                         continue;
@@ -1580,7 +1763,9 @@ impl IRPass for ClightEmitPass {
                 }
                 let mut offsets: HashMap<usize, std::collections::BTreeSet<i64>> = HashMap::new();
                 for (ident, sid, fields) in db
-                    .rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_global_struct_fields")
+                    .rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>(
+                        "emit_global_struct_fields",
+                    )
                 {
                     if chosen_sid.get(ident) != Some(sid) {
                         continue;
@@ -1604,7 +1789,9 @@ impl IRPass for ClightEmitPass {
                 offsets
             };
 
-            for (interior_ident, base_name, offset) in db.rel_iter::<(Ident, Symbol, i64)>("emit_address_as_offset") {
+            for (interior_ident, base_name, offset) in
+                db.rel_iter::<(Ident, Symbol, i64)>("emit_address_as_offset")
+            {
                 let maybe_base_ident = symbol_addr_by_name.get(*base_name).copied();
 
                 let rewritten_name = if let Some(base_ident) = maybe_base_ident {
@@ -1642,13 +1829,16 @@ impl IRPass for ClightEmitPass {
 
         // P5 decl solve: program-level decl decisions from the selected statements, BEFORE any TU build so both the raw and optimized paths (global decls, TR-3 field selection) consume them.
         {
-            let param_xtypes = crate::decompile::passes::clight_select::query::build_param_xtypes(db);
-            let rtl_to_mreg = crate::decompile::passes::clight_select::query::build_rtl_to_mreg_at_entry(db);
-            let callee_sigs = crate::decompile::passes::clight_select::query::extract_callee_signatures(
-                db,
-                &param_xtypes,
-                &rtl_to_mreg,
-            );
+            let param_xtypes =
+                crate::decompile::passes::clight_select::query::build_param_xtypes(db);
+            let rtl_to_mreg =
+                crate::decompile::passes::clight_select::query::build_rtl_to_mreg_at_entry(db);
+            let callee_sigs =
+                crate::decompile::passes::clight_select::query::extract_callee_signatures(
+                    db,
+                    &param_xtypes,
+                    &rtl_to_mreg,
+                );
             // Sort (id, name) before the first-wins insert so the surviving id for a duplicated name is deterministic, not dependent on HashMap iteration order. Mirrors the sibling builder in decl_solve::field_ptr_selection.
             let mut name_to_ident: HashMap<String, Ident> = HashMap::new();
             let mut sorted_id_name: Vec<(&usize, &String)> = id_to_name.iter().collect();
@@ -1658,7 +1848,17 @@ impl IRPass for ClightEmitPass {
             }
             // Data globals = OBJECT-kind symbols; a call through one of these names is the call-through-non-function family.
             let global_names: HashSet<String> = db
-                .rel_iter::<(Address, usize, Symbol, Symbol, Symbol, usize, Symbol, usize, Symbol)>("symbol_table")
+                .rel_iter::<(
+                    Address,
+                    usize,
+                    Symbol,
+                    Symbol,
+                    Symbol,
+                    usize,
+                    Symbol,
+                    usize,
+                    Symbol,
+                )>("symbol_table")
                 .filter(|(_, _, sym_type, ..)| **sym_type == *"OBJECT")
                 .map(|(.., name)| name.to_string())
                 .collect();
@@ -1684,10 +1884,8 @@ impl IRPass for ClightEmitPass {
                 &global_names,
                 &id_to_name,
             );
-            let force_long_reg_total: usize =
-                out.force_long_regs.values().map(|s| s.len()).sum();
-            let force_ptr_reg_total: usize =
-                out.force_ptr_regs.values().map(|s| s.len()).sum();
+            let force_long_reg_total: usize = out.force_long_regs.values().map(|s| s.len()).sum();
+            let force_ptr_reg_total: usize = out.force_ptr_regs.values().map(|s| s.len()).sum();
             eprintln!(
                 "[clight-emit] decl-solve: {} int-veto fields, {} force-long fields, {} field-ptr selections, {} fnptr globals, {} force-long regs / {} force-ptr regs in {} funcs",
                 out.field_int_veto.len(),
@@ -1710,8 +1908,13 @@ impl IRPass for ClightEmitPass {
         // translation unit is built. Assignment compatibility must use the same
         // field types that are eventually emitted.
         let t = std::time::Instant::now();
-        let mut struct_defs = crate::decompile::passes::clight_select::query::extract_struct_definitions(db);
-        eprintln!("[clight-emit] extract_struct_definitions: {:?} ({} structs)", t.elapsed(), struct_defs.len());
+        let mut struct_defs =
+            crate::decompile::passes::clight_select::query::extract_struct_definitions(db);
+        eprintln!(
+            "[clight-emit] extract_struct_definitions: {:?} ({} structs)",
+            t.elapsed(),
+            struct_defs.len()
+        );
         {
             let t = std::time::Instant::now();
             let mut field_selection: HashMap<(String, String), String> =
@@ -1719,10 +1922,11 @@ impl IRPass for ClightEmitPass {
             for key in &db.decl_solve_field_force_long {
                 field_selection.insert(key.clone(), "long".to_string());
             }
-            let patched = crate::decompile::passes::clight_select::query::apply_struct_field_type_selection(
-                &mut struct_defs,
-                &field_selection,
-            );
+            let patched =
+                crate::decompile::passes::clight_select::query::apply_struct_field_type_selection(
+                    &mut struct_defs,
+                    &field_selection,
+                );
             if patched > 0 {
                 eprintln!(
                     "[clight-emit] decl-solve field-type selection: {} field(s) retyped ({:?})",
@@ -1760,7 +1964,10 @@ impl IRPass for ClightEmitPass {
                 &edges,
                 &field_types,
             );
-            eprintln!("[clight-emit] build_cast_from_relations (raw TU): {:?}", t.elapsed());
+            eprintln!(
+                "[clight-emit] build_cast_from_relations (raw TU): {:?}",
+                t.elapsed()
+            );
             tu
         } else {
             crate::decompile::passes::c_pass::TranslationUnit::default()
@@ -1782,10 +1989,13 @@ impl IRPass for ClightEmitPass {
             .filter(|g| !g.scalar_writable)
             .filter_map(|g| Some((g.name.clone(), g.scalar_value.as_ref()?.to_cexpr())))
             .collect();
-        let struct_layouts = crate::decompile::passes::clight_select::query::extract_struct_layout_map(db);
+        let struct_layouts =
+            crate::decompile::passes::clight_select::query::extract_struct_layout_map(db);
 
-        let external_funcs: HashSet<u64> =
-            db.rel_iter::<(Address,)>("is_external_function").map(|(a,)| *a).collect();
+        let external_funcs: HashSet<u64> = db
+            .rel_iter::<(Address,)>("is_external_function")
+            .map(|(a,)| *a)
+            .collect();
 
         let internal_functions: Vec<_> = selected_functions
             .iter()
@@ -1808,9 +2018,9 @@ impl IRPass for ClightEmitPass {
             let called_addrs: HashSet<u64> = db
                 .rel_iter::<(Address, Address)>("direct_call")
                 .filter(|(caller, _)| {
-                    node_to_funcs
-                        .get(caller)
-                        .map_or(false, |funcs| funcs.iter().any(|f| internal_addrs.contains(f)))
+                    node_to_funcs.get(caller).map_or(false, |funcs| {
+                        funcs.iter().any(|f| internal_addrs.contains(f))
+                    })
                 })
                 .map(|(_, callee)| *callee)
                 .collect();
@@ -1819,18 +2029,24 @@ impl IRPass for ClightEmitPass {
                     && called_addrs.contains(&func.address)
                 {
                     let has_sig = db
-                        .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
+                        .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>(
+                            "known_extern_signature",
+                        )
                         .any(|(n, ..)| *n == func.name.as_str());
                     if !has_sig {
-                        db.rel_push("unknown_extern", (crate::util::leak::<String, str>(func.name.clone()),));
+                        db.rel_push(
+                            "unknown_extern",
+                            (crate::util::leak::<String, str>(func.name.clone()),),
+                        );
                     }
                 }
             }
         }
 
-        let mut ctx = crate::decompile::passes::c_pass::convert::from_relations::ConversionContext::new(
-            id_to_name.clone(),
-        );
+        let mut ctx =
+            crate::decompile::passes::c_pass::convert::from_relations::ConversionContext::new(
+                id_to_name.clone(),
+            );
 
         let mut var_types_for_emission: HashMap<String, CType> = HashMap::new();
         let mut all_statements: Vec<(Node, CStmt)> = Vec::new();
@@ -1845,9 +2061,7 @@ impl IRPass for ClightEmitPass {
                 let name = param_name_for_reg(*reg);
                 let ty = match pty {
                     crate::x86::types::ParamType::StructPointer(_)
-                    | crate::x86::types::ParamType::Typed(_) => {
-                        convert_param_type_from_param(pty)
-                    }
+                    | crate::x86::types::ParamType::Typed(_) => convert_param_type_from_param(pty),
                     _ => {
                         if let Some(type_str) = func.var_types.get(reg) {
                             xtype_string_to_ctype(type_str)
@@ -1880,16 +2094,21 @@ impl IRPass for ClightEmitPass {
                 sorted_stmt_nodes.sort();
                 for node in sorted_stmt_nodes {
                     let clight_stmt = &func.statements[&node];
-                    let cstmt = crate::decompile::passes::c_pass::convert::from_relations::convert_stmt(
-                        clight_stmt,
-                        &mut ctx,
+                    let cstmt =
+                        crate::decompile::passes::c_pass::convert::from_relations::convert_stmt(
+                            clight_stmt,
+                            &mut ctx,
+                        );
+                    let cstmt =
+                        crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
+                            inline_string_literals(e, &string_map)
+                        });
+                    let cstmt = crate::decompile::passes::c_pass::helpers::map_stmt_exprs_total(
+                        &cstmt,
+                        &|e| {
+                            crate::decompile::passes::c_pass::helpers::inline_rodata_constants_preserving_addrof(e, &rodata_const_map)
+                        },
                     );
-                    let cstmt = crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
-                        inline_string_literals(e, &string_map)
-                    });
-                    let cstmt = crate::decompile::passes::c_pass::helpers::map_stmt_exprs_total(&cstmt, &|e| {
-                        crate::decompile::passes::c_pass::helpers::inline_rodata_constants_preserving_addrof(e, &rodata_const_map)
-                    });
                     let cstmt = crate::decompile::passes::c_pass::convert::from_relations::narrow_varargs_in_stmt(&cstmt);
                     statements.push((node, cstmt));
                 }
@@ -1910,13 +2129,15 @@ impl IRPass for ClightEmitPass {
                 let mut label_to_node: HashMap<String, Node> = HashMap::new();
                 for (n, s) in &statements {
                     let mut labels = Vec::new();
-                    crate::decompile::passes::c_pass::helpers::collect_defined_labels(s, &mut labels);
+                    crate::decompile::passes::c_pass::helpers::collect_defined_labels(
+                        s,
+                        &mut labels,
+                    );
                     for label in labels {
                         label_to_node.entry(label).or_insert(*n);
                     }
                 }
-                let node_set: HashSet<Node> =
-                    statements.iter().map(|(n, _)| *n).collect();
+                let node_set: HashSet<Node> = statements.iter().map(|(n, _)| *n).collect();
                 let mut extra_edges = Vec::new();
                 for (node, stmt) in &statements {
                     let mut targets = Vec::new();
@@ -1933,11 +2154,9 @@ impl IRPass for ClightEmitPass {
             }
 
             {
-                let mut sorted_nodes: Vec<Node> =
-                    statements.iter().map(|(n, _)| *n).collect();
+                let mut sorted_nodes: Vec<Node> = statements.iter().map(|(n, _)| *n).collect();
                 sorted_nodes.sort();
-                let has_outgoing: HashSet<Node> =
-                    func_edges.iter().map(|(f, _)| *f).collect();
+                let has_outgoing: HashSet<Node> = func_edges.iter().map(|(f, _)| *f).collect();
                 let stmt_map: HashMap<Node, &CStmt> =
                     statements.iter().map(|(n, s)| (*n, s)).collect();
                 let mut extra_edges = Vec::new();
@@ -1991,7 +2210,10 @@ impl IRPass for ClightEmitPass {
             &node_to_func_addr,
             &field_types,
         );
-        eprintln!("[clight-emit] build_translation_unit (optimized TU): {:?}", t.elapsed());
+        eprintln!(
+            "[clight-emit] build_translation_unit (optimized TU): {:?}",
+            t.elapsed()
+        );
 
         // SR-1 (FIXPLAN 4.5): rewrite function bodies to be consistent with the recovered-global declarations (struct/array VarDecls produced only by from_relations, not convert_xtype). Must run before opaqueness/layout analyses.
         {
@@ -2031,7 +2253,11 @@ impl IRPass for ClightEmitPass {
                         rewrite_recovered_global_stmt(&mut f.body, &array_globals, &struct_globals);
                         for v in &mut f.local_vars {
                             if let Some(init) = &mut v.init {
-                                rewrite_recovered_global_init(init, &array_globals, &struct_globals);
+                                rewrite_recovered_global_init(
+                                    init,
+                                    &array_globals,
+                                    &struct_globals,
+                                );
                             }
                         }
                     }
@@ -2060,7 +2286,11 @@ impl IRPass for ClightEmitPass {
         // Identify opaque libc structs (FILE, DIR) via C AST scan and RTL-level analysis.
         let t = std::time::Instant::now();
         let mut opaque_map = identify_opaque_libc_structs_from_tu(&tu);
-        eprintln!("[clight-emit] identify_opaque_libc_structs: {:?} ({} found)", t.elapsed(), opaque_map.len());
+        eprintln!(
+            "[clight-emit] identify_opaque_libc_structs: {:?} ({} found)",
+            t.elapsed(),
+            opaque_map.len()
+        );
 
         // Supplement with RTL-level analysis: struct IDs flowing through opaque-pointer call args.
         {
@@ -2084,7 +2314,9 @@ impl IRPass for ClightEmitPass {
                             for &(expected_pos, typedef_name) in param_info {
                                 if pos == expected_pos {
                                     let struct_name = format!("struct_{:x}", sid);
-                                    opaque_map.entry(struct_name).or_insert_with(|| typedef_name.to_string());
+                                    opaque_map
+                                        .entry(struct_name)
+                                        .or_insert_with(|| typedef_name.to_string());
                                 }
                             }
                         }
@@ -2113,7 +2345,9 @@ impl IRPass for ClightEmitPass {
         loop {
             let mut changed = false;
             for extracted in &struct_defs {
-                let Some(name) = extracted.definition.name.as_ref() else { continue };
+                let Some(name) = extracted.definition.name.as_ref() else {
+                    continue;
+                };
                 let tabled_opaque = opaque_map.contains_key(name)
                     && (!analysis_complete || !needs_layout.contains(name));
                 let emits_full = structs_referenced_in_code.contains(name)
@@ -2153,7 +2387,8 @@ impl IRPass for ClightEmitPass {
             }
         }
 
-        let (mut n_full, mut n_opaque, mut n_tabled, mut n_voided) = (0usize, 0usize, 0usize, 0usize);
+        let (mut n_full, mut n_opaque, mut n_tabled, mut n_voided) =
+            (0usize, 0usize, 0usize, 0usize);
         for extracted in &struct_defs {
             if let Some(name) = &extracted.definition.name {
                 if let Some(typedef_name) = opaque_map.get(name) {
@@ -2172,16 +2407,25 @@ impl IRPass for ClightEmitPass {
                     continue;
                 }
                 if analysis_complete && !needs_layout.contains(name) {
-                    // IL-3: referenced only behind pointers, never dereferenced -- emit empty-body tag so pointer uses compile while the bogus layout is suppressed.
+                    // IL-3: referenced only behind pointers, never dereferenced.
+                    // ISO C and VS2013 C reject an empty struct definition, so
+                    // retain an inert one-byte placeholder.  No generated code
+                    // can observe its size because the layout proof above says
+                    // this tag is used only opaquely behind pointers.
                     let mut opaque_def = extracted.definition.clone();
                     opaque_def.fields.clear();
+                    opaque_def.fields.push(StructField::new(
+                        "_opaque",
+                        CType::char_unsigned(),
+                    ));
                     tu.decls.push(TopLevelDecl::StructDef(opaque_def));
                     n_opaque += 1;
                     continue;
                 }
                 n_full += 1;
             }
-            tu.decls.push(TopLevelDecl::StructDef(extracted.definition.clone()));
+            tu.decls
+                .push(TopLevelDecl::StructDef(extracted.definition.clone()));
         }
         eprintln!(
             "[clight-emit] struct usage evidence: {} full, {} opaque, {} tabled({}), {} voided, analysis_complete={} ({:?})",
@@ -2217,5 +2461,97 @@ impl IRPass for ClightEmitPass {
 
     fn extra_reads(&self) -> &'static [&'static str] {
         CLIGHT_EMIT_EXTRA_READS
+    }
+}
+
+#[cfg(test)]
+mod provider_identity_tests {
+    use super::*;
+    use crate::decompile::passes::c_pass::convert::from_relations::{
+        convert_expr, ConversionContext,
+    };
+
+    #[test]
+    fn omitted_provider_overrides_alias_at_direct_evar_call_site() {
+        let address: Address = 0x401000;
+        let mut db = DecompileDB::default();
+        // No SelectedFunction is present: this models a rejected/omitted
+        // callee that is still directly called by a selected sibling.
+        db.rel_push(
+            "ident_to_symbol",
+            (address as Ident, "callee_alias_b"),
+        );
+        db.rel_push(
+            "ident_to_symbol",
+            (address as Ident, "callee_alias_a"),
+        );
+        db.rel_push(
+            "emit_function",
+            (address, "authoritative_callee", address as Node),
+        );
+
+        let names = build_emission_name_map(&db).expect("provider names");
+        let mut context = ConversionContext::new(names);
+        let emitted = convert_expr(
+            &ClightExpr::Evar(address as Ident, ClightType::Tvoid),
+            &mut context,
+        );
+
+        assert_eq!(emitted, CExpr::Var("authoritative_callee".to_string()));
+    }
+
+    #[test]
+    fn anonymous_and_duplicate_providers_keep_deterministic_names() {
+        fn names_with_alias_order(reverse: bool) -> HashMap<usize, String> {
+            let anonymous: Address = 0x402000;
+            let duplicate_a: Address = 0x403000;
+            let duplicate_b: Address = 0x404000;
+            let mut db = DecompileDB::default();
+            let aliases = if reverse {
+                ["anonymous_b", "anonymous_a"]
+            } else {
+                ["anonymous_a", "anonymous_b"]
+            };
+            for alias in aliases {
+                db.rel_push("ident_to_symbol", (anonymous as Ident, alias));
+            }
+            db.rel_push(
+                "emit_function",
+                (anonymous, "FUN_402000", anonymous as Node),
+            );
+            db.rel_push(
+                "ident_to_symbol",
+                (duplicate_a as Ident, "duplicate_alias_a"),
+            );
+            db.rel_push(
+                "ident_to_symbol",
+                (duplicate_b as Ident, "duplicate_alias_b"),
+            );
+            db.rel_push(
+                "emit_function",
+                (duplicate_a, "shared_provider", duplicate_a as Node),
+            );
+            db.rel_push(
+                "emit_function",
+                (duplicate_b, "shared_provider", duplicate_b as Node),
+            );
+            build_emission_name_map(&db).expect("provider names")
+        }
+
+        let forward = names_with_alias_order(false);
+        let reverse = names_with_alias_order(true);
+        assert_eq!(forward, reverse);
+        assert_eq!(
+            forward.get(&0x402000).map(String::as_str),
+            Some("anonymous_a")
+        );
+        assert_eq!(
+            forward.get(&0x403000).map(String::as_str),
+            Some("shared_provider")
+        );
+        assert_eq!(
+            forward.get(&0x404000).map(String::as_str),
+            Some("shared_provider")
+        );
     }
 }

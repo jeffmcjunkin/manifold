@@ -1,14 +1,39 @@
-
-
+use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_pass::is_nonempty_stmt;
 use crate::decompile::passes::csh_pass::ident_from_node;
-use crate::decompile::elevator::DecompileDB;
 use crate::mreg::Mreg;
 use crate::x86::types::*;
 use object::{Object, ObjectSection, ObjectSymbol, SymbolKind};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+
+pub(crate) fn insert_preferred_symbol_name(
+    names: &mut HashMap<usize, String>,
+    id: usize,
+    candidate: &str,
+) {
+    names
+        .entry(id)
+        .and_modify(|existing| {
+            if (candidate.len(), candidate) < (existing.len(), existing.as_str()) {
+                *existing = candidate.to_string();
+            }
+        })
+        .or_insert_with(|| candidate.to_string());
+}
+
+const SYNTHETIC_NODE_BITS: Node = (1u64 << 62) | (1u64 << 63);
+
+fn containing_function_owner(node: Node, claimants: &[Address]) -> Option<Address> {
+    let real = node & !SYNTHETIC_NODE_BITS;
+    claimants
+        .iter()
+        .filter(|&&address| address <= real)
+        .max()
+        .copied()
+        .or_else(|| claimants.iter().min().copied())
+}
 
 fn xtype_to_string(xtype: &XType) -> String {
     match xtype {
@@ -60,19 +85,33 @@ fn xtype_priority(xtype: &XType) -> u8 {
 
 /// Sort priority for type candidate strings (mirrors xtype_priority).
 fn type_str_sort_priority(s: &str) -> u8 {
-    if s.starts_with("ptr_struct_") { 15 }
-    else if s == "ptr_func" { 14 }
-    else if s == "ptr_char" { 13 }
-    else if s.starts_with("ptr_") { 12 }
-    else if s == "float_F64" { 10 }
-    else if s == "float_F32" { 11 }
-    else if s.starts_with("int_I8") { 8 }
-    else if s.starts_with("int_I16") { 9 }
-    else if s == "int_U64" { 7 }
-    else if s == "int_I64" { 6 }
-    else if s == "int_U32" { 5 }
-    else if s == "int_I32" { 4 }
-    else { 3 }
+    if s.starts_with("ptr_struct_") {
+        15
+    } else if s == "ptr_func" {
+        14
+    } else if s == "ptr_char" {
+        13
+    } else if s.starts_with("ptr_") {
+        12
+    } else if s == "float_F64" {
+        10
+    } else if s == "float_F32" {
+        11
+    } else if s.starts_with("int_I8") {
+        8
+    } else if s.starts_with("int_I16") {
+        9
+    } else if s == "int_U64" {
+        7
+    } else if s == "int_I64" {
+        6
+    } else if s == "int_U32" {
+        5
+    } else if s == "int_I32" {
+        4
+    } else {
+        3
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -228,13 +267,19 @@ pub(crate) fn build_param_xtypes(db: &DecompileDB) -> HashMap<(Address, RTLReg),
             .and_modify(|existing| {
                 let dominated_by_int = matches!(
                     (*existing, *xtype),
-                    (XType::Xlong | XType::Xlongunsigned, XType::Xint | XType::Xintunsigned)
+                    (
+                        XType::Xlong | XType::Xlongunsigned,
+                        XType::Xint | XType::Xintunsigned
+                    )
                 );
                 if dominated_by_int {
                     *existing = *xtype;
                 } else if !matches!(
                     (*existing, *xtype),
-                    (XType::Xint | XType::Xintunsigned, XType::Xlong | XType::Xlongunsigned)
+                    (
+                        XType::Xint | XType::Xintunsigned,
+                        XType::Xlong | XType::Xlongunsigned
+                    )
                 ) {
                     if xtype_priority(xtype) > xtype_priority(existing) {
                         *existing = *xtype;
@@ -296,15 +341,15 @@ pub(crate) fn extract_callee_signatures(
 
     // resolved_extern_signature is multi-valued per symbol (one row per call-site signature); group and pick the lexicographically smallest tuple so the chosen signature is identical across runs regardless of Ascent set order.
     {
-        let mut by_symbol: BTreeMap<Symbol, Vec<(usize, XType, Arc<Vec<XType>>)>> =
-            BTreeMap::new();
+        let mut by_symbol: BTreeMap<Symbol, Vec<(usize, XType, Arc<Vec<XType>>)>> = BTreeMap::new();
         for (name, param_count, ret_type, param_types) in
             db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature")
         {
-            by_symbol
-                .entry(*name)
-                .or_default()
-                .push((*param_count, *ret_type, param_types.clone()));
+            by_symbol.entry(*name).or_default().push((
+                *param_count,
+                *ret_type,
+                param_types.clone(),
+            ));
         }
         for (name, mut sigs) in by_symbol {
             sigs.sort();
@@ -312,12 +357,15 @@ pub(crate) fn extract_callee_signatures(
             let is_varargs = known_varargs_syms.contains(&name);
             if let Some(idents) = symbol_to_idents.get(&name) {
                 for &id in idents {
-                    callee_sigs.insert(id, CalleeSignature {
-                        param_count,
-                        return_type: ret_type,
-                        param_types: (*param_types).clone(),
-                        is_varargs,
-                    });
+                    callee_sigs.insert(
+                        id,
+                        CalleeSignature {
+                            param_count,
+                            return_type: ret_type,
+                            param_types: (*param_types).clone(),
+                            is_varargs,
+                        },
+                    );
                 }
             }
         }
@@ -345,11 +393,15 @@ pub(crate) fn extract_callee_signatures(
         typed.sort_by(|x, y| {
             let kx = rtl_to_mreg_at_entry
                 .get(&(addr, x.0))
-                .map(|m| crate::decompile::analysis::signature_pass::param_mreg_sort_key(*m, db.abi()))
+                .map(|m| {
+                    crate::decompile::analysis::signature_pass::param_mreg_sort_key(*m, db.abi())
+                })
                 .unwrap_or(usize::MAX);
             let ky = rtl_to_mreg_at_entry
                 .get(&(addr, y.0))
-                .map(|m| crate::decompile::analysis::signature_pass::param_mreg_sort_key(*m, db.abi()))
+                .map(|m| {
+                    crate::decompile::analysis::signature_pass::param_mreg_sort_key(*m, db.abi())
+                })
                 .unwrap_or(usize::MAX);
             kx.cmp(&ky).then(x.0.cmp(&y.0))
         });
@@ -360,21 +412,31 @@ pub(crate) fn extract_callee_signatures(
             .rel_iter::<(Address, XType)>("emit_function_return_type_xtype")
             .filter(|(a, _)| *a == addr)
             .map(|(_, t)| *t)
-            .max_by_key(|t| (crate::decompile::passes::clight_pass::xtype_refine_priority(t), *t))
+            .max_by_key(|t| {
+                (
+                    crate::decompile::passes::clight_pass::xtype_refine_priority(t),
+                    *t,
+                )
+            })
             .unwrap_or(XType::Xvoid);
 
-        callee_sigs.insert(ident, CalleeSignature {
-            param_count: count,
-            return_type: ret_type,
-            param_types,
-            is_varargs: is_varargs_set.contains(&addr),
-        });
+        callee_sigs.insert(
+            ident,
+            CalleeSignature {
+                param_count: count,
+                return_type: ret_type,
+                param_types,
+                is_varargs: is_varargs_set.contains(&addr),
+            },
+        );
     }
 
     callee_sigs
 }
 
-pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap<usize, String>), String> {
+pub fn extract_functions(
+    db: &DecompileDB,
+) -> Result<(Vec<FunctionData>, HashMap<usize, String>), String> {
     let mut functions = Vec::new();
     let mut func_map: HashMap<Address, FunctionData> = HashMap::new();
     let param_xtypes = build_param_xtypes(db);
@@ -388,9 +450,9 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
                 let cand_contains = *func <= *node;
                 let cur_contains = *e <= *node;
                 let better = match (cand_contains, cur_contains) {
-                    (true, true) => *func > *e,   // both contain the node: nearest preceding = larger entry
-                    (true, false) => true,        // only candidate contains it
-                    (false, true) => false,       // only current contains it
+                    (true, true) => *func > *e, // both contain the node: nearest preceding = larger entry
+                    (true, false) => true,      // only candidate contains it
+                    (false, true) => false,     // only current contains it
                     (false, false) => *func < *e, // neither contains (shouldn't happen): smaller for stability
                 };
                 if better {
@@ -402,20 +464,16 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
 
     let mut id_to_name: HashMap<usize, String> = HashMap::new();
     for (id, name) in db.rel_iter::<(Ident, Symbol)>("ident_to_symbol") {
-        let name_str = name.to_string();
-        id_to_name
-            .entry(*id)
-            .and_modify(|existing| {
-                if name.len() < existing.len() {
-                    *existing = name_str.clone();
-                }
-            })
-            .or_insert_with(|| name_str);
+        insert_preferred_symbol_name(&mut id_to_name, *id, name);
     }
     // ELF symbols are authoritative: override ident_to_symbol entries.
+    // Resolve aliases first: Ascent relation iteration order is not stable.
+    let mut symbol_names: HashMap<usize, String> = HashMap::new();
     for (addr, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
-        let id = *addr as usize;
-        id_to_name.insert(id, name.to_string());
+        insert_preferred_symbol_name(&mut symbol_names, *addr as usize, name);
+    }
+    for (id, name) in symbol_names {
+        id_to_name.insert(id, name);
     }
 
     // emit_function_param iteration order is non-deterministic, so sort each function's params by the Mreg's calling-convention slot with the RTLReg as tiebreak for stable p0/p1 assignments.
@@ -431,11 +489,15 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
         params.sort_by(|a, b| {
             let ka = rtl_to_mreg_at_entry
                 .get(&(*addr, *a))
-                .map(|m| crate::decompile::analysis::signature_pass::param_mreg_sort_key(*m, db.abi()))
+                .map(|m| {
+                    crate::decompile::analysis::signature_pass::param_mreg_sort_key(*m, db.abi())
+                })
                 .unwrap_or(usize::MAX);
             let kb = rtl_to_mreg_at_entry
                 .get(&(*addr, *b))
-                .map(|m| crate::decompile::analysis::signature_pass::param_mreg_sort_key(*m, db.abi()))
+                .map(|m| {
+                    crate::decompile::analysis::signature_pass::param_mreg_sort_key(*m, db.abi())
+                })
                 .unwrap_or(usize::MAX);
             ka.cmp(&kb).then_with(|| a.cmp(b))
         });
@@ -447,7 +509,9 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
     }
 
     let mut param_struct_by_pos: HashMap<(Address, usize), usize> = HashMap::new();
-    for (func_addr, pos, canonical_id) in db.rel_iter::<(Address, usize, usize)>("func_param_struct_type") {
+    for (func_addr, pos, canonical_id) in
+        db.rel_iter::<(Address, usize, usize)>("func_param_struct_type")
+    {
         param_struct_by_pos.insert((*func_addr, *pos), *canonical_id);
     }
 
@@ -466,6 +530,11 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
         func_return.insert(*addr, *reg);
     }
 
+    // A function provider is the final authority for both the emitted
+    // definition name and call-site identifier.  Resolve it independently of
+    // relation iteration order and reject contradictory providers instead of
+    // silently choosing the last row.
+    let mut emit_functions: BTreeMap<Address, (String, Node)> = BTreeMap::new();
     for (addr, name, entry_node) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
         let ident = *addr as usize;
         let final_name = if name.starts_with("FUN_") {
@@ -476,30 +545,58 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
         } else {
             name.to_string()
         };
+        match emit_functions.entry(*addr) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((final_name, *entry_node));
+            }
+            std::collections::btree_map::Entry::Occupied(entry)
+                if entry.get() != &(final_name.clone(), *entry_node) =>
+            {
+                return Err(format!(
+                    "emit_function gives address 0x{addr:x} conflicting provider identity: {:?} versus {:?}",
+                    entry.get(),
+                    (final_name, *entry_node)
+                ));
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
 
-        let param_regs: Vec<RTLReg> = func_params.get(addr).cloned().unwrap_or_default();
+    for (&addr, (final_name, entry_node)) in &emit_functions {
+        let ident = addr as usize;
+        id_to_name.insert(ident, final_name.clone());
+
+        let param_regs: Vec<RTLReg> = func_params.get(&addr).cloned().unwrap_or_default();
 
         let param_types: Vec<ParamType> = param_regs
             .iter()
             .enumerate()
             .map(|(pos, reg)| {
-                if let Some(xtype) = param_xtypes.get(&(*addr, *reg)) {
-                    if !matches!(xtype,
-                        XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
-                        XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::Xlong |
-                        XType::Xlongunsigned | XType::Xany64)
-                    {
+                if let Some(xtype) = param_xtypes.get(&(addr, *reg)) {
+                    if !matches!(
+                        xtype,
+                        XType::Xptr
+                            | XType::Xcharptr
+                            | XType::Xcharptrptr
+                            | XType::Xintptr
+                            | XType::Xfloatptr
+                            | XType::Xsingleptr
+                            | XType::Xfuncptr
+                            | XType::Xlong
+                            | XType::Xlongunsigned
+                            | XType::Xany64
+                    ) {
                         return ParamType::Typed(*xtype);
                     }
                 }
-                if let Some(sid) = var_is_struct.get(&(*addr, *reg)) {
+                if let Some(sid) = var_is_struct.get(&(addr, *reg)) {
                     let canonical_id = struct_canonical.get(sid).copied().unwrap_or(*sid);
                     ParamType::StructPointer(canonical_id)
-                } else if let Some(&canonical_id) = param_struct_by_pos.get(&(*addr, pos)) {
+                } else if let Some(&canonical_id) = param_struct_by_pos.get(&(addr, pos)) {
                     ParamType::StructPointer(canonical_id)
-                } else if let Some(xtype) = param_xtypes.get(&(*addr, *reg)) {
+                } else if let Some(xtype) = param_xtypes.get(&(addr, *reg)) {
                     ParamType::Typed(*xtype)
-                } else if param_is_pointer.contains(&(*addr, *reg)) {
+                } else if param_is_pointer.contains(&(addr, *reg)) {
                     ParamType::Pointer
                 } else {
                     ParamType::Integer
@@ -507,18 +604,18 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
             })
             .collect();
 
-        let return_reg = func_return.get(addr).copied();
+        let return_reg = func_return.get(&addr).copied();
 
         let func_data = FunctionData::new(
-            *addr,
-            final_name,
+            addr,
+            final_name.clone(),
             param_regs,
             param_types,
             return_reg,
             0,
             *entry_node,
         );
-        func_map.insert(*addr, func_data);
+        func_map.insert(addr, func_data);
     }
 
     for (head, member) in db.rel_iter::<(Node, Node)>("emit_sseq") {
@@ -544,24 +641,19 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
         }
     }
 
-    let goto_targets: HashSet<Node> = db.rel_iter::<(Address, Node)>("emit_goto_target").map(|(_, target)| *target).collect();
+    let goto_targets: HashSet<Node> = db
+        .rel_iter::<(Address, Node)>("emit_goto_target")
+        .map(|(_, target)| *target)
+        .collect();
 
     // emit_clight_stmt is multi-valued, so resolve each node to the single function that CONTAINS it (nearest preceding entry) or one body is duplicated into every reaching function.
-    const SYNTH_BIT: u64 = 1u64 << 62;
     let mut node_candidate_addrs: HashMap<Node, Vec<Address>> = HashMap::new();
     for (addr, node, _stmt) in db.rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt") {
         node_candidate_addrs.entry(*node).or_default().push(*addr);
     }
     let mut node_owner: HashMap<Node, Address> = HashMap::new();
     for (node, addrs) in &node_candidate_addrs {
-        let real = *node & !SYNTH_BIT;
-        // Nearest preceding entry: largest claiming addr <= real; if none precedes, the smallest claimant.
-        let owner = addrs
-            .iter()
-            .filter(|&&a| a <= real)
-            .max()
-            .copied()
-            .or_else(|| addrs.iter().min().copied());
+        let owner = containing_function_owner(*node, addrs);
         if let Some(owner) = owner {
             node_owner.insert(*node, owner);
         }
@@ -653,7 +745,6 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
         }
     }
 
-
     for (addr, head, _) in db.rel_iter::<(Address, Node, Node)>("emit_loop_body") {
         if let Some(func) = func_map.get_mut(addr) {
             func.loop_headers.insert(*head);
@@ -666,12 +757,13 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
         }
     }
 
-    for (addr, struct_id, fields) in db.rel_iter::<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_struct_fields") {
+    for (addr, struct_id, fields) in
+        db.rel_iter::<(Address, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_struct_fields")
+    {
         if let Some(func) = func_map.get_mut(addr) {
             func.struct_fields.insert(*struct_id, fields.to_vec());
         }
     }
-
 
     // Collect all type candidates per register and pick the priority-based best; group first, since emit_var_type_candidate iteration order varies across runs, with a deterministic XType tiebreak.
     let mut reg_xtypes: HashMap<RTLReg, Vec<XType>> = HashMap::new();
@@ -713,15 +805,23 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
                 let current = func.param_types.get(i);
                 let should_upgrade = match (current, best_xtype) {
                     // Upgrade from 64-bit register-width placeholders (long/any64/ptr) to struct pointer.
-                    (Some(ParamType::Typed(
-                        XType::Xlong | XType::Xlongunsigned |
-                        XType::Xany64 |
-                        XType::Xptr
-                    )), XType::XstructPtr(sid)) => Some(ParamType::StructPointer(*sid)),
-                    (Some(ParamType::Pointer), XType::XstructPtr(sid)) => Some(ParamType::StructPointer(*sid)),
-                    (Some(ParamType::Integer), XType::XstructPtr(sid)) => Some(ParamType::StructPointer(*sid)),
+                    (
+                        Some(ParamType::Typed(
+                            XType::Xlong | XType::Xlongunsigned | XType::Xany64 | XType::Xptr,
+                        )),
+                        XType::XstructPtr(sid),
+                    ) => Some(ParamType::StructPointer(*sid)),
+                    (Some(ParamType::Pointer), XType::XstructPtr(sid)) => {
+                        Some(ParamType::StructPointer(*sid))
+                    }
+                    (Some(ParamType::Integer), XType::XstructPtr(sid)) => {
+                        Some(ParamType::StructPointer(*sid))
+                    }
                     // Upgrade Xlong (64-bit generic) to pointer when load analysis says it's a ptr. Xint stays Xint: int->ptr upgrade would clobber explicit `int argc` etc.
-                    (Some(ParamType::Typed(XType::Xlong)), XType::Xptr | XType::Xcharptr | XType::Xintptr) => Some(ParamType::Pointer),
+                    (
+                        Some(ParamType::Typed(XType::Xlong)),
+                        XType::Xptr | XType::Xcharptr | XType::Xintptr,
+                    ) => Some(ParamType::Pointer),
                     _ => None,
                 };
                 if let Some(new_type) = should_upgrade {
@@ -743,14 +843,15 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
 
     // Store all type candidates per register (sorted by priority, best first) and pad with same-size-class alternatives so clang_refine can search across ptr/int within the same width.
     for func in func_map.values_mut() {
-        let all_regs: Vec<RTLReg> = func.used_regs.iter().copied()
+        let all_regs: Vec<RTLReg> = func
+            .used_regs
+            .iter()
+            .copied()
             .chain(func.param_regs.iter().copied())
             .collect();
         for reg in all_regs {
-            let mut candidates: Vec<String> = reg_all_type_strs
-                .get(&reg)
-                .cloned()
-                .unwrap_or_default();
+            let mut candidates: Vec<String> =
+                reg_all_type_strs.get(&reg).cloned().unwrap_or_default();
 
             // Add struct pointer candidate if this register is a known struct base
             if let Some(&sid) = func.reg_struct_ids.get(&reg) {
@@ -761,13 +862,11 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
             }
 
             // Determine size class from existing candidates; float registers keep only float types.
-            let has_64 = candidates.iter().any(|s|
-                s == "int_I64" || s == "int_U64"
-                || s.starts_with("ptr_"));
-            let has_32 = candidates.iter().any(|s|
-                s == "int_I32" || s == "int_U32");
-            let has_float = candidates.iter().any(|s|
-                s.starts_with("float_"));
+            let has_64 = candidates
+                .iter()
+                .any(|s| s == "int_I64" || s == "int_U64" || s.starts_with("ptr_"));
+            let has_32 = candidates.iter().any(|s| s == "int_I32" || s == "int_U32");
+            let has_float = candidates.iter().any(|s| s.starts_with("float_"));
             let has_ptr = candidates.iter().any(|s| s.starts_with("ptr_"));
 
             if !has_float {
@@ -796,10 +895,11 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
             }
 
             if candidates.len() > 1 {
-                candidates.sort_by(|a, b|
-                    type_str_sort_priority(b).cmp(&type_str_sort_priority(a))
+                candidates.sort_by(|a, b| {
+                    type_str_sort_priority(b)
+                        .cmp(&type_str_sort_priority(a))
                         .then_with(|| a.cmp(b))
-                );
+                });
                 func.var_type_candidates.insert(reg, candidates);
             }
         }
@@ -871,7 +971,9 @@ pub fn extract_functions(db: &DecompileDB) -> Result<(Vec<FunctionData>, HashMap
         for (addr, func) in func_map.iter() {
             let entry = name_to_best_addr.entry(func.name.clone());
             match entry {
-                std::collections::hash_map::Entry::Vacant(e) => { e.insert(*addr); }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(*addr);
+                }
                 std::collections::hash_map::Entry::Occupied(mut e) => {
                     let existing_addr = *e.get();
                     let existing_count = func_map[&existing_addr].node_statements.len();
@@ -909,7 +1011,8 @@ fn is_valid_ascii_content(bytes: &[u8]) -> bool {
         if b == 0 {
             return true;
         }
-        let is_printable = (b >= 0x20 && b <= 0x7E) || b == b'\n' || b == b'\r' || b == b'\t' || b == 0x1b;
+        let is_printable =
+            (b >= 0x20 && b <= 0x7E) || b == b'\n' || b == b'\r' || b == b'\t' || b == 0x1b;
         if !is_printable {
             return false;
         }
@@ -920,9 +1023,7 @@ fn is_valid_ascii_content(bytes: &[u8]) -> bool {
 // A section is "allocated" (gets a runtime address) when SHF_ALLOC is set for ELF; non-allocated sections (.comment, .note.*, .debug_*) live at sh_addr=0 and are never valid pointer targets. For non-ELF formats, fall back to a nonzero load address.
 fn section_is_allocated(section: &object::Section) -> bool {
     match section.flags() {
-        object::SectionFlags::Elf { sh_flags } => {
-            sh_flags & u64::from(object::elf::SHF_ALLOC) != 0
-        }
+        object::SectionFlags::Elf { sh_flags } => sh_flags & u64::from(object::elf::SHF_ALLOC) != 0,
         _ => section.address() != 0,
     }
 }
@@ -930,9 +1031,7 @@ fn section_is_allocated(section: &object::Section) -> bool {
 // A section is writable when SHF_WRITE is set for ELF, else by the object crate's kind; a writable scalar global must keep its storage, while a read-only one may be inlined.
 fn section_is_writable(section: &object::Section) -> bool {
     match section.flags() {
-        object::SectionFlags::Elf { sh_flags } => {
-            sh_flags & u64::from(object::elf::SHF_WRITE) != 0
-        }
+        object::SectionFlags::Elf { sh_flags } => sh_flags & u64::from(object::elf::SHF_WRITE) != 0,
         _ => matches!(section.kind(), object::SectionKind::Data),
     }
 }
@@ -947,9 +1046,8 @@ fn is_string_literal(bytes: &[u8]) -> Option<usize> {
     }
 
     for &b in str_bytes {
-        let is_printable = (b >= 0x20 && b <= 0x7E)
-            || b == b'\n' || b == b'\r' || b == b'\t'
-            || b >= 0x80;
+        let is_printable =
+            (b >= 0x20 && b <= 0x7E) || b == b'\n' || b == b'\r' || b == b'\t' || b >= 0x80;
         if !is_printable {
             return None;
         }
@@ -965,17 +1063,29 @@ fn is_string_literal(bytes: &[u8]) -> Option<usize> {
 }
 
 fn try_read_float32(remaining: &[u8]) -> Option<ScalarConstant> {
-    if remaining.len() < 4 { return None; }
+    if remaining.len() < 4 {
+        return None;
+    }
     let bytes: [u8; 4] = remaining[..4].try_into().ok()?;
     let val = f32::from_le_bytes(bytes);
-    if val.is_finite() { Some(ScalarConstant::Float32(val)) } else { None }
+    if val.is_finite() {
+        Some(ScalarConstant::Float32(val))
+    } else {
+        None
+    }
 }
 
 fn try_read_float64(remaining: &[u8]) -> Option<ScalarConstant> {
-    if remaining.len() < 8 { return None; }
+    if remaining.len() < 8 {
+        return None;
+    }
     let bytes: [u8; 8] = remaining[..8].try_into().ok()?;
     let val = f64::from_le_bytes(bytes);
-    if val.is_finite() { Some(ScalarConstant::Float64(val)) } else { None }
+    if val.is_finite() {
+        Some(ScalarConstant::Float64(val))
+    } else {
+        None
+    }
 }
 
 /// Resolve a scalar global's initial value from its section bytes, with a writable flag deciding between an initialized declaration and constant-folding; .bss resolves to None.
@@ -1051,11 +1161,17 @@ pub fn extract_globals(db: &DecompileDB, _binary_path: &Path) -> Result<Vec<Glob
     // Globals can have several symbols at one address, so collect candidates and pick the lex-smallest name per id; HashMap::insert would pick a different alias each run and flip the type.
     let mut ident_name_candidates: HashMap<usize, Vec<String>> = HashMap::new();
     for (id, name) in db.rel_iter::<(Ident, Symbol)>("ident_to_symbol") {
-        ident_name_candidates.entry(*id).or_default().push(name.to_string());
+        ident_name_candidates
+            .entry(*id)
+            .or_default()
+            .push(name.to_string());
     }
     let mut symbol_name_candidates: HashMap<usize, Vec<String>> = HashMap::new();
     for (addr, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
-        symbol_name_candidates.entry(*addr as usize).or_default().push(name.to_string());
+        symbol_name_candidates
+            .entry(*addr as usize)
+            .or_default()
+            .push(name.to_string());
     }
     let mut id_to_name: HashMap<usize, String> = HashMap::new();
     for (id, mut names) in ident_name_candidates {
@@ -1068,7 +1184,8 @@ pub fn extract_globals(db: &DecompileDB, _binary_path: &Path) -> Result<Vec<Glob
         id_to_name.insert(id, names.into_iter().next().unwrap());
     }
 
-    let global_ptr_ids: std::collections::HashSet<usize> = db.rel_iter::<(Ident,)>("emit_global_is_ptr")
+    let global_ptr_ids: std::collections::HashSet<usize> = db
+        .rel_iter::<(Ident,)>("emit_global_is_ptr")
         .map(|(id,)| *id)
         .collect();
 
@@ -1078,7 +1195,6 @@ pub fn extract_globals(db: &DecompileDB, _binary_path: &Path) -> Result<Vec<Glob
         .ok_or("loaded binary image is unavailable")?;
     let obj_file = object::File::parse(&***bin_data)
         .map_err(|e| format!("Failed to parse loaded binary image: {}", e))?;
-
 
     let func_addrs: HashSet<usize> = {
         let mut addrs = HashSet::new();
@@ -1093,7 +1209,9 @@ pub fn extract_globals(db: &DecompileDB, _binary_path: &Path) -> Result<Vec<Glob
         for (id, sym) in db.rel_iter::<(Ident, Symbol)>("ident_to_symbol") {
             symbol_to_idents.entry(*sym).or_default().push(*id);
         }
-        for (name, _, _, _) in db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature") {
+        for (name, _, _, _) in
+            db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature")
+        {
             if let Some(idents) = symbol_to_idents.get(name) {
                 for &id in idents {
                     addrs.insert(id);
@@ -1155,10 +1273,19 @@ pub fn extract_globals(db: &DecompileDB, _binary_path: &Path) -> Result<Vec<Glob
     // Initialized-data section ranges scanned for scalar globals, each tagged with writability, so non-zero .data scalars recover their file bytes; .bss is NOBITS and correctly stays zero.
     let data_ranges: Vec<(u64, u64, Vec<u8>, bool)> = obj_file
         .sections()
-        .filter(|s| matches!(s.kind(), object::SectionKind::ReadOnlyData | object::SectionKind::ReadOnlyString | object::SectionKind::Data))
+        .filter(|s| {
+            matches!(
+                s.kind(),
+                object::SectionKind::ReadOnlyData
+                    | object::SectionKind::ReadOnlyString
+                    | object::SectionKind::Data
+            )
+        })
         .filter_map(|s| {
             let writable = section_is_writable(&s);
-            s.data().ok().map(|d| (s.address(), s.address() + s.size(), d.to_vec(), writable))
+            s.data()
+                .ok()
+                .map(|d| (s.address(), s.address() + s.size(), d.to_vec(), writable))
         })
         .collect();
 
@@ -1168,7 +1295,10 @@ pub fn extract_globals(db: &DecompileDB, _binary_path: &Path) -> Result<Vec<Glob
         .collect();
     let mut string_addr_map: Vec<(u64, String)> = Vec::new();
     for (label, content, _) in db.rel_iter::<(String, String, usize)>("string_data") {
-        if let Some(hex) = label.strip_prefix("L_").or_else(|| label.strip_prefix(".L_")) {
+        if let Some(hex) = label
+            .strip_prefix("L_")
+            .or_else(|| label.strip_prefix(".L_"))
+        {
             if let Ok(addr) = u64::from_str_radix(hex, 16) {
                 string_addr_map.push((addr, content.clone()));
             }
@@ -1230,8 +1360,8 @@ pub fn extract_globals(db: &DecompileDB, _binary_path: &Path) -> Result<Vec<Glob
                 }
                 return Some(String::from_utf8_lossy(&bytes).into_owned());
             }
-            let printable = (b >= 0x20 && b <= 0x7e)
-                || b == b'\n' || b == b'\r' || b == b'\t' || b >= 0x80;
+            let printable =
+                (b >= 0x20 && b <= 0x7e) || b == b'\n' || b == b'\r' || b == b'\t' || b >= 0x80;
             if !printable {
                 return None;
             }
@@ -1333,8 +1463,7 @@ pub fn extract_globals(db: &DecompileDB, _binary_path: &Path) -> Result<Vec<Glob
                 for k in 0..total_slots {
                     let slot_addr = addr + k * 8;
                     if let Some(&target) = reloc_targets.get(&slot_addr) {
-                        if read_cstr(target).is_none()
-                            && !addr_to_data_symbol.contains_key(&target)
+                        if read_cstr(target).is_none() && !addr_to_data_symbol.contains_key(&target)
                         {
                             ok = false;
                             break;
@@ -1405,43 +1534,45 @@ pub fn extract_globals(db: &DecompileDB, _binary_path: &Path) -> Result<Vec<Glob
         // Pointer globals must never be classified as string literals: their file bytes are zero pre-relocation, so a leading 0x00 does not mean an empty string.
         if !is_string && scalar_value.is_none() && !is_pointer {
             for section in obj_file.sections() {
-                 // A global_var_ref id is a runtime address, which only SHF_ALLOC sections have; non-allocated metadata sections sit at sh_addr=0 and would render a constant as their bytes, so skip them.
-                 if !section_is_allocated(&section) {
-                     continue;
-                 }
-                 let sect_addr = section.address();
-                 let sect_size = section.size();
+                // A global_var_ref id is a runtime address, which only SHF_ALLOC sections have; non-allocated metadata sections sit at sh_addr=0 and would render a constant as their bytes, so skip them.
+                if !section_is_allocated(&section) {
+                    continue;
+                }
+                let sect_addr = section.address();
+                let sect_size = section.size();
 
-                 if addr >= sect_addr && addr < sect_addr + sect_size {
-                     if let Ok(data) = section.data() {
-                         let offset = (addr - sect_addr) as usize;
-                         if offset < data.len() {
-                             // Scan to NUL bounded by the section end, not a fixed window, or a >128-byte string is missed entirely; cheap on non-strings since is_string_literal bails at the first non-printable byte.
-                             let remaining = &data[offset..];
-                             // Relocation hardening: a pointer relocation inside a candidate string's byte span means those printable bytes are a relocated address, so refuse string classification.
-                             let str_len = is_string_literal(remaining);
-                             let reloc_in_span = match str_len {
-                                 Some(len) => {
-                                     let lo = reloc_slots.partition_point(|&s| s < addr);
-                                     reloc_slots.get(lo).map_or(false, |&s| s < addr + len as u64)
-                                 }
-                                 None => false,
-                             };
-                             if let (Some(len), false) = (str_len, reloc_in_span) {
-                                 is_string = true;
-                                 content = remaining[0..len].to_vec();
-                             } else if remaining[0] == 0
-                                 && !section_is_writable(&section)
-                                 && empty_string_addrs.contains(&addr)
-                             {
-                                 // Empty string literal: a read-only 0x00-leading address that is also a recorded terminator anchor, the gate that keeps an anonymous 0x00-leading float constant from becoming "".
-                                 is_string = true;
-                                 content = vec![0u8];
-                             }
-                         }
-                     }
-                     break;
-                 }
+                if addr >= sect_addr && addr < sect_addr + sect_size {
+                    if let Ok(data) = section.data() {
+                        let offset = (addr - sect_addr) as usize;
+                        if offset < data.len() {
+                            // Scan to NUL bounded by the section end, not a fixed window, or a >128-byte string is missed entirely; cheap on non-strings since is_string_literal bails at the first non-printable byte.
+                            let remaining = &data[offset..];
+                            // Relocation hardening: a pointer relocation inside a candidate string's byte span means those printable bytes are a relocated address, so refuse string classification.
+                            let str_len = is_string_literal(remaining);
+                            let reloc_in_span = match str_len {
+                                Some(len) => {
+                                    let lo = reloc_slots.partition_point(|&s| s < addr);
+                                    reloc_slots
+                                        .get(lo)
+                                        .map_or(false, |&s| s < addr + len as u64)
+                                }
+                                None => false,
+                            };
+                            if let (Some(len), false) = (str_len, reloc_in_span) {
+                                is_string = true;
+                                content = remaining[0..len].to_vec();
+                            } else if remaining[0] == 0
+                                && !section_is_writable(&section)
+                                && empty_string_addrs.contains(&addr)
+                            {
+                                // Empty string literal: a read-only 0x00-leading address that is also a recorded terminator anchor, the gate that keeps an anonymous 0x00-leading float constant from becoming "".
+                                is_string = true;
+                                content = vec![0u8];
+                            }
+                        }
+                    }
+                    break;
+                }
             }
         }
 
@@ -1462,9 +1593,11 @@ pub fn extract_globals(db: &DecompileDB, _binary_path: &Path) -> Result<Vec<Glob
     Ok(globals)
 }
 
-use crate::decompile::passes::c_pass::types::{CType, FloatSize, IntSize, Signedness, StructDef, StructField, TypeQualifiers};
-use crate::x86::types::FieldType;
+use crate::decompile::passes::c_pass::types::{
+    CType, FloatSize, IntSize, Signedness, StructDef, StructField, TypeQualifiers,
+};
 use crate::x86::op::Condition;
+use crate::x86::types::FieldType;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -1499,7 +1632,7 @@ pub struct LoopInfo {
 
 use std::cmp::Ordering;
 
-/// Low-6-bit mreg discriminant for fresh_xtl_reg when the backing Mreg is `Unknown` / "RTEMP" (rtl_pass::mreg_discriminant).
+/// Low-7-bit mreg discriminant for fresh_xtl_reg when the backing Mreg is `Unknown` / "RTEMP" (rtl_pass::mreg_discriminant).
 const MREG_UNKNOWN_DISCRIMINANT: u64 = 33;
 
 /// True for RTL register ids that do not carry a machine-register-backed value (DEFAULT_VAR sentinel or Unknown/RTEMP-backed temporaries).
@@ -1541,7 +1674,9 @@ fn csharp_expr_stats(e: &CsharpminorExpr) -> (u32, u32) {
 }
 
 fn csharp_args_stats(args: &[CsharpminorExpr]) -> (u32, u32) {
-    args.iter().map(csharp_expr_stats).fold((0, 0), |(fa, sa), (f, s)| (fa + f, sa + s))
+    args.iter()
+        .map(csharp_expr_stats)
+        .fold((0, 0), |(fa, sa), (f, s)| (fa + f, sa + s))
 }
 
 /// (fabricated, void-typed, size) accumulated over a Clight expr tree.
@@ -1691,20 +1826,54 @@ fn cmp_constant(a: &Constant, b: &Constant) -> Ordering {
 fn cminor_binop_key(op: &CminorBinop) -> (u8, u8) {
     use CminorBinop as B;
     match op {
-        B::Oadd => (0, 0), B::Osub => (1, 0), B::Omul => (2, 0), B::Odiv => (3, 0),
-        B::Odivu => (4, 0), B::Omod => (5, 0), B::Omodu => (6, 0), B::Oand => (7, 0),
-        B::Oor => (8, 0), B::Oxor => (9, 0), B::Oshl => (10, 0), B::Oshr => (11, 0),
-        B::Oshru => (12, 0), B::Oaddf => (13, 0), B::Osubf => (14, 0), B::Omulf => (15, 0),
-        B::Odivf => (16, 0), B::Oaddfs => (17, 0), B::Osubfs => (18, 0), B::Omulfs => (19, 0),
-        B::Odivfs => (20, 0), B::Omaxf => (21, 0), B::Ominf => (22, 0), B::Oaddl => (23, 0),
-        B::Osubl => (24, 0), B::Omull => (25, 0), B::Odivl => (26, 0), B::Odivlu => (27, 0),
-        B::Omodl => (28, 0), B::Omodlu => (29, 0), B::Oandl => (30, 0), B::Oorl => (31, 0),
-        B::Oxorl => (32, 0), B::Oshll => (33, 0), B::Oshrl => (34, 0), B::Oshrlu => (35, 0),
-        B::Omulhs => (36, 0), B::Omulhu => (37, 0), B::Omullhs => (38, 0), B::Omullhu => (39, 0),
-        B::Ocmp(c) => (40, *c as u8), B::Ocmpu(c) => (41, *c as u8),
-        B::Ocmpf(c) => (42, *c as u8), B::Ocmpnotf(c) => (43, *c as u8),
-        B::Ocmpfs(c) => (44, *c as u8), B::Ocmpnotfs(c) => (45, *c as u8),
-        B::Ocmpl(c) => (46, *c as u8), B::Ocmplu(c) => (47, *c as u8),
+        B::Oadd => (0, 0),
+        B::Osub => (1, 0),
+        B::Omul => (2, 0),
+        B::Odiv => (3, 0),
+        B::Odivu => (4, 0),
+        B::Omod => (5, 0),
+        B::Omodu => (6, 0),
+        B::Oand => (7, 0),
+        B::Oor => (8, 0),
+        B::Oxor => (9, 0),
+        B::Oshl => (10, 0),
+        B::Oshr => (11, 0),
+        B::Oshru => (12, 0),
+        B::Oaddf => (13, 0),
+        B::Osubf => (14, 0),
+        B::Omulf => (15, 0),
+        B::Odivf => (16, 0),
+        B::Oaddfs => (17, 0),
+        B::Osubfs => (18, 0),
+        B::Omulfs => (19, 0),
+        B::Odivfs => (20, 0),
+        B::Omaxf => (21, 0),
+        B::Ominf => (22, 0),
+        B::Oaddl => (23, 0),
+        B::Osubl => (24, 0),
+        B::Omull => (25, 0),
+        B::Odivl => (26, 0),
+        B::Odivlu => (27, 0),
+        B::Omodl => (28, 0),
+        B::Omodlu => (29, 0),
+        B::Oandl => (30, 0),
+        B::Oorl => (31, 0),
+        B::Oxorl => (32, 0),
+        B::Oshll => (33, 0),
+        B::Oshrl => (34, 0),
+        B::Oshrlu => (35, 0),
+        B::Omulhs => (36, 0),
+        B::Omulhu => (37, 0),
+        B::Omullhs => (38, 0),
+        B::Omullhu => (39, 0),
+        B::Ocmp(c) => (40, *c as u8),
+        B::Ocmpu(c) => (41, *c as u8),
+        B::Ocmpf(c) => (42, *c as u8),
+        B::Ocmpnotf(c) => (43, *c as u8),
+        B::Ocmpfs(c) => (44, *c as u8),
+        B::Ocmpnotfs(c) => (45, *c as u8),
+        B::Ocmpl(c) => (46, *c as u8),
+        B::Ocmplu(c) => (47, *c as u8),
     }
 }
 
@@ -1727,15 +1896,15 @@ fn cmp_csharp_expr(a: &CsharpminorExpr, b: &CsharpminorExpr) -> Ordering {
         (E::Econst(x), E::Econst(y)) => cmp_constant(x, y),
         (E::Eunop(oa, xa), E::Eunop(ob, xb)) => {
             // CminorUnop is fieldless: the integer cast is its variant rank.
-            (oa.clone() as u8).cmp(&(ob.clone() as u8)).then_with(|| cmp_csharp_expr(xa, xb))
+            (oa.clone() as u8)
+                .cmp(&(ob.clone() as u8))
+                .then_with(|| cmp_csharp_expr(xa, xb))
         }
         (E::Ebinop(oa, la, ra), E::Ebinop(ob, lb, rb)) => cminor_binop_key(oa)
             .cmp(&cminor_binop_key(ob))
             .then_with(|| cmp_csharp_expr(la, lb))
             .then_with(|| cmp_csharp_expr(ra, rb)),
-        (E::Eload(ca, xa), E::Eload(cb, xb)) => {
-            ca.cmp(cb).then_with(|| cmp_csharp_expr(xa, xb))
-        }
+        (E::Eload(ca, xa), E::Eload(cb, xb)) => ca.cmp(cb).then_with(|| cmp_csharp_expr(xa, xb)),
         (E::Econdition(ca, ta, fa), E::Econdition(cb, tb, fb)) => cmp_csharp_expr(ca, cb)
             .then_with(|| cmp_csharp_expr(ta, tb))
             .then_with(|| cmp_csharp_expr(fa, fb)),
@@ -1770,15 +1939,15 @@ fn cmp_clight_type(a: &ClightType, b: &ClightType) -> Ordering {
             .cmp(&(*sb as u8))
             .then((*ga as u8).cmp(&(*gb as u8)))
             .then_with(|| cmp_clight_attr(aa, ab)),
-        (T::Tlong(ga, aa), T::Tlong(gb, ab)) => {
-            (*ga as u8).cmp(&(*gb as u8)).then_with(|| cmp_clight_attr(aa, ab))
-        }
-        (T::Tint128(ga, aa), T::Tint128(gb, ab)) => {
-            (*ga as u8).cmp(&(*gb as u8)).then_with(|| cmp_clight_attr(aa, ab))
-        }
-        (T::Tfloat(fa, aa), T::Tfloat(fb, ab)) => {
-            (*fa as u8).cmp(&(*fb as u8)).then_with(|| cmp_clight_attr(aa, ab))
-        }
+        (T::Tlong(ga, aa), T::Tlong(gb, ab)) => (*ga as u8)
+            .cmp(&(*gb as u8))
+            .then_with(|| cmp_clight_attr(aa, ab)),
+        (T::Tint128(ga, aa), T::Tint128(gb, ab)) => (*ga as u8)
+            .cmp(&(*gb as u8))
+            .then_with(|| cmp_clight_attr(aa, ab)),
+        (T::Tfloat(fa, aa), T::Tfloat(fb, ab)) => (*fa as u8)
+            .cmp(&(*fb as u8))
+            .then_with(|| cmp_clight_attr(aa, ab)),
         (T::Tpointer(ta, aa), T::Tpointer(tb, ab)) => {
             cmp_clight_type(ta, tb).then_with(|| cmp_clight_attr(aa, ab))
         }
@@ -1823,14 +1992,12 @@ fn cmp_clight_expr(a: &ClightExpr, b: &ClightExpr) -> Ordering {
         (E::EconstInt(va, ta), E::EconstInt(vb, tb)) => {
             va.cmp(vb).then_with(|| cmp_clight_type(ta, tb))
         }
-        (E::EconstFloat(va, ta), E::EconstFloat(vb, tb)) => va
-            .0
-            .total_cmp(&vb.0)
-            .then_with(|| cmp_clight_type(ta, tb)),
-        (E::EconstSingle(va, ta), E::EconstSingle(vb, tb)) => va
-            .0
-            .total_cmp(&vb.0)
-            .then_with(|| cmp_clight_type(ta, tb)),
+        (E::EconstFloat(va, ta), E::EconstFloat(vb, tb)) => {
+            va.0.total_cmp(&vb.0).then_with(|| cmp_clight_type(ta, tb))
+        }
+        (E::EconstSingle(va, ta), E::EconstSingle(vb, tb)) => {
+            va.0.total_cmp(&vb.0).then_with(|| cmp_clight_type(ta, tb))
+        }
         (E::EconstLong(va, ta), E::EconstLong(vb, tb)) => {
             va.cmp(vb).then_with(|| cmp_clight_type(ta, tb))
         }
@@ -1840,7 +2007,8 @@ fn cmp_clight_expr(a: &ClightExpr, b: &ClightExpr) -> Ordering {
         (E::EvarSymbol(sa, ta), E::EvarSymbol(sb, tb)) => {
             sa.cmp(sb).then_with(|| cmp_clight_type(ta, tb))
         }
-        (E::Ederef(xa, ta), E::Ederef(xb, tb)) | (E::Eaddrof(xa, ta), E::Eaddrof(xb, tb))
+        (E::Ederef(xa, ta), E::Ederef(xb, tb))
+        | (E::Eaddrof(xa, ta), E::Eaddrof(xb, tb))
         | (E::Ecast(xa, ta), E::Ecast(xb, tb)) => {
             cmp_clight_expr(xa, xb).then_with(|| cmp_clight_type(ta, tb))
         }
@@ -1956,9 +2124,7 @@ fn cmp_clight_stmt(a: &ClightStmt, b: &ClightStmt) -> Ordering {
                 la.cmp(lb).then_with(|| cmp_clight_stmt(sa, sb))
             })
         }),
-        (S::Slabel(ia, sa), S::Slabel(ib, sb)) => {
-            ia.cmp(ib).then_with(|| cmp_clight_stmt(sa, sb))
-        }
+        (S::Slabel(ia, sa), S::Slabel(ib, sb)) => ia.cmp(ib).then_with(|| cmp_clight_stmt(sa, sb)),
         (S::Sgoto(ia), S::Sgoto(ib)) => ia.cmp(ib),
         _ => Ordering::Equal, // unit variants / unreachable mixed pairs
     })
@@ -1992,8 +2158,8 @@ fn cmp_break_stmt_cand(a: &ClightStmt, b: &ClightStmt) -> Ordering {
 pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, LoopInfo>> {
     let mut result: HashMap<Address, HashMap<Node, LoopInfo>> = HashMap::new();
 
-
-    for (func_addr, loop_head, body_node) in db.rel_iter::<(Address, Node, Node)>("emit_loop_body") {
+    for (func_addr, loop_head, body_node) in db.rel_iter::<(Address, Node, Node)>("emit_loop_body")
+    {
         if body_node != loop_head {
             result
                 .entry(*func_addr)
@@ -2007,7 +2173,16 @@ pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, Loo
 
     // (func, header, branch_node) -> exit_target, so a primary break follows its own landing node when the layout puts a sibling between the loop and its exit; smallest target kept for determinism.
     let mut exit_target_by_branch: HashMap<(Address, Node, Node), Node> = HashMap::new();
-    for (func_addr, loop_head, exit_node, _, _, exit_target, _) in db.rel_iter::<(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node)>("emit_loop_exit") {
+    for (func_addr, loop_head, exit_node, _, _, exit_target, _) in db.rel_iter::<(
+        Address,
+        Node,
+        Node,
+        Condition,
+        Arc<Vec<CsharpminorExpr>>,
+        Node,
+        Node,
+    )>("emit_loop_exit")
+    {
         // emit_loop_exit is multi-valued for loops with several exit branches; Ascent set order is non-deterministic, so keep the smallest exit node.
         let info = result
             .entry(*func_addr)
@@ -2031,16 +2206,31 @@ pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, Loo
             .entry(*loop_header)
             .or_insert_with(LoopInfo::default);
         match info.step_node {
-            Some(existing) if *step_node > existing => { info.step_node = Some(*step_node); }
-            None => { info.step_node = Some(*step_node); }
+            Some(existing) if *step_node > existing => {
+                info.step_node = Some(*step_node);
+            }
+            None => {
+                info.step_node = Some(*step_node);
+            }
             _ => {}
         }
     }
 
     // Pre-index loop_exit_branch for O(1) lookup; keep the RB-5 cmp_exit_branch_cand minimum per (f, h, en) for a deterministic result.
-    let mut exit_branch_index: HashMap<(Address, Node, Node), (Condition, Arc<Vec<CsharpminorExpr>>, bool)> = HashMap::new();
-    for (f, h, en, cond, args, _exit_target, _cont_target, inverted) in
-        db.rel_iter::<(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node, bool)>("loop_exit_branch")
+    let mut exit_branch_index: HashMap<
+        (Address, Node, Node),
+        (Condition, Arc<Vec<CsharpminorExpr>>, bool),
+    > = HashMap::new();
+    for (f, h, en, cond, args, _exit_target, _cont_target, inverted) in db.rel_iter::<(
+        Address,
+        Node,
+        Node,
+        Condition,
+        Arc<Vec<CsharpminorExpr>>,
+        Node,
+        Node,
+        bool,
+    )>("loop_exit_branch")
     {
         let cand = (cond.clone(), args.clone(), *inverted);
         let take = match exit_branch_index.get(&(*f, *h, *en)) {
@@ -2052,8 +2242,12 @@ pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, Loo
         }
     }
 
-    for (func_addr, loop_header, exit_node) in db.rel_iter::<(Address, Node, Node)>("primary_exit_node") {
-        if let Some((cond, args, inverted)) = exit_branch_index.get(&(*func_addr, *loop_header, *exit_node)) {
+    for (func_addr, loop_header, exit_node) in
+        db.rel_iter::<(Address, Node, Node)>("primary_exit_node")
+    {
+        if let Some((cond, args, inverted)) =
+            exit_branch_index.get(&(*func_addr, *loop_header, *exit_node))
+        {
             let info = result
                 .entry(*func_addr)
                 .or_default()
@@ -2142,7 +2336,8 @@ pub fn extract_loop_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, Loo
     // exec_order_key (not raw id) is required: it keeps a synthetic node (addr | 1<<62) immediately after its base, preventing calls from being pushed past exits and eliminated as unreachable.
     for func_map in result.values_mut() {
         for info in func_map.values_mut() {
-            info.body_nodes.sort_by_key(|&n| crate::util::exec_order_key(n));
+            info.body_nodes
+                .sort_by_key(|&n| crate::util::exec_order_key(n));
         }
     }
 
@@ -2206,8 +2401,10 @@ pub fn extract_ite_info(db: &DecompileDB) -> HashMap<Address, HashMap<Node, IteI
     // exec_order_key places a synthetic node (addr | 1<<62) immediately after its base; a raw id sort would push all synthetic members after all real ones, tearing fused stores out of position.
     for func_map in result.values_mut() {
         for info in func_map.values_mut() {
-            info.true_body_nodes.sort_by_key(|&n| crate::util::exec_order_key(n));
-            info.false_body_nodes.sort_by_key(|&n| crate::util::exec_order_key(n));
+            info.true_body_nodes
+                .sort_by_key(|&n| crate::util::exec_order_key(n));
+            info.false_body_nodes
+                .sort_by_key(|&n| crate::util::exec_order_key(n));
         }
     }
 
@@ -2237,9 +2434,7 @@ fn fieldtype_to_ctype(field_type: &FieldType) -> CType {
         FieldType::Array(elem, size) => {
             CType::Array(Box::new(fieldtype_to_ctype(elem)), Some(*size))
         }
-        FieldType::EmbeddedStruct(struct_id) => {
-            CType::Struct(format!("struct_{:x}", struct_id))
-        }
+        FieldType::EmbeddedStruct(struct_id) => CType::Struct(format!("struct_{:x}", struct_id)),
         FieldType::Union(variants) => {
             // SR-2: layout advance is the MAX variant size; pick the first max-size variant so printed width == advance (a smaller variant first would shift all later fields).
             let max_size = variants.iter().map(|v| v.size(8)).max().unwrap_or(4);
@@ -2249,9 +2444,10 @@ fn fieldtype_to_ctype(field_type: &FieldType) -> CType {
                 .map(fieldtype_to_ctype)
                 .unwrap_or(CType::Int(IntSize::Int, Signedness::Signed))
         }
-        FieldType::OpaqueBlob(size) => {
-            CType::Array(Box::new(CType::Int(IntSize::Char, Signedness::Unsigned)), Some(*size))
-        }
+        FieldType::OpaqueBlob(size) => CType::Array(
+            Box::new(CType::Int(IntSize::Char, Signedness::Unsigned)),
+            Some(*size),
+        ),
         FieldType::Unknown => CType::Int(IntSize::Int, Signedness::Signed),
     }
 }
@@ -2266,21 +2462,21 @@ fn chunk_size(chunk: &MemoryChunk) -> usize {
     }
 }
 
-fn build_fields_with_padding(
-    field_tuples: &[(usize, i64, FieldType, usize)]
-) -> Vec<StructField> {
+fn build_fields_with_padding(field_tuples: &[(usize, i64, FieldType, usize)]) -> Vec<StructField> {
     let mut offset_map: BTreeMap<i64, &(usize, i64, FieldType, usize)> = BTreeMap::new();
     for entry in field_tuples {
         let (idx, offset, _, _) = entry;
         match offset_map.get(offset) {
             Some(existing) if existing.0 >= *idx => {}
-            _ => { offset_map.insert(*offset, entry); }
+            _ => {
+                offset_map.insert(*offset, entry);
+            }
         }
     }
 
     let mut fields = Vec::new();
     let mut current_end: i64 = 0;
-    
+
     for (_offset, (_idx, offset, field_type, field_name)) in &offset_map {
         if *offset > current_end {
             let pad_size = (*offset - current_end) as usize;
@@ -2306,14 +2502,15 @@ fn build_fields_with_padding(
                 )),
             }
         }
-        
-        let name = crate::decompile::analysis::struct_recovery_pass::field_ident_to_name(*field_name);
+
+        let name =
+            crate::decompile::analysis::struct_recovery_pass::field_ident_to_name(*field_name);
         let ty = fieldtype_to_ctype(field_type);
         fields.push(StructField::new(name, ty));
-        
+
         current_end = *offset + field_type.size(8) as i64;
     }
-    
+
     fields
 }
 
@@ -2342,7 +2539,8 @@ pub fn extract_struct_definitions(db: &DecompileDB) -> Vec<ExtractedStruct> {
         db.rel_iter::<(u64, i64, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_struct_fields")
     {
         let reg = *base_offset as u64;
-        let struct_id = reg_to_canonical_ids.get(&reg)
+        let struct_id = reg_to_canonical_ids
+            .get(&reg)
             .copied()
             .unwrap_or_else(|| base_offset.unsigned_abs() as usize);
         for (field_offset, field_name, chunk) in fields.iter() {
@@ -2350,7 +2548,8 @@ pub fn extract_struct_definitions(db: &DecompileDB) -> Vec<ExtractedStruct> {
         }
     }
     efield_collected.sort();
-    let mut efield_extra_fields: HashMap<usize, BTreeMap<i64, (Ident, MemoryChunk)>> = HashMap::new();
+    let mut efield_extra_fields: HashMap<usize, BTreeMap<i64, (Ident, MemoryChunk)>> =
+        HashMap::new();
     for (struct_id, field_offset, field_name, chunk) in efield_collected {
         efield_extra_fields
             .entry(struct_id)
@@ -2359,24 +2558,35 @@ pub fn extract_struct_definitions(db: &DecompileDB) -> Vec<ExtractedStruct> {
             .or_insert((field_name, chunk));
     }
 
-    for (layout_hash, canonical_id, _field_count, _total_size) in db.rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog") {
+    for (layout_hash, canonical_id, _field_count, _total_size) in
+        db.rel_iter::<(u64, usize, usize, usize)>("global_struct_catalog")
+    {
         if seen_struct_ids.contains(canonical_id) {
             continue;
         }
         seen_struct_ids.insert(*canonical_id);
 
-        let mut field_tuples: Vec<_> = db.rel_iter::<(usize, usize, i64, FieldType, Ident)>("emit_struct_field")
+        let mut field_tuples: Vec<_> = db
+            .rel_iter::<(usize, usize, i64, FieldType, Ident)>("emit_struct_field")
             .filter(|(sid, _, _, _, _)| *sid == *canonical_id)
-            .map(|(_, idx, offset, field_type, field_name)| (*idx, *offset, field_type.clone(), *field_name))
+            .map(|(_, idx, offset, field_type, field_name)| {
+                (*idx, *offset, field_type.clone(), *field_name)
+            })
             .collect();
 
         // Merge efield-detected fields that aren't in the canonical definition
         if let Some(efield_fields) = efield_extra_fields.get(canonical_id) {
-            let existing_offsets: HashSet<i64> = field_tuples.iter().map(|(_, off, _, _)| *off).collect();
+            let existing_offsets: HashSet<i64> =
+                field_tuples.iter().map(|(_, off, _, _)| *off).collect();
             let next_idx = field_tuples.len();
             for (idx, (offset, (field_name, chunk))) in efield_fields.iter().enumerate() {
                 if !existing_offsets.contains(offset) {
-                    field_tuples.push((next_idx + idx, *offset, FieldType::Scalar(chunk.clone()), *field_name));
+                    field_tuples.push((
+                        next_idx + idx,
+                        *offset,
+                        FieldType::Scalar(chunk.clone()),
+                        *field_name,
+                    ));
                 }
             }
         }
@@ -2397,17 +2607,22 @@ pub fn extract_struct_definitions(db: &DecompileDB) -> Vec<ExtractedStruct> {
     }
 
     if structs.is_empty() {
-        for (struct_id, _field_count, _total_size) in db.rel_iter::<(usize, usize, usize)>("emit_struct_def") {
+        for (struct_id, _field_count, _total_size) in
+            db.rel_iter::<(usize, usize, usize)>("emit_struct_def")
+        {
             if seen_struct_ids.contains(struct_id) {
                 continue;
             }
             seen_struct_ids.insert(*struct_id);
 
-            let mut field_tuples: Vec<_> = db.rel_iter::<(usize, usize, i64, FieldType, Ident)>("emit_struct_field")
+            let mut field_tuples: Vec<_> = db
+                .rel_iter::<(usize, usize, i64, FieldType, Ident)>("emit_struct_field")
                 .filter(|(sid, _, _, _, _)| *sid == *struct_id)
-                .map(|(_, idx, offset, field_type, field_name)| (*idx, *offset, field_type.clone(), *field_name))
+                .map(|(_, idx, offset, field_type, field_name)| {
+                    (*idx, *offset, field_type.clone(), *field_name)
+                })
                 .collect();
-            
+
             field_tuples.sort_by_key(|(_idx, offset, _, _)| *offset);
 
             let struct_name = format!("struct_{:x}", struct_id);
@@ -2468,31 +2683,42 @@ fn compute_field_hash(fields: &[(usize, i64, FieldType, usize)]) -> u64 {
     hasher.finish()
 }
 
-pub fn extract_struct_layout_map(db: &DecompileDB) -> HashMap<usize, Vec<(i64, String, MemoryChunk)>> {
+pub fn extract_struct_layout_map(
+    db: &DecompileDB,
+) -> HashMap<usize, Vec<(i64, String, MemoryChunk)>> {
     let mut layouts = HashMap::new();
-    
-    let id_to_name: HashMap<usize, String> = db.rel_iter::<(Ident, Symbol)>("ident_to_symbol")
+
+    let id_to_name: HashMap<usize, String> = db
+        .rel_iter::<(Ident, Symbol)>("ident_to_symbol")
         .map(|(id, name)| (*id, name.to_string()))
         .collect();
-    
-    let canonical_ids: HashSet<usize> = db.rel_iter::<(u64, usize)>("emit_canonical_struct_id")
+
+    let canonical_ids: HashSet<usize> = db
+        .rel_iter::<(u64, usize)>("emit_canonical_struct_id")
         .map(|(_hash, id)| *id)
         .collect();
-    
-    for (global_ident, struct_id, fields) in db.rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_global_struct_fields") {
+
+    for (global_ident, struct_id, fields) in db
+        .rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>(
+            "emit_global_struct_fields",
+        )
+    {
         let _global_name = id_to_name
             .get(&(*global_ident as usize))
             .cloned()
             .unwrap_or_else(|| format!("global_{:x}", global_ident));
-        
-        let mapped_fields: Vec<(i64, String, MemoryChunk)> = fields.iter().map(|(offset, field_ident, chunk)| {
-            let field_name = id_to_name
-                .get(&(*field_ident as usize))
-                .cloned()
-                .unwrap_or_else(|| format!("field_{:x}", offset));
-            (*offset, field_name, *chunk)
-        }).collect();
-        
+
+        let mapped_fields: Vec<(i64, String, MemoryChunk)> = fields
+            .iter()
+            .map(|(offset, field_ident, chunk)| {
+                let field_name = id_to_name
+                    .get(&(*field_ident as usize))
+                    .cloned()
+                    .unwrap_or_else(|| format!("field_{:x}", offset));
+                (*offset, field_name, *chunk)
+            })
+            .collect();
+
         layouts.insert(*struct_id, mapped_fields);
     }
 
@@ -2509,8 +2735,12 @@ fn chunk_to_ctype(chunk: MemoryChunk, size: usize) -> CType {
         MemoryChunk::MInt16Unsigned => CType::Int(IntSize::Short, Signedness::Unsigned),
         MemoryChunk::MInt32 | MemoryChunk::MAny32 => CType::Int(IntSize::Int, Signedness::Signed),
         MemoryChunk::MInt64 | MemoryChunk::MAny64 => CType::Int(IntSize::Long, Signedness::Signed),
-        MemoryChunk::MFloat32 => CType::Float(crate::decompile::passes::c_pass::types::FloatSize::Float),
-        MemoryChunk::MFloat64 => CType::Float(crate::decompile::passes::c_pass::types::FloatSize::Double),
+        MemoryChunk::MFloat32 => {
+            CType::Float(crate::decompile::passes::c_pass::types::FloatSize::Float)
+        }
+        MemoryChunk::MFloat64 => {
+            CType::Float(crate::decompile::passes::c_pass::types::FloatSize::Double)
+        }
         MemoryChunk::Unknown => match size {
             1 => CType::Int(IntSize::Char, Signedness::Unsigned),
             2 => CType::Int(IntSize::Short, Signedness::Signed),
@@ -2731,8 +2961,7 @@ pub(crate) fn widen_ptr_regs_by_defs<'a>(
             }
             ClightExpr::Evar(_, ct) => matches!(ct, ClightType::Tpointer(..)),
             ClightExpr::Ecast(inner, ct) => {
-                matches!(ct, ClightType::Tpointer(..))
-                    || value_is_ptr_veto(inner, regs, evidenced)
+                matches!(ct, ClightType::Tpointer(..)) || value_is_ptr_veto(inner, regs, evidenced)
             }
             ClightExpr::Ebinop(ClightBinaryOp::Oadd, l, r, _) => {
                 value_is_ptr_veto(l, regs, evidenced) || value_is_ptr_veto(r, regs, evidenced)
@@ -3064,7 +3293,10 @@ pub(crate) fn pick_field_ptr_candidate(cands: &[String]) -> Option<usize> {
 /// Parses a pointer candidate string ("void *" or "struct NAME *") back into a CType.
 fn parse_field_type_candidate(s: &str) -> Option<CType> {
     if s == "void *" {
-        return Some(CType::Pointer(Box::new(CType::Void), TypeQualifiers::none()));
+        return Some(CType::Pointer(
+            Box::new(CType::Void),
+            TypeQualifiers::none(),
+        ));
     }
     if let Some(name) = s.strip_prefix("struct ").and_then(|r| r.strip_suffix(" *")) {
         return Some(CType::Pointer(
@@ -3086,10 +3318,16 @@ pub fn apply_struct_field_type_selection(
     let trace = std::env::var("MANIFOLD_TR3_TRACE").is_ok();
     let mut patched = 0usize;
     for ex in structs.iter_mut() {
-        let Some(sname) = ex.definition.name.clone() else { continue };
+        let Some(sname) = ex.definition.name.clone() else {
+            continue;
+        };
         for field in ex.definition.fields.iter_mut() {
-            let Some(fname) = field.name.clone() else { continue };
-            let Some(want) = selection.get(&(sname.clone(), fname)) else { continue };
+            let Some(fname) = field.name.clone() else {
+                continue;
+            };
+            let Some(want) = selection.get(&(sname.clone(), fname)) else {
+                continue;
+            };
             // P5 decl solve: "long" forces an integer def onto a POINTER field whose every use is integer arithmetic (gcc proves the layout guess wrong) -- the inverse of the ptr patch below; 8-byte either way, layout preserved.
             if want == "long" {
                 if matches!(field.ty, CType::Pointer(..)) {
@@ -3131,7 +3369,6 @@ pub fn apply_struct_field_type_selection(
     patched
 }
 
-
 /// Collect all register IDs (from Etempvar) used in a statement.
 pub fn collect_stmt_regs(stmt: &ClightStmt) -> Vec<RTLReg> {
     let mut regs = Vec::new();
@@ -3139,10 +3376,14 @@ pub fn collect_stmt_regs(stmt: &ClightStmt) -> Vec<RTLReg> {
         match expr {
             ClightExpr::Etempvar(id, _) => {
                 let reg = *id as RTLReg;
-                if !regs.contains(&reg) { regs.push(reg); }
+                if !regs.contains(&reg) {
+                    regs.push(reg);
+                }
             }
-            ClightExpr::Ederef(inner, _) | ClightExpr::Eaddrof(inner, _)
-            | ClightExpr::Eunop(_, inner, _) | ClightExpr::Ecast(inner, _)
+            ClightExpr::Ederef(inner, _)
+            | ClightExpr::Eaddrof(inner, _)
+            | ClightExpr::Eunop(_, inner, _)
+            | ClightExpr::Ecast(inner, _)
             | ClightExpr::Efield(inner, _, _) => collect_expr_regs(inner, regs),
             ClightExpr::Ebinop(_, lhs, rhs, _) => {
                 collect_expr_regs(lhs, regs);
@@ -3153,15 +3394,45 @@ pub fn collect_stmt_regs(stmt: &ClightStmt) -> Vec<RTLReg> {
     }
     fn collect_stmt_regs_inner(stmt: &ClightStmt, regs: &mut Vec<RTLReg>) {
         match stmt {
-            ClightStmt::Sassign(lhs, rhs) => { collect_expr_regs(lhs, regs); collect_expr_regs(rhs, regs); }
-            ClightStmt::Sset(id, expr) => { let r = *id as RTLReg; if !regs.contains(&r) { regs.push(r); } collect_expr_regs(expr, regs); }
-            ClightStmt::Scall(_, f, args) => { collect_expr_regs(f, regs); for a in args { collect_expr_regs(a, regs); } }
+            ClightStmt::Sassign(lhs, rhs) => {
+                collect_expr_regs(lhs, regs);
+                collect_expr_regs(rhs, regs);
+            }
+            ClightStmt::Sset(id, expr) => {
+                let r = *id as RTLReg;
+                if !regs.contains(&r) {
+                    regs.push(r);
+                }
+                collect_expr_regs(expr, regs);
+            }
+            ClightStmt::Scall(_, f, args) => {
+                collect_expr_regs(f, regs);
+                for a in args {
+                    collect_expr_regs(a, regs);
+                }
+            }
             ClightStmt::Sreturn(Some(e)) => collect_expr_regs(e, regs),
-            ClightStmt::Sifthenelse(c, t, e) => { collect_expr_regs(c, regs); collect_stmt_regs_inner(t, regs); collect_stmt_regs_inner(e, regs); }
-            ClightStmt::Ssequence(ss) => { for s in ss { collect_stmt_regs_inner(s, regs); } }
-            ClightStmt::Sloop(a, b) => { collect_stmt_regs_inner(a, regs); collect_stmt_regs_inner(b, regs); }
+            ClightStmt::Sifthenelse(c, t, e) => {
+                collect_expr_regs(c, regs);
+                collect_stmt_regs_inner(t, regs);
+                collect_stmt_regs_inner(e, regs);
+            }
+            ClightStmt::Ssequence(ss) => {
+                for s in ss {
+                    collect_stmt_regs_inner(s, regs);
+                }
+            }
+            ClightStmt::Sloop(a, b) => {
+                collect_stmt_regs_inner(a, regs);
+                collect_stmt_regs_inner(b, regs);
+            }
             ClightStmt::Slabel(_, inner) => collect_stmt_regs_inner(inner, regs),
-            ClightStmt::Sswitch(e, cases) => { collect_expr_regs(e, regs); for (_, s) in cases { collect_stmt_regs_inner(s, regs); } }
+            ClightStmt::Sswitch(e, cases) => {
+                collect_expr_regs(e, regs);
+                for (_, s) in cases {
+                    collect_stmt_regs_inner(s, regs);
+                }
+            }
             _ => {}
         }
     }
@@ -3172,6 +3443,41 @@ pub fn collect_stmt_regs(stmt: &ClightStmt) -> Vec<RTLReg> {
 #[cfg(test)]
 mod tr3_tests {
     use super::*;
+
+    #[test]
+    fn preferred_symbol_name_is_order_independent_for_equal_length_aliases() {
+        let mut forward = HashMap::new();
+        insert_preferred_symbol_name(&mut forward, 7, "alias_b");
+        insert_preferred_symbol_name(&mut forward, 7, "alias_a");
+
+        let mut reverse = HashMap::new();
+        insert_preferred_symbol_name(&mut reverse, 7, "alias_a");
+        insert_preferred_symbol_name(&mut reverse, 7, "alias_b");
+
+        assert_eq!(forward.get(&7).map(String::as_str), Some("alias_a"));
+        assert_eq!(forward, reverse);
+    }
+
+    #[test]
+    fn containing_function_owner_masks_all_synthetic_node_bits() {
+        let claimants = [0x1000, 0x1080];
+        let real = 0x1050;
+        for node in [
+            real,
+            real | (1u64 << 62),
+            real | (1u64 << 63),
+            real | (1u64 << 62) | (1u64 << 63),
+        ] {
+            assert_eq!(containing_function_owner(node, &claimants), Some(0x1000));
+        }
+
+        assert_eq!(
+            containing_function_owner(0x0500 | (1u64 << 63), &claimants),
+            Some(0x1000),
+            "when no claimant precedes the node, the smallest claimant is stable"
+        );
+        assert_eq!(containing_function_owner(real, &[]), None);
+    }
 
     fn tlong() -> ClightType {
         ClightType::Tlong(ClightSignedness::Signed, ClightAttr::default())
@@ -3211,7 +3517,10 @@ mod tr3_tests {
     fn parse_candidate_roundtrip() {
         assert_eq!(
             parse_field_type_candidate("void *"),
-            Some(CType::Pointer(Box::new(CType::Void), TypeQualifiers::none()))
+            Some(CType::Pointer(
+                Box::new(CType::Void),
+                TypeQualifiers::none()
+            ))
         );
         assert_eq!(
             parse_field_type_candidate("struct struct_7 *"),
@@ -3231,7 +3540,11 @@ mod tr3_tests {
         let s2 = field_store(
             1,
             0,
-            ClightType::Tint(ClightIntSize::I32, ClightSignedness::Signed, ClightAttr::default()),
+            ClightType::Tint(
+                ClightIntSize::I32,
+                ClightSignedness::Signed,
+                ClightAttr::default(),
+            ),
             ClightExpr::Etempvar(2, tlong()),
         );
         // already-pointer field: no re-selection needed.
@@ -3244,7 +3557,9 @@ mod tr3_tests {
         let stmts = vec![s1, s2, s3];
         let cands = collect_struct_field_type_candidates(stmts.iter());
         assert_eq!(cands.len(), 1);
-        let c = cands.get(&("struct_1".to_string(), "ofs_8".to_string())).unwrap();
+        let c = cands
+            .get(&("struct_1".to_string(), "ofs_8".to_string()))
+            .unwrap();
         assert_eq!(c[0], "long");
         assert_eq!(c.last().unwrap(), "void *");
     }
@@ -3287,8 +3602,14 @@ mod tr3_tests {
     #[test]
     fn apply_patches_only_8byte_scalars() {
         let selection: HashMap<(String, String), String> = [
-            (("struct_1".to_string(), "ofs_8".to_string()), "void *".to_string()),
-            (("struct_1".to_string(), "ofs_0".to_string()), "void *".to_string()),
+            (
+                ("struct_1".to_string(), "ofs_8".to_string()),
+                "void *".to_string(),
+            ),
+            (
+                ("struct_1".to_string(), "ofs_0".to_string()),
+                "void *".to_string(),
+            ),
         ]
         .into_iter()
         .collect();

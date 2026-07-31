@@ -1,11 +1,9 @@
-
-
-use capstone::prelude::*;
-use capstone::arch::x86::X86OperandType;
-use object::{Object, ObjectSection, SectionFlags, SectionKind};
 use crate::decompile::disassembly::operand::*;
 use crate::decompile::elevator::DecompileDB;
 use crate::mreg::Mreg;
+use capstone::arch::x86::X86OperandType;
+use capstone::prelude::*;
+use object::{Object, ObjectSection, SectionFlags, SectionKind};
 
 const SHF_EXECINSTR: u64 = 0x4;
 
@@ -14,6 +12,13 @@ fn is_rsp_reg(cs: &Capstone, op_type: &X86OperandType) -> bool {
     matches!(op_type, X86OperandType::Reg(reg_id) if {
         let name = cs.reg_name(*reg_id).unwrap_or_default().to_ascii_uppercase();
         name == "RSP"
+    })
+}
+
+fn is_stack_pointer_family_reg(cs: &Capstone, op_type: &X86OperandType) -> bool {
+    matches!(op_type, X86OperandType::Reg(reg_id) if {
+        let name = cs.reg_name(*reg_id).unwrap_or_default().to_ascii_uppercase();
+        matches!(name.as_str(), "RSP" | "SP")
     })
 }
 
@@ -34,10 +39,7 @@ pub struct DecodedInsn {
 }
 
 // Disassemble executable sections into the instruction/operand/register relations, dispatching on target arch.
-pub fn disassemble_sections(
-    db: &mut DecompileDB,
-    obj: &object::File,
-) -> Vec<DecodedInsn> {
+pub fn disassemble_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<DecodedInsn> {
     match db.abi().arch {
         crate::abi::Arch::Aarch64 => {
             crate::decompile::disassembly::aarch64::disassemble_sections(db, obj)
@@ -46,10 +48,7 @@ pub fn disassemble_sections(
     }
 }
 
-fn disassemble_x86_sections(
-    db: &mut DecompileDB,
-    obj: &object::File,
-) -> Vec<DecodedInsn> {
+fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<DecodedInsn> {
     let cs = {
         let mode = if db.abi().is_64bit() {
             arch::x86::ArchMode::Mode64
@@ -69,12 +68,35 @@ fn disassemble_x86_sections(
 
     let mut op_registers: Vec<(&'static str, &'static str)> = Vec::new();
     let mut op_immediates: Vec<(&'static str, i64, usize)> = Vec::new();
-    let mut op_indirects: Vec<(&'static str, &'static str, &'static str, &'static str, i64, i64, usize)> = Vec::new();
-    let mut instructions: Vec<(u64, usize, &'static str, &'static str,
-                                &'static str, &'static str, &'static str, &'static str,
-                                usize, usize)> = Vec::new();
+    let mut op_indirects: Vec<(
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        i64,
+        i64,
+        usize,
+    )> = Vec::new();
+    let mut instructions: Vec<(
+        u64,
+        usize,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        usize,
+        usize,
+    )> = Vec::new();
+    let mut instruction_address_sizes: Vec<(u64, u8)> = Vec::new();
     let mut stack_defs: Vec<(u64, &'static str, i64)> = Vec::new();
     let mut stack_uses: Vec<(u64, &'static str, i64)> = Vec::new();
+    // Exact decoded memory-write operands, including non-RSP/RBP bases.  The
+    // operand ID preserves the full base/index/displacement/width row in
+    // op_indirect so later stack-provenance analysis need not guess writes
+    // from mnemonic position.
+    let mut decoded_memory_writes: Vec<(u64, &'static str)> = Vec::new();
     let mut reg_defs: Vec<(u64, Mreg)> = Vec::new();
     let mut reg_uses: Vec<(u64, Mreg)> = Vec::new();
     let mut adjusts_stack: Vec<(u64, &'static str, i64)> = Vec::new();
@@ -90,8 +112,9 @@ fn disassemble_x86_sections(
         };
         let base_addr = section.address();
 
-        let insns = cs.disasm_all(data, base_addr)
-            .unwrap_or_else(|e| panic!("Disassembly failed at section {:?}: {}", section.name(), e));
+        let insns = cs.disasm_all(data, base_addr).unwrap_or_else(|e| {
+            panic!("Disassembly failed at section {:?}: {}", section.name(), e)
+        });
 
         for insn in insns.as_ref() {
             let addr = insn.address();
@@ -128,10 +151,12 @@ fn disassemble_x86_sections(
                 p.unwrap_or("")
             };
 
-            let detail = cs.insn_detail(insn)
+            let detail = cs
+                .insn_detail(insn)
                 .expect("insn_detail failed; was detail mode enabled?");
             let arch_detail = detail.arch_detail();
             let x86_detail = arch_detail.x86().expect("Not x86");
+            instruction_address_sizes.push((addr, x86_detail.addr_size()));
             let ops = x86_detail.operands();
 
             let mut op_ids: [&'static str; 4] = [NO_OP; 4];
@@ -150,7 +175,9 @@ fn disassemble_x86_sections(
             };
 
             for (i, op) in ops.enumerate() {
-                if i >= 4 { break; }
+                if i >= 4 {
+                    break;
+                }
                 match op.op_type {
                     X86OperandType::Reg(reg_id) => {
                         let id = alloc_op_id();
@@ -196,6 +223,10 @@ fn disassemble_x86_sections(
                         op_indirects.push((id, seg, base, index, scale, disp, op.size as usize));
                         op_ids[i] = id;
 
+                        if !is_nop && op.access.map_or(false, |a| a.is_writable()) {
+                            decoded_memory_writes.push((addr, id));
+                        }
+
                         // Memory operand base/index registers count as reg_use
                         if !is_nop {
                             if base != "NONE" && base != "RIP" {
@@ -212,8 +243,12 @@ fn disassemble_x86_sections(
                             }
                         }
 
-                        // Stack def/use classification for RBP/RSP-relative memory accesses
-                        if (base == "RBP" || base == "RSP")
+                        // An explicit segment contributes an unmodelled base to
+                        // the effective address.  Do not publish FS/GS memory
+                        // as ordinary scalar stack storage; AsmPass records a
+                        // structured unsupported-address diagnostic instead.
+                        if seg == "NONE"
+                            && (base == "RBP" || base == "RSP")
                             && index == "NONE"
                             && mnemonic != "LEA"
                         {
@@ -228,8 +263,7 @@ fn disassemble_x86_sections(
                             }
                         }
                     }
-                    _ => {
-                    }
+                    _ => {}
                 }
             }
 
@@ -247,10 +281,32 @@ fn disassemble_x86_sections(
             // Stack pointer modification tracking
             match mnemonic {
                 "PUSH" => {
-                    adjusts_stack.push((addr, "RSP", -8));
+                    // In long mode PUSH is an eight-byte stack transfer unless
+                    // the operand-size override selects the two-byte form.
+                    let width = if x86_detail.prefix()[2] == 0x66 {
+                        2
+                    } else {
+                        8
+                    };
+                    adjusts_stack.push((addr, "RSP", -width));
                 }
                 "POP" => {
-                    adjusts_stack.push((addr, "RSP", 8));
+                    let ops_vec: Vec<_> = x86_detail.operands().collect();
+                    // POP into any spelling of the stack-pointer family is not
+                    // affine: the popped value itself overwrites part or all of
+                    // the post-increment pointer. Leave it out of adjusts_stack
+                    // so the provenance analysis kills the coordinate.
+                    let overwrites_sp = ops_vec
+                        .first()
+                        .is_some_and(|op| is_stack_pointer_family_reg(&cs, &op.op_type));
+                    if !overwrites_sp {
+                        let width = if x86_detail.prefix()[2] == 0x66 {
+                            2
+                        } else {
+                            8
+                        };
+                        adjusts_stack.push((addr, "RSP", width));
+                    }
                 }
                 "SUB" => {
                     if num_operands >= 2 {
@@ -283,7 +339,9 @@ fn disassemble_x86_sections(
                             if is_rsp_reg(&cs, &dst_op.op_type) {
                                 if let X86OperandType::Mem(mem) = src_op.op_type {
                                     let base_name = if mem.base().0 != 0 {
-                                        cs.reg_name(mem.base()).unwrap_or_default().to_ascii_uppercase()
+                                        cs.reg_name(mem.base())
+                                            .unwrap_or_default()
+                                            .to_ascii_uppercase()
                                     } else {
                                         String::new()
                                     };
@@ -306,14 +364,22 @@ fn disassemble_x86_sections(
                     let dst_reg = match dst_op.op_type {
                         X86OperandType::Reg(reg_id) => {
                             let name = cs.reg_name(reg_id).unwrap_or_default().to_ascii_uppercase();
-                            if name == "RSP" || name == "RBP" { Some(name) } else { None }
+                            if name == "RSP" || name == "RBP" {
+                                Some(name)
+                            } else {
+                                None
+                            }
                         }
                         _ => None,
                     };
                     let src_reg = match src_op.op_type {
                         X86OperandType::Reg(reg_id) => {
                             let name = cs.reg_name(reg_id).unwrap_or_default().to_ascii_uppercase();
-                            if name == "RSP" || name == "RBP" { Some(name) } else { None }
+                            if name == "RSP" || name == "RBP" {
+                                Some(name)
+                            } else {
+                                None
+                            }
                         }
                         _ => None,
                     };
@@ -351,13 +417,14 @@ fn disassemble_x86_sections(
             }
 
             instructions.push((
-                addr, size, prefix, mnemonic,
-                op_ids[0], op_ids[1], op_ids[2], op_ids[3],
-                0, 0,
+                addr, size, prefix, mnemonic, op_ids[0], op_ids[1], op_ids[2], op_ids[3], 0, 0,
             ));
 
             let op_str: &'static str = Box::leak(
-                insn.op_str().unwrap_or("").to_ascii_uppercase().into_boxed_str()
+                insn.op_str()
+                    .unwrap_or("")
+                    .to_ascii_uppercase()
+                    .into_boxed_str(),
             );
 
             decoded.push(DecodedInsn {
@@ -373,7 +440,10 @@ fn disassemble_x86_sections(
     instructions.sort_by_key(|t| t.0);
 
     // Populate DB relations
-    db.rel_set("unrefinedinstruction", instructions.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    db.rel_set(
+        "unrefinedinstruction",
+        instructions.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
 
     let mut nexts: Vec<(u64, u64)> = Vec::with_capacity(decoded.len());
     for w in decoded.windows(2) {
@@ -381,22 +451,85 @@ fn disassemble_x86_sections(
             nexts.push((w[0].address, w[1].address));
         }
     }
-    db.rel_set("next", nexts.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    db.rel_set(
+        "next",
+        nexts.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
 
-    db.rel_set("op_register", op_registers.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    db.rel_set(
+        "op_register",
+        op_registers.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
 
-    db.rel_set("op_immediate", op_immediates.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    db.rel_set(
+        "op_immediate",
+        op_immediates
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
 
-    db.rel_set("op_indirect", op_indirects.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    db.rel_set(
+        "op_indirect",
+        op_indirects.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
 
-    db.rel_set("stack_def", stack_defs.into_iter().collect::<ascent::boxcar::Vec<_>>());
-    db.rel_set("stack_use", stack_uses.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    db.rel_set(
+        "instruction_address_size",
+        instruction_address_sizes
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
 
-    db.rel_set("reg_def", reg_defs.into_iter().collect::<ascent::boxcar::Vec<_>>());
-    db.rel_set("reg_use", reg_uses.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    db.rel_set(
+        "stack_def",
+        stack_defs.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "stack_use",
+        stack_uses.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
 
-    db.rel_set("adjusts_stack", adjusts_stack.into_iter().collect::<ascent::boxcar::Vec<_>>());
-    db.rel_set("stack_base_move", stack_base_moves.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    db.rel_set(
+        "decoded_memory_write_operand",
+        decoded_memory_writes
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    // Immutable decoder-owned register effects.  Later IR passes intentionally
+    // augment the public reg_use/reg_def relations; retaining this snapshot
+    // prevents a repeated AsmPass run from mistaking its own synthesized facts
+    // for new Capstone evidence.
+    db.rel_set(
+        "decoded_reg_def",
+        reg_defs.iter().copied().collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "decoded_reg_use",
+        reg_uses.iter().copied().collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    db.rel_set(
+        "reg_def",
+        reg_defs.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "reg_use",
+        reg_uses.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    db.rel_set(
+        "adjusts_stack",
+        adjusts_stack
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "stack_base_move",
+        stack_base_moves
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
 
     decoded
 }

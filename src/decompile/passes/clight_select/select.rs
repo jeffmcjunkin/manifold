@@ -1,11 +1,10 @@
 #![allow(dead_code, unused_variables, unused_imports, unused_mut)]
 
 use crate::decompile::elevator::DecompileDB;
-use crate::decompile::passes::clight_select::query::{
-    extract_functions, extract_ite_info, extract_loop_info,
-    FunctionData, IteInfo, LoopInfo,
-};
 use crate::decompile::passes::clight_pass::is_nonempty_stmt;
+use crate::decompile::passes::clight_select::query::{
+    extract_functions, extract_ite_info, extract_loop_info, FunctionData, IteInfo, LoopInfo,
+};
 use crate::decompile::passes::csh_pass::ident_from_node;
 use crate::x86::types::*;
 use std::collections::{HashMap, HashSet};
@@ -59,9 +58,19 @@ pub struct SelectedFunction {
     pub loop_info: HashMap<Node, LoopInfo>,
 }
 
-
 pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, String> {
     let (mut functions, id_to_name) = extract_functions(db)?;
+
+    // An arbitrary current RSP value cannot be represented faithfully in the
+    // source IR.  AsmPass records the affected function explicitly rather
+    // than fabricating an Ainstack slot or an unbound pointer.  Remove only
+    // those functions before the program-wide solver; supported siblings in
+    // the same object continue through the normal selection path.
+    let unsupported_stack_functions: HashSet<Address> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .map(|(func, _, _)| *func)
+        .collect();
+    functions.retain(|func| !unsupported_stack_functions.contains(&func.address));
 
     let mut name_to_ident: HashMap<String, Ident> = HashMap::new();
     {
@@ -69,7 +78,10 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
         let mut sorted_id_name: Vec<(&usize, &String)> = id_to_name.iter().collect();
         sorted_id_name.sort_by_key(|(id, name)| (**id, (*name).clone()));
         for (id, name) in sorted_id_name {
-            let sanitized = crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(name);
+            let sanitized =
+                crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(
+                    name,
+                );
             name_to_ident.entry(sanitized).or_insert(*id as Ident);
             name_to_ident.entry(name.clone()).or_insert(*id as Ident);
         }
@@ -111,7 +123,8 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
 
     // Dump candidate distribution stats when CANDIDATE_STATS_OUT is set
     if let Ok(out_path) = std::env::var("CANDIDATE_STATS_OUT") {
-        let mut histogram: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        let mut histogram: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
         let mut total_nodes: usize = 0;
         for func in &functions {
             for stmts in func.node_statements.values() {
@@ -120,12 +133,16 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
             }
         }
         // Write as JSON: {"total_nodes": N, "total_functions": N, "histogram": {"1": N, "2": N, ...}}
-        let hist_json: String = histogram.iter()
+        let hist_json: String = histogram
+            .iter()
             .map(|(k, v)| format!("\"{}\": {}", k, v))
-            .collect::<Vec<_>>().join(", ");
+            .collect::<Vec<_>>()
+            .join(", ");
         let json = format!(
             "{{\"total_nodes\": {}, \"total_functions\": {}, \"histogram\": {{{}}}}}",
-            total_nodes, functions.len(), hist_json
+            total_nodes,
+            functions.len(),
+            hist_json
         );
         let _ = std::fs::write(&out_path, &json);
     }
@@ -149,14 +166,47 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
         };
         for f in &functions {
             // Candidate vectors keep their stored order (position = priority); maps are key-sorted.
-            let vtc = sorted_kv(f.var_type_candidates.iter().map(|(r, cs)| format!("{}:{:?}", r, cs)).collect());
-            let ns = sorted_kv(f.node_statements.iter().map(|(n, ss)| format!("{}:{:?}", n, ss)).collect());
-            let sigs = sorted_kv(f.callee_signatures.iter().map(|(id, s)| {
-                format!("{}:{}/{:?}/{:?}", id, s.param_count, s.return_type, s.param_types)
-            }).collect());
-            let sftc = sorted_kv(f.struct_field_type_candidates.iter().map(|(k, v)| format!("{:?}:{:?}", k, v)).collect());
-            let sfti = sorted_kv(f.struct_field_type_idx.iter().map(|(k, v)| format!("{:?}:{}", k, v)).collect());
-            let rsi = sorted_kv(f.reg_struct_ids.iter().map(|(k, v)| format!("{}:{}", k, v)).collect());
+            let vtc = sorted_kv(
+                f.var_type_candidates
+                    .iter()
+                    .map(|(r, cs)| format!("{}:{:?}", r, cs))
+                    .collect(),
+            );
+            let ns = sorted_kv(
+                f.node_statements
+                    .iter()
+                    .map(|(n, ss)| format!("{}:{:?}", n, ss))
+                    .collect(),
+            );
+            let sigs = sorted_kv(
+                f.callee_signatures
+                    .iter()
+                    .map(|(id, s)| {
+                        format!(
+                            "{}:{}/{:?}/{:?}",
+                            id, s.param_count, s.return_type, s.param_types
+                        )
+                    })
+                    .collect(),
+            );
+            let sftc = sorted_kv(
+                f.struct_field_type_candidates
+                    .iter()
+                    .map(|(k, v)| format!("{:?}:{:?}", k, v))
+                    .collect(),
+            );
+            let sfti = sorted_kv(
+                f.struct_field_type_idx
+                    .iter()
+                    .map(|(k, v)| format!("{:?}:{}", k, v))
+                    .collect(),
+            );
+            let rsi = sorted_kv(
+                f.reg_struct_ids
+                    .iter()
+                    .map(|(k, v)| format!("{}:{}", k, v))
+                    .collect(),
+            );
             eprintln!(
                 "[FP-IN] {:016x} vtc={:016x} ns={:016x} sigs={:016x} ret={:016x} rsi={:016x} sftc={:016x} sfti={:016x}",
                 f.address, fh(&vtc), fh(&ns), fh(&sigs), fh(&format!("{:?}", f.return_type)),
@@ -166,15 +216,20 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
     }
 
     // Statement-form + type selection is done entirely by the Z3/SMT inference model; the clang-in-the-loop greedy search has been removed (full migration to Z3).
-    let best_state =
-        crate::decompile::passes::clight_select::solve::infer_select_program(&functions, &name_to_ident);
+    let best_state = crate::decompile::passes::clight_select::solve::infer_select_program(
+        &functions,
+        &name_to_ident,
+    );
 
     // Split result into per-function SelectedFunction
     let selected: Vec<SelectedFunction> = functions
         .iter()
         .map(|func| {
             build_selected_function_from_program_state(
-                func, &best_state, &loop_info_all, &ite_info_all,
+                func,
+                &best_state,
+                &loop_info_all,
+                &ite_info_all,
             )
         })
         .collect();
@@ -182,7 +237,9 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
     // Read-only wt audit (CTYPING_PLAN.md P2): frontend-typing diagnoses over the selected statements/decls, stderr only.
     if std::env::var("MANIFOLD_WT_AUDIT_OFF").is_err() {
         crate::decompile::passes::clight_select::wt_audit::wt_audit(
-            &functions, &selected, &name_to_ident,
+            &functions,
+            &selected,
+            &name_to_ident,
         );
     }
 
@@ -195,30 +252,65 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
             h.finish()
         };
         for f in &selected {
-            let mut st: Vec<String> = f.statements.iter().map(|(n, s)| format!("{}:{:?}", n, s)).collect();
+            let mut st: Vec<String> = f
+                .statements
+                .iter()
+                .map(|(n, s)| format!("{}:{:?}", n, s))
+                .collect();
             st.sort();
-            let mut su: Vec<String> = f.successors.iter().map(|(n, v)| format!("{}:{:?}", n, v)).collect();
+            let mut su: Vec<String> = f
+                .successors
+                .iter()
+                .map(|(n, v)| format!("{}:{:?}", n, v))
+                .collect();
             su.sort();
-            let mut sg: Vec<String> = f.sseq_groups.iter().map(|(k, v)| format!("{}:{:?}", k, v)).collect();
+            let mut sg: Vec<String> = f
+                .sseq_groups
+                .iter()
+                .map(|(k, v)| format!("{}:{:?}", k, v))
+                .collect();
             sg.sort();
             // LoopInfo HashMaps have non-deterministic Debug order; key-sort so the fingerprint only moves on real content changes.
-            let mut li: Vec<String> = f.loop_info.iter().map(|(n, v)| {
-                let mut bs: Vec<String> = v.break_stmts.iter().map(|(k, s)| format!("{}:{:?}", k, s)).collect();
-                bs.sort();
-                let mut er: Vec<(Node, (Node, Node))> = v.exit_returns.iter().map(|(k, p)| (*k, *p)).collect();
-                er.sort();
-                format!(
-                    "{}:body={:?} exit={:?} step={:?} primary={:?} breaks=[{}] rets={:?}",
-                    n, v.body_nodes, v.exit_node, v.step_node, v.primary_exit, bs.join(","), er
-                )
-            }).collect();
+            let mut li: Vec<String> = f
+                .loop_info
+                .iter()
+                .map(|(n, v)| {
+                    let mut bs: Vec<String> = v
+                        .break_stmts
+                        .iter()
+                        .map(|(k, s)| format!("{}:{:?}", k, s))
+                        .collect();
+                    bs.sort();
+                    let mut er: Vec<(Node, (Node, Node))> =
+                        v.exit_returns.iter().map(|(k, p)| (*k, *p)).collect();
+                    er.sort();
+                    format!(
+                        "{}:body={:?} exit={:?} step={:?} primary={:?} breaks=[{}] rets={:?}",
+                        n,
+                        v.body_nodes,
+                        v.exit_node,
+                        v.step_node,
+                        v.primary_exit,
+                        bs.join(","),
+                        er
+                    )
+                })
+                .collect();
             li.sort();
-            let mut rsi: Vec<String> = f.reg_struct_ids.iter().map(|(k, v)| format!("{}:{}", k, v)).collect();
+            let mut rsi: Vec<String> = f
+                .reg_struct_ids
+                .iter()
+                .map(|(k, v)| format!("{}:{}", k, v))
+                .collect();
             rsi.sort();
             eprintln!(
                 "[FP-A] {:016x} stmts={:016x} succ={:016x} sseq={:016x} linfo={:016x} rsi={:016x}",
-                f.address, fh(&st.join(",")), fh(&su.join(",")), fh(&sg.join(",")),
-                fh(&li.join(",")), fh(&rsi.join(",")),
+                f.address,
+                fh(&st.join(",")),
+                fh(&su.join(",")),
+                fh(&sg.join(",")),
+                fh(&li.join(",")),
+                fh(&rsi.join(",")),
             );
         }
     }
@@ -249,7 +341,10 @@ fn det_fp_stage(addr: Address, stage: &str, statements: &HashMap<Node, ClightStm
     }
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    let mut items: Vec<String> = statements.iter().map(|(n, s)| format!("{}:{:?}", n, s)).collect();
+    let mut items: Vec<String> = statements
+        .iter()
+        .map(|(n, s)| format!("{}:{:?}", n, s))
+        .collect();
     items.sort();
     let mut h = DefaultHasher::new();
     items.join(",").hash(&mut h);
@@ -310,20 +405,21 @@ fn build_selected_function_from_program_state(
     // The solver is allowed to omit an explicit Sskip candidate. Keep the raw
     // candidate map as proof that such an absent target is empty; arbitrary
     // missing nodes are never threaded across.
-    let explicit_empty_nodes: HashSet<Node> = func.node_statements.iter()
+    let explicit_empty_nodes: HashSet<Node> = func
+        .node_statements
+        .iter()
         .filter(|(_, candidates)| {
             !candidates.is_empty() && candidates.iter().all(|stmt| !is_nonempty_stmt(stmt))
         })
         .map(|(&node, _)| node)
         .collect();
-    thread_gotos_through_empty_landings(
-        &mut statements,
-        &func.successors,
-        &explicit_empty_nodes,
-    );
+    thread_gotos_through_empty_landings(&mut statements, &func.successors, &explicit_empty_nodes);
     det_fp_stage(func.address, "S1thread", &statements);
 
-    let func_loop_info = loop_info_all.get(&func.address).cloned().unwrap_or_default();
+    let func_loop_info = loop_info_all
+        .get(&func.address)
+        .cloned()
+        .unwrap_or_default();
 
     assemble_loops(&mut statements, &func_loop_info, &func.successors);
     det_fp_stage(func.address, "S2loop", &statements);
@@ -333,7 +429,9 @@ fn build_selected_function_from_program_state(
     det_fp_stage(func.address, "S3ite", &statements);
 
     // Sort sseq groups by head so overlapping groups resolve deterministically.
-    let mut sorted_sseq: Vec<(Node, Vec<Node>)> = func.sseq_groups.iter()
+    let mut sorted_sseq: Vec<(Node, Vec<Node>)> = func
+        .sseq_groups
+        .iter()
         .map(|(&h, m)| (h, m.clone()))
         .collect();
     sorted_sseq.sort_by_key(|(h, _)| *h);
@@ -402,10 +500,7 @@ fn thread_gotos_through_empty_landings(
     successors: &HashMap<Node, Vec<Node>>,
     explicit_empty_nodes: &HashSet<Node>,
 ) {
-    let goto_targets: HashSet<Node> = statements
-        .values()
-        .flat_map(collect_goto_targets)
-        .collect();
+    let goto_targets: HashSet<Node> = statements.values().flat_map(collect_goto_targets).collect();
     if goto_targets.is_empty() {
         return;
     }
@@ -467,7 +562,8 @@ fn thread_gotos_through_empty_landings(
     destinations.dedup();
     for destination in destinations {
         if let Some(stmt) = statements.get(&destination).cloned() {
-            if !matches!(&stmt, ClightStmt::Slabel(label, _) if *label == ident_from_node(destination)) {
+            if !matches!(&stmt, ClightStmt::Slabel(label, _) if *label == ident_from_node(destination))
+            {
                 statements.insert(
                     destination,
                     ClightStmt::Slabel(ident_from_node(destination), Box::new(stmt)),
@@ -487,7 +583,6 @@ fn thread_gotos_through_empty_landings(
         }
     }
 }
-
 
 fn materialize_statements(
     state: &SelectionState,
@@ -527,7 +622,9 @@ fn stmt_uses_efield(stmt: &ClightStmt) -> bool {
             | ClightExpr::Eunop(_, inner, _)
             | ClightExpr::Ecast(inner, _) => expr_has_efield(inner),
             ClightExpr::Ebinop(_, l, r, _) => expr_has_efield(l) || expr_has_efield(r),
-            ClightExpr::Econdition(c, t, f, _) => expr_has_efield(c) || expr_has_efield(t) || expr_has_efield(f),
+            ClightExpr::Econdition(c, t, f, _) => {
+                expr_has_efield(c) || expr_has_efield(t) || expr_has_efield(f)
+            }
             _ => false,
         }
     }
@@ -537,11 +634,15 @@ fn stmt_uses_efield(stmt: &ClightStmt) -> bool {
         ClightStmt::Scall(_, f, args) => expr_has_efield(f) || args.iter().any(expr_has_efield),
         ClightStmt::Sbuiltin(_, _, _, args) => args.iter().any(expr_has_efield),
         ClightStmt::Sreturn(Some(e)) => expr_has_efield(e),
-        ClightStmt::Sifthenelse(c, t, e) => expr_has_efield(c) || stmt_uses_efield(t) || stmt_uses_efield(e),
+        ClightStmt::Sifthenelse(c, t, e) => {
+            expr_has_efield(c) || stmt_uses_efield(t) || stmt_uses_efield(e)
+        }
         ClightStmt::Ssequence(ss) => ss.iter().any(stmt_uses_efield),
         ClightStmt::Sloop(a, b) => stmt_uses_efield(a) || stmt_uses_efield(b),
         ClightStmt::Slabel(_, inner) => stmt_uses_efield(inner),
-        ClightStmt::Sswitch(e, cases) => expr_has_efield(e) || cases.iter().any(|(_, s)| stmt_uses_efield(s)),
+        ClightStmt::Sswitch(e, cases) => {
+            expr_has_efield(e) || cases.iter().any(|(_, s)| stmt_uses_efield(s))
+        }
         _ => false,
     }
 }
@@ -629,11 +730,15 @@ fn walk_stmt_exprs(stmt: &ClightStmt, pred: &dyn Fn(&ClightExpr) -> bool) -> boo
         ClightStmt::Scall(_, f, args) => pred(f) || args.iter().any(|a| pred(a)),
         ClightStmt::Sbuiltin(_, _, _, args) => args.iter().any(|a| pred(a)),
         ClightStmt::Sreturn(Some(e)) => pred(e),
-        ClightStmt::Sifthenelse(c, t, e) => pred(c) || walk_stmt_exprs(t, pred) || walk_stmt_exprs(e, pred),
+        ClightStmt::Sifthenelse(c, t, e) => {
+            pred(c) || walk_stmt_exprs(t, pred) || walk_stmt_exprs(e, pred)
+        }
         ClightStmt::Ssequence(ss) => ss.iter().any(|s| walk_stmt_exprs(s, pred)),
         ClightStmt::Sloop(a, b) => walk_stmt_exprs(a, pred) || walk_stmt_exprs(b, pred),
         ClightStmt::Slabel(_, inner) => walk_stmt_exprs(inner, pred),
-        ClightStmt::Sswitch(e, cases) => pred(e) || cases.iter().any(|(_, s)| walk_stmt_exprs(s, pred)),
+        ClightStmt::Sswitch(e, cases) => {
+            pred(e) || cases.iter().any(|(_, s)| walk_stmt_exprs(s, pred))
+        }
         _ => false,
     }
 }
@@ -645,7 +750,12 @@ fn assemble_loops(
 ) {
     // Process smallest loops first (inner before outer). Break ties by header address.
     let mut headers: Vec<(&Node, &LoopInfo)> = loop_info.iter().collect();
-    headers.sort_by(|a, b| a.1.body_nodes.len().cmp(&b.1.body_nodes.len()).then(a.0.cmp(b.0)));
+    headers.sort_by(|a, b| {
+        a.1.body_nodes
+            .len()
+            .cmp(&b.1.body_nodes.len())
+            .then(a.0.cmp(b.0))
+    });
 
     // Top-level value nodes tail-duplicated into a loop exit branch, removed here so they are not also hoisted outside; only single-predecessor nodes, since a shared return still has another path.
     let mut absorbed_value_nodes: Vec<Node> = Vec::new();
@@ -714,7 +824,11 @@ fn assemble_loops(
                 let node_label = ident_from_node(node);
                 let keep_label = body_goto_targets.contains(&node_label);
                 let wrap = |s: ClightStmt| -> ClightStmt {
-                    if keep_label { ClightStmt::Slabel(node_label, Box::new(s)) } else { s }
+                    if keep_label {
+                        ClightStmt::Slabel(node_label, Box::new(s))
+                    } else {
+                        s
+                    }
                 };
                 // A5: if this exit flows to a function return, tail-duplicate the value assignment + the return into the branch rather than emitting a valueless break, which drops the returned value at the post-loop join.
                 if let Some(&(value_node, ret_node)) = info.exit_returns.get(&node) {
@@ -753,7 +867,13 @@ fn assemble_loops(
             };
 
             // Convert gotos: header_label->Scontinue, outside loop->Sbreak, recurse into branches.
-            let mut converted = convert_loop_gotos(&stmt, header_label, body_top_label, &body_node_set, &exit_target_label);
+            let mut converted = convert_loop_gotos(
+                &stmt,
+                header_label,
+                body_top_label,
+                &body_node_set,
+                &exit_target_label,
+            );
             // The PRIMARY exit also flows to a return when the loop has 2+ distinct return-exits, so tail-duplicate its own return in place of its break or its value collapses onto the other exit's.
             if info.primary_exit.as_ref().map(|pe| pe.exit_node) == Some(node) {
                 if let Some(&(value_node, ret_node)) = info.exit_returns.get(&node) {
@@ -796,7 +916,9 @@ fn assemble_loops(
                 } else {
                     // Strip one outer label so the body falls through via the parent Ssequence, unless an in-body goto targets it: ensure_goto_labels would re-create it OUTSIDE the loop and the body would be dropped.
                     let stripped = match converted {
-                        ClightStmt::Slabel(lbl, inner) if !body_goto_targets.contains(&lbl) => *inner,
+                        ClightStmt::Slabel(lbl, inner) if !body_goto_targets.contains(&lbl) => {
+                            *inner
+                        }
                         other => other,
                     };
                     body_stmts.push(stripped);
@@ -806,7 +928,10 @@ fn assemble_loops(
                 if let Some(succs) = successors.get(&node) {
                     if succs.len() == 1
                         && succs[0] == header
-                        && body_stmts.last().map(stmt_may_fall_through).unwrap_or(false)
+                        && body_stmts
+                            .last()
+                            .map(stmt_may_fall_through)
+                            .unwrap_or(false)
                     {
                         body_stmts.push(ClightStmt::Scontinue);
                         body_stmt_nodes.push(node);
@@ -830,7 +955,10 @@ fn assemble_loops(
             body_iter_nodes.first().copied(),
         ) {
             if std::env::var("CF4_TRACE").is_ok() {
-                eprintln!("[cf4] skip header={:#x} label={} body={:#?}", header, header_label, body_stmts);
+                eprintln!(
+                    "[cf4] skip header={:#x} label={} body={:#?}",
+                    header, header_label, body_stmts
+                );
             }
             continue;
         }
@@ -853,9 +981,7 @@ fn assemble_loops(
 
         // Preserve label on the header node if present
         let final_stmt = match statements.get(&header) {
-            Some(ClightStmt::Slabel(lbl, _)) => {
-                ClightStmt::Slabel(*lbl, Box::new(loop_stmt))
-            }
+            Some(ClightStmt::Slabel(lbl, _)) => ClightStmt::Slabel(*lbl, Box::new(loop_stmt)),
             _ => loop_stmt,
         };
 
@@ -934,9 +1060,9 @@ fn assemble_loops(
                 continue;
             }
             // A live CFG predecessor is any surviving top-level node (other than ret_node itself) whose successor set includes ret_node.
-            let pred_alive = successors
-                .iter()
-                .any(|(p, succs)| *p != ret_node && statements.contains_key(p) && succs.contains(&ret_node));
+            let pred_alive = successors.iter().any(|(p, succs)| {
+                *p != ret_node && statements.contains_key(p) && succs.contains(&ret_node)
+            });
             if pred_alive {
                 continue;
             }
@@ -1003,15 +1129,17 @@ fn clight_stmt_size(s: &ClightStmt) -> usize {
         ClightStmt::Sifthenelse(_, a, b) => 1 + clight_stmt_size(a) + clight_stmt_size(b),
         ClightStmt::Sloop(a, b) => 1 + clight_stmt_size(a) + clight_stmt_size(b),
         ClightStmt::Slabel(_, inner) => 1 + clight_stmt_size(inner),
-        ClightStmt::Sswitch(_, cases) => 1 + cases.iter().map(|(_, c)| clight_stmt_size(c)).sum::<usize>(),
+        ClightStmt::Sswitch(_, cases) => {
+            1 + cases
+                .iter()
+                .map(|(_, c)| clight_stmt_size(c))
+                .sum::<usize>()
+        }
         _ => 1,
     }
 }
 
-fn assemble_ite(
-    statements: &mut HashMap<Node, ClightStmt>,
-    ite_info: &HashMap<Node, IteInfo>,
-) {
+fn assemble_ite(statements: &mut HashMap<Node, ClightStmt>, ite_info: &HashMap<Node, IteInfo>) {
     if ite_info.is_empty() {
         return;
     }
@@ -1030,10 +1158,7 @@ fn assemble_ite(
     // Labels targeted from another selected statement remain semantic after
     // their node is nested into a compound arm. Preserve those wrappers when
     // collect_body absorbs the top-level node.
-    let goto_targets: HashSet<Node> = statements
-        .values()
-        .flat_map(collect_goto_targets)
-        .collect();
+    let goto_targets: HashSet<Node> = statements.values().flat_map(collect_goto_targets).collect();
 
     for (&branch, info) in &branches {
         // Branch holds Sifthenelse from clight_pass flat Scond rule, possibly wrapped in Slabel.
@@ -1058,7 +1183,12 @@ fn assemble_ite(
                     .max()
                     .map(|m| m.max(branch))
                     .unwrap_or(branch);
-                statements.keys().filter(|n| **n > body_span_max).min().copied() == Some(join)
+                statements
+                    .keys()
+                    .filter(|n| **n > body_span_max)
+                    .min()
+                    .copied()
+                    == Some(join)
             }
             None => false,
         };
@@ -1082,7 +1212,9 @@ fn assemble_ite(
                 if let Some(stmt) = statements.get(&node) {
                     // Strip outer label; the node identity is subsumed by the compound
                     let stripped = match stmt {
-                        ClightStmt::Slabel(_, inner) if !goto_targets.contains(&node) => (**inner).clone(),
+                        ClightStmt::Slabel(_, inner) if !goto_targets.contains(&node) => {
+                            (**inner).clone()
+                        }
                         other => other.clone(),
                     };
                     if !matches!(&stripped, ClightStmt::Sskip) {
@@ -1115,7 +1247,8 @@ fn assemble_ite(
 
         // A branch side not inlined because its target is a shared landing pad keeps its original goto rather than collapsing to an Sskip that drops the control edge; only when the target is a real jump.
         let join_ident = info.join_node.map(ident_from_node);
-        let goto_is_to_join = |g: &ClightStmt| matches!(g, ClightStmt::Sgoto(t) if Some(*t) == join_ident);
+        let goto_is_to_join =
+            |g: &ClightStmt| matches!(g, ClightStmt::Sgoto(t) if Some(*t) == join_ident);
         if info.true_body_nodes.is_empty()
             && matches!(then_body, ClightStmt::Sskip)
             && matches!(then_target.as_ref(), ClightStmt::Sgoto(_))
@@ -1164,7 +1297,10 @@ fn assemble_ite(
 fn count_switches(s: &ClightStmt) -> usize {
     match s {
         ClightStmt::Sswitch(_, cases) => {
-            1 + cases.iter().map(|(_, cs)| count_switches(cs)).sum::<usize>()
+            1 + cases
+                .iter()
+                .map(|(_, cs)| count_switches(cs))
+                .sum::<usize>()
         }
         ClightStmt::Ssequence(ss) => ss.iter().map(count_switches).sum(),
         ClightStmt::Sifthenelse(_, a, b) => count_switches(a) + count_switches(b),
@@ -1217,19 +1353,45 @@ fn convert_loop_gotos(
             ClightStmt::Sswitch(e.clone(), new_cases)
         }
         ClightStmt::Sifthenelse(cond, then_box, else_box) => {
-            let new_then = convert_loop_gotos(then_box, header_label, body_top_label, body_node_set, _exit_target_label);
-            let new_else = convert_loop_gotos(else_box, header_label, body_top_label, body_node_set, _exit_target_label);
+            let new_then = convert_loop_gotos(
+                then_box,
+                header_label,
+                body_top_label,
+                body_node_set,
+                _exit_target_label,
+            );
+            let new_else = convert_loop_gotos(
+                else_box,
+                header_label,
+                body_top_label,
+                body_node_set,
+                _exit_target_label,
+            );
             ClightStmt::Sifthenelse(cond.clone(), Box::new(new_then), Box::new(new_else))
         }
         ClightStmt::Ssequence(stmts) => {
             let new_stmts: Vec<ClightStmt> = stmts
                 .iter()
-                .map(|s| convert_loop_gotos(s, header_label, body_top_label, body_node_set, _exit_target_label))
+                .map(|s| {
+                    convert_loop_gotos(
+                        s,
+                        header_label,
+                        body_top_label,
+                        body_node_set,
+                        _exit_target_label,
+                    )
+                })
                 .collect();
             ClightStmt::Ssequence(new_stmts)
         }
         ClightStmt::Slabel(lbl, inner) => {
-            let new_inner = convert_loop_gotos(inner, header_label, body_top_label, body_node_set, _exit_target_label);
+            let new_inner = convert_loop_gotos(
+                inner,
+                header_label,
+                body_top_label,
+                body_node_set,
+                _exit_target_label,
+            );
             ClightStmt::Slabel(*lbl, Box::new(new_inner))
         }
         _ => stmt.clone(),
@@ -1266,7 +1428,9 @@ fn inline_switch_case_bodies(statements: &mut HashMap<Node, ClightStmt>) {
                     *switch_count.entry(t).or_default() += 1;
                 }
             }
-            ClightStmt::Ssequence(ss) => ss.iter().for_each(|x| scan_switches(x, entry_gotos, switch_count)),
+            ClightStmt::Ssequence(ss) => ss
+                .iter()
+                .for_each(|x| scan_switches(x, entry_gotos, switch_count)),
             ClightStmt::Sifthenelse(_, a, b) => {
                 scan_switches(a, entry_gotos, switch_count);
                 scan_switches(b, entry_gotos, switch_count);
@@ -1285,7 +1449,8 @@ fn inline_switch_case_bodies(statements: &mut HashMap<Node, ClightStmt>) {
     let inlinable: HashSet<Ident> = entry_gotos
         .iter()
         .filter(|(t, &ec)| {
-            total_gotos.get(t).copied().unwrap_or(0) == ec && switch_count.get(t).copied().unwrap_or(0) == 1
+            total_gotos.get(t).copied().unwrap_or(0) == ec
+                && switch_count.get(t).copied().unwrap_or(0) == 1
         })
         .map(|(&t, _)| t)
         .collect();
@@ -1398,7 +1563,9 @@ fn rebuild_with_inlined_cases(
                             && !stmt_may_fall_through(inner)
                             && !contains_escaping_break(inner) =>
                     {
-                        kept.last().map(|p| !stmt_may_fall_through(p)).unwrap_or(false)
+                        kept.last()
+                            .map(|p| !stmt_may_fall_through(p))
+                            .unwrap_or(false)
                     }
                     _ => false,
                 };
@@ -1434,9 +1601,10 @@ fn rebuild_with_inlined_cases(
             Box::new(rebuild_with_inlined_cases(*a, inlinable, harvested)),
             Box::new(rebuild_with_inlined_cases(*b, inlinable, harvested)),
         ),
-        ClightStmt::Slabel(l, inner) => {
-            ClightStmt::Slabel(l, Box::new(rebuild_with_inlined_cases(*inner, inlinable, harvested)))
-        }
+        ClightStmt::Slabel(l, inner) => ClightStmt::Slabel(
+            l,
+            Box::new(rebuild_with_inlined_cases(*inner, inlinable, harvested)),
+        ),
         mut other => {
             let mut empty: HashMap<Ident, (usize, usize, ClightStmt)> = HashMap::new();
             inline_into_switches(&mut other, inlinable, &mut empty, harvested, 0);
@@ -1459,7 +1627,10 @@ fn inline_into_switches(
             let mut order: Vec<Ident> = Vec::new();
             for (_, cs) in cases.iter() {
                 if let ClightStmt::Sgoto(t) = cs {
-                    if inlinable.contains(t) && !order.contains(t) && (local.contains_key(t) || harvested.contains_key(t)) {
+                    if inlinable.contains(t)
+                        && !order.contains(t)
+                        && (local.contains_key(t) || harvested.contains_key(t))
+                    {
                         order.push(*t);
                     }
                 }
@@ -1475,7 +1646,9 @@ fn inline_into_switches(
                 }
                 // Past an Sloop boundary the enclosing loop changed, so a continue-carrying body must not be claimed; check before pool removal so it remains available to a zero-crossing switch.
                 if loop_crossings > 0
-                    && local.get(&t).is_some_and(|(_, _, b)| contains_loop_level_continue(b))
+                    && local
+                        .get(&t)
+                        .is_some_and(|(_, _, b)| contains_loop_level_continue(b))
                 {
                     continue;
                 }
@@ -1502,7 +1675,11 @@ fn inline_into_switches(
                 };
                 if std::env::var("CF3_INLINE_TRACE").is_ok() {
                     let bd = format!("{:?}", body);
-                    eprintln!("[cf3-inline] claim target={:#x} body={}", t, &bd[..bd.len().min(300)]);
+                    eprintln!(
+                        "[cf3-inline] claim target={:#x} body={}",
+                        t,
+                        &bd[..bd.len().min(300)]
+                    );
                 }
                 // Remove all `goto t` entries, re-inserting the stacked run at the FIRST removed position to preserve case order (appending at end drifts cases out of order, e.g. cases 2/4/5 below 10 in cut).
                 let mut run_vals: Vec<Option<Z>> = Vec::new();
@@ -1570,9 +1747,7 @@ fn convert_case_continues(
     body_top_label: Option<Ident>,
 ) -> ClightStmt {
     match stmt {
-        ClightStmt::Sgoto(target)
-            if *target == header_label || Some(*target) == body_top_label =>
-        {
+        ClightStmt::Sgoto(target) if *target == header_label || Some(*target) == body_top_label => {
             ClightStmt::Scontinue
         }
         ClightStmt::Ssequence(ss) => ClightStmt::Ssequence(
@@ -1659,7 +1834,9 @@ fn contains_loop_level_continue(s: &ClightStmt) -> bool {
             contains_loop_level_continue(t) || contains_loop_level_continue(e)
         }
         ClightStmt::Slabel(_, inner) => contains_loop_level_continue(inner),
-        ClightStmt::Sswitch(_, cases) => cases.iter().any(|(_, st)| contains_loop_level_continue(st)),
+        ClightStmt::Sswitch(_, cases) => {
+            cases.iter().any(|(_, st)| contains_loop_level_continue(st))
+        }
         ClightStmt::Sloop(..) => false,
         _ => false,
     }
@@ -1670,7 +1847,9 @@ fn contains_escaping_break(s: &ClightStmt) -> bool {
     match s {
         ClightStmt::Sbreak => true,
         ClightStmt::Ssequence(ss) => ss.iter().any(contains_escaping_break),
-        ClightStmt::Sifthenelse(_, t, e) => contains_escaping_break(t) || contains_escaping_break(e),
+        ClightStmt::Sifthenelse(_, t, e) => {
+            contains_escaping_break(t) || contains_escaping_break(e)
+        }
         ClightStmt::Slabel(_, inner) => contains_escaping_break(inner),
         ClightStmt::Sloop(..) | ClightStmt::Sswitch(..) => false,
         _ => false,
@@ -1690,7 +1869,9 @@ fn stmt_may_fall_through(s: &ClightStmt) -> bool {
         ClightStmt::Sloop(b, _) => contains_escaping_break(b),
         ClightStmt::Sswitch(_, cases) => {
             cases.iter().any(|(_, st)| contains_escaping_break(st))
-                || cases.last().map_or(true, |(_, st)| stmt_may_fall_through(st))
+                || cases
+                    .last()
+                    .map_or(true, |(_, st)| stmt_may_fall_through(st))
         }
         _ => true,
     }
@@ -1707,7 +1888,10 @@ pub(crate) fn callee_ident_from_expr(
             if let Some(&id) = name_to_ident.get(&key) {
                 return Some(id);
             }
-            let sanitized = crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(name);
+            let sanitized =
+                crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(
+                    name,
+                );
             name_to_ident.get(&sanitized).copied()
         }
         ClightExpr::Eaddrof(inner, _) => callee_ident_from_expr(inner, name_to_ident),
@@ -1912,7 +2096,6 @@ fn redirect_gotos_in_stmt(stmt: &ClightStmt, redirect_map: &HashMap<Node, Node>)
     }
 }
 
-
 fn inline_control_flow_bodies(
     statements: &mut HashMap<Node, ClightStmt>,
     successors: &HashMap<Node, Vec<Node>>,
@@ -1929,8 +2112,14 @@ fn inline_control_flow_bodies(
         if let Some(stmt) = statements.get(&node).cloned() {
             let mut visiting = HashSet::new();
             visiting.insert(node);
-            let (inlined, newly_inlined) =
-                inline_stmt_recursive_track(&stmt, statements, &preds, &mut visiting, 0, &mut depth_of);
+            let (inlined, newly_inlined) = inline_stmt_recursive_track(
+                &stmt,
+                statements,
+                &preds,
+                &mut visiting,
+                0,
+                &mut depth_of,
+            );
             // Free absorbed children immediately: each inlined node has pred_count==1 so it is referenced nowhere else, and keeping every fully-inlined tree is O(n^2) memory that OOMs large functions.
             for &n in &newly_inlined {
                 statements.remove(&n);
@@ -2102,19 +2291,43 @@ fn inline_stmt_recursive_track(
 
     let result = match stmt {
         ClightStmt::Sifthenelse(cond, then_box, else_box) => {
-            let (then_stmt, then_inlined) =
-                inline_body_if_local_track(&**then_box, statements, preds, visiting, depth + 1, depth_of);
-            let (else_stmt, else_inlined) =
-                inline_body_if_local_track(&**else_box, statements, preds, visiting, depth + 1, depth_of);
+            let (then_stmt, then_inlined) = inline_body_if_local_track(
+                &**then_box,
+                statements,
+                preds,
+                visiting,
+                depth + 1,
+                depth_of,
+            );
+            let (else_stmt, else_inlined) = inline_body_if_local_track(
+                &**else_box,
+                statements,
+                preds,
+                visiting,
+                depth + 1,
+                depth_of,
+            );
             inlined.extend(then_inlined);
             inlined.extend(else_inlined);
             ClightStmt::Sifthenelse(cond.clone(), Box::new(then_stmt), Box::new(else_stmt))
         }
         ClightStmt::Sloop(body_box, incr_box) => {
-            let (body_stmt, body_inlined) =
-                inline_body_if_local_track(&**body_box, statements, preds, visiting, depth + 1, depth_of);
-            let (incr_stmt, incr_inlined) =
-                inline_body_if_local_track(&**incr_box, statements, preds, visiting, depth + 1, depth_of);
+            let (body_stmt, body_inlined) = inline_body_if_local_track(
+                &**body_box,
+                statements,
+                preds,
+                visiting,
+                depth + 1,
+                depth_of,
+            );
+            let (incr_stmt, incr_inlined) = inline_body_if_local_track(
+                &**incr_box,
+                statements,
+                preds,
+                visiting,
+                depth + 1,
+                depth_of,
+            );
             inlined.extend(body_inlined);
             inlined.extend(incr_inlined);
             ClightStmt::Sloop(Box::new(body_stmt), Box::new(incr_stmt))
@@ -2122,24 +2335,42 @@ fn inline_stmt_recursive_track(
         ClightStmt::Ssequence(stmts) => {
             let mut result_stmts = Vec::new();
             for s in stmts {
-                let (inlined_s, s_inlined) =
-                    inline_stmt_recursive_track(s, statements, preds, visiting, depth + 1, depth_of);
+                let (inlined_s, s_inlined) = inline_stmt_recursive_track(
+                    s,
+                    statements,
+                    preds,
+                    visiting,
+                    depth + 1,
+                    depth_of,
+                );
                 result_stmts.push(inlined_s);
                 inlined.extend(s_inlined);
             }
             ClightStmt::Ssequence(flatten_sequence(result_stmts))
         }
         ClightStmt::Slabel(lbl, inner) => {
-            let (inner_inlined, inner_nodes) =
-                inline_stmt_recursive_track(&**inner, statements, preds, visiting, depth + 1, depth_of);
+            let (inner_inlined, inner_nodes) = inline_stmt_recursive_track(
+                &**inner,
+                statements,
+                preds,
+                visiting,
+                depth + 1,
+                depth_of,
+            );
             inlined.extend(inner_nodes);
             ClightStmt::Slabel(*lbl, Box::new(inner_inlined))
         }
         ClightStmt::Sswitch(expr, cases) => {
             let mut new_cases = Vec::new();
             for (label, case_stmt) in cases {
-                let (inlined_case, case_inlined) =
-                    inline_body_if_local_track(case_stmt, statements, preds, visiting, depth + 1, depth_of);
+                let (inlined_case, case_inlined) = inline_body_if_local_track(
+                    case_stmt,
+                    statements,
+                    preds,
+                    visiting,
+                    depth + 1,
+                    depth_of,
+                );
                 inlined.extend(case_inlined);
                 new_cases.push((label.clone(), inlined_case));
             }
@@ -2174,12 +2405,20 @@ fn inline_body_if_local_track(
                         .entry(target_node)
                         .or_insert_with(|| stmt_depth(target_stmt));
                     if depth > 300 && std::env::var("RB2_TRACE").is_ok() {
-                        eprintln!("[rb2] RUNAWAY depth={} target={:x} tdepth={}", depth, target_node, target_depth);
+                        eprintln!(
+                            "[rb2] RUNAWAY depth={} target={:x} tdepth={}",
+                            depth, target_node, target_depth
+                        );
                     }
                     if depth + target_depth <= MAX_GOTO_INLINE_DEPTH {
                         visiting.insert(target_node);
                         let (recursed_stmt, mut recursed_nodes) = inline_stmt_recursive_track(
-                            target_stmt, statements, preds, visiting, depth + 1, depth_of,
+                            target_stmt,
+                            statements,
+                            preds,
+                            visiting,
+                            depth + 1,
+                            depth_of,
                         );
                         recursed_nodes.push(target_node);
                         return (recursed_stmt, recursed_nodes);
@@ -2275,15 +2514,12 @@ fn stmt_contains_label(stmt: &ClightStmt, target_label: usize) -> bool {
                 || stmt_contains_label(else_stmt, target_label)
         }
         ClightStmt::Sloop(body, incr) => {
-            stmt_contains_label(body, target_label)
-                || stmt_contains_label(incr, target_label)
+            stmt_contains_label(body, target_label) || stmt_contains_label(incr, target_label)
         }
-        ClightStmt::Ssequence(stmts) => {
-            stmts.iter().any(|s| stmt_contains_label(s, target_label))
-        }
-        ClightStmt::Sswitch(_, cases) => {
-            cases.iter().any(|(_, s)| stmt_contains_label(s, target_label))
-        }
+        ClightStmt::Ssequence(stmts) => stmts.iter().any(|s| stmt_contains_label(s, target_label)),
+        ClightStmt::Sswitch(_, cases) => cases
+            .iter()
+            .any(|(_, s)| stmt_contains_label(s, target_label)),
         _ => false,
     }
 }
@@ -2301,7 +2537,9 @@ fn ensure_goto_labels(statements: &mut HashMap<Node, ClightStmt>) {
     let mut missing: Vec<usize> = goto_targets.difference(&label_defs).copied().collect();
     missing.sort();
     for label_ident in missing {
-        let already_nested = statements.values().any(|s| stmt_contains_label(s, label_ident));
+        let already_nested = statements
+            .values()
+            .any(|s| stmt_contains_label(s, label_ident));
         if already_nested {
             continue;
         }
@@ -2311,7 +2549,10 @@ fn ensure_goto_labels(statements: &mut HashMap<Node, ClightStmt>) {
             let wrapped = ClightStmt::Slabel(label_ident, Box::new(stmt.clone()));
             statements.insert(node, wrapped);
         } else {
-            statements.insert(node, ClightStmt::Slabel(label_ident, Box::new(ClightStmt::Sskip)));
+            statements.insert(
+                node,
+                ClightStmt::Slabel(label_ident, Box::new(ClightStmt::Sskip)),
+            );
         }
     }
 }

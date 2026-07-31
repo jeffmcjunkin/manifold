@@ -1,13 +1,14 @@
-
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_pass::invert_condition;
 use crate::decompile::passes::pass::IRPass;
 use crate::util::exec_order_key;
 use crate::x86::op::{Comparison, Condition};
-use crate::x86::types::{Address, BuiltinArg, Constant, CsharpminorExpr, CsharpminorStmt, Node, RTLReg, Symbol};
+use crate::x86::types::{
+    Address, BuiltinArg, Constant, CsharpminorExpr, CsharpminorStmt, Node, RTLReg, Symbol,
+};
 use ascent::ascent_par;
-use ascent::Dual;
 use ascent::lattice::set::Set;
+use ascent::Dual;
 use log::debug;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -107,9 +108,7 @@ impl IRPass for StructuringPass {
             .map(|(addr, _, entry)| (*addr, *entry))
             .collect();
 
-        let all_stmts: Vec<(Node, CsharpminorStmt)> = working
-            .into_iter()
-            .collect();
+        let all_stmts: Vec<(Node, CsharpminorStmt)> = working.into_iter().collect();
 
         let mut func_stmts: HashMap<Address, Vec<(Node, CsharpminorStmt)>> = HashMap::new();
         let mut unowned_stmts: Vec<(Node, CsharpminorStmt)> = Vec::new();
@@ -136,23 +135,33 @@ impl IRPass for StructuringPass {
         }
 
         // Process functions in parallel
-        let per_func_results: Vec<_> = func_stmts.par_iter()
+        let per_func_results: Vec<_> = func_stmts
+            .par_iter()
             .map(|(func_addr, stmts)| {
                 if stmts.len() <= 1 {
-                    return (*func_addr, StructuringResult {
-                        stmts: stmts.clone(),
-                        goto_is_break: vec![],
-                        switch_chain_members: vec![],
-                        valid_switches: vec![],
-                        ifbody_true: vec![],
-                        ifbody_false: vec![],
-                        join_points: vec![],
-                        scond_no_join: vec![],
-                    });
+                    return (
+                        *func_addr,
+                        StructuringResult {
+                            stmts: stmts.clone(),
+                            goto_is_break: vec![],
+                            switch_chain_members: vec![],
+                            valid_switches: vec![],
+                            ifbody_true: vec![],
+                            ifbody_false: vec![],
+                            join_points: vec![],
+                            scond_no_join: vec![],
+                        },
+                    );
                 }
 
                 let declared_entry = func_entry.get(func_addr).copied();
-                let structured = structure(stmts, &next_map, declared_entry, &cminor_preds, &packed_alu_nodes);
+                let structured = structure(
+                    stmts,
+                    &next_map,
+                    declared_entry,
+                    &cminor_preds,
+                    &packed_alu_nodes,
+                );
                 (*func_addr, structured)
             })
             .collect();
@@ -255,15 +264,41 @@ impl IRPass for StructuringPass {
             scond_no_join_rel.push(tuple);
         }
         db.rel_set("emit_scond_no_join", scond_no_join_rel);
+        crate::decompile::passes::rtl_pass::enforce_win64_home_slot_types(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
-        &["csharp_stmt_candidate", "instr_in_function", "single_def_const", "dead_def", "code_in_block", "next", "emit_inline_temp", "emit_var_type_candidate", "emit_function", "emit_function_param_candidate", "packed_alu_addr"]
+        &[
+            "csharp_stmt_candidate",
+            "instr_in_function",
+            "single_def_const",
+            "dead_def",
+            "code_in_block",
+            "next",
+            "emit_inline_temp",
+            "emit_var_type_candidate",
+            "emit_function",
+            "emit_function_param_candidate",
+            "packed_alu_addr",
+            "slot_escaped_canonical",
+            "win64_home_escaped",
+            "win64_home_slot_type",
+        ]
     }
 
     fn outputs(&self) -> &'static [&'static str] {
-        &["csharp_stmt", "goto_is_break", "switch_chain_member", "valid_switch_chain", "emit_switch_chain",
-          "emit_ifbody_true", "emit_ifbody_false", "emit_join_point", "emit_scond_no_join", "emit_var_type_candidate"]
+        &[
+            "csharp_stmt",
+            "goto_is_break",
+            "switch_chain_member",
+            "valid_switch_chain",
+            "emit_switch_chain",
+            "emit_ifbody_true",
+            "emit_ifbody_false",
+            "emit_join_point",
+            "emit_scond_no_join",
+            "emit_var_type_candidate",
+        ]
     }
 }
 
@@ -998,7 +1033,8 @@ fn unmerge_pure_branch_tails(
         }
     }
     let pred_count = |node: Node| -> usize {
-        branch_preds.get(&node).map_or(0, |v| v.len()) + fall_preds.get(&node).map_or(0, |v| v.len())
+        branch_preds.get(&node).map_or(0, |v| v.len())
+            + fall_preds.get(&node).map_or(0, |v| v.len())
     };
 
     let mut new_stmts: Vec<(Node, CsharpminorStmt)> = Vec::new();
@@ -1069,10 +1105,12 @@ fn unmerge_pure_branch_tails(
         {
             continue;
         }
-        if !chain
-            .iter()
-            .any(|n| matches!(stmt_map[n], CsharpminorStmt::Sset(_, _) | CsharpminorStmt::Sstore(_, _, _)))
-        {
+        if !chain.iter().any(|n| {
+            matches!(
+                stmt_map[n],
+                CsharpminorStmt::Sset(_, _) | CsharpminorStmt::Sstore(_, _, _)
+            )
+        }) {
             continue;
         }
         // Scope to RETURN tails: follow the exit jump through straight-line nodes and require an Sreturn, since duplicating into a loop continuation or switch merge would mangle it.
@@ -1229,8 +1267,7 @@ pub fn structure(
 
     prog.run();
 
-    let stmt_map: HashMap<Node, CsharpminorStmt> =
-        current_stmts.iter().cloned().collect();
+    let stmt_map: HashMap<Node, CsharpminorStmt> = current_stmts.iter().cloned().collect();
 
     let join_points: HashMap<Node, Node> = prog
         .join_point
@@ -1244,11 +1281,7 @@ pub fn structure(
         .map(|(branch, t, f)| (*branch, (*t, *f)))
         .collect();
 
-    let no_join_nodes: HashSet<Node> = prog
-        .scond_no_join
-        .iter()
-        .map(|(n,)| *n)
-        .collect();
+    let no_join_nodes: HashSet<Node> = prog.scond_no_join.iter().map(|(n,)| *n).collect();
 
     let mut true_bodies: HashMap<Node, Vec<Node>> = HashMap::new();
     for (branch, member) in &prog.ifbody_true {
@@ -1257,7 +1290,6 @@ pub fn structure(
     for nodes in true_bodies.values_mut() {
         nodes.sort();
     }
-
 
     let mut false_bodies: HashMap<Node, Vec<Node>> = HashMap::new();
     for (branch, member) in &prog.ifbody_false {
@@ -1294,11 +1326,7 @@ pub fn structure(
         v
     };
 
-    let trimmed: HashSet<Node> = prog
-        .trim_node
-        .iter()
-        .map(|(n,)| *n)
-        .collect();
+    let trimmed: HashSet<Node> = prog.trim_node.iter().map(|(n,)| *n).collect();
 
     let break_stmts: HashMap<Node, CsharpminorStmt> = prog
         .break_stmt
@@ -1306,17 +1334,10 @@ pub fn structure(
         .map(|(n, s)| (*n, s.clone()))
         .collect();
 
-    let goto_is_break: Vec<(Node, Node)> = prog
-        .goto_is_break
-        .iter()
-        .map(|(n, t)| (*n, *t))
-        .collect();
+    let goto_is_break: Vec<(Node, Node)> =
+        prog.goto_is_break.iter().map(|(n, t)| (*n, *t)).collect();
 
-    let loop_exit_cond_nodes: HashSet<Node> = prog
-        .cond_is_break
-        .iter()
-        .map(|(n, _)| *n)
-        .collect();
+    let loop_exit_cond_nodes: HashSet<Node> = prog.cond_is_break.iter().map(|(n, _)| *n).collect();
 
     let primary_exits: HashMap<Node, Node> = prog
         .primary_exit_cond
@@ -1330,9 +1351,7 @@ pub fn structure(
     let mut switch_chain_members: Vec<(Node, Node, u64, i64, Node)> = prog
         .switch_chain
         .iter()
-        .filter(|(head, _, _, _, _)| {
-            prog.primary_switch.iter().any(|(h, _)| h == head)
-        })
+        .filter(|(head, _, _, _, _)| prog.primary_switch.iter().any(|(h, _)| h == head))
         .map(|(head, member, reg, val, target)| (*head, *member, *reg, *val, *target))
         .collect();
 
@@ -1341,6 +1360,23 @@ pub fn structure(
         .iter()
         .map(|(head, reg)| (*head, *reg))
         .collect();
+
+    // A C switch cannot contain the same case value more than once.  Repeated
+    // values here mean the comparison chain changes the discriminant between
+    // members (for example, DEC/Jcc cascades) and the Ascent relation has not
+    // represented that rebasing.  Keep the original conditionals instead of
+    // suppressing members under an unsound switch.
+    let mut values_by_head: HashMap<Node, HashSet<i64>> = HashMap::new();
+    let mut duplicate_value_heads: HashSet<Node> = HashSet::new();
+    for (head, _, _, value, _) in &switch_chain_members {
+        if !values_by_head.entry(*head).or_default().insert(*value) {
+            duplicate_value_heads.insert(*head);
+        }
+    }
+    if !duplicate_value_heads.is_empty() {
+        switch_chain_members.retain(|(head, _, _, _, _)| !duplicate_value_heads.contains(head));
+        valid_switches.retain(|(head, _)| !duplicate_value_heads.contains(head));
+    }
 
     // Fallback imperative comparison-tree analysis, deduplicated by head AND by any node already in an Ascent chain, or the walker rediscovers each chain from every interior Ceq node.
     let ascent_chain_nodes: HashSet<Node> = switch_chain_members
@@ -1354,7 +1390,9 @@ pub fn structure(
     {
         let mut by_head: HashMap<Node, (u64, Vec<Node>, Vec<(i64, Node)>)> = HashMap::new();
         for (head, member, reg, val, target) in &switch_chain_members {
-            let e = by_head.entry(*head).or_insert((*reg, Vec::new(), Vec::new()));
+            let e = by_head
+                .entry(*head)
+                .or_insert((*reg, Vec::new(), Vec::new()));
             e.1.push(*member);
             e.2.push((*val, *target));
         }
@@ -1383,7 +1421,8 @@ pub fn structure(
     }
 
     // Walker fallback roots flow through the same shape canonicalization, processed LARGEST-first so a full-cascade walk canonicalizes before the mid-entry walks that see only its tail.
-    let mut tree_results = detect_comparison_tree_switches(&current_stmts, next_map, &loop_exit_cond_nodes);
+    let mut tree_results =
+        detect_comparison_tree_switches(&current_stmts, next_map, &loop_exit_cond_nodes);
     tree_results.sort_by(|a, b| b.2.len().cmp(&a.2.len()).then(a.0.cmp(&b.0)));
     // CF-6 diagnostics: per-function dump of walker inputs/results and canonicalization decisions. Buffered into one eprint per function so parallel structure() calls do not interleave lines.
     let cf6_trace = std::env::var("MANIFOLD_CF6_TRACE").is_ok();
@@ -1393,8 +1432,15 @@ pub fn structure(
         for (n, s) in &current_stmts {
             match s {
                 CsharpminorStmt::Scond(cond, args, t, f) => {
-                    buf.push_str(&format!("[CF6] stmt {:#x}: Scond {:?} args={:?} t={:#x} f={:#x} break={}\n",
-                        n, cond, args, t, f, loop_exit_cond_nodes.contains(n)));
+                    buf.push_str(&format!(
+                        "[CF6] stmt {:#x}: Scond {:?} args={:?} t={:#x} f={:#x} break={}\n",
+                        n,
+                        cond,
+                        args,
+                        t,
+                        f,
+                        loop_exit_cond_nodes.contains(n)
+                    ));
                 }
                 CsharpminorStmt::Sset(d, e) => {
                     buf.push_str(&format!("[CF6] stmt {:#x}: Sset r{} = {:?}\n", n, d, e));
@@ -1408,11 +1454,21 @@ pub fn structure(
         let mut ac: Vec<(Node, Node, u64, i64, Node)> = switch_chain_members.clone();
         ac.sort_unstable();
         for (h, m, r, v, t) in ac {
-            buf.push_str(&format!("[CF6] ascent row: head={:#x} member={:#x} reg=r{} val={} target={:#x}\n", h, m, r, v, t));
+            buf.push_str(&format!(
+                "[CF6] ascent row: head={:#x} member={:#x} reg=r{} val={} target={:#x}\n",
+                h, m, r, v, t
+            ));
         }
         for (head, reg, cases) in &tree_results {
-            buf.push_str(&format!("[CF6] walker root {:#x} reg=r{} cases={:?}\n", head, reg,
-                cases.iter().map(|(v, t, m)| format!("{}=>{:#x}@{:#x}", v, t, m)).collect::<Vec<_>>()));
+            buf.push_str(&format!(
+                "[CF6] walker root {:#x} reg=r{} cases={:?}\n",
+                head,
+                reg,
+                cases
+                    .iter()
+                    .map(|(v, t, m)| format!("{}=>{:#x}@{:#x}", v, t, m))
+                    .collect::<Vec<_>>()
+            ));
         }
         eprint!("{}", buf);
     }
@@ -1422,7 +1478,9 @@ pub fn structure(
         kept_members_by_reg.entry(*reg).or_default().insert(*member);
     }
     for (head, reg, ref cases) in &tree_results {
-        if ascent_chain_nodes.contains(head) { continue; }
+        if ascent_chain_nodes.contains(head) {
+            continue;
+        }
         if cases.len() >= 3 {
             let mut members: Vec<Node> = cases.iter().map(|(_, _, m)| *m).collect();
             members.sort_unstable();
@@ -1546,7 +1604,11 @@ pub fn structure(
                     break;
                 }
             }
-            let mut members: Vec<Node> = rows.iter().map(|(m, _)| *m).filter(|m| *m != head).collect();
+            let mut members: Vec<Node> = rows
+                .iter()
+                .map(|(m, _)| *m)
+                .filter(|m| *m != head)
+                .collect();
             members.sort_unstable();
             members.dedup();
             // Leaf = exactly one chain-exiting branch. Rewrite is sound: untainted leaves are only reached through suppressed in-chain compares, so `goto exit` IS the no-match branch.
@@ -1604,7 +1666,10 @@ pub fn structure(
                 if head_set.contains(&m) {
                     continue;
                 }
-                if member_heads.get(&m).map_or(false, |hs| hs.as_slice() != [head]) {
+                if member_heads
+                    .get(&m)
+                    .map_or(false, |hs| hs.as_slice() != [head])
+                {
                     continue;
                 }
                 leaf_rewrites.push((m, exit));
@@ -1616,7 +1681,10 @@ pub fn structure(
         }
         if cf6_trace {
             for (m, ex) in &leaf_rewrites {
-                eprintln!("[CF6] leaf member {:#x} rewritten to goto {:#x} (no-match routing)", m, ex);
+                eprintln!(
+                    "[CF6] leaf member {:#x} rewritten to goto {:#x} (no-match routing)",
+                    m, ex
+                );
             }
         }
         // Reattribute rewritten leaves' case rows to their head so chain_member_node no longer suppresses the node (its statement is now the default goto).
@@ -1637,13 +1705,15 @@ pub fn structure(
 
     // Valid if-then-else branches for metadata export, excluding loop exit conditions, switch members, and vector-bypass guards whose Scond becomes an unconditional Sjump.
     let bypass_guard_set: HashSet<Node> = vec_bypass_rewrites.iter().map(|(g, _)| *g).collect();
-    let skip_branches: HashSet<Node> = loop_exit_cond_nodes.iter()
+    let skip_branches: HashSet<Node> = loop_exit_cond_nodes
+        .iter()
         .chain(switch_member_nodes.iter())
         .chain(bypass_guard_set.iter())
         .copied()
         .collect();
 
-    let valid_ite_branches: HashSet<Node> = join_points.keys()
+    let valid_ite_branches: HashSet<Node> = join_points
+        .keys()
         .chain(no_join_nodes.iter())
         .filter(|branch| !skip_branches.contains(branch))
         .copied()
@@ -1703,12 +1773,14 @@ pub fn structure(
         }
     }
 
-    let out_join_points: Vec<(Node, Node)> = join_points.iter()
+    let out_join_points: Vec<(Node, Node)> = join_points
+        .iter()
         .filter(|(branch, _)| valid_ite_branches.contains(branch))
         .map(|(&branch, &join)| (branch, join))
         .collect();
 
-    let out_scond_no_join: Vec<Node> = no_join_nodes.iter()
+    let out_scond_no_join: Vec<Node> = no_join_nodes
+        .iter()
         .filter(|branch| valid_ite_branches.contains(branch))
         .copied()
         .collect();
@@ -1863,7 +1935,9 @@ fn detect_comparison_tree_switches(
         if let CsharpminorStmt::Sset(dst, expr) = s {
             match expr {
                 CsharpminorExpr::Ebinop(op, lhs, rhs) => {
-                    if let (CsharpminorExpr::Evar(src), CsharpminorExpr::Econst(cst)) = (lhs.as_ref(), rhs.as_ref()) {
+                    if let (CsharpminorExpr::Evar(src), CsharpminorExpr::Econst(cst)) =
+                        (lhs.as_ref(), rhs.as_ref())
+                    {
                         if *src == *dst {
                             continue;
                         }
@@ -1883,7 +1957,9 @@ fn detect_comparison_tree_switches(
         let mut total_offset: i64 = 0;
         let mut visited = HashSet::new();
         while let Some(&(src, off)) = reg_derivation.get(&current) {
-            if !visited.insert(current) { break; }
+            if !visited.insert(current) {
+                break;
+            }
             total_offset += off;
             current = src;
         }
@@ -1905,10 +1981,14 @@ fn detect_comparison_tree_switches(
         cases: &mut Vec<(i64, Node, Node)>,
         visited: &mut HashSet<Node>,
     ) {
-        if !visited.insert(node) { return; }
+        if !visited.insert(node) {
+            return;
+        }
 
         // Loop-exit compares are not dispatch members (same exclusion the Ascent chain rules apply via !cond_is_break, and the same reason roots skip them): crossing one walks out of the dispatch region, e.g. around a loop back edge into the next iteration's tests.
-        if cond_break_nodes.contains(&node) { return; }
+        if cond_break_nodes.contains(&node) {
+            return;
+        }
 
         // Track in-place self-updates of the discriminant for subsequent compares on this path: `Sset(disc_reg, disc_reg + N)` updates local_disc_offset by N.
         if let Some(s) = stmt_map.get(&node) {
@@ -1922,7 +2002,20 @@ fn detect_comparison_tree_switches(
                                 if let Some(off) = switch_disc_offset(op, cst) {
                                     if let Some(&next) = seq_next_map.get(&node) {
                                         // The path interval is in root space (compare offsets renormalize), so it passes through unchanged.
-                                        walk_tree(next, disc_reg, local_disc_offset + off, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                                        walk_tree(
+                                            next,
+                                            disc_reg,
+                                            local_disc_offset + off,
+                                            path_lo,
+                                            path_hi,
+                                            stmt_map,
+                                            seq_next_map,
+                                            reg_derivation,
+                                            resolve_reg,
+                                            cond_break_nodes,
+                                            cases,
+                                            visited,
+                                        );
                                     }
                                     return;
                                 }
@@ -1941,8 +2034,8 @@ fn detect_comparison_tree_switches(
                 let (reg_opt, inline_off) = match &args[0] {
                     CsharpminorExpr::Evar(reg) => (Some(*reg), 0i64),
                     CsharpminorExpr::Ebinop(op, lhs, rhs) => {
-                        if let (CsharpminorExpr::Evar(reg), CsharpminorExpr::Econst(cst))
-                            = (lhs.as_ref(), rhs.as_ref())
+                        if let (CsharpminorExpr::Evar(reg), CsharpminorExpr::Econst(cst)) =
+                            (lhs.as_ref(), rhs.as_ref())
                         {
                             match switch_disc_offset(op, cst) {
                                 Some(o) => (Some(*reg), o),
@@ -1966,28 +2059,69 @@ fn detect_comparison_tree_switches(
                 match stmt_map.get(&node) {
                     Some(CsharpminorStmt::Sjump(t)) => {
                         if *t != node {
-                            walk_tree(*t, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                            walk_tree(
+                                *t,
+                                disc_reg,
+                                local_disc_offset,
+                                path_lo,
+                                path_hi,
+                                stmt_map,
+                                seq_next_map,
+                                reg_derivation,
+                                resolve_reg,
+                                cond_break_nodes,
+                                cases,
+                                visited,
+                            );
                         }
                     }
                     Some(CsharpminorStmt::Snop) => {
                         if let Some(&next) = seq_next_map.get(&node) {
-                            walk_tree(next, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                            walk_tree(
+                                next,
+                                disc_reg,
+                                local_disc_offset,
+                                path_lo,
+                                path_hi,
+                                stmt_map,
+                                seq_next_map,
+                                reg_derivation,
+                                resolve_reg,
+                                cond_break_nodes,
+                                cases,
+                                visited,
+                            );
                         }
                     }
                     Some(CsharpminorStmt::Sset(_, expr)) => {
                         let rebase_copy = match expr {
-                            CsharpminorExpr::Ebinop(op, lhs, rhs) => match (lhs.as_ref(), rhs.as_ref()) {
-                                (CsharpminorExpr::Evar(src), CsharpminorExpr::Econst(cst)) => {
-                                    switch_disc_offset(op, cst).is_some()
-                                        && resolve_reg(*src).0 == disc_reg
+                            CsharpminorExpr::Ebinop(op, lhs, rhs) => {
+                                match (lhs.as_ref(), rhs.as_ref()) {
+                                    (CsharpminorExpr::Evar(src), CsharpminorExpr::Econst(cst)) => {
+                                        switch_disc_offset(op, cst).is_some()
+                                            && resolve_reg(*src).0 == disc_reg
+                                    }
+                                    _ => false,
                                 }
-                                _ => false,
-                            },
+                            }
                             _ => false,
                         };
                         if rebase_copy {
                             if let Some(&next) = seq_next_map.get(&node) {
-                                walk_tree(next, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                                walk_tree(
+                                    next,
+                                    disc_reg,
+                                    local_disc_offset,
+                                    path_lo,
+                                    path_hi,
+                                    stmt_map,
+                                    seq_next_map,
+                                    reg_derivation,
+                                    resolve_reg,
+                                    cond_break_nodes,
+                                    cases,
+                                    visited,
+                                );
                             }
                         }
                     }
@@ -1999,7 +2133,11 @@ fn detect_comparison_tree_switches(
 
         let (root_reg, derive_off) = resolve_reg(reg);
         // Apply the local offset only if the comparison's register IS the discriminant (an in-place update to disc_reg shifts the effective compared value).
-        let path_off = if root_reg == disc_reg { local_disc_offset } else { 0 };
+        let path_off = if root_reg == disc_reg {
+            local_disc_offset
+        } else {
+            0
+        };
         let offset = derive_off + inline_off + path_off;
         let is_disc = root_reg == disc_reg;
 
@@ -2008,39 +2146,97 @@ fn detect_comparison_tree_switches(
             Condition::Ccompimm(Comparison::Ceq, val)
             | Condition::Ccompuimm(Comparison::Ceq, val)
             | Condition::Ccomplimm(Comparison::Ceq, val)
-            | Condition::Ccompluimm(Comparison::Ceq, val) if is_disc => {
+            | Condition::Ccompluimm(Comparison::Ceq, val)
+                if is_disc =>
+            {
                 let case_val = val - offset;
                 cases.push((case_val, ifso, node));
-                walk_tree(ifnot, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                walk_tree(
+                    ifnot,
+                    disc_reg,
+                    local_disc_offset,
+                    path_lo,
+                    path_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
             }
 
             // Cne: false branch = case body (inverted), true continues
             Condition::Ccompimm(Comparison::Cne, val)
             | Condition::Ccompuimm(Comparison::Cne, val)
             | Condition::Ccomplimm(Comparison::Cne, val)
-            | Condition::Ccompluimm(Comparison::Cne, val) if is_disc => {
+            | Condition::Ccompluimm(Comparison::Cne, val)
+                if is_disc =>
+            {
                 let case_val = val - offset;
                 cases.push((case_val, ifnot, node));
-                walk_tree(ifso, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                walk_tree(
+                    ifso,
+                    disc_reg,
+                    local_disc_offset,
+                    path_lo,
+                    path_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
             }
 
             // Cmaskzero(M) on disc is (disc & M) == 0, which when the AND bounded disc to [0..M] is exactly disc == 0, so treat it like Ceq(0); clang -O1 fuses the and and je into it.
             Condition::Cmaskzero(mask) if is_disc && mask > 0 && (mask & (mask + 1)) == 0 => {
                 let case_val = -offset;
                 cases.push((case_val, ifso, node));
-                walk_tree(ifnot, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                walk_tree(
+                    ifnot,
+                    disc_reg,
+                    local_disc_offset,
+                    path_lo,
+                    path_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
             }
 
             // Cmasknotzero(M) on disc means `(disc & M) != 0`. With M = 2^n - 1, this is the negation of case 0. Treat like Cne(0).
             Condition::Cmasknotzero(mask) if is_disc && mask > 0 && (mask & (mask + 1)) == 0 => {
                 let case_val = -offset;
                 cases.push((case_val, ifnot, node));
-                walk_tree(ifso, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                walk_tree(
+                    ifso,
+                    disc_reg,
+                    local_disc_offset,
+                    path_lo,
+                    path_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
             }
 
             // Unsigned disc < bound with a non-positive offset enumerates a bounded range for the true branch, which also implies a signed interval that narrows the path for nested signed guards.
             Condition::Ccompuimm(Comparison::Clt, bound)
-            | Condition::Ccompluimm(Comparison::Clt, bound) if is_disc => {
+            | Condition::Ccompluimm(Comparison::Clt, bound)
+                if is_disc =>
+            {
                 let disc_lower = -offset;
                 let disc_upper = bound - offset - 1;
                 if disc_lower >= 0 && disc_upper >= disc_lower && (disc_upper - disc_lower) < 32 {
@@ -2050,14 +2246,44 @@ fn detect_comparison_tree_switches(
                 }
                 let (t_lo, t_hi) = if disc_lower >= 0 && disc_upper >= disc_lower {
                     (clamp_lo(path_lo, disc_lower), clamp_hi(path_hi, disc_upper))
-                } else { (path_lo, path_hi) };
-                walk_tree(ifso, disc_reg, local_disc_offset, t_lo, t_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
-                walk_tree(ifnot, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                } else {
+                    (path_lo, path_hi)
+                };
+                walk_tree(
+                    ifso,
+                    disc_reg,
+                    local_disc_offset,
+                    t_lo,
+                    t_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
+                walk_tree(
+                    ifnot,
+                    disc_reg,
+                    local_disc_offset,
+                    path_lo,
+                    path_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
             }
 
             // Unsigned `disc <= bound`: similar but inclusive upper bound.
             Condition::Ccompuimm(Comparison::Cle, bound)
-            | Condition::Ccompluimm(Comparison::Cle, bound) if is_disc => {
+            | Condition::Ccompluimm(Comparison::Cle, bound)
+                if is_disc =>
+            {
                 let disc_lower = -offset;
                 let disc_upper = bound - offset;
                 if disc_lower >= 0 && disc_upper >= disc_lower && (disc_upper - disc_lower) < 32 {
@@ -2067,14 +2293,44 @@ fn detect_comparison_tree_switches(
                 }
                 let (t_lo, t_hi) = if disc_lower >= 0 && disc_upper >= disc_lower {
                     (clamp_lo(path_lo, disc_lower), clamp_hi(path_hi, disc_upper))
-                } else { (path_lo, path_hi) };
-                walk_tree(ifso, disc_reg, local_disc_offset, t_lo, t_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
-                walk_tree(ifnot, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                } else {
+                    (path_lo, path_hi)
+                };
+                walk_tree(
+                    ifso,
+                    disc_reg,
+                    local_disc_offset,
+                    t_lo,
+                    t_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
+                walk_tree(
+                    ifnot,
+                    disc_reg,
+                    local_disc_offset,
+                    path_lo,
+                    path_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
             }
 
             // Unsigned (disc + neg_off) > bound with neg_off < 0: false branch represents disc in [-off, -off + bound]. Used by gcc -O1 to test a contiguous case cluster like `case 2: case 3:` via `sub $2,%eax; cmp $1,%eax; ja default`.
             Condition::Ccompuimm(Comparison::Cgt, bound)
-            | Condition::Ccompluimm(Comparison::Cgt, bound) if is_disc && offset < 0 => {
+            | Condition::Ccompluimm(Comparison::Cgt, bound)
+                if is_disc && offset < 0 =>
+            {
                 let disc_lower = -offset;
                 let disc_upper = bound - offset;
                 if disc_lower >= 0 && disc_upper >= disc_lower && (disc_upper - disc_lower) < 32 {
@@ -2084,14 +2340,44 @@ fn detect_comparison_tree_switches(
                 }
                 let (f_lo, f_hi) = if disc_lower >= 0 && disc_upper >= disc_lower {
                     (clamp_lo(path_lo, disc_lower), clamp_hi(path_hi, disc_upper))
-                } else { (path_lo, path_hi) };
-                walk_tree(ifso, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
-                walk_tree(ifnot, disc_reg, local_disc_offset, f_lo, f_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                } else {
+                    (path_lo, path_hi)
+                };
+                walk_tree(
+                    ifso,
+                    disc_reg,
+                    local_disc_offset,
+                    path_lo,
+                    path_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
+                walk_tree(
+                    ifnot,
+                    disc_reg,
+                    local_disc_offset,
+                    f_lo,
+                    f_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
             }
 
             // Unsigned (disc + neg_off) >= bound: false branch represents disc in [-off, -off + bound - 1].
             Condition::Ccompuimm(Comparison::Cge, bound)
-            | Condition::Ccompluimm(Comparison::Cge, bound) if is_disc && offset < 0 => {
+            | Condition::Ccompluimm(Comparison::Cge, bound)
+                if is_disc && offset < 0 =>
+            {
                 let disc_lower = -offset;
                 let disc_upper = bound - offset - 1;
                 if disc_lower >= 0 && disc_upper >= disc_lower && (disc_upper - disc_lower) < 32 {
@@ -2101,69 +2387,203 @@ fn detect_comparison_tree_switches(
                 }
                 let (f_lo, f_hi) = if disc_lower >= 0 && disc_upper >= disc_lower {
                     (clamp_lo(path_lo, disc_lower), clamp_hi(path_hi, disc_upper))
-                } else { (path_lo, path_hi) };
-                walk_tree(ifso, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
-                walk_tree(ifnot, disc_reg, local_disc_offset, f_lo, f_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                } else {
+                    (path_lo, path_hi)
+                };
+                walk_tree(
+                    ifso,
+                    disc_reg,
+                    local_disc_offset,
+                    path_lo,
+                    path_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
+                walk_tree(
+                    ifnot,
+                    disc_reg,
+                    local_disc_offset,
+                    f_lo,
+                    f_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
             }
 
             // SIGNED range guards narrow the path interval, and a branch whose interval becomes finite and small is a contiguous case CLUSTER, enumerated as cases when it lands on a body not further dispatch.
-            Condition::Ccompimm(scmp, val)
-            | Condition::Ccomplimm(scmp, val)
-                if is_disc && matches!(scmp, Comparison::Cgt | Comparison::Cge | Comparison::Clt | Comparison::Cle) => {
+            Condition::Ccompimm(scmp, val) | Condition::Ccomplimm(scmp, val)
+                if is_disc
+                    && matches!(
+                        scmp,
+                        Comparison::Cgt | Comparison::Cge | Comparison::Clt | Comparison::Cle
+                    ) =>
+            {
                 // Bound in root-disc space, since the compare tests (disc_root + offset); on overflow the branch intervals stay UNNARROWED and must not enumerate, or both branches bind the same values.
                 let b = val.checked_sub(offset);
                 let (t_lo, t_hi, f_lo, f_hi) = match (scmp, b) {
                     (Comparison::Cgt, Some(b)) => (
-                        b.checked_add(1).map_or(path_lo, |x| clamp_lo(path_lo, x)), path_hi,
-                        path_lo, clamp_hi(path_hi, b),
+                        b.checked_add(1).map_or(path_lo, |x| clamp_lo(path_lo, x)),
+                        path_hi,
+                        path_lo,
+                        clamp_hi(path_hi, b),
                     ),
                     (Comparison::Cge, Some(b)) => (
-                        clamp_lo(path_lo, b), path_hi,
-                        path_lo, b.checked_sub(1).map_or(path_hi, |x| clamp_hi(path_hi, x)),
+                        clamp_lo(path_lo, b),
+                        path_hi,
+                        path_lo,
+                        b.checked_sub(1).map_or(path_hi, |x| clamp_hi(path_hi, x)),
                     ),
                     (Comparison::Clt, Some(b)) => (
-                        path_lo, b.checked_sub(1).map_or(path_hi, |x| clamp_hi(path_hi, x)),
-                        clamp_lo(path_lo, b), path_hi,
+                        path_lo,
+                        b.checked_sub(1).map_or(path_hi, |x| clamp_hi(path_hi, x)),
+                        clamp_lo(path_lo, b),
+                        path_hi,
                     ),
                     (Comparison::Cle, Some(b)) => (
-                        path_lo, clamp_hi(path_hi, b),
-                        b.checked_add(1).map_or(path_lo, |x| clamp_lo(path_lo, x)), path_hi,
+                        path_lo,
+                        clamp_hi(path_hi, b),
+                        b.checked_add(1).map_or(path_lo, |x| clamp_lo(path_lo, x)),
+                        path_hi,
                     ),
                     _ => (path_lo, path_hi, path_lo, path_hi),
                 };
                 if b.is_some() {
                     if let Some((l, h)) = enumerable_range(t_lo, t_hi) {
-                        if !range_target_is_interior(ifso, disc_reg, stmt_map, seq_next_map, resolve_reg, cond_break_nodes) {
+                        if !range_target_is_interior(
+                            ifso,
+                            disc_reg,
+                            stmt_map,
+                            seq_next_map,
+                            resolve_reg,
+                            cond_break_nodes,
+                        ) {
                             for v in l..=h {
                                 cases.push((v, ifso, node));
                             }
                         }
                     }
                     if let Some((l, h)) = enumerable_range(f_lo, f_hi) {
-                        if !range_target_is_interior(ifnot, disc_reg, stmt_map, seq_next_map, resolve_reg, cond_break_nodes) {
+                        if !range_target_is_interior(
+                            ifnot,
+                            disc_reg,
+                            stmt_map,
+                            seq_next_map,
+                            resolve_reg,
+                            cond_break_nodes,
+                        ) {
                             for v in l..=h {
                                 cases.push((v, ifnot, node));
                             }
                         }
                     }
                 }
-                walk_tree(ifso, disc_reg, local_disc_offset, t_lo, t_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
-                walk_tree(ifnot, disc_reg, local_disc_offset, f_lo, f_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                walk_tree(
+                    ifso,
+                    disc_reg,
+                    local_disc_offset,
+                    t_lo,
+                    t_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
+                walk_tree(
+                    ifnot,
+                    disc_reg,
+                    local_disc_offset,
+                    f_lo,
+                    f_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
             }
 
             // Other range guards on the discriminant (unsigned Cgt/Cge with offset >= 0): partition the disc space without binding case values; cases come only from Ceq/Cne leaves below.
             Condition::Ccompuimm(Comparison::Cgt, _)
             | Condition::Ccompluimm(Comparison::Cgt, _)
             | Condition::Ccompuimm(Comparison::Cge, _)
-            | Condition::Ccompluimm(Comparison::Cge, _) if is_disc => {
-                walk_tree(ifso, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
-                walk_tree(ifnot, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+            | Condition::Ccompluimm(Comparison::Cge, _)
+                if is_disc =>
+            {
+                walk_tree(
+                    ifso,
+                    disc_reg,
+                    local_disc_offset,
+                    path_lo,
+                    path_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
+                walk_tree(
+                    ifnot,
+                    disc_reg,
+                    local_disc_offset,
+                    path_lo,
+                    path_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
             }
 
             // Non-discriminant or mask test: explore both branches
             _ => {
-                walk_tree(ifso, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
-                walk_tree(ifnot, disc_reg, local_disc_offset, path_lo, path_hi, stmt_map, seq_next_map, reg_derivation, resolve_reg, cond_break_nodes, cases, visited);
+                walk_tree(
+                    ifso,
+                    disc_reg,
+                    local_disc_offset,
+                    path_lo,
+                    path_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
+                walk_tree(
+                    ifnot,
+                    disc_reg,
+                    local_disc_offset,
+                    path_lo,
+                    path_hi,
+                    stmt_map,
+                    seq_next_map,
+                    reg_derivation,
+                    resolve_reg,
+                    cond_break_nodes,
+                    cases,
+                    visited,
+                );
             }
         }
     }
@@ -2174,43 +2594,61 @@ fn detect_comparison_tree_switches(
 
     for (node, s) in stmts {
         // Loop-exit Sconds match the discriminant pattern syntactically but are not switch cases; treating them as roots replays a chain the Ascent rules already recovered, duplicating switches.
-        if cond_break_nodes.contains(node) { continue; }
+        if cond_break_nodes.contains(node) {
+            continue;
+        }
         if let CsharpminorStmt::Scond(cond, args, _, _) = s {
-            if args.len() != 1 { continue; }
+            if args.len() != 1 {
+                continue;
+            }
             // Extract reg (possibly through Oaddl/Osubl with constant inline offset)
             let reg_opt: Option<RTLReg> = match &args[0] {
                 CsharpminorExpr::Evar(reg) => Some(*reg),
                 CsharpminorExpr::Ebinop(_, lhs, rhs) => {
-                    if let (CsharpminorExpr::Evar(reg), CsharpminorExpr::Econst(_))
-                        = (lhs.as_ref(), rhs.as_ref())
+                    if let (CsharpminorExpr::Evar(reg), CsharpminorExpr::Econst(_)) =
+                        (lhs.as_ref(), rhs.as_ref())
                     {
                         Some(*reg)
-                    } else { None }
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             };
             if let Some(reg) = reg_opt {
-                let is_disc_compare = matches!(cond,
+                let is_disc_compare = matches!(
+                    cond,
                     Condition::Ccompimm(_, _)
-                    | Condition::Ccompuimm(_, _)
-                    | Condition::Ccomplimm(_, _)
-                    | Condition::Ccompluimm(_, _)
-                    | Condition::Cmaskzero(_)
-                    | Condition::Cmasknotzero(_)
+                        | Condition::Ccompuimm(_, _)
+                        | Condition::Ccomplimm(_, _)
+                        | Condition::Ccompluimm(_, _)
+                        | Condition::Cmaskzero(_)
+                        | Condition::Cmasknotzero(_)
                 );
-                if !is_disc_compare { continue; }
+                if !is_disc_compare {
+                    continue;
+                }
 
                 let (root_reg, _) = resolve_reg(reg);
-                if used_heads.contains(node) { continue; }
+                if used_heads.contains(node) {
+                    continue;
+                }
 
                 let mut cases: Vec<(i64, Node, Node)> = Vec::new();
                 let mut visited = HashSet::new();
                 walk_tree(
-                    *node, root_reg, 0i64,
-                    None, None,
-                    &stmt_map, &seq_next_map, &reg_derivation,
-                    &resolve_reg, cond_break_nodes,
-                    &mut cases, &mut visited,
+                    *node,
+                    root_reg,
+                    0i64,
+                    None,
+                    None,
+                    &stmt_map,
+                    &seq_next_map,
+                    &reg_derivation,
+                    &resolve_reg,
+                    cond_break_nodes,
+                    &mut cases,
+                    &mut visited,
                 );
 
                 // Deduplicate cases by value (keep first occurrence)
@@ -2272,9 +2710,7 @@ fn compute_sequential_edges(
     let stmt_nodes: HashSet<Node> = stmts.iter().map(|(n, _)| *n).collect();
     stmts
         .iter()
-        .filter_map(|(n, _)| {
-            walk_next_to_stmt(*n, next_map, &stmt_nodes).map(|nxt| (*n, nxt))
-        })
+        .filter_map(|(n, _)| walk_next_to_stmt(*n, next_map, &stmt_nodes).map(|nxt| (*n, nxt)))
         .collect()
 }
 
@@ -2286,7 +2722,11 @@ fn lift_setcc_arith_to_ite(working: &mut HashMap<Node, CsharpminorStmt>, db: &De
         .map(|&(a, b)| (a, b))
         .collect();
 
-    fn walk_to_working(start: Node, next_map: &Map<Node, Node>, working: &HashMap<Node, CsharpminorStmt>) -> Option<Node> {
+    fn walk_to_working(
+        start: Node,
+        next_map: &Map<Node, Node>,
+        working: &HashMap<Node, CsharpminorStmt>,
+    ) -> Option<Node> {
         let mut cur = start;
         let mut seen = HashSet::new();
         while seen.insert(cur) {
@@ -2313,23 +2753,30 @@ fn lift_setcc_arith_to_ite(working: &mut HashMap<Node, CsharpminorStmt>, db: &De
         }
     }
 
-    let snapshot: Vec<(Node, CsharpminorStmt)> = working.iter().map(|(n, s)| (*n, s.clone())).collect();
+    let snapshot: Vec<(Node, CsharpminorStmt)> =
+        working.iter().map(|(n, s)| (*n, s.clone())).collect();
     let mut rewrites: Vec<(Node, CsharpminorStmt, Node)> = Vec::new();
 
     for (n1, s1) in &snapshot {
         let (reg1, cmp_op, arg_reg, rhs_const) = match s1 {
             CsharpminorStmt::Sset(r, CsharpminorExpr::Ebinop(op, lhs, rhs))
-                if matches!(op,
-                    CminorBinop::Ocmp(_) | CminorBinop::Ocmpu(_)
-                    | CminorBinop::Ocmpl(_) | CminorBinop::Ocmplu(_)) =>
+                if matches!(
+                    op,
+                    CminorBinop::Ocmp(_)
+                        | CminorBinop::Ocmpu(_)
+                        | CminorBinop::Ocmpl(_)
+                        | CminorBinop::Ocmplu(_)
+                ) =>
             {
                 match (lhs.as_ref(), rhs.as_ref()) {
-                    (CsharpminorExpr::Evar(arg), CsharpminorExpr::Econst(Constant::Ointconst(c))) => {
-                        (*r, op.clone(), *arg, *c as i64)
-                    }
-                    (CsharpminorExpr::Evar(arg), CsharpminorExpr::Econst(Constant::Olongconst(c))) => {
-                        (*r, op.clone(), *arg, *c)
-                    }
+                    (
+                        CsharpminorExpr::Evar(arg),
+                        CsharpminorExpr::Econst(Constant::Ointconst(c)),
+                    ) => (*r, op.clone(), *arg, *c as i64),
+                    (
+                        CsharpminorExpr::Evar(arg),
+                        CsharpminorExpr::Econst(Constant::Olongconst(c)),
+                    ) => (*r, op.clone(), *arg, *c),
                     _ => continue,
                 }
             }
@@ -2357,24 +2804,41 @@ fn lift_setcc_arith_to_ite(working: &mut HashMap<Node, CsharpminorStmt>, db: &De
                     continue;
                 }
                 match (lhs.as_ref(), rhs.as_ref()) {
-                    (CsharpminorExpr::Evar(v), CsharpminorExpr::Econst(Constant::Ointconst(c))) if *v == reg1 => {
+                    (CsharpminorExpr::Evar(v), CsharpminorExpr::Econst(Constant::Ointconst(c)))
+                        if *v == reg1 =>
+                    {
                         (*c as i64, is_long)
                     }
-                    (CsharpminorExpr::Evar(v), CsharpminorExpr::Econst(Constant::Olongconst(c))) if *v == reg1 => {
-                        (*c, is_long)
-                    }
+                    (
+                        CsharpminorExpr::Evar(v),
+                        CsharpminorExpr::Econst(Constant::Olongconst(c)),
+                    ) if *v == reg1 => (*c, is_long),
                     _ => continue,
                 }
             }
             _ => continue,
         };
 
-        let true_const = if is_long { Constant::Olongconst(add_const + 1) } else { Constant::Ointconst(add_const + 1) };
-        let false_const = if is_long { Constant::Olongconst(add_const) } else { Constant::Ointconst(add_const) };
+        let true_const = if is_long {
+            Constant::Olongconst(add_const + 1)
+        } else {
+            Constant::Ointconst(add_const + 1)
+        };
+        let false_const = if is_long {
+            Constant::Olongconst(add_const)
+        } else {
+            Constant::Ointconst(add_const)
+        };
 
         let cond_args = vec![CsharpminorExpr::Evar(arg_reg)];
-        let then_stmt = Box::new(CsharpminorStmt::Sset(reg1, CsharpminorExpr::Econst(true_const)));
-        let else_stmt = Box::new(CsharpminorStmt::Sset(reg1, CsharpminorExpr::Econst(false_const)));
+        let then_stmt = Box::new(CsharpminorStmt::Sset(
+            reg1,
+            CsharpminorExpr::Econst(true_const),
+        ));
+        let else_stmt = Box::new(CsharpminorStmt::Sset(
+            reg1,
+            CsharpminorExpr::Econst(false_const),
+        ));
 
         let ite = CsharpminorStmt::Sifthenelse(cond, cond_args, then_stmt, else_stmt);
         rewrites.push((*n1, ite, n2));
@@ -2418,7 +2882,10 @@ fn inline_constants(working: &mut HashMap<Node, CsharpminorStmt>, db: &Decompile
         .rel_iter::<(RTLReg, Constant)>("single_def_const")
         .cloned()
         .collect();
-    sdc_tuples.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| format!("{:?}", a.1).cmp(&format!("{:?}", b.1))));
+    sdc_tuples.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| format!("{:?}", a.1).cmp(&format!("{:?}", b.1)))
+    });
     for (reg, cst) in sdc_tuples {
         if multi_def.contains(&reg) {
             continue;
@@ -2440,13 +2907,20 @@ fn inline_constants(working: &mut HashMap<Node, CsharpminorStmt>, db: &Decompile
         return;
     }
 
-    let const_set_nodes: HashSet<Node> = working.iter().filter_map(|(node, stmt)| {
-        if let CsharpminorStmt::Sset(reg, CsharpminorExpr::Econst(cst)) = stmt {
-            if const_map.get(reg) == Some(cst) { Some(*node) } else { None }
-        } else {
-            None
-        }
-    }).collect();
+    let const_set_nodes: HashSet<Node> = working
+        .iter()
+        .filter_map(|(node, stmt)| {
+            if let CsharpminorStmt::Sset(reg, CsharpminorExpr::Econst(cst)) = stmt {
+                if const_map.get(reg) == Some(cst) {
+                    Some(*node)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
 
     let nodes: Vec<Node> = working.keys().copied().collect();
     for node in nodes {
@@ -2481,23 +2955,19 @@ fn subst_consts_in_expr(
         CsharpminorExpr::Eunop(op, inner) => {
             CsharpminorExpr::Eunop(op.clone(), Box::new(subst_consts_in_expr(inner, consts)))
         }
-        CsharpminorExpr::Ebinop(op, lhs, rhs) => {
-            CsharpminorExpr::Ebinop(
-                op.clone(),
-                Box::new(subst_consts_in_expr(lhs, consts)),
-                Box::new(subst_consts_in_expr(rhs, consts)),
-            )
-        }
+        CsharpminorExpr::Ebinop(op, lhs, rhs) => CsharpminorExpr::Ebinop(
+            op.clone(),
+            Box::new(subst_consts_in_expr(lhs, consts)),
+            Box::new(subst_consts_in_expr(rhs, consts)),
+        ),
         CsharpminorExpr::Eload(chunk, addr) => {
             CsharpminorExpr::Eload(*chunk, Box::new(subst_consts_in_expr(addr, consts)))
         }
-        CsharpminorExpr::Econdition(cond, t, f) => {
-            CsharpminorExpr::Econdition(
-                Box::new(subst_consts_in_expr(cond, consts)),
-                Box::new(subst_consts_in_expr(t, consts)),
-                Box::new(subst_consts_in_expr(f, consts)),
-            )
-        }
+        CsharpminorExpr::Econdition(cond, t, f) => CsharpminorExpr::Econdition(
+            Box::new(subst_consts_in_expr(cond, consts)),
+            Box::new(subst_consts_in_expr(t, consts)),
+            Box::new(subst_consts_in_expr(f, consts)),
+        ),
         _ => expr.clone(),
     }
 }
@@ -2510,13 +2980,11 @@ fn subst_consts_in_stmt(
         CsharpminorStmt::Sset(reg, expr) => {
             CsharpminorStmt::Sset(*reg, subst_consts_in_expr(expr, consts))
         }
-        CsharpminorStmt::Sstore(chunk, addr, val) => {
-            CsharpminorStmt::Sstore(
-                *chunk,
-                subst_consts_in_expr(addr, consts),
-                subst_consts_in_expr(val, consts),
-            )
-        }
+        CsharpminorStmt::Sstore(chunk, addr, val) => CsharpminorStmt::Sstore(
+            *chunk,
+            subst_consts_in_expr(addr, consts),
+            subst_consts_in_expr(val, consts),
+        ),
         CsharpminorStmt::Scall(dst, sig, callee, args) => {
             let new_callee = match callee {
                 either::Either::Left(expr) => {
@@ -2524,7 +2992,8 @@ fn subst_consts_in_stmt(
                 }
                 r => r.clone(),
             };
-            let new_args: Vec<_> = args.iter()
+            let new_args: Vec<_> = args
+                .iter()
                 .map(|a| subst_consts_in_expr(a, consts))
                 .collect();
             CsharpminorStmt::Scall(*dst, sig.clone(), new_callee, new_args)
@@ -2536,34 +3005,35 @@ fn subst_consts_in_stmt(
                 }
                 r => r.clone(),
             };
-            let new_args: Vec<_> = args.iter()
+            let new_args: Vec<_> = args
+                .iter()
                 .map(|a| subst_consts_in_expr(a, consts))
                 .collect();
             CsharpminorStmt::Stailcall(sig.clone(), new_callee, new_args)
         }
         CsharpminorStmt::Scond(cond, args, ifso, ifnot) => {
-            let new_args: Vec<_> = args.iter()
+            let new_args: Vec<_> = args
+                .iter()
                 .map(|a| subst_consts_in_expr(a, consts))
                 .collect();
             CsharpminorStmt::Scond(cond.clone(), new_args, *ifso, *ifnot)
         }
         CsharpminorStmt::Sjumptable(expr, targets) => {
-            CsharpminorStmt::Sjumptable(
-                subst_consts_in_expr(expr, consts),
-                targets.clone(),
-            )
+            CsharpminorStmt::Sjumptable(subst_consts_in_expr(expr, consts), targets.clone())
         }
         CsharpminorStmt::Sreturn(expr) => {
             CsharpminorStmt::Sreturn(subst_consts_in_expr(expr, consts))
         }
         CsharpminorStmt::Sseq(stmts) => {
-            let new_stmts: Vec<_> = stmts.iter()
+            let new_stmts: Vec<_> = stmts
+                .iter()
                 .map(|s| subst_consts_in_stmt(s, consts))
                 .collect();
             CsharpminorStmt::Sseq(new_stmts)
         }
         CsharpminorStmt::Sbuiltin(dst, name, args, res) => {
-            let new_args: Vec<_> = args.iter()
+            let new_args: Vec<_> = args
+                .iter()
                 .map(|a| subst_consts_in_builtin_arg(a, consts))
                 .collect();
             let new_res = subst_consts_in_builtin_arg(res, consts);
@@ -2578,26 +3048,32 @@ fn subst_consts_in_builtin_arg(
     consts: &HashMap<RTLReg, Constant>,
 ) -> BuiltinArg<CsharpminorExpr> {
     match arg {
-        BuiltinArg::BA(expr) => {
-            BuiltinArg::BA(subst_consts_in_expr(expr, consts))
-        }
-        BuiltinArg::BASplitLong(hi, lo) => {
-            BuiltinArg::BASplitLong(
-                Box::new(subst_consts_in_builtin_arg(hi, consts)),
-                Box::new(subst_consts_in_builtin_arg(lo, consts)),
-            )
-        }
-        BuiltinArg::BAAddPtr(base, ofs) => {
-            BuiltinArg::BAAddPtr(
-                Box::new(subst_consts_in_builtin_arg(base, consts)),
-                Box::new(subst_consts_in_builtin_arg(ofs, consts)),
-            )
-        }
+        BuiltinArg::BA(expr) => BuiltinArg::BA(subst_consts_in_expr(expr, consts)),
+        BuiltinArg::BASplitLong(hi, lo) => BuiltinArg::BASplitLong(
+            Box::new(subst_consts_in_builtin_arg(hi, consts)),
+            Box::new(subst_consts_in_builtin_arg(lo, consts)),
+        ),
+        BuiltinArg::BAAddPtr(base, ofs) => BuiltinArg::BAAddPtr(
+            Box::new(subst_consts_in_builtin_arg(base, consts)),
+            Box::new(subst_consts_in_builtin_arg(ofs, consts)),
+        ),
         _ => arg.clone(),
     }
 }
 
-// Block-local copy propagation; analysis in CopyPropagationProgram, fixpoint fold in Rust.
+fn protected_stack_regs(db: &DecompileDB) -> HashSet<RTLReg> {
+    let mut protected: HashSet<RTLReg> = db
+        .rel_iter::<(Address, i64, RTLReg)>("slot_escaped_canonical")
+        .map(|(_, _, reg)| *reg)
+        .collect();
+    protected.extend(
+        db.rel_iter::<(Address, RTLReg)>("win64_home_escaped")
+            .map(|(_, reg)| *reg),
+    );
+    protected
+}
+
+// Block-local and CFG copy propagation; analysis in CopyPropagationProgram, fixpoint fold in Rust.
 fn propagate_copies(working: &mut HashMap<Node, CsharpminorStmt>, db: &mut DecompileDB) {
     use crate::x86::types::XType;
 
@@ -2628,6 +3104,9 @@ fn propagate_copies(working: &mut HashMap<Node, CsharpminorStmt>, db: &mut Decom
     }
     for &(_, entry) in db.rel_iter::<(Address, Node)>("func_entry_node") {
         prog.entry.push((entry,));
+    }
+    for reg in protected_stack_regs(db) {
+        prog.protected_reg.push((reg,));
     }
 
     prog.run();
@@ -2711,19 +3190,31 @@ fn stmt_uses_set(stmt: &CsharpminorStmt) -> HashSet<RTLReg> {
             collect_expr_vars(val, &mut vars);
         }
         CsharpminorStmt::Scall(_, _, callee, args) => {
-            if let either::Either::Left(e) = callee { collect_expr_vars(e, &mut vars); }
-            for a in args { collect_expr_vars(a, &mut vars); }
+            if let either::Either::Left(e) = callee {
+                collect_expr_vars(e, &mut vars);
+            }
+            for a in args {
+                collect_expr_vars(a, &mut vars);
+            }
         }
         CsharpminorStmt::Stailcall(_, callee, args) => {
-            if let either::Either::Left(e) = callee { collect_expr_vars(e, &mut vars); }
-            for a in args { collect_expr_vars(a, &mut vars); }
+            if let either::Either::Left(e) = callee {
+                collect_expr_vars(e, &mut vars);
+            }
+            for a in args {
+                collect_expr_vars(a, &mut vars);
+            }
         }
         CsharpminorStmt::Sbuiltin(_, _, args, res) => {
-            for a in args { collect_builtin_arg_vars(a, &mut vars); }
+            for a in args {
+                collect_builtin_arg_vars(a, &mut vars);
+            }
             collect_builtin_arg_vars(res, &mut vars);
         }
         CsharpminorStmt::Scond(_, args, _, _) => {
-            for a in args { collect_expr_vars(a, &mut vars); }
+            for a in args {
+                collect_expr_vars(a, &mut vars);
+            }
         }
         CsharpminorStmt::Sjumptable(expr, _) => collect_expr_vars(expr, &mut vars),
         CsharpminorStmt::Sreturn(expr) => collect_expr_vars(expr, &mut vars),
@@ -2741,108 +3232,113 @@ fn stmt_def_reg(stmt: &CsharpminorStmt) -> Option<RTLReg> {
     }
 }
 
-fn subst_var_in_expr(
-    expr: &CsharpminorExpr, old: RTLReg, new: RTLReg,
-) -> CsharpminorExpr {
+fn subst_var_in_expr(expr: &CsharpminorExpr, old: RTLReg, new: RTLReg) -> CsharpminorExpr {
     match expr {
         CsharpminorExpr::Evar(r) if *r == old => CsharpminorExpr::Evar(new),
-        CsharpminorExpr::Eunop(op, inner) =>
-            CsharpminorExpr::Eunop(op.clone(), Box::new(subst_var_in_expr(inner, old, new))),
-        CsharpminorExpr::Ebinop(op, l, r) =>
-            CsharpminorExpr::Ebinop(
-                op.clone(),
-                Box::new(subst_var_in_expr(l, old, new)),
-                Box::new(subst_var_in_expr(r, old, new)),
-            ),
-        CsharpminorExpr::Eload(chunk, addr) =>
-            CsharpminorExpr::Eload(*chunk, Box::new(subst_var_in_expr(addr, old, new))),
-        CsharpminorExpr::Econdition(c, t, f) =>
-            CsharpminorExpr::Econdition(
-                Box::new(subst_var_in_expr(c, old, new)),
-                Box::new(subst_var_in_expr(t, old, new)),
-                Box::new(subst_var_in_expr(f, old, new)),
-            ),
+        CsharpminorExpr::Eunop(op, inner) => {
+            CsharpminorExpr::Eunop(op.clone(), Box::new(subst_var_in_expr(inner, old, new)))
+        }
+        CsharpminorExpr::Ebinop(op, l, r) => CsharpminorExpr::Ebinop(
+            op.clone(),
+            Box::new(subst_var_in_expr(l, old, new)),
+            Box::new(subst_var_in_expr(r, old, new)),
+        ),
+        CsharpminorExpr::Eload(chunk, addr) => {
+            CsharpminorExpr::Eload(*chunk, Box::new(subst_var_in_expr(addr, old, new)))
+        }
+        CsharpminorExpr::Econdition(c, t, f) => CsharpminorExpr::Econdition(
+            Box::new(subst_var_in_expr(c, old, new)),
+            Box::new(subst_var_in_expr(t, old, new)),
+            Box::new(subst_var_in_expr(f, old, new)),
+        ),
         _ => expr.clone(),
     }
 }
 
 fn subst_var_in_ba(
-    ba: &BuiltinArg<CsharpminorExpr>, old: RTLReg, new: RTLReg,
+    ba: &BuiltinArg<CsharpminorExpr>,
+    old: RTLReg,
+    new: RTLReg,
 ) -> BuiltinArg<CsharpminorExpr> {
     match ba {
         BuiltinArg::BA(e) => BuiltinArg::BA(subst_var_in_expr(e, old, new)),
-        BuiltinArg::BASplitLong(a, b) =>
-            BuiltinArg::BASplitLong(
-                Box::new(subst_var_in_ba(a, old, new)),
-                Box::new(subst_var_in_ba(b, old, new)),
-            ),
-        BuiltinArg::BAAddPtr(a, b) =>
-            BuiltinArg::BAAddPtr(
-                Box::new(subst_var_in_ba(a, old, new)),
-                Box::new(subst_var_in_ba(b, old, new)),
-            ),
+        BuiltinArg::BASplitLong(a, b) => BuiltinArg::BASplitLong(
+            Box::new(subst_var_in_ba(a, old, new)),
+            Box::new(subst_var_in_ba(b, old, new)),
+        ),
+        BuiltinArg::BAAddPtr(a, b) => BuiltinArg::BAAddPtr(
+            Box::new(subst_var_in_ba(a, old, new)),
+            Box::new(subst_var_in_ba(b, old, new)),
+        ),
         _ => ba.clone(),
     }
 }
 
-fn subst_var_in_stmt(
-    stmt: &CsharpminorStmt, old: RTLReg, new: RTLReg,
-) -> CsharpminorStmt {
+fn subst_var_in_stmt(stmt: &CsharpminorStmt, old: RTLReg, new: RTLReg) -> CsharpminorStmt {
     match stmt {
-        CsharpminorStmt::Sset(dst, expr) =>
-            CsharpminorStmt::Sset(*dst, subst_var_in_expr(expr, old, new)),
-        CsharpminorStmt::Sstore(chunk, addr, val) =>
-            CsharpminorStmt::Sstore(
-                *chunk,
-                subst_var_in_expr(addr, old, new),
-                subst_var_in_expr(val, old, new),
-            ),
+        CsharpminorStmt::Sset(dst, expr) => {
+            CsharpminorStmt::Sset(*dst, subst_var_in_expr(expr, old, new))
+        }
+        CsharpminorStmt::Sstore(chunk, addr, val) => CsharpminorStmt::Sstore(
+            *chunk,
+            subst_var_in_expr(addr, old, new),
+            subst_var_in_expr(val, old, new),
+        ),
         CsharpminorStmt::Scall(dst, sig, callee, args) => {
             let new_callee = match callee {
-                either::Either::Left(e) =>
-                    either::Either::Left(subst_var_in_expr(e, old, new)),
+                either::Either::Left(e) => either::Either::Left(subst_var_in_expr(e, old, new)),
                 other => other.clone(),
             };
-            let new_args: Vec<_> = args.iter()
-                .map(|a| subst_var_in_expr(a, old, new)).collect();
+            let new_args: Vec<_> = args
+                .iter()
+                .map(|a| subst_var_in_expr(a, old, new))
+                .collect();
             CsharpminorStmt::Scall(dst.clone(), sig.clone(), new_callee, new_args)
         }
         CsharpminorStmt::Stailcall(sig, callee, args) => {
             let new_callee = match callee {
-                either::Either::Left(e) =>
-                    either::Either::Left(subst_var_in_expr(e, old, new)),
+                either::Either::Left(e) => either::Either::Left(subst_var_in_expr(e, old, new)),
                 other => other.clone(),
             };
-            let new_args: Vec<_> = args.iter()
-                .map(|a| subst_var_in_expr(a, old, new)).collect();
+            let new_args: Vec<_> = args
+                .iter()
+                .map(|a| subst_var_in_expr(a, old, new))
+                .collect();
             CsharpminorStmt::Stailcall(sig.clone(), new_callee, new_args)
         }
         CsharpminorStmt::Sbuiltin(dst, name, args, res) => {
-            let new_args: Vec<_> = args.iter()
-                .map(|a| subst_var_in_ba(a, old, new)).collect();
+            let new_args: Vec<_> = args.iter().map(|a| subst_var_in_ba(a, old, new)).collect();
             let new_res = subst_var_in_ba(res, old, new);
             CsharpminorStmt::Sbuiltin(dst.clone(), name.clone(), new_args, new_res)
         }
         CsharpminorStmt::Scond(cond, args, ifso, ifnot) => {
-            let new_args: Vec<_> = args.iter()
-                .map(|a| subst_var_in_expr(a, old, new)).collect();
+            let new_args: Vec<_> = args
+                .iter()
+                .map(|a| subst_var_in_expr(a, old, new))
+                .collect();
             CsharpminorStmt::Scond(cond.clone(), new_args, *ifso, *ifnot)
         }
-        CsharpminorStmt::Sjumptable(expr, targets) =>
-            CsharpminorStmt::Sjumptable(subst_var_in_expr(expr, old, new), targets.clone()),
-        CsharpminorStmt::Sreturn(expr) =>
-            CsharpminorStmt::Sreturn(subst_var_in_expr(expr, old, new)),
+        CsharpminorStmt::Sjumptable(expr, targets) => {
+            CsharpminorStmt::Sjumptable(subst_var_in_expr(expr, old, new), targets.clone())
+        }
+        CsharpminorStmt::Sreturn(expr) => {
+            CsharpminorStmt::Sreturn(subst_var_in_expr(expr, old, new))
+        }
         _ => stmt.clone(),
     }
 }
 
 // VR-2 helpers: available-copies dataflow over the statement-level CFG.
 
-// Transfer one statement through the avail-copies lattice: kill entries whose dst or src is redefined, then gen the statement's own copy.
+// Transfer one statement through the avail-copies lattice: kill entries whose dst or src is
+// redefined, then optionally generate the statement's own copy.  `generate_copy` must come from
+// `copy_intro`, rather than re-matching Sset here, so protected memory-backed locals never enter
+// the cross-block lattice.
 fn copy_transfer(
     avail: &Set<(Node, RTLReg, RTLReg)>,
     node: Node,
     stmt: &CsharpminorStmt,
+    generate_copy: bool,
 ) -> Set<(Node, RTLReg, RTLReg)> {
     let def = stmt_def_reg(stmt);
     let mut out: std::collections::BTreeSet<(Node, RTLReg, RTLReg)> = avail
@@ -2851,9 +3347,11 @@ fn copy_transfer(
         .filter(|(_, dst, src)| def.map_or(true, |d| d != *dst && d != *src))
         .copied()
         .collect();
-    if let CsharpminorStmt::Sset(dst, CsharpminorExpr::Evar(src)) = stmt {
-        if dst != src {
-            out.insert((node, *dst, *src));
+    if generate_copy {
+        if let CsharpminorStmt::Sset(dst, CsharpminorExpr::Evar(src)) = stmt {
+            if dst != src {
+                out.insert((node, *dst, *src));
+            }
         }
     }
     Set(out)
@@ -2878,6 +3376,7 @@ ascent_par! {
     // VR-2 inputs: statement-level CFG edges (cminor_succ) and function entry nodes.
     relation edge(Node, Node);
     relation entry(Node);
+    relation protected_reg(RTLReg);
 
     // Both in the same block AND a strictly precedes b; exec_order_key folds the address into a 2x+1 form so a synth at base X sits between real X and the next real address.
     relation before_in_block(Node, Node);
@@ -2903,7 +3402,9 @@ ascent_par! {
     relation copy_intro(Node, RTLReg, RTLReg);
     copy_intro(*n, *dst, *src) <--
         stmt(n, ?CsharpminorStmt::Sset(dst, CsharpminorExpr::Evar(src))),
-        if dst != src;
+        if dst != src,
+        !protected_reg(dst),
+        !protected_reg(src);
 
     // A kill of the copy between intro and use: some k strictly between intro and u (same block) defines either dst or src.
     relation copy_killed_between(Node, RTLReg, RTLReg, Node);
@@ -2927,11 +3428,20 @@ ascent_par! {
     // Function entries start with no available copies.
     avail_in(*e, Dual(Set::default())) <-- entry(e);
 
-    // Propagate along CFG edges through the pred's transfer (kill defs, then gen intro).
-    avail_in(*n, Dual(copy_transfer(&pin.0, *p, s))) <--
+    // Propagate along CFG edges through the pred's transfer.  Generation is gated by
+    // copy_intro so a copy involving a protected address-escaped local is killed but never
+    // reintroduced into the cross-block available-copy set.
+    avail_in(*n, Dual(copy_transfer(&pin.0, *p, s, true))) <--
         edge(p, n),
         avail_in(p, pin),
-        stmt(p, s);
+        stmt(p, s),
+        copy_intro(p, _, _);
+
+    avail_in(*n, Dual(copy_transfer(&pin.0, *p, s, false))) <--
+        edge(p, n),
+        avail_in(p, pin),
+        stmt(p, s),
+        !copy_intro(p, _, _);
 
     // Pred without a statement in this program's view has unknown effects: kill everything.
     avail_in(*n, Dual(Set::default())) <--
@@ -3002,20 +3512,28 @@ fn eliminate_dead_returns(working: &mut HashMap<Node, CsharpminorStmt>, db: &Dec
                 if let either::Either::Left(expr) = callee {
                     collect_expr_vars(expr, &mut used_regs);
                 }
-                for a in args.iter() { collect_expr_vars(a, &mut used_regs); }
+                for a in args.iter() {
+                    collect_expr_vars(a, &mut used_regs);
+                }
             }
             CsharpminorStmt::Stailcall(_, callee, args) => {
                 if let either::Either::Left(expr) = callee {
                     collect_expr_vars(expr, &mut used_regs);
                 }
-                for a in args.iter() { collect_expr_vars(a, &mut used_regs); }
+                for a in args.iter() {
+                    collect_expr_vars(a, &mut used_regs);
+                }
             }
             CsharpminorStmt::Sbuiltin(_, _, args, res) => {
-                for a in args.iter() { collect_builtin_arg_vars(a, &mut used_regs); }
+                for a in args.iter() {
+                    collect_builtin_arg_vars(a, &mut used_regs);
+                }
                 collect_builtin_arg_vars(res, &mut used_regs);
             }
             CsharpminorStmt::Scond(_, args, _, _) => {
-                for a in args.iter() { collect_expr_vars(a, &mut used_regs); }
+                for a in args.iter() {
+                    collect_expr_vars(a, &mut used_regs);
+                }
             }
             CsharpminorStmt::Sjumptable(expr, _) => {
                 collect_expr_vars(expr, &mut used_regs);
@@ -3031,7 +3549,10 @@ fn eliminate_dead_returns(working: &mut HashMap<Node, CsharpminorStmt>, db: &Dec
         let stmt = working.get(&node).unwrap().clone();
         if let CsharpminorStmt::Scall(Some(dst), sig, callee, args) = &stmt {
             if dead_regs.contains(dst) && !used_regs.contains(dst) {
-                working.insert(node, CsharpminorStmt::Scall(None, sig.clone(), callee.clone(), args.clone()));
+                working.insert(
+                    node,
+                    CsharpminorStmt::Scall(None, sig.clone(), callee.clone(), args.clone()),
+                );
             }
         }
     }
@@ -3052,12 +3573,19 @@ fn collect_builtin_arg_vars(ba: &BuiltinArg<CsharpminorExpr>, out: &mut HashSet<
 /// Collect all free variable registers referenced in an expression.
 fn collect_expr_vars(expr: &CsharpminorExpr, out: &mut HashSet<RTLReg>) {
     match expr {
-        CsharpminorExpr::Evar(r) => { out.insert(*r); }
+        CsharpminorExpr::Evar(r) => {
+            out.insert(*r);
+        }
         CsharpminorExpr::Eunop(_, inner) => collect_expr_vars(inner, out),
-        CsharpminorExpr::Ebinop(_, l, r) => { collect_expr_vars(l, out); collect_expr_vars(r, out); }
+        CsharpminorExpr::Ebinop(_, l, r) => {
+            collect_expr_vars(l, out);
+            collect_expr_vars(r, out);
+        }
         CsharpminorExpr::Eload(_, addr) => collect_expr_vars(addr, out),
         CsharpminorExpr::Econdition(c, t, f) => {
-            collect_expr_vars(c, out); collect_expr_vars(t, out); collect_expr_vars(f, out);
+            collect_expr_vars(c, out);
+            collect_expr_vars(t, out);
+            collect_expr_vars(f, out);
         }
         _ => {}
     }
@@ -3066,12 +3594,19 @@ fn collect_expr_vars(expr: &CsharpminorExpr, out: &mut HashSet<RTLReg>) {
 /// Count occurrences of `Evar(reg)` in an expression.
 fn count_var_in_expr(expr: &CsharpminorExpr, reg: RTLReg) -> usize {
     match expr {
-        CsharpminorExpr::Evar(r) => if *r == reg { 1 } else { 0 },
+        CsharpminorExpr::Evar(r) => {
+            if *r == reg {
+                1
+            } else {
+                0
+            }
+        }
         CsharpminorExpr::Eunop(_, inner) => count_var_in_expr(inner, reg),
         CsharpminorExpr::Ebinop(_, l, r) => count_var_in_expr(l, reg) + count_var_in_expr(r, reg),
         CsharpminorExpr::Eload(_, addr) => count_var_in_expr(addr, reg),
-        CsharpminorExpr::Econdition(c, t, f) =>
-            count_var_in_expr(c, reg) + count_var_in_expr(t, reg) + count_var_in_expr(f, reg),
+        CsharpminorExpr::Econdition(c, t, f) => {
+            count_var_in_expr(c, reg) + count_var_in_expr(t, reg) + count_var_in_expr(f, reg)
+        }
         _ => 0,
     }
 }
@@ -3079,8 +3614,9 @@ fn count_var_in_expr(expr: &CsharpminorExpr, reg: RTLReg) -> usize {
 fn count_var_in_builtin_arg(ba: &BuiltinArg<CsharpminorExpr>, reg: RTLReg) -> usize {
     match ba {
         BuiltinArg::BA(e) => count_var_in_expr(e, reg),
-        BuiltinArg::BASplitLong(a, b) | BuiltinArg::BAAddPtr(a, b) =>
-            count_var_in_builtin_arg(a, reg) + count_var_in_builtin_arg(b, reg),
+        BuiltinArg::BASplitLong(a, b) | BuiltinArg::BAAddPtr(a, b) => {
+            count_var_in_builtin_arg(a, reg) + count_var_in_builtin_arg(b, reg)
+        }
         _ => 0,
     }
 }
@@ -3089,126 +3625,168 @@ fn count_var_in_builtin_arg(ba: &BuiltinArg<CsharpminorExpr>, reg: RTLReg) -> us
 fn count_var_in_stmt(stmt: &CsharpminorStmt, reg: RTLReg) -> usize {
     match stmt {
         CsharpminorStmt::Sset(_, expr) => count_var_in_expr(expr, reg),
-        CsharpminorStmt::Sstore(_, addr, val) =>
-            count_var_in_expr(addr, reg) + count_var_in_expr(val, reg),
+        CsharpminorStmt::Sstore(_, addr, val) => {
+            count_var_in_expr(addr, reg) + count_var_in_expr(val, reg)
+        }
         CsharpminorStmt::Scall(_, _, callee, args) => {
-            let c = if let either::Either::Left(e) = callee { count_var_in_expr(e, reg) } else { 0 };
-            c + args.iter().map(|a| count_var_in_expr(a, reg)).sum::<usize>()
+            let c = if let either::Either::Left(e) = callee {
+                count_var_in_expr(e, reg)
+            } else {
+                0
+            };
+            c + args
+                .iter()
+                .map(|a| count_var_in_expr(a, reg))
+                .sum::<usize>()
         }
         CsharpminorStmt::Stailcall(_, callee, args) => {
-            let c = if let either::Either::Left(e) = callee { count_var_in_expr(e, reg) } else { 0 };
-            c + args.iter().map(|a| count_var_in_expr(a, reg)).sum::<usize>()
+            let c = if let either::Either::Left(e) = callee {
+                count_var_in_expr(e, reg)
+            } else {
+                0
+            };
+            c + args
+                .iter()
+                .map(|a| count_var_in_expr(a, reg))
+                .sum::<usize>()
         }
         CsharpminorStmt::Sbuiltin(_, _, args, res) => {
-            args.iter().map(|a| count_var_in_builtin_arg(a, reg)).sum::<usize>()
+            args.iter()
+                .map(|a| count_var_in_builtin_arg(a, reg))
+                .sum::<usize>()
                 + count_var_in_builtin_arg(res, reg)
         }
-        CsharpminorStmt::Scond(_, args, _, _) =>
-            args.iter().map(|a| count_var_in_expr(a, reg)).sum::<usize>(),
+        CsharpminorStmt::Scond(_, args, _, _) => args
+            .iter()
+            .map(|a| count_var_in_expr(a, reg))
+            .sum::<usize>(),
         CsharpminorStmt::Sjumptable(expr, _) => count_var_in_expr(expr, reg),
         CsharpminorStmt::Sreturn(expr) => count_var_in_expr(expr, reg),
-        CsharpminorStmt::Sseq(stmts) =>
-            stmts.iter().map(|s| count_var_in_stmt(s, reg)).sum::<usize>(),
+        CsharpminorStmt::Sseq(stmts) => stmts
+            .iter()
+            .map(|s| count_var_in_stmt(s, reg))
+            .sum::<usize>(),
         _ => 0,
     }
 }
 
 /// Substitute `replacement` for every `Evar(reg)` in an expression.
 fn subst_expr_for_var_in_expr(
-    expr: &CsharpminorExpr, reg: RTLReg, replacement: &CsharpminorExpr,
+    expr: &CsharpminorExpr,
+    reg: RTLReg,
+    replacement: &CsharpminorExpr,
 ) -> CsharpminorExpr {
     match expr {
         CsharpminorExpr::Evar(r) if *r == reg => replacement.clone(),
-        CsharpminorExpr::Eunop(op, inner) =>
-            CsharpminorExpr::Eunop(op.clone(), Box::new(subst_expr_for_var_in_expr(inner, reg, replacement))),
-        CsharpminorExpr::Ebinop(op, l, r) =>
-            CsharpminorExpr::Ebinop(
-                op.clone(),
-                Box::new(subst_expr_for_var_in_expr(l, reg, replacement)),
-                Box::new(subst_expr_for_var_in_expr(r, reg, replacement)),
-            ),
-        CsharpminorExpr::Eload(chunk, addr) =>
-            CsharpminorExpr::Eload(*chunk, Box::new(subst_expr_for_var_in_expr(addr, reg, replacement))),
-        CsharpminorExpr::Econdition(c, t, f) =>
-            CsharpminorExpr::Econdition(
-                Box::new(subst_expr_for_var_in_expr(c, reg, replacement)),
-                Box::new(subst_expr_for_var_in_expr(t, reg, replacement)),
-                Box::new(subst_expr_for_var_in_expr(f, reg, replacement)),
-            ),
+        CsharpminorExpr::Eunop(op, inner) => CsharpminorExpr::Eunop(
+            op.clone(),
+            Box::new(subst_expr_for_var_in_expr(inner, reg, replacement)),
+        ),
+        CsharpminorExpr::Ebinop(op, l, r) => CsharpminorExpr::Ebinop(
+            op.clone(),
+            Box::new(subst_expr_for_var_in_expr(l, reg, replacement)),
+            Box::new(subst_expr_for_var_in_expr(r, reg, replacement)),
+        ),
+        CsharpminorExpr::Eload(chunk, addr) => CsharpminorExpr::Eload(
+            *chunk,
+            Box::new(subst_expr_for_var_in_expr(addr, reg, replacement)),
+        ),
+        CsharpminorExpr::Econdition(c, t, f) => CsharpminorExpr::Econdition(
+            Box::new(subst_expr_for_var_in_expr(c, reg, replacement)),
+            Box::new(subst_expr_for_var_in_expr(t, reg, replacement)),
+            Box::new(subst_expr_for_var_in_expr(f, reg, replacement)),
+        ),
         _ => expr.clone(),
     }
 }
 
 fn subst_expr_for_var_in_ba(
-    ba: &BuiltinArg<CsharpminorExpr>, reg: RTLReg, replacement: &CsharpminorExpr,
+    ba: &BuiltinArg<CsharpminorExpr>,
+    reg: RTLReg,
+    replacement: &CsharpminorExpr,
 ) -> BuiltinArg<CsharpminorExpr> {
     match ba {
         BuiltinArg::BA(e) => BuiltinArg::BA(subst_expr_for_var_in_expr(e, reg, replacement)),
-        BuiltinArg::BASplitLong(a, b) =>
-            BuiltinArg::BASplitLong(
-                Box::new(subst_expr_for_var_in_ba(a, reg, replacement)),
-                Box::new(subst_expr_for_var_in_ba(b, reg, replacement)),
-            ),
-        BuiltinArg::BAAddPtr(a, b) =>
-            BuiltinArg::BAAddPtr(
-                Box::new(subst_expr_for_var_in_ba(a, reg, replacement)),
-                Box::new(subst_expr_for_var_in_ba(b, reg, replacement)),
-            ),
+        BuiltinArg::BASplitLong(a, b) => BuiltinArg::BASplitLong(
+            Box::new(subst_expr_for_var_in_ba(a, reg, replacement)),
+            Box::new(subst_expr_for_var_in_ba(b, reg, replacement)),
+        ),
+        BuiltinArg::BAAddPtr(a, b) => BuiltinArg::BAAddPtr(
+            Box::new(subst_expr_for_var_in_ba(a, reg, replacement)),
+            Box::new(subst_expr_for_var_in_ba(b, reg, replacement)),
+        ),
         _ => ba.clone(),
     }
 }
 
 /// Substitute `replacement` for every `Evar(reg)` in a statement.
 fn subst_expr_for_var_in_stmt(
-    stmt: &CsharpminorStmt, reg: RTLReg, replacement: &CsharpminorExpr,
+    stmt: &CsharpminorStmt,
+    reg: RTLReg,
+    replacement: &CsharpminorExpr,
 ) -> CsharpminorStmt {
     match stmt {
-        CsharpminorStmt::Sset(dst, expr) =>
-            CsharpminorStmt::Sset(*dst, subst_expr_for_var_in_expr(expr, reg, replacement)),
-        CsharpminorStmt::Sstore(chunk, addr, val) =>
-            CsharpminorStmt::Sstore(
-                *chunk,
-                subst_expr_for_var_in_expr(addr, reg, replacement),
-                subst_expr_for_var_in_expr(val, reg, replacement),
-            ),
+        CsharpminorStmt::Sset(dst, expr) => {
+            CsharpminorStmt::Sset(*dst, subst_expr_for_var_in_expr(expr, reg, replacement))
+        }
+        CsharpminorStmt::Sstore(chunk, addr, val) => CsharpminorStmt::Sstore(
+            *chunk,
+            subst_expr_for_var_in_expr(addr, reg, replacement),
+            subst_expr_for_var_in_expr(val, reg, replacement),
+        ),
         CsharpminorStmt::Scall(dst, sig, callee, args) => {
             let new_callee = match callee {
-                either::Either::Left(e) =>
-                    either::Either::Left(subst_expr_for_var_in_expr(e, reg, replacement)),
+                either::Either::Left(e) => {
+                    either::Either::Left(subst_expr_for_var_in_expr(e, reg, replacement))
+                }
                 other => other.clone(),
             };
-            let new_args: Vec<_> = args.iter()
-                .map(|a| subst_expr_for_var_in_expr(a, reg, replacement)).collect();
+            let new_args: Vec<_> = args
+                .iter()
+                .map(|a| subst_expr_for_var_in_expr(a, reg, replacement))
+                .collect();
             CsharpminorStmt::Scall(*dst, sig.clone(), new_callee, new_args)
         }
         CsharpminorStmt::Stailcall(sig, callee, args) => {
             let new_callee = match callee {
-                either::Either::Left(e) =>
-                    either::Either::Left(subst_expr_for_var_in_expr(e, reg, replacement)),
+                either::Either::Left(e) => {
+                    either::Either::Left(subst_expr_for_var_in_expr(e, reg, replacement))
+                }
                 other => other.clone(),
             };
-            let new_args: Vec<_> = args.iter()
-                .map(|a| subst_expr_for_var_in_expr(a, reg, replacement)).collect();
+            let new_args: Vec<_> = args
+                .iter()
+                .map(|a| subst_expr_for_var_in_expr(a, reg, replacement))
+                .collect();
             CsharpminorStmt::Stailcall(sig.clone(), new_callee, new_args)
         }
         CsharpminorStmt::Sbuiltin(dst, name, args, res) => {
-            let new_args: Vec<_> = args.iter()
-                .map(|a| subst_expr_for_var_in_ba(a, reg, replacement)).collect();
+            let new_args: Vec<_> = args
+                .iter()
+                .map(|a| subst_expr_for_var_in_ba(a, reg, replacement))
+                .collect();
             let new_res = subst_expr_for_var_in_ba(res, reg, replacement);
             CsharpminorStmt::Sbuiltin(*dst, name.clone(), new_args, new_res)
         }
         CsharpminorStmt::Scond(cond, args, ifso, ifnot) => {
-            let new_args: Vec<_> = args.iter()
-                .map(|a| subst_expr_for_var_in_expr(a, reg, replacement)).collect();
+            let new_args: Vec<_> = args
+                .iter()
+                .map(|a| subst_expr_for_var_in_expr(a, reg, replacement))
+                .collect();
             CsharpminorStmt::Scond(cond.clone(), new_args, *ifso, *ifnot)
         }
-        CsharpminorStmt::Sjumptable(expr, targets) =>
-            CsharpminorStmt::Sjumptable(subst_expr_for_var_in_expr(expr, reg, replacement), targets.clone()),
-        CsharpminorStmt::Sreturn(expr) =>
-            CsharpminorStmt::Sreturn(subst_expr_for_var_in_expr(expr, reg, replacement)),
+        CsharpminorStmt::Sjumptable(expr, targets) => CsharpminorStmt::Sjumptable(
+            subst_expr_for_var_in_expr(expr, reg, replacement),
+            targets.clone(),
+        ),
+        CsharpminorStmt::Sreturn(expr) => {
+            CsharpminorStmt::Sreturn(subst_expr_for_var_in_expr(expr, reg, replacement))
+        }
         CsharpminorStmt::Sseq(stmts) => {
-            let new_stmts: Vec<_> = stmts.iter()
-                .map(|s| subst_expr_for_var_in_stmt(s, reg, replacement)).collect();
+            let new_stmts: Vec<_> = stmts
+                .iter()
+                .map(|s| subst_expr_for_var_in_stmt(s, reg, replacement))
+                .collect();
             CsharpminorStmt::Sseq(new_stmts)
         }
         _ => stmt.clone(),
@@ -3222,16 +3800,19 @@ fn expr_is_pure(expr: &CsharpminorExpr) -> bool {
         CsharpminorExpr::Eunop(_, inner) => expr_is_pure(inner),
         CsharpminorExpr::Ebinop(_, l, r) => expr_is_pure(l) && expr_is_pure(r),
         CsharpminorExpr::Eload(_, _) => false,
-        CsharpminorExpr::Econdition(c, t, f) =>
-            expr_is_pure(c) && expr_is_pure(t) && expr_is_pure(f),
+        CsharpminorExpr::Econdition(c, t, f) => {
+            expr_is_pure(c) && expr_is_pure(t) && expr_is_pure(f)
+        }
     }
 }
 
 /// Inline single-def/single-use Iop temps; skips Iload, backward refs, and intervening redefs.
 fn inline_single_use_temps(working: &mut HashMap<Node, CsharpminorStmt>, db: &DecompileDB) {
+    let protected = protected_stack_regs(db);
     let inline_regs: HashSet<RTLReg> = db
         .rel_iter::<RTLReg>("emit_inline_temp")
         .copied()
+        .filter(|reg| !protected.contains(reg))
         .collect();
     if inline_regs.is_empty() {
         return;
@@ -3266,7 +3847,9 @@ fn inline_single_use_temps(working: &mut HashMap<Node, CsharpminorStmt>, db: &De
     let mut use_sites: HashMap<RTLReg, Vec<(Node, usize)>> = HashMap::new();
     for (&node, stmt) in working.iter() {
         for (&reg, (def_node, _)) in &def_map {
-            if node == *def_node { continue; }
+            if node == *def_node {
+                continue;
+            }
             let count = count_var_in_stmt(stmt, reg);
             if count > 0 {
                 use_sites.entry(reg).or_default().push((node, count));
@@ -3275,7 +3858,8 @@ fn inline_single_use_temps(working: &mut HashMap<Node, CsharpminorStmt>, db: &De
     }
 
     // Process in sorted node order (by def_node address) for determinism.
-    let mut candidates: Vec<(RTLReg, Node, CsharpminorExpr)> = def_map.into_iter()
+    let mut candidates: Vec<(RTLReg, Node, CsharpminorExpr)> = def_map
+        .into_iter()
         .map(|(reg, (node, expr))| (reg, node, expr))
         .collect();
     candidates.sort_by_key(|(_, node, _)| *node);
@@ -3285,17 +3869,25 @@ fn inline_single_use_temps(working: &mut HashMap<Node, CsharpminorStmt>, db: &De
 
     let mut inlined = 0usize;
     for (reg, def_node, expr) in &candidates {
-        if modified_nodes.contains(def_node) { continue; }
+        if modified_nodes.contains(def_node) {
+            continue;
+        }
 
         let sites = match use_sites.get(reg) {
             Some(s) => s,
             None => continue,
         };
-        if sites.len() != 1 { continue; }
+        if sites.len() != 1 {
+            continue;
+        }
         let (use_node, occurrence_count) = sites[0];
-        if occurrence_count != 1 { continue; }
+        if occurrence_count != 1 {
+            continue;
+        }
 
-        if modified_nodes.contains(&use_node) { continue; }
+        if modified_nodes.contains(&use_node) {
+            continue;
+        }
 
         // Backward-reference and intervening-redefinition safety are enforced upstream by src_not_redefined_on_paths_to_uses, so the old unsound address-window scan is gone (STRUCT-1).
 
@@ -3314,5 +3906,62 @@ fn inline_single_use_temps(working: &mut HashMap<Node, CsharpminorStmt>, db: &De
 
     if inlined > 0 {
         debug!("inline_single_use_temps: inlined {} temporaries", inlined);
+    }
+}
+
+#[cfg(test)]
+mod copy_propagation_tests {
+    use super::*;
+
+    fn cross_block_copy(protected: bool) -> CopyPropagationProgram {
+        let copy_node = 0x100;
+        let use_node = 0x200;
+        let slot = 0x10;
+        let parameter = 0x20;
+
+        let mut prog = CopyPropagationProgram::default();
+        prog.stmt.push((
+            copy_node,
+            CsharpminorStmt::Sset(slot, CsharpminorExpr::Evar(parameter)),
+        ));
+        prog.stmt.push((
+            use_node,
+            CsharpminorStmt::Sreturn(CsharpminorExpr::Evar(slot)),
+        ));
+        prog.edge.push((copy_node, use_node));
+        prog.entry.push((copy_node,));
+        if protected {
+            prog.protected_reg.push((slot,));
+        }
+        prog.run();
+        prog
+    }
+
+    #[test]
+    fn protected_copy_never_enters_cross_block_substitution() {
+        let protected = cross_block_copy(true);
+        assert!(protected.copy_intro.is_empty());
+        assert!(protected.applicable_subst.is_empty());
+        assert!(protected.dead_copy_v2.is_empty());
+
+        let ordinary = cross_block_copy(false);
+        assert!(ordinary
+            .copy_intro
+            .iter()
+            .any(|row| *row == (0x100, 0x10, 0x20)));
+        assert!(ordinary
+            .applicable_subst
+            .iter()
+            .any(|row| *row == (0x200, 0x10, 0x20)));
+        assert!(ordinary.dead_copy_v2.iter().any(|row| *row == (0x100,)));
+    }
+
+    #[test]
+    fn both_address_escaped_stack_kinds_are_protected() {
+        let mut db = DecompileDB::default();
+        db.rel_push("slot_escaped_canonical", (0x1000_u64, 16_i64, 0x10_u64));
+        db.rel_push("win64_home_escaped", (0x2000_u64, 0x20_u64));
+
+        assert_eq!(protected_stack_regs(&db), HashSet::from([0x10, 0x20]));
     }
 }

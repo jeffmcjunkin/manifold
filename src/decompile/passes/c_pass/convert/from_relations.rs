@@ -1,19 +1,17 @@
-
-
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::c_pass::types::{
     AssignOp, BinaryOp, CBlockItem, CExpr, CStmt, CType, ExprTransform, FloatLiteral,
-    FloatLiteralSuffix, FuncDef, FuncParam, IntLiteral, IntLiteralBase,
-    IntLiteralSuffix, IntSize, Label, Signedness, SourceLoc, StorageClass, StmtTransform,
-    StringLiteral, TypeQualifiers, UnaryOp, VarDecl,
+    FloatLiteralSuffix, FuncDef, FuncParam, IntLiteral, IntLiteralBase, IntLiteralSuffix, IntSize,
+    Label, Signedness, SourceLoc, StmtTransform, StorageClass, StringLiteral, TypeQualifiers,
+    UnaryOp, VarDecl,
 };
 use crate::decompile::passes::c_pass::TranslationUnit;
 use crate::decompile::passes::clight_select::query::GlobalData;
 use crate::decompile::passes::clight_select::select::SelectedFunction;
 use crate::x86::types as clight;
 use crate::x86::types::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
 use log::debug;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 // GCC hot/cold splitting emits `<base>_cold` companions with trivial abort/unreachable bodies; drop only when name ends in `_cold` AND body matches that trivial pattern (empty body is kept, not silently deleted).
@@ -25,15 +23,16 @@ fn is_trivial_cold_body(body: &CStmt) -> bool {
     // Unwrap a single-statement Block/Sequence wrapper, then require exactly one trivial call.
     match body {
         CStmt::Block(items) => {
-            let stmts: Vec<&CStmt> = items.iter().filter_map(|item| match item {
-                CBlockItem::Stmt(s) => Some(s),
-                CBlockItem::Decl(_) => None,
-            }).collect();
+            let stmts: Vec<&CStmt> = items
+                .iter()
+                .filter_map(|item| match item {
+                    CBlockItem::Stmt(s) => Some(s),
+                    CBlockItem::Decl(_) => None,
+                })
+                .collect();
             stmts.len() == 1 && is_trivial_cold_call(stmts[0])
         }
-        CStmt::Sequence(stmts) => {
-            stmts.len() == 1 && is_trivial_cold_call(&stmts[0])
-        }
+        CStmt::Sequence(stmts) => stmts.len() == 1 && is_trivial_cold_call(&stmts[0]),
         other => is_trivial_cold_call(other),
     }
 }
@@ -62,27 +61,47 @@ fn convert_clight_type(ty: &crate::x86::types::ClightType) -> CType {
             let c_size = match size {
                 ClightIntSize::I8 => crate::decompile::passes::c_pass::types::IntSize::Char,
                 ClightIntSize::I16 => crate::decompile::passes::c_pass::types::IntSize::Short,
-                ClightIntSize::I32 | ClightIntSize::IBool => crate::decompile::passes::c_pass::types::IntSize::Int,
+                ClightIntSize::I32 | ClightIntSize::IBool => {
+                    crate::decompile::passes::c_pass::types::IntSize::Int
+                }
             };
             let c_sign = match sign {
-                ClightSignedness::Signed => crate::decompile::passes::c_pass::types::Signedness::Signed,
-                ClightSignedness::Unsigned => crate::decompile::passes::c_pass::types::Signedness::Unsigned,
+                ClightSignedness::Signed => {
+                    crate::decompile::passes::c_pass::types::Signedness::Signed
+                }
+                ClightSignedness::Unsigned => {
+                    crate::decompile::passes::c_pass::types::Signedness::Unsigned
+                }
             };
             CType::Int(c_size, c_sign)
         }
         crate::x86::types::ClightType::Tlong(sign, _attr) => {
             let c_sign = match sign {
-                ClightSignedness::Signed => crate::decompile::passes::c_pass::types::Signedness::Signed,
-                ClightSignedness::Unsigned => crate::decompile::passes::c_pass::types::Signedness::Unsigned,
+                ClightSignedness::Signed => {
+                    crate::decompile::passes::c_pass::types::Signedness::Signed
+                }
+                ClightSignedness::Unsigned => {
+                    crate::decompile::passes::c_pass::types::Signedness::Unsigned
+                }
             };
-            CType::Int(crate::decompile::passes::c_pass::types::IntSize::Long, c_sign)
+            CType::Int(
+                crate::decompile::passes::c_pass::types::IntSize::Long,
+                c_sign,
+            )
         }
         crate::x86::types::ClightType::Tint128(sign, _attr) => {
             let c_sign = match sign {
-                ClightSignedness::Signed => crate::decompile::passes::c_pass::types::Signedness::Signed,
-                ClightSignedness::Unsigned => crate::decompile::passes::c_pass::types::Signedness::Unsigned,
+                ClightSignedness::Signed => {
+                    crate::decompile::passes::c_pass::types::Signedness::Signed
+                }
+                ClightSignedness::Unsigned => {
+                    crate::decompile::passes::c_pass::types::Signedness::Unsigned
+                }
             };
-            CType::Int(crate::decompile::passes::c_pass::types::IntSize::Int128, c_sign)
+            CType::Int(
+                crate::decompile::passes::c_pass::types::IntSize::Int128,
+                c_sign,
+            )
         }
         crate::x86::types::ClightType::Tfloat(size, _attr) => {
             let c_size = match size {
@@ -144,13 +163,32 @@ fn clight_expr_to_ctype(expr: &clight::ClightExpr) -> CType {
 fn is_known_variadic_fn(name: &str) -> bool {
     matches!(
         name,
-        "printf" | "fprintf" | "sprintf" | "snprintf" | "dprintf"
-            | "scanf" | "fscanf" | "sscanf"
-            | "__printf_chk" | "__fprintf_chk" | "__sprintf_chk" | "__snprintf_chk"
-            | "__isoc99_scanf" | "__isoc99_fscanf" | "__isoc99_sscanf"
-            | "error" | "error_at_line"
-            | "open" | "openat" | "fcntl" | "ioctl"
-            | "syslog" | "asprintf" | "execl" | "execlp" | "execle"
+        "printf"
+            | "fprintf"
+            | "sprintf"
+            | "snprintf"
+            | "dprintf"
+            | "scanf"
+            | "fscanf"
+            | "sscanf"
+            | "__printf_chk"
+            | "__fprintf_chk"
+            | "__sprintf_chk"
+            | "__snprintf_chk"
+            | "__isoc99_scanf"
+            | "__isoc99_fscanf"
+            | "__isoc99_sscanf"
+            | "error"
+            | "error_at_line"
+            | "open"
+            | "openat"
+            | "fcntl"
+            | "ioctl"
+            | "syslog"
+            | "asprintf"
+            | "execl"
+            | "execlp"
+            | "execle"
     )
 }
 
@@ -215,11 +253,15 @@ fn convert_xtype(xt: &XType) -> CType {
             TypeQualifiers::none(),
         ),
         XType::Xfloatptr => CType::Pointer(
-            Box::new(CType::Float(crate::decompile::passes::c_pass::types::FloatSize::Double)),
+            Box::new(CType::Float(
+                crate::decompile::passes::c_pass::types::FloatSize::Double,
+            )),
             TypeQualifiers::none(),
         ),
         XType::Xsingleptr => CType::Pointer(
-            Box::new(CType::Float(crate::decompile::passes::c_pass::types::FloatSize::Float)),
+            Box::new(CType::Float(
+                crate::decompile::passes::c_pass::types::FloatSize::Float,
+            )),
             TypeQualifiers::none(),
         ),
         XType::Xfuncptr => CType::Pointer(
@@ -254,7 +296,10 @@ fn recovered_ret_ctype(map: &HashMap<String, XType>, name: &str) -> CType {
     map.get(name)
         .and_then(|xt| match xt {
             XType::Xvoid => None,
-            XType::XstructPtr(_) => Some(CType::Pointer(Box::new(CType::Void), TypeQualifiers::none())),
+            XType::XstructPtr(_) => Some(CType::Pointer(
+                Box::new(CType::Void),
+                TypeQualifiers::none(),
+            )),
             other => Some(convert_xtype(other)),
         })
         .unwrap_or(CType::Int(
@@ -300,7 +345,9 @@ fn header_collision_policy(selected_functions: &[SelectedFunction]) -> LocalDefP
         if hdb.local_def_filter.contains(name.as_str()) {
             policy.filtered.insert(name);
         } else {
-            policy.renames.insert(name.clone(), format!("{}_local", name));
+            policy
+                .renames
+                .insert(name.clone(), format!("{}_local", name));
         }
     }
     policy
@@ -322,9 +369,10 @@ pub fn build_cast_from_relations(
         }
     }
     for (label, content, _size) in db.rel_iter::<(String, String, usize)>("string_data") {
-        ctx.string_label_to_content.insert(label.clone(), content.clone());
+        ctx.string_label_to_content
+            .insert(label.clone(), content.clone());
     }
-    
+
     {
         let mut addr_name_map: HashMap<u64, String> = HashMap::new();
         for (addr, name, _entry_node) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
@@ -368,7 +416,6 @@ pub fn build_cast_from_relations(
     )
 }
 
-
 pub fn build_translation_unit_from_stmt_map_with_types(
     db: &DecompileDB,
     selected_functions: &[SelectedFunction],
@@ -399,7 +446,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         global_names.insert(sanitize_c_symbol_name(name));
     }
 
-    let known_global_types: HashMap<String, CType> = db.rel_iter::<(Symbol, XType)>("known_global_type")
+    let known_global_types: HashMap<String, CType> = db
+        .rel_iter::<(Symbol, XType)>("known_global_type")
         .map(|(name, xtype)| (sanitize_c_symbol_name(name), convert_xtype(xtype)))
         .collect();
 
@@ -416,38 +464,66 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         for (id, chunk) in db.rel_iter::<(Ident, MemoryChunk)>("global_load_chunk") {
             chunks.entry(*id).or_default().push(*chunk);
         }
-        chunks.into_iter().map(|(id, mut chunk_list)| {
-            // Filter out generic MAny/Unknown when specific chunks exist
-            let has_specific = chunk_list.iter().any(|c|
-                !matches!(c, MemoryChunk::MAny32 | MemoryChunk::MAny64 | MemoryChunk::Unknown));
-            if has_specific {
-                chunk_list.retain(|c|
-                    !matches!(c, MemoryChunk::MAny32 | MemoryChunk::MAny64 | MemoryChunk::Unknown));
-            }
-            // Filter out float chunks when integer chunks exist (SSE bulk copies produce MFloat64)
-            let has_int = chunk_list.iter().any(|c|
-                matches!(c, MemoryChunk::MBool | MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned
-                    | MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned
-                    | MemoryChunk::MInt32 | MemoryChunk::MInt64));
-            if has_int {
-                chunk_list.retain(|c|
-                    !matches!(c, MemoryChunk::MFloat32 | MemoryChunk::MFloat64));
-            }
-            // Among remaining, prefer the largest integer type; use the chunk itself as a tiebreak so signed/unsigned pairs of the same width don't flip across parallel-Ascent runs.
-            let best = chunk_list.iter().max_by_key(|c| (match c {
-                MemoryChunk::MBool => 0,
-                MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => 1,
-                MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => 2,
-                MemoryChunk::MInt32 => 3,
-                MemoryChunk::MFloat32 => 4,
-                MemoryChunk::MFloat64 => 5,
-                MemoryChunk::MInt64 => 6,
-                MemoryChunk::MAny32 => 7,
-                MemoryChunk::MAny64 => 8,
-                MemoryChunk::Unknown => 9,
-            }, **c)).copied().unwrap_or(MemoryChunk::Unknown);
-            (id, best)
-        }).collect()
+        chunks
+            .into_iter()
+            .map(|(id, mut chunk_list)| {
+                // Filter out generic MAny/Unknown when specific chunks exist
+                let has_specific = chunk_list.iter().any(|c| {
+                    !matches!(
+                        c,
+                        MemoryChunk::MAny32 | MemoryChunk::MAny64 | MemoryChunk::Unknown
+                    )
+                });
+                if has_specific {
+                    chunk_list.retain(|c| {
+                        !matches!(
+                            c,
+                            MemoryChunk::MAny32 | MemoryChunk::MAny64 | MemoryChunk::Unknown
+                        )
+                    });
+                }
+                // Filter out float chunks when integer chunks exist (SSE bulk copies produce MFloat64)
+                let has_int = chunk_list.iter().any(|c| {
+                    matches!(
+                        c,
+                        MemoryChunk::MBool
+                            | MemoryChunk::MInt8Signed
+                            | MemoryChunk::MInt8Unsigned
+                            | MemoryChunk::MInt16Signed
+                            | MemoryChunk::MInt16Unsigned
+                            | MemoryChunk::MInt32
+                            | MemoryChunk::MInt64
+                    )
+                });
+                if has_int {
+                    chunk_list
+                        .retain(|c| !matches!(c, MemoryChunk::MFloat32 | MemoryChunk::MFloat64));
+                }
+                // Among remaining, prefer the largest integer type; use the chunk itself as a tiebreak so signed/unsigned pairs of the same width don't flip across parallel-Ascent runs.
+                let best = chunk_list
+                    .iter()
+                    .max_by_key(|c| {
+                        (
+                            match c {
+                                MemoryChunk::MBool => 0,
+                                MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => 1,
+                                MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => 2,
+                                MemoryChunk::MInt32 => 3,
+                                MemoryChunk::MFloat32 => 4,
+                                MemoryChunk::MFloat64 => 5,
+                                MemoryChunk::MInt64 => 6,
+                                MemoryChunk::MAny32 => 7,
+                                MemoryChunk::MAny64 => 8,
+                                MemoryChunk::Unknown => 9,
+                            },
+                            **c,
+                        )
+                    })
+                    .copied()
+                    .unwrap_or(MemoryChunk::Unknown);
+                (id, best)
+            })
+            .collect()
     };
 
     // Rodata FP constants recovered from the binary (address, width, raw IEEE-754 bits), keyed by address so an unnamed .rodata slot emits a typed static const instead of a zeroed long.
@@ -456,32 +532,53 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         .map(|(addr, width, bits)| (*addr, (*width, *bits)))
         .collect();
     // Build a static const double/float VarDecl for a recovered rodata FP constant, or None for a non-finite bit pattern, which is more likely a misclassified bitmask.
-    let make_rodata_fp_decl = |name: String, width: usize, bits: u64|
-        -> Option<crate::decompile::passes::c_pass::types::TopLevelDecl> {
-        use crate::decompile::passes::c_pass::types::{FloatLiteral, Initializer, TopLevelDecl};
-        let (ty, value, suffix) = if width == 4 {
-            (CType::float(), f32::from_bits(bits as u32) as f64, FloatLiteralSuffix::F)
-        } else {
-            (CType::double(), f64::from_bits(bits), FloatLiteralSuffix::None)
+    let make_rodata_fp_decl =
+        |name: String,
+         width: usize,
+         bits: u64|
+         -> Option<crate::decompile::passes::c_pass::types::TopLevelDecl> {
+            use crate::decompile::passes::c_pass::types::{
+                FloatLiteral, Initializer, TopLevelDecl,
+            };
+            let (ty, value, suffix) = if width == 4 {
+                (
+                    CType::float(),
+                    f32::from_bits(bits as u32) as f64,
+                    FloatLiteralSuffix::F,
+                )
+            } else {
+                (
+                    CType::double(),
+                    f64::from_bits(bits),
+                    FloatLiteralSuffix::None,
+                )
+            };
+            if !value.is_finite() {
+                return None;
+            }
+            Some(TopLevelDecl::VarDecl(VarDecl {
+                name,
+                ty,
+                storage_class: StorageClass::Static,
+                qualifiers: TypeQualifiers {
+                    is_const: true,
+                    ..TypeQualifiers::none()
+                },
+                init: Some(Initializer::Expr(CExpr::FloatLit(FloatLiteral {
+                    value,
+                    suffix,
+                }))),
+                loc: SourceLoc::unknown(),
+            }))
         };
-        if !value.is_finite() {
-            return None;
-        }
-        Some(TopLevelDecl::VarDecl(VarDecl {
-            name,
-            ty,
-            storage_class: StorageClass::Static,
-            qualifiers: TypeQualifiers { is_const: true, ..TypeQualifiers::none() },
-            init: Some(Initializer::Expr(CExpr::FloatLit(FloatLiteral { value, suffix }))),
-            loc: SourceLoc::unknown(),
-        }))
-    };
 
     // Build global pointer sets from rtl_pass analysis
-    let global_ptr_ids: HashSet<usize> = db.rel_iter::<(Ident,)>("emit_global_is_ptr")
+    let global_ptr_ids: HashSet<usize> = db
+        .rel_iter::<(Ident,)>("emit_global_is_ptr")
         .map(|(id,)| *id)
         .collect();
-    let global_char_ptr_ids: HashSet<usize> = db.rel_iter::<(Ident,)>("emit_global_is_char_ptr")
+    let global_char_ptr_ids: HashSet<usize> = db
+        .rel_iter::<(Ident,)>("emit_global_is_char_ptr")
         .map(|(id,)| *id)
         .collect();
 
@@ -492,8 +589,10 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             .map(|(_, id, _, _)| *id)
             .collect();
         let mut m: HashMap<usize, usize> = HashMap::new();
-        for (ident, sid, _fields) in
-            db.rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>("emit_global_struct_fields")
+        for (ident, sid, _fields) in db
+            .rel_iter::<(Ident, usize, Arc<Vec<(i64, Ident, MemoryChunk)>>)>(
+                "emit_global_struct_fields",
+            )
         {
             if !catalog_ids.contains(sid) {
                 continue;
@@ -551,12 +650,12 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 crate::decompile::passes::c_pass::types::IntSize::Short,
                 crate::decompile::passes::c_pass::types::Signedness::Unsigned,
             ),
-            MemoryChunk::MFloat32 => CType::Float(
-                crate::decompile::passes::c_pass::types::FloatSize::Float,
-            ),
-            MemoryChunk::MFloat64 => CType::Float(
-                crate::decompile::passes::c_pass::types::FloatSize::Double,
-            ),
+            MemoryChunk::MFloat32 => {
+                CType::Float(crate::decompile::passes::c_pass::types::FloatSize::Float)
+            }
+            MemoryChunk::MFloat64 => {
+                CType::Float(crate::decompile::passes::c_pass::types::FloatSize::Double)
+            }
             _ => CType::long(),
         }
     };
@@ -596,11 +695,19 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         groups
             .into_iter()
             .map(|(id, mut chunks)| {
-                let has_specific = chunks.iter().any(|c|
-                    !matches!(c, MemoryChunk::MAny32 | MemoryChunk::MAny64 | MemoryChunk::Unknown));
+                let has_specific = chunks.iter().any(|c| {
+                    !matches!(
+                        c,
+                        MemoryChunk::MAny32 | MemoryChunk::MAny64 | MemoryChunk::Unknown
+                    )
+                });
                 if has_specific {
-                    chunks.retain(|c|
-                        !matches!(c, MemoryChunk::MAny32 | MemoryChunk::MAny64 | MemoryChunk::Unknown));
+                    chunks.retain(|c| {
+                        !matches!(
+                            c,
+                            MemoryChunk::MAny32 | MemoryChunk::MAny64 | MemoryChunk::Unknown
+                        )
+                    });
                 }
                 chunks.sort();
                 (id, chunks[0])
@@ -655,11 +762,9 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             .and_then(|h| u64::from_str_radix(h, 16).ok())
         {
             if let Some(&(width, bits)) = rodata_fp_consts.get(&addr) {
-                if let Some(decl) = make_rodata_fp_decl(
-                    sanitize_c_symbol_name(&global.name),
-                    width,
-                    bits,
-                ) {
+                if let Some(decl) =
+                    make_rodata_fp_decl(sanitize_c_symbol_name(&global.name), width, bits)
+                {
                     tu.decls.push(decl);
                     continue;
                 }
@@ -672,7 +777,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         }
         let (ty, init) = if !global.pointer_init.is_empty() {
             // Relocated pointer-valued global from ELF ground truth: a single slot is a scalar void*, a run is a pointer table emitted as long name[N] = {...} so the runtime bytes are reconstructed.
-            use crate::decompile::passes::c_pass::types::{Initializer, InitItem};
+            use crate::decompile::passes::c_pass::types::{InitItem, Initializer};
             if global.pointer_init.len() == 1 {
                 let e = global.pointer_init[0].clone();
                 let init_expr = CExpr::Cast(CType::ptr(CType::Void), Box::new(e));
@@ -699,7 +804,9 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             // Writable initialized scalar global: width from the narrowest recorded chunk or ELF symbol size, initializer from the .data bytes, declared here so runtime stores are preserved.
             (
                 scalar_global_ctype(global.id),
-                Some(crate::decompile::passes::c_pass::types::Initializer::Expr(scalar.to_cexpr())),
+                Some(crate::decompile::passes::c_pass::types::Initializer::Expr(
+                    scalar.to_cexpr(),
+                )),
             )
         } else if let Some(known_ty) = known_global_types.get(&sanitized_name) {
             (known_ty.clone(), None)
@@ -711,9 +818,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             let (elem_ty, decl_count) = match elem_size {
                 1 | 2 | 4 | 8 => {
                     let elem_ty = match global_chunks.get(&global.id) {
-                        Some(chunk) if chunk_byte_size(chunk) == elem_size => {
-                            ctype_of_chunk(chunk)
-                        }
+                        Some(chunk) if chunk_byte_size(chunk) == elem_size => ctype_of_chunk(chunk),
                         _ => match elem_size {
                             1 => CType::Int(
                                 crate::decompile::passes::c_pass::types::IntSize::Char,
@@ -739,13 +844,16 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             };
             (CType::Array(Box::new(elem_ty), Some(decl_count)), None)
         } else if global_char_ptr_ids.contains(&global.id) {
-            (CType::Pointer(
-                Box::new(CType::Int(
-                    crate::decompile::passes::c_pass::types::IntSize::Char,
-                    crate::decompile::passes::c_pass::types::Signedness::Signed,
-                )),
-                TypeQualifiers::none(),
-            ), None)
+            (
+                CType::Pointer(
+                    Box::new(CType::Int(
+                        crate::decompile::passes::c_pass::types::IntSize::Char,
+                        crate::decompile::passes::c_pass::types::Signedness::Signed,
+                    )),
+                    TypeQualifiers::none(),
+                ),
+                None,
+            )
         } else if global.is_pointer || global_ptr_ids.contains(&global.id) {
             (CType::ptr(CType::Void), None)
         } else {
@@ -758,9 +866,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             .variables
             .get(sanitized_name.as_str())
         {
-            Some(spelling) if init.is_none() => {
-                parse_canonical_var_type(spelling).unwrap_or(ty)
-            }
+            Some(spelling) if init.is_none() => parse_canonical_var_type(spelling).unwrap_or(ty),
             _ => ty,
         };
 
@@ -823,7 +929,13 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             for (&head, members) in &f.sseq_groups {
                 for &mem in members {
                     if mem != head {
-                        m.entry(mem).and_modify(|h| { if head < *h { *h = head; } }).or_insert(head);
+                        m.entry(mem)
+                            .and_modify(|h| {
+                                if head < *h {
+                                    *h = head;
+                                }
+                            })
+                            .or_insert(head);
                     }
                 }
             }
@@ -834,7 +946,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         order_sseq_member_to_head.get(&n).copied().unwrap_or(n) & ORDER_SYNTH_MASK
     };
     let loop_members: HashMap<crate::x86::types::Node, HashSet<crate::x86::types::Node>> = {
-        let mut m: HashMap<crate::x86::types::Node, HashSet<crate::x86::types::Node>> = HashMap::new();
+        let mut m: HashMap<crate::x86::types::Node, HashSet<crate::x86::types::Node>> =
+            HashMap::new();
         for (_func, header, member) in db.rel_iter::<(Address, Node, Node)>("loop_body") {
             let h = norm_order_id(*header);
             let mem = norm_order_id(*member);
@@ -844,14 +957,23 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     };
     // Innermost natural loop per normalized node, memoized once from loop_members (smallest body, ties on header address), turning order_nodes_dfs's per-node rescan into an O(1) lookup.
     let node_innermost_loop: HashMap<crate::x86::types::Node, crate::x86::types::Node> = {
-        let mut best: HashMap<crate::x86::types::Node, (usize, crate::x86::types::Node)> = HashMap::new();
+        let mut best: HashMap<crate::x86::types::Node, (usize, crate::x86::types::Node)> =
+            HashMap::new();
         for (header, members) in &loop_members {
             let cand = (members.len(), *header);
             for &node in members {
-                best.entry(node).and_modify(|cur| { if cand < *cur { *cur = cand; } }).or_insert(cand);
+                best.entry(node)
+                    .and_modify(|cur| {
+                        if cand < *cur {
+                            *cur = cand;
+                        }
+                    })
+                    .or_insert(cand);
             }
         }
-        best.into_iter().map(|(node, (_, header))| (node, header)).collect()
+        best.into_iter()
+            .map(|(node, (_, header))| (node, header))
+            .collect()
     };
 
     let mut emitted_func_names: HashSet<String> = HashSet::new();
@@ -870,7 +992,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             params.iter().filter_map(|p| p.name.clone()).collect();
 
         let func_addr = func.address;
-        
+
         let nodes_set: HashSet<_> = stmt_map
             .keys()
             .copied()
@@ -882,7 +1004,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             .collect();
 
         // sseq bundling drops members whose clight_succ edges still point at them, so remap member->synth edges to the head; min-head-wins is order-independent, since a member can sit in two bundles.
-        let mut sseq_member_to_head: HashMap<crate::x86::types::Node, crate::x86::types::Node> = HashMap::new();
+        let mut sseq_member_to_head: HashMap<crate::x86::types::Node, crate::x86::types::Node> =
+            HashMap::new();
         for (&head, members) in &func.sseq_groups {
             for &m in members {
                 if m != head {
@@ -898,7 +1021,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             }
         }
         const SYNTH_BIT: u64 = 1u64 << 62;
-        let remapped_edges: Vec<(crate::x86::types::Node, crate::x86::types::Node)> = edges.iter()
+        let remapped_edges: Vec<(crate::x86::types::Node, crate::x86::types::Node)> = edges
+            .iter()
             .flat_map(|&(s, d)| {
                 let mut out: Vec<(crate::x86::types::Node, crate::x86::types::Node)> = vec![(s, d)];
                 let dst_is_synth = (d & SYNTH_BIT) != 0;
@@ -924,12 +1048,24 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             let resolved = sseq_member_to_head.get(&n).copied().unwrap_or(n);
             resolved & ORDER_SYNTH_MASK
         };
-        let nodes = order_nodes_dfs(entry_node, &nodes_set, &remapped_edges, |n| {
-            stmt_map.get(&n).map_or(false, is_unconditional_exit)
-        }, &loop_members, &node_innermost_loop, order_normalize);
+        let nodes = order_nodes_dfs(
+            entry_node,
+            &nodes_set,
+            &remapped_edges,
+            |n| stmt_map.get(&n).map_or(false, is_unconditional_exit),
+            &loop_members,
+            &node_innermost_loop,
+            order_normalize,
+        );
         if let Ok(pat) = std::env::var("MANIFOLD_PR_DUMP") {
             if !pat.is_empty() && func.name.contains(&pat) {
-                eprintln!("[PR-NODES] fn {} ({:#x}) n={}: {:x?}", func.name, func_addr, nodes.len(), nodes);
+                eprintln!(
+                    "[PR-NODES] fn {} ({:#x}) n={}: {:x?}",
+                    func.name,
+                    func_addr,
+                    nodes.len(),
+                    nodes
+                );
             }
         }
 
@@ -984,8 +1120,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
 
         let expected_stmts = func.statements.len();
         let actual_leaf_count = count_leaf_stmts_in_block(&body_items);
-        let is_incomplete = body_items.is_empty()
-            || (expected_stmts > 4 && actual_leaf_count * 2 < expected_stmts);
+        let is_incomplete =
+            body_items.is_empty() || (expected_stmts > 4 && actual_leaf_count * 2 < expected_stmts);
         if is_incomplete {
             let covered_nodes: HashSet<crate::x86::types::Node> = nodes.iter().copied().collect();
 
@@ -993,7 +1129,9 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             fb_ctx.func_renames = local_def_policy.renames.clone();
             {
                 let mut addr_name_map: HashMap<u64, String> = HashMap::new();
-                for (addr, name, _entry_node) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
+                for (addr, name, _entry_node) in
+                    db.rel_iter::<(Address, Symbol, Node)>("emit_function")
+                {
                     addr_name_map.insert(*addr as u64, sanitize_c_symbol_name(name));
                 }
                 for f in selected_functions {
@@ -1008,16 +1146,23 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 sorted.sort_by_key(|(addr, _)| *addr);
                 fb_ctx.func_addrs_sorted = sorted;
             }
-            let mut fb_nodes: Vec<_> = func.statements.keys().copied()
+            let mut fb_nodes: Vec<_> = func
+                .statements
+                .keys()
+                .copied()
                 .filter(|n| !covered_nodes.contains(n))
                 .collect();
             fb_nodes.sort();
             for node in fb_nodes {
                 if let Some(cl_stmt) = func.statements.get(&node) {
                     let cstmt = convert_stmt(cl_stmt, &mut fb_ctx);
-                    let cstmt = crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
-                        crate::decompile::passes::c_pass::helpers::inline_string_literals(e, &string_map)
-                    });
+                    let cstmt =
+                        crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
+                            crate::decompile::passes::c_pass::helpers::inline_string_literals(
+                                e,
+                                &string_map,
+                            )
+                        });
                     let cstmt = strip_trivial_casts(&cstmt, &fb_ctx.var_types);
                     if !matches!(cstmt, CStmt::Empty) {
                         body_items.push(CBlockItem::Stmt(cstmt));
@@ -1060,7 +1205,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             let idx = func.var_decl_idx.get(reg).copied().unwrap_or(0);
             if let Some(type_str) = candidates.get(idx).or_else(|| func.var_types.get(reg)) {
                 let var_name = crate::decompile::passes::c_pass::helpers::param_name_for_reg(*reg);
-                let ctype = crate::decompile::passes::c_pass::helpers::xtype_string_to_ctype(type_str);
+                let ctype =
+                    crate::decompile::passes::c_pass::helpers::xtype_string_to_ctype(type_str);
                 local_var_types.insert(var_name, ctype);
             }
         }
@@ -1068,12 +1214,15 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         body = strip_trivial_casts(&body, &local_var_types);
         body = forward_return_value(&body);
 
-        let is_reconciled_void = db.rel_iter::<(Address,)>("emit_function_void").any(|&(addr,)| addr == func.address);
+        let is_reconciled_void = db
+            .rel_iter::<(Address,)>("emit_function_void")
+            .any(|&(addr,)| addr == func.address);
 
         // Return type from signature_pass; the relation is multi-valued, so reduce with the same .min() query.rs uses and every consumer selects the identical type.
         let return_type = if is_reconciled_void {
             CType::Void
-        } else if let Some(xtype) = db.rel_iter::<(Address, XType)>("emit_function_return_type_xtype")
+        } else if let Some(xtype) = db
+            .rel_iter::<(Address, XType)>("emit_function_return_type_xtype")
             .filter(|(a, _)| *a == func.address)
             .map(|(_, t)| *t)
             .min()
@@ -1135,10 +1284,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                     continue;
                 }
                 let elem = ctype_from_memchunk(chunk);
-                local_var_types.insert(
-                    var_name,
-                    CType::Array(Box::new(elem), Some(*count)),
-                );
+                local_var_types.insert(var_name, CType::Array(Box::new(elem), Some(*count)));
             }
         }
 
@@ -1156,11 +1302,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                                 Box::new(CExpr::Var(name.clone())),
                                 Box::new(CExpr::int(0)),
                             );
-                            return Some(CExpr::Assign(
-                                *op,
-                                Box::new(elem_lhs),
-                                rhs.clone(),
-                            ));
+                            return Some(CExpr::Assign(*op, Box::new(elem_lhs), rhs.clone()));
                         }
                     }
                 }
@@ -1170,18 +1312,21 @@ pub fn build_translation_unit_from_stmt_map_with_types(
 
         let bool_vars = detect_bool_variables(&body);
 
-        let mut params: Vec<FuncParam> = params.into_iter().map(|mut p| {
-            if let Some(name) = &p.name {
-                if p.ty == CType::long() {
-                    if let Some(inferred_ty) = local_var_types.get(name) {
-                        p.ty = inferred_ty.clone();
-                    } else if bool_vars.contains(name.as_str()) {
-                        p.ty = CType::int();
+        let mut params: Vec<FuncParam> = params
+            .into_iter()
+            .map(|mut p| {
+                if let Some(name) = &p.name {
+                    if p.ty == CType::long() {
+                        if let Some(inferred_ty) = local_var_types.get(name) {
+                            p.ty = inferred_ty.clone();
+                        } else if bool_vars.contains(name.as_str()) {
+                            p.ty = CType::int();
+                        }
                     }
                 }
-            }
-            p
-        }).collect();
+                p
+            })
+            .collect();
 
         // const-qualify a read-only char * parameter whose name is never a write target in the emitted body, sound because the mutated-name set comes from the same body that will be compiled.
         {
@@ -1200,9 +1345,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             );
             for p in &mut params {
                 if let Some(name) = &p.name {
-                    if p.ty == CType::ptr(CType::char_signed())
-                        && !mutated_names.contains(name)
-                    {
+                    if p.ty == CType::ptr(CType::char_signed()) && !mutated_names.contains(name) {
                         p.ty = const_char_ptr.clone();
                     }
                 }
@@ -1230,7 +1373,10 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         let mut local_vars: Vec<VarDecl> = local_names
             .into_iter()
             .map(|name| {
-                let ty = local_var_types.get(&name).cloned().unwrap_or_else(CType::int);
+                let ty = local_var_types
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(CType::int);
                 VarDecl {
                     name,
                     ty,
@@ -1252,14 +1398,25 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             let mut h = DefaultHasher::new();
             body_str.hash(&mut h);
             lv.join(",").hash(&mut h);
-            eprintln!("[FP-PR] {:016x} {} {:016x}", func_addr, func.name, h.finish());
+            eprintln!(
+                "[FP-PR] {:016x} {} {:016x}",
+                func_addr,
+                func.name,
+                h.finish()
+            );
         }
         if let Ok(pat) = std::env::var("MANIFOLD_PR_DUMP") {
             if !pat.is_empty() && func.name.contains(&pat) {
                 let body_str = crate::decompile::passes::c_pass::print::print_stmt(&body);
                 let mut lv: Vec<String> = local_vars.iter().map(|v| format!("{:?}", v)).collect();
                 lv.sort();
-                eprintln!("[PR-DUMP] fn {} ({:#x}) locals:\n{}\n[PR-DUMP] body:\n{}", func.name, func_addr, lv.join("\n"), body_str);
+                eprintln!(
+                    "[PR-DUMP] fn {} ({:#x}) locals:\n{}\n[PR-DUMP] body:\n{}",
+                    func.name,
+                    func_addr,
+                    lv.join("\n"),
+                    body_str
+                );
             }
         }
         let mut renamer = VarRenamer::new();
@@ -1277,19 +1434,27 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             renamer.ensure_mapping(&v.name);
         }
         let body = StmtTransform::transform_stmt(&mut renamer, body);
-        let params: Vec<FuncParam> = params.iter().map(|p| {
-            let new_name = p.name.as_ref().map(|n| renamer.rename(n));
-            FuncParam::new(new_name, p.ty.clone())
-        }).collect();
-        let local_vars: Vec<VarDecl> = local_vars.into_iter().map(|mut v| {
-            v.name = renamer.rename(&v.name);
-            v
-        }).collect();
+        let params: Vec<FuncParam> = params
+            .iter()
+            .map(|p| {
+                let new_name = p.name.as_ref().map(|n| renamer.rename(n));
+                FuncParam::new(new_name, p.ty.clone())
+            })
+            .collect();
+        let local_vars: Vec<VarDecl> = local_vars
+            .into_iter()
+            .map(|mut v| {
+                v.name = renamer.rename(&v.name);
+                v
+            })
+            .collect();
 
         // Use-before-def guard: a local that is read but never assigned, address-taken or inc/dec'd has no producer, so zero-initialize it; a defensive last resort, with the real fixes upstream.
         let mut local_origin_names: HashSet<String> = HashSet::new();
         for p in &params {
-            if let Some(n) = &p.name { local_origin_names.insert(n.clone()); }
+            if let Some(n) = &p.name {
+                local_origin_names.insert(n.clone());
+            }
         }
         collect_var_origins_stmt(&body, &mut local_origin_names);
         let local_vars: Vec<VarDecl> = local_vars
@@ -1303,7 +1468,10 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             .collect();
 
         let func_name = if func.name.starts_with("FUN_") {
-            recovered_func_names.get(&func.address).cloned().unwrap_or_else(|| func.name.clone())
+            recovered_func_names
+                .get(&func.address)
+                .cloned()
+                .unwrap_or_else(|| func.name.clone())
         } else {
             func.name.clone()
         };
@@ -1337,12 +1505,21 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
             let body_str = crate::decompile::passes::c_pass::print::print_stmt(&func_def.body);
-            let mut lv: Vec<String> = func_def.local_vars.iter().map(|v| format!("{:?}", v)).collect();
+            let mut lv: Vec<String> = func_def
+                .local_vars
+                .iter()
+                .map(|v| format!("{:?}", v))
+                .collect();
             lv.sort();
             let mut h = DefaultHasher::new();
             body_str.hash(&mut h);
             lv.join(",").hash(&mut h);
-            eprintln!("[FP-E] {:016x} {} {:016x}", func_addr, func_def.name, h.finish());
+            eprintln!(
+                "[FP-E] {:016x} {} {:016x}",
+                func_addr,
+                func_def.name,
+                h.finish()
+            );
         }
         tu.add_function(func_def);
     }
@@ -1354,20 +1531,28 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     };
 
     // resolved_extern_signature has set semantics and may carry several rows per name, so group by sanitized name, pick one deterministically, and emit in sorted order for a byte-stable file.
-    let mut extern_by_name: BTreeMap<String, Vec<(usize, XType, Arc<Vec<XType>>)>> = BTreeMap::new();
-    for (name, param_count, ret_type, param_types) in db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature") {
+    let mut extern_by_name: BTreeMap<String, Vec<(usize, XType, Arc<Vec<XType>>)>> =
+        BTreeMap::new();
+    for (name, param_count, ret_type, param_types) in
+        db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature")
+    {
         let sanitized = sanitize_c_symbol_name(name);
-        extern_by_name
-            .entry(sanitized)
-            .or_default()
-            .push((*param_count, *ret_type, param_types.clone()));
+        extern_by_name.entry(sanitized).or_default().push((
+            *param_count,
+            *ret_type,
+            param_types.clone(),
+        ));
     }
     for (sanitized_name, mut sigs) in extern_by_name {
         if emitted_func_names.contains(&sanitized_name) || is_compiler_provided(&sanitized_name) {
             continue;
         }
         // Deterministic pick: prefer the row whose XType vector compares smallest.
-        sigs.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(&b.1)).then_with(|| a.0.cmp(&b.0)));
+        sigs.sort_by(|a, b| {
+            a.2.cmp(&b.2)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
         // RB-1: each Vec holds >= 1 row by construction (.or_default().push(...)); no input shape produces an empty group.
         let (_param_count, ret_type, param_types) = sigs.into_iter().next().unwrap();
         let ret_ctype = convert_xtype(&ret_type);
@@ -1378,7 +1563,11 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             .collect();
 
         let variadic = is_known_variadic_fn(&sanitized_name);
-        let mut decl = crate::decompile::passes::c_pass::types::FuncDecl::new(sanitized_name, ret_ctype, params);
+        let mut decl = crate::decompile::passes::c_pass::types::FuncDecl::new(
+            sanitized_name,
+            ret_ctype,
+            params,
+        );
         decl.is_variadic = variadic;
         tu.add_func_decl(decl);
     }
@@ -1394,7 +1583,9 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                     callee_ret.insert(f.name.clone(), f.return_type.clone());
                 }
                 crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(d) => {
-                    callee_ret.entry(d.name.clone()).or_insert_with(|| d.return_type.clone());
+                    callee_ret
+                        .entry(d.name.clone())
+                        .or_insert_with(|| d.return_type.clone());
                 }
                 crate::decompile::passes::c_pass::types::TopLevelDecl::VarDecl(v) => {
                     global_types.insert(v.name.clone(), v.ty.clone());
@@ -1426,7 +1617,12 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     };
     // Recovered return type per callee name, most-refined candidate winning to match clight_select's pick, so a skip-listed internal declares its true return width instead of int.
     let recovered_ret_by_name: HashMap<String, XType> = {
-        let prio = |t: &XType| (crate::decompile::passes::clight_pass::xtype_refine_priority(t), *t);
+        let prio = |t: &XType| {
+            (
+                crate::decompile::passes::clight_pass::xtype_refine_priority(t),
+                *t,
+            )
+        };
         let mut by_addr: HashMap<Address, XType> = HashMap::new();
         for (addr, xt) in db.rel_iter::<(Address, XType)>("emit_function_return_type_xtype") {
             by_addr
@@ -1544,9 +1740,14 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         sorted_called_funcs.sort();
         for name in sorted_called_funcs {
             let is_label = name.starts_with("L_")
-                || (name.starts_with('L') && name.len() > 1 && name[1..].chars().all(|c| c.is_ascii_hexdigit()));
-            if !declared.contains(name) && !is_label && !is_compiler_provided(name)
-                && !emitted_func_names.contains(name) {
+                || (name.starts_with('L')
+                    && name.len() > 1
+                    && name[1..].chars().all(|c| c.is_ascii_hexdigit()));
+            if !declared.contains(name)
+                && !is_label
+                && !is_compiler_provided(name)
+                && !emitted_func_names.contains(name)
+            {
                 // Called-but-undeclared external: a curated one keeps its typed prototype, an unknown one gets a K&R name(); guarded to externals, with the return type from the recovered signature.
                 let ret_ctype = recovered_ret_ctype(&recovered_ret_by_name, name);
                 let decl = if known_sig_by_name.contains_key(name) {
@@ -1564,7 +1765,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                         ret_ctype.clone(),
                     )
                 };
-                forward_decls.push(crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(decl));
+                forward_decls
+                    .push(crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(decl));
             }
         }
         for decl in forward_decls {
@@ -1592,7 +1794,8 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             }
         }
         for fd in internal_decls {
-            tu.decls.push(crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(fd));
+            tu.decls
+                .push(crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(fd));
         }
     }
 
@@ -1643,15 +1846,25 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 TopLevelDecl::FuncDef(f) => {
                     callee_params.insert(
                         f.name.clone(),
-                        (f.params.iter().map(|p| p.ty.clone()).collect(), f.is_variadic, false),
+                        (
+                            f.params.iter().map(|p| p.ty.clone()).collect(),
+                            f.is_variadic,
+                            false,
+                        ),
                     );
                     callee_ret.insert(f.name.clone(), f.return_type.clone());
                 }
                 TopLevelDecl::FuncDecl(d) => {
                     callee_params.entry(d.name.clone()).or_insert_with(|| {
-                        (d.params.iter().map(|p| p.ty.clone()).collect(), d.is_variadic, d.unspecified_params)
+                        (
+                            d.params.iter().map(|p| p.ty.clone()).collect(),
+                            d.is_variadic,
+                            d.unspecified_params,
+                        )
                     });
-                    callee_ret.entry(d.name.clone()).or_insert_with(|| d.return_type.clone());
+                    callee_ret
+                        .entry(d.name.clone())
+                        .or_insert_with(|| d.return_type.clone());
                 }
                 TopLevelDecl::VarDecl(v) => {
                     global_types.insert(v.name.clone(), v.ty.clone());
@@ -1717,8 +1930,12 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         let uses_overflow_marker = referenced.contains("__builtin_overflow");
         let mut undeclared: Vec<String> = referenced
             .into_iter()
-            .filter(|n| !declared.contains(n) && !locals.contains(n) && is_global_like_name(n)
-                && !is_libc_stdio_global(n))
+            .filter(|n| {
+                !declared.contains(n)
+                    && !locals.contains(n)
+                    && is_global_like_name(n)
+                    && !is_libc_stdio_global(n)
+            })
             .collect();
         undeclared.sort();
         undeclared.dedup();
@@ -1741,7 +1958,10 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 let decl = known_decl(&name).unwrap_or_else(|| {
                     crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
                         name.clone(),
-                        CType::Int(crate::decompile::passes::c_pass::types::IntSize::Int, Signedness::Signed),
+                        CType::Int(
+                            crate::decompile::passes::c_pass::types::IntSize::Int,
+                            Signedness::Signed,
+                        ),
                     )
                 });
                 tu.add_func_decl(decl);
@@ -1881,13 +2101,24 @@ pub(crate) fn convert_param_type_from_param(param: &ParamType) -> CType {
 fn collect_var_origins_expr(expr: &CExpr, out: &mut HashSet<String>) {
     match expr {
         CExpr::Assign(_, lhs, rhs) => {
-            if let CExpr::Var(n) = lhs.as_ref() { out.insert(n.clone()); }
+            if let CExpr::Var(n) = lhs.as_ref() {
+                out.insert(n.clone());
+            }
             collect_var_origins_expr(lhs, out);
             collect_var_origins_expr(rhs, out);
         }
         CExpr::Unary(op, inner) => {
-            if matches!(op, UnaryOp::AddrOf | UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::PostInc | UnaryOp::PostDec) {
-                if let CExpr::Var(n) = inner.as_ref() { out.insert(n.clone()); }
+            if matches!(
+                op,
+                UnaryOp::AddrOf
+                    | UnaryOp::PreInc
+                    | UnaryOp::PreDec
+                    | UnaryOp::PostInc
+                    | UnaryOp::PostDec
+            ) {
+                if let CExpr::Var(n) = inner.as_ref() {
+                    out.insert(n.clone());
+                }
             }
             collect_var_origins_expr(inner, out);
         }
@@ -1902,14 +2133,21 @@ fn collect_var_origins_expr(expr: &CExpr, out: &mut HashSet<String>) {
         }
         CExpr::Call(f, args) => {
             collect_var_origins_expr(f, out);
-            for a in args { collect_var_origins_expr(a, out); }
+            for a in args {
+                collect_var_origins_expr(a, out);
+            }
         }
-        CExpr::Cast(_, inner) | CExpr::Paren(inner) | CExpr::Member(inner, _)
-        | CExpr::MemberPtr(inner, _) | CExpr::SizeofExpr(inner) => {
+        CExpr::Cast(_, inner)
+        | CExpr::Paren(inner)
+        | CExpr::Member(inner, _)
+        | CExpr::MemberPtr(inner, _)
+        | CExpr::SizeofExpr(inner) => {
             collect_var_origins_expr(inner, out);
         }
         CExpr::StmtExpr(stmts, fin) => {
-            for s in stmts { collect_var_origins_stmt(s, out); }
+            for s in stmts {
+                collect_var_origins_stmt(s, out);
+            }
             collect_var_origins_expr(fin, out);
         }
         _ => {}
@@ -1923,7 +2161,9 @@ fn collect_var_origins_stmt(stmt: &CStmt, out: &mut HashSet<String>) {
         CStmt::If(c, t, e) => {
             collect_var_origins_expr(c, out);
             collect_var_origins_stmt(t, out);
-            if let Some(s) = e { collect_var_origins_stmt(s, out); }
+            if let Some(s) = e {
+                collect_var_origins_stmt(s, out);
+            }
         }
         CStmt::Switch(e, body) => {
             collect_var_origins_expr(e, out);
@@ -1936,36 +2176,56 @@ fn collect_var_origins_stmt(stmt: &CStmt, out: &mut HashSet<String>) {
         CStmt::For(init, cond, update, body) => {
             match init {
                 Some(ForInit::Expr(e)) => collect_var_origins_expr(e, out),
-                Some(ForInit::Decl(decls)) => { for d in decls { out.insert(d.name.clone()); } }
+                Some(ForInit::Decl(decls)) => {
+                    for d in decls {
+                        out.insert(d.name.clone());
+                    }
+                }
                 None => {}
             }
-            if let Some(c) = cond { collect_var_origins_expr(c, out); }
-            if let Some(u) = update { collect_var_origins_expr(u, out); }
+            if let Some(c) = cond {
+                collect_var_origins_expr(c, out);
+            }
+            if let Some(u) = update {
+                collect_var_origins_expr(u, out);
+            }
             collect_var_origins_stmt(body, out);
         }
         CStmt::Block(items) => {
             for item in items {
                 match item {
                     CBlockItem::Stmt(s) => collect_var_origins_stmt(s, out),
-                    CBlockItem::Decl(decls) => { for d in decls { out.insert(d.name.clone()); } }
+                    CBlockItem::Decl(decls) => {
+                        for d in decls {
+                            out.insert(d.name.clone());
+                        }
+                    }
                 }
             }
         }
-        CStmt::Sequence(stmts) => { for s in stmts { collect_var_origins_stmt(s, out); } }
+        CStmt::Sequence(stmts) => {
+            for s in stmts {
+                collect_var_origins_stmt(s, out);
+            }
+        }
         CStmt::Labeled(_, inner) => collect_var_origins_stmt(inner, out),
         _ => {}
     }
 }
 
 // Zero initializer for a "variable from nowhere": scalars/pointers get `= 0`, aggregates get `= {0}` (both valid C); function/void-typed declarations are left untouched.
-fn zero_initializer_for_var(ty: &CType) -> Option<crate::decompile::passes::c_pass::types::Initializer> {
+fn zero_initializer_for_var(
+    ty: &CType,
+) -> Option<crate::decompile::passes::c_pass::types::Initializer> {
     use crate::decompile::passes::c_pass::types::{InitItem, Initializer};
     match ty {
         CType::Void | CType::Function(..) => None,
-        CType::Struct(_) | CType::Union(_) | CType::Array(..) => Some(Initializer::List(vec![InitItem {
-            designator: None,
-            init: Initializer::Expr(CExpr::int(0)),
-        }])),
+        CType::Struct(_) | CType::Union(_) | CType::Array(..) => {
+            Some(Initializer::List(vec![InitItem {
+                designator: None,
+                init: Initializer::Expr(CExpr::int(0)),
+            }]))
+        }
         _ => Some(Initializer::Expr(CExpr::int(0))),
     }
 }
@@ -2177,17 +2437,25 @@ fn infer_var_types_from_usage(
                     infer_types_from_expr(e, var_types, extern_return_types);
                 }
             }
-            if let Some(e) = cond { infer_types_from_expr(e, var_types, extern_return_types); }
-            if let Some(e) = update { infer_types_from_expr(e, var_types, extern_return_types); }
+            if let Some(e) = cond {
+                infer_types_from_expr(e, var_types, extern_return_types);
+            }
+            if let Some(e) = update {
+                infer_types_from_expr(e, var_types, extern_return_types);
+            }
             infer_var_types_from_usage(body, var_types, extern_return_types);
         }
         CStmt::Switch(e, body) => {
             infer_types_from_expr(e, var_types, extern_return_types);
             infer_var_types_from_usage(body, var_types, extern_return_types);
         }
-        CStmt::Labeled(_, inner) => infer_var_types_from_usage(inner, var_types, extern_return_types),
+        CStmt::Labeled(_, inner) => {
+            infer_var_types_from_usage(inner, var_types, extern_return_types)
+        }
         CStmt::Sequence(stmts) => {
-            for s in stmts { infer_var_types_from_usage(s, var_types, extern_return_types); }
+            for s in stmts {
+                infer_var_types_from_usage(s, var_types, extern_return_types);
+            }
         }
         _ => {}
     }
@@ -2195,16 +2463,24 @@ fn infer_var_types_from_usage(
 
 fn insert_or_refine(var_types: &mut HashMap<String, CType>, name: String, new_ty: CType) {
     match var_types.get(&name) {
-        None => { var_types.insert(name, new_ty); }
+        None => {
+            var_types.insert(name, new_ty);
+        }
         Some(existing) => {
-            if *existing == CType::ptr(CType::Void) && new_ty != CType::ptr(CType::Void) && new_ty.is_pointer() {
+            if *existing == CType::ptr(CType::Void)
+                && new_ty != CType::ptr(CType::Void)
+                && new_ty.is_pointer()
+            {
                 var_types.insert(name, new_ty);
             }
             // NOTE (plan 5.4): the int/long -> pointer FLIP is retired. Pointerness is decided by the solver and force_ptr_regs; usage inference defers on that axis and only refines the pointee or width.
-            else if *existing == CType::long() && !new_ty.is_pointer() && new_ty != CType::long() {
+            else if *existing == CType::long() && !new_ty.is_pointer() && new_ty != CType::long()
+            {
                 var_types.insert(name, new_ty);
-            }
-            else if existing.is_generic_long_ptr() && new_ty.is_pointer() && !new_ty.is_generic_long_ptr() {
+            } else if existing.is_generic_long_ptr()
+                && new_ty.is_pointer()
+                && !new_ty.is_generic_long_ptr()
+            {
                 var_types.insert(name, new_ty);
             }
         }
@@ -2238,9 +2514,10 @@ fn infer_types_from_expr(
                         insert_or_refine(var_types, name.to_string(), ty.clone());
                     }
                 }
-            }
-            else if let CExpr::Paren(paren_inner) = inner.as_ref() {
-                if let CExpr::Binary(BinaryOp::Add, lhs, _) | CExpr::Binary(BinaryOp::Sub, lhs, _) = paren_inner.as_ref() {
+            } else if let CExpr::Paren(paren_inner) = inner.as_ref() {
+                if let CExpr::Binary(BinaryOp::Add, lhs, _) | CExpr::Binary(BinaryOp::Sub, lhs, _) =
+                    paren_inner.as_ref()
+                {
                     if let CExpr::Cast(ty, cast_inner) = lhs.as_ref() {
                         if let Some(name) = extract_var_name(cast_inner) {
                             if ty.is_pointer() {
@@ -2249,9 +2526,10 @@ fn infer_types_from_expr(
                         }
                     }
                 }
-            }
-            else if let CExpr::Var(name) = inner.as_ref() {
-                var_types.entry(name.clone()).or_insert_with(|| CType::ptr(CType::Void));
+            } else if let CExpr::Var(name) = inner.as_ref() {
+                var_types
+                    .entry(name.clone())
+                    .or_insert_with(|| CType::ptr(CType::Void));
             }
             infer_types_from_expr(inner, var_types, extern_return_types);
         }
@@ -2275,7 +2553,8 @@ fn infer_types_from_expr(
                     if let CExpr::Var(func_name) = callee.as_ref() {
                         if let Some(ret_ty) = extern_return_types.get(func_name.as_str()) {
                             // The result of a known POINTER-returning call is that pointer (a declared return type, not a cast inference); overrides only a default int/long scalar that would truncate it.
-                            if ret_ty.is_pointer() && is_default_int_scalar_ty(var_types.get(name)) {
+                            if ret_ty.is_pointer() && is_default_int_scalar_ty(var_types.get(name))
+                            {
                                 var_types.insert(name.clone(), ret_ty.clone());
                             } else {
                                 var_types.entry(name.clone()).or_insert(ret_ty.clone());
@@ -2292,23 +2571,32 @@ fn infer_types_from_expr(
                 infer_call_arg_types(func_name, args, var_types);
             }
             infer_types_from_expr(func, var_types, extern_return_types);
-            for arg in args { infer_types_from_expr(arg, var_types, extern_return_types); }
+            for arg in args {
+                infer_types_from_expr(arg, var_types, extern_return_types);
+            }
         }
         CExpr::MemberPtr(inner, _) => {
             if let CExpr::Var(name) = inner.as_ref() {
-                var_types.entry(name.clone()).or_insert_with(|| CType::ptr(CType::Void));
+                var_types
+                    .entry(name.clone())
+                    .or_insert_with(|| CType::ptr(CType::Void));
             }
             infer_types_from_expr(inner, var_types, extern_return_types);
         }
         CExpr::Index(base, index) => {
             if let CExpr::Var(name) = base.as_ref() {
-                var_types.entry(name.clone()).or_insert_with(|| CType::ptr(CType::Void));
+                var_types
+                    .entry(name.clone())
+                    .or_insert_with(|| CType::ptr(CType::Void));
             }
             infer_types_from_expr(base, var_types, extern_return_types);
             infer_types_from_expr(index, var_types, extern_return_types);
         }
-        CExpr::Unary(_, inner) | CExpr::Cast(_, inner) | CExpr::Paren(inner)
-        | CExpr::SizeofExpr(inner) | CExpr::Member(inner, _) => {
+        CExpr::Unary(_, inner)
+        | CExpr::Cast(_, inner)
+        | CExpr::Paren(inner)
+        | CExpr::SizeofExpr(inner)
+        | CExpr::Member(inner, _) => {
             infer_types_from_expr(inner, var_types, extern_return_types);
         }
         CExpr::Binary(_, lhs, rhs) => {
@@ -2328,16 +2616,54 @@ fn infer_call_arg_types(func_name: &str, args: &[CExpr], var_types: &mut HashMap
     let char_ptr = || CType::ptr(CType::char_signed());
     let void_ptr = || CType::ptr(CType::Void);
     let str_first: &[&str] = &[
-        "strlen", "strcmp", "strncmp", "strcpy", "strdup", "strndup",
-        "strcat", "strncat", "strchr", "strrchr", "strstr", "strtol", "strtoul",
-        "strtoll", "strtoull", "strtod", "atoi", "atol", "atoll",
-        "fputs", "puts", "printf", "sprintf", "snprintf",
-        "__sprintf_chk", "__snprintf_chk", "__fprintf_chk", "__printf_chk",
-        "dcgettext", "gettext", "ngettext", "dgettext",
-        "setlocale", "getenv", "putenv",
-        "opendir", "stat", "lstat", "access", "unlink", "rmdir", "mkdir",
-        "fopen", "freopen", "remove", "rename",
-        "error", "error_at_line",
+        "strlen",
+        "strcmp",
+        "strncmp",
+        "strcpy",
+        "strdup",
+        "strndup",
+        "strcat",
+        "strncat",
+        "strchr",
+        "strrchr",
+        "strstr",
+        "strtol",
+        "strtoul",
+        "strtoll",
+        "strtoull",
+        "strtod",
+        "atoi",
+        "atol",
+        "atoll",
+        "fputs",
+        "puts",
+        "printf",
+        "sprintf",
+        "snprintf",
+        "__sprintf_chk",
+        "__snprintf_chk",
+        "__fprintf_chk",
+        "__printf_chk",
+        "dcgettext",
+        "gettext",
+        "ngettext",
+        "dgettext",
+        "setlocale",
+        "getenv",
+        "putenv",
+        "opendir",
+        "stat",
+        "lstat",
+        "access",
+        "unlink",
+        "rmdir",
+        "mkdir",
+        "fopen",
+        "freopen",
+        "remove",
+        "rename",
+        "error",
+        "error_at_line",
     ];
     if str_first.contains(&func_name) {
         if let Some(name) = args.first().and_then(extract_var_name) {
@@ -2345,10 +2671,21 @@ fn infer_call_arg_types(func_name: &str, args: &[CExpr], var_types: &mut HashMap
         }
     }
     let str_second: &[&str] = &[
-        "strcmp", "strncmp", "strcpy", "strncpy", "strcat", "strncat", "strstr",
-        "fprintf", "sprintf", "snprintf",
-        "fopen", "freopen", "rename",
-        "__sprintf_chk", "__snprintf_chk",
+        "strcmp",
+        "strncmp",
+        "strcpy",
+        "strncpy",
+        "strcat",
+        "strncat",
+        "strstr",
+        "fprintf",
+        "sprintf",
+        "snprintf",
+        "fopen",
+        "freopen",
+        "rename",
+        "__sprintf_chk",
+        "__snprintf_chk",
     ];
     if str_second.contains(&func_name) {
         if let Some(name) = args.get(1).and_then(extract_var_name) {
@@ -2393,7 +2730,11 @@ fn infer_call_arg_types(func_name: &str, args: &[CExpr], var_types: &mut HashMap
             insert_or_refine(var_types, name.to_string(), CType::int());
         }
         if let Some(name) = args.get(1).and_then(extract_var_name) {
-            insert_or_refine(var_types, name.to_string(), CType::ptr(CType::ptr(CType::char_signed())));
+            insert_or_refine(
+                var_types,
+                name.to_string(),
+                CType::ptr(CType::ptr(CType::char_signed())),
+            );
         }
         if let Some(name) = args.get(2).and_then(extract_var_name) {
             insert_or_refine(var_types, name.to_string(), char_ptr());
@@ -2427,12 +2768,18 @@ fn infer_call_arg_types(func_name: &str, args: &[CExpr], var_types: &mut HashMap
             insert_or_refine(var_types, name.to_string(), CType::int());
         }
     }
-    if matches!(func_name, "close" | "read" | "write" | "dup" | "dup2" | "fcntl" | "ioctl" | "isatty") {
+    if matches!(
+        func_name,
+        "close" | "read" | "write" | "dup" | "dup2" | "fcntl" | "ioctl" | "isatty"
+    ) {
         if let Some(name) = args.first().and_then(extract_var_name) {
             insert_or_refine(var_types, name.to_string(), CType::int());
         }
     }
-    if matches!(func_name, "strtol" | "strtoul" | "strtoll" | "strtoull" | "strtod") {
+    if matches!(
+        func_name,
+        "strtol" | "strtoul" | "strtoll" | "strtoull" | "strtod"
+    ) {
         if let Some(name) = args.get(2).and_then(extract_var_name) {
             insert_or_refine(var_types, name.to_string(), CType::int());
         }
@@ -2442,18 +2789,25 @@ fn infer_call_arg_types(func_name: &str, args: &[CExpr], var_types: &mut HashMap
 fn detect_bool_variables(stmt: &CStmt) -> HashSet<&str> {
     let mut bool_uses: HashMap<&str, (usize, usize)> = HashMap::new();
     collect_bool_evidence(stmt, &mut bool_uses, false);
-    bool_uses.into_iter()
+    bool_uses
+        .into_iter()
         .filter(|(_, (bool_count, non_bool_count))| *bool_count > 0 && *non_bool_count == 0)
         .map(|(name, _)| name)
         .collect()
 }
 
-fn collect_bool_evidence<'a>(stmt: &'a CStmt, evidence: &mut HashMap<&'a str, (usize, usize)>, _in_bool_ctx: bool) {
+fn collect_bool_evidence<'a>(
+    stmt: &'a CStmt,
+    evidence: &mut HashMap<&'a str, (usize, usize)>,
+    _in_bool_ctx: bool,
+) {
     match stmt {
         CStmt::If(cond, then_s, else_s) => {
             collect_bool_evidence_expr(cond, evidence, true);
             collect_bool_evidence(then_s, evidence, false);
-            if let Some(e) = else_s { collect_bool_evidence(e, evidence, false); }
+            if let Some(e) = else_s {
+                collect_bool_evidence(e, evidence, false);
+            }
         }
         CStmt::While(cond, body) | CStmt::DoWhile(body, cond) => {
             collect_bool_evidence_expr(cond, evidence, true);
@@ -2465,8 +2819,12 @@ fn collect_bool_evidence<'a>(stmt: &'a CStmt, evidence: &mut HashMap<&'a str, (u
                     collect_bool_evidence_expr(e, evidence, false);
                 }
             }
-            if let Some(e) = cond { collect_bool_evidence_expr(e, evidence, true); }
-            if let Some(e) = update { collect_bool_evidence_expr(e, evidence, false); }
+            if let Some(e) = cond {
+                collect_bool_evidence_expr(e, evidence, true);
+            }
+            if let Some(e) = update {
+                collect_bool_evidence_expr(e, evidence, false);
+            }
             collect_bool_evidence(body, evidence, false);
         }
         CStmt::Expr(e) => collect_bool_evidence_expr(e, evidence, false),
@@ -2484,13 +2842,19 @@ fn collect_bool_evidence<'a>(stmt: &'a CStmt, evidence: &mut HashMap<&'a str, (u
         }
         CStmt::Labeled(_, inner) => collect_bool_evidence(inner, evidence, false),
         CStmt::Sequence(stmts) => {
-            for s in stmts { collect_bool_evidence(s, evidence, false); }
+            for s in stmts {
+                collect_bool_evidence(s, evidence, false);
+            }
         }
         _ => {}
     }
 }
 
-fn collect_bool_evidence_expr<'a>(expr: &'a CExpr, evidence: &mut HashMap<&'a str, (usize, usize)>, in_bool_ctx: bool) {
+fn collect_bool_evidence_expr<'a>(
+    expr: &'a CExpr,
+    evidence: &mut HashMap<&'a str, (usize, usize)>,
+    in_bool_ctx: bool,
+) {
     match expr {
         CExpr::Var(name) => {
             let entry = evidence.entry(name.as_str()).or_insert((0, 0));
@@ -2504,8 +2868,10 @@ fn collect_bool_evidence_expr<'a>(expr: &'a CExpr, evidence: &mut HashMap<&'a st
             collect_bool_evidence_expr(inner, evidence, true);
         }
         CExpr::Binary(op, lhs, rhs) if matches!(op, BinaryOp::Eq | BinaryOp::Ne) => {
-            let lhs_is_bool_const = matches!(rhs.as_ref(), CExpr::IntLit(lit) if lit.value == 0 || lit.value == 1);
-            let rhs_is_bool_const = matches!(lhs.as_ref(), CExpr::IntLit(lit) if lit.value == 0 || lit.value == 1);
+            let lhs_is_bool_const =
+                matches!(rhs.as_ref(), CExpr::IntLit(lit) if lit.value == 0 || lit.value == 1);
+            let rhs_is_bool_const =
+                matches!(lhs.as_ref(), CExpr::IntLit(lit) if lit.value == 0 || lit.value == 1);
             collect_bool_evidence_expr(lhs, evidence, lhs_is_bool_const || in_bool_ctx);
             collect_bool_evidence_expr(rhs, evidence, rhs_is_bool_const || in_bool_ctx);
         }
@@ -2533,10 +2899,16 @@ fn collect_bool_evidence_expr<'a>(expr: &'a CExpr, evidence: &mut HashMap<&'a st
         }
         CExpr::Call(func, args) => {
             collect_bool_evidence_expr(func, evidence, false);
-            for arg in args { collect_bool_evidence_expr(arg, evidence, false); }
+            for arg in args {
+                collect_bool_evidence_expr(arg, evidence, false);
+            }
         }
-        CExpr::Unary(_, inner) | CExpr::Cast(_, inner) | CExpr::Paren(inner)
-        | CExpr::SizeofExpr(inner) | CExpr::Member(inner, _) | CExpr::MemberPtr(inner, _) => {
+        CExpr::Unary(_, inner)
+        | CExpr::Cast(_, inner)
+        | CExpr::Paren(inner)
+        | CExpr::SizeofExpr(inner)
+        | CExpr::Member(inner, _)
+        | CExpr::MemberPtr(inner, _) => {
             collect_bool_evidence_expr(inner, evidence, false);
         }
         _ => {}
@@ -2558,7 +2930,9 @@ fn strip_trivial_casts(stmt: &CStmt, var_types: &HashMap<String, CType>) -> CStm
         CStmt::If(cond, then_s, else_s) => CStmt::If(
             strip_trivial_casts_expr(cond, var_types),
             Box::new(strip_trivial_casts(then_s, var_types)),
-            else_s.as_ref().map(|e| Box::new(strip_trivial_casts(e, var_types))),
+            else_s
+                .as_ref()
+                .map(|e| Box::new(strip_trivial_casts(e, var_types))),
         ),
         CStmt::While(cond, body) => CStmt::While(
             strip_trivial_casts_expr(cond, var_types),
@@ -2570,8 +2944,11 @@ fn strip_trivial_casts(stmt: &CStmt, var_types: &HashMap<String, CType>) -> CStm
         ),
         CStmt::For(init, cond, update, body) => CStmt::For(
             init.clone(),
-            cond.as_ref().map(|e| strip_trivial_casts_expr(e, var_types)),
-            update.as_ref().map(|e| strip_trivial_casts_expr(e, var_types)),
+            cond.as_ref()
+                .map(|e| strip_trivial_casts_expr(e, var_types)),
+            update
+                .as_ref()
+                .map(|e| strip_trivial_casts_expr(e, var_types)),
             Box::new(strip_trivial_casts(body, var_types)),
         ),
         CStmt::Return(Some(e)) => CStmt::Return(Some(strip_trivial_casts_expr(e, var_types))),
@@ -2579,8 +2956,15 @@ fn strip_trivial_casts(stmt: &CStmt, var_types: &HashMap<String, CType>) -> CStm
             strip_trivial_casts_expr(e, var_types),
             Box::new(strip_trivial_casts(body, var_types)),
         ),
-        CStmt::Labeled(lbl, inner) => CStmt::Labeled(lbl.clone(), Box::new(strip_trivial_casts(inner, var_types))),
-        CStmt::Sequence(stmts) => CStmt::Sequence(stmts.iter().map(|s| strip_trivial_casts(s, var_types)).collect()),
+        CStmt::Labeled(lbl, inner) => {
+            CStmt::Labeled(lbl.clone(), Box::new(strip_trivial_casts(inner, var_types)))
+        }
+        CStmt::Sequence(stmts) => CStmt::Sequence(
+            stmts
+                .iter()
+                .map(|s| strip_trivial_casts(s, var_types))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -2639,18 +3023,28 @@ fn strip_trivial_casts_expr(expr: &CExpr, var_types: &HashMap<String, CType>) ->
             Box::new(strip_trivial_casts_expr(lhs, var_types)),
             Box::new(strip_trivial_casts_expr(rhs, var_types)),
         ),
-        CExpr::Unary(op, inner) => CExpr::Unary(*op, Box::new(strip_trivial_casts_expr(inner, var_types))),
+        CExpr::Unary(op, inner) => {
+            CExpr::Unary(*op, Box::new(strip_trivial_casts_expr(inner, var_types)))
+        }
         CExpr::Call(func, args) => CExpr::Call(
             Box::new(strip_trivial_casts_expr(func, var_types)),
-            args.iter().map(|a| strip_trivial_casts_expr(a, var_types)).collect(),
+            args.iter()
+                .map(|a| strip_trivial_casts_expr(a, var_types))
+                .collect(),
         ),
         CExpr::Paren(inner) => CExpr::Paren(Box::new(strip_trivial_casts_expr(inner, var_types))),
         CExpr::Index(arr, idx) => CExpr::Index(
             Box::new(strip_trivial_casts_expr(arr, var_types)),
             Box::new(strip_trivial_casts_expr(idx, var_types)),
         ),
-        CExpr::Member(inner, field) => CExpr::Member(Box::new(strip_trivial_casts_expr(inner, var_types)), field.clone()),
-        CExpr::MemberPtr(inner, field) => CExpr::MemberPtr(Box::new(strip_trivial_casts_expr(inner, var_types)), field.clone()),
+        CExpr::Member(inner, field) => CExpr::Member(
+            Box::new(strip_trivial_casts_expr(inner, var_types)),
+            field.clone(),
+        ),
+        CExpr::MemberPtr(inner, field) => CExpr::MemberPtr(
+            Box::new(strip_trivial_casts_expr(inner, var_types)),
+            field.clone(),
+        ),
         CExpr::Ternary(cond, then_e, else_e) => CExpr::Ternary(
             Box::new(strip_trivial_casts_expr(cond, var_types)),
             Box::new(strip_trivial_casts_expr(then_e, var_types)),
@@ -2901,7 +3295,10 @@ impl VarRenamer {
     }
 
     fn rename(&self, name: &str) -> String {
-        self.map.get(name).cloned().unwrap_or_else(|| name.to_string())
+        self.map
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
     }
 }
 
@@ -3021,7 +3418,9 @@ fn collect_var_names_from_initializer(
     vars: &mut HashSet<String>,
 ) {
     match init {
-        crate::decompile::passes::c_pass::types::Initializer::Expr(e) => collect_var_names_from_expr(e, vars),
+        crate::decompile::passes::c_pass::types::Initializer::Expr(e) => {
+            collect_var_names_from_expr(e, vars)
+        }
         crate::decompile::passes::c_pass::types::Initializer::List(items) => {
             for item in items {
                 collect_var_names_from_initializer(&item.init, vars);
@@ -3081,7 +3480,10 @@ impl ConversionContext {
     fn build_label_disambig(id_to_name: &HashMap<usize, String>) -> HashMap<usize, String> {
         let mut by_base: HashMap<String, Vec<usize>> = HashMap::new();
         for (id, raw) in id_to_name {
-            by_base.entry(Self::label_name_base(raw)).or_default().push(*id);
+            by_base
+                .entry(Self::label_name_base(raw))
+                .or_default()
+                .push(*id);
         }
         let mut out: HashMap<usize, String> = HashMap::new();
         for (base, mut ids) in by_base {
@@ -3140,10 +3542,11 @@ impl ConversionContext {
             Ok(a) => a,
             Err(_) => return sanitize_c_ident(name),
         };
-        match self.func_addrs_sorted.binary_search_by_key(&addr, |(a, _)| *a) {
-            Ok(idx) => {
-                sanitize_c_symbol_name(&self.func_addrs_sorted[idx].1)
-            }
+        match self
+            .func_addrs_sorted
+            .binary_search_by_key(&addr, |(a, _)| *a)
+        {
+            Ok(idx) => sanitize_c_symbol_name(&self.func_addrs_sorted[idx].1),
             Err(idx) => {
                 if idx > 0 {
                     sanitize_c_symbol_name(&self.func_addrs_sorted[idx - 1].1)
@@ -3154,7 +3557,6 @@ impl ConversionContext {
         }
     }
 }
-
 
 fn convert_unary_op(op: &clight::ClightUnaryOp) -> UnaryOp {
     match op {
@@ -3212,10 +3614,22 @@ fn repair_pointer_arith(
 fn clight_expr_ctype(e: &clight::ClightExpr) -> &clight::ClightType {
     use clight::ClightExpr::*;
     match e {
-        EconstInt(_, t) | EconstFloat(_, t) | EconstSingle(_, t) | EconstLong(_, t)
-        | Evar(_, t) | EvarSymbol(_, t) | Etempvar(_, t) | Ederef(_, t) | Eaddrof(_, t)
-        | Eunop(_, _, t) | Ebinop(_, _, _, t) | Ecast(_, t) | Efield(_, _, t)
-        | Esizeof(_, t) | Ealignof(_, t) | Econdition(_, _, _, t) => t,
+        EconstInt(_, t)
+        | EconstFloat(_, t)
+        | EconstSingle(_, t)
+        | EconstLong(_, t)
+        | Evar(_, t)
+        | EvarSymbol(_, t)
+        | Etempvar(_, t)
+        | Ederef(_, t)
+        | Eaddrof(_, t)
+        | Eunop(_, _, t)
+        | Ebinop(_, _, _, t)
+        | Ecast(_, t)
+        | Efield(_, _, t)
+        | Esizeof(_, t)
+        | Ealignof(_, t)
+        | Econdition(_, _, _, t) => t,
     }
 }
 
@@ -3313,7 +3727,10 @@ fn peel_char_byte_rebase(e: &CExpr) -> Option<(CType, CExpr)> {
 }
 
 /// A pointer base whose sibling integral operand is a raw BYTE offset that must not be re-scaled: a bare T * Var whose B2 rebase did not fire, or the char*-rebased shape this fix produces.
-fn scaling_ptr_byte_base(e: &CExpr, types: &HashMap<String, CType>) -> Option<(CType, Option<CExpr>)> {
+fn scaling_ptr_byte_base(
+    e: &CExpr,
+    types: &HashMap<String, CType>,
+) -> Option<(CType, Option<CExpr>)> {
     match e {
         CExpr::Paren(inner) => scaling_ptr_byte_base(inner, types),
         CExpr::Var(name) => match types.get(name) {
@@ -3347,7 +3764,7 @@ fn rebase_byte_add_through_char(
 
 /// CType for a memory chunk (element type of a runtime-indexed stack array).
 fn ctype_from_memchunk(chunk: &MemoryChunk) -> CType {
-    use crate::decompile::passes::c_pass::types::{IntSize, Signedness, FloatSize};
+    use crate::decompile::passes::c_pass::types::{FloatSize, IntSize, Signedness};
     match chunk {
         MemoryChunk::MBool => CType::Bool,
         MemoryChunk::MInt8Signed => CType::Int(IntSize::Char, Signedness::Signed),
@@ -3416,13 +3833,25 @@ fn repair_arith_expr(e: &CExpr, types: &HashMap<String, CType>) -> CExpr {
                         }
                         // A scalarized pointer base plus a plain integer offset: the outer (long) hid the pointer from the arms above, so strip the base's scalarizing cast to keep base + off a T * + long.
                         BinaryOp::Add if l_base && !cexpr_is_pointer(&r, types) => {
-                            return CExpr::Binary(*op, Box::new(strip_scalarizing_cast(l, types)), Box::new(r));
+                            return CExpr::Binary(
+                                *op,
+                                Box::new(strip_scalarizing_cast(l, types)),
+                                Box::new(r),
+                            );
                         }
                         BinaryOp::Add if r_base && !cexpr_is_pointer(&l, types) => {
-                            return CExpr::Binary(*op, Box::new(l), Box::new(strip_scalarizing_cast(r, types)));
+                            return CExpr::Binary(
+                                *op,
+                                Box::new(l),
+                                Box::new(strip_scalarizing_cast(r, types)),
+                            );
                         }
                         BinaryOp::Sub if l_base && !cexpr_is_pointer(&r, types) => {
-                            return CExpr::Binary(*op, Box::new(strip_scalarizing_cast(l, types)), Box::new(r));
+                            return CExpr::Binary(
+                                *op,
+                                Box::new(strip_scalarizing_cast(l, types)),
+                                Box::new(r),
+                            );
                         }
                         _ => {}
                     }
@@ -3458,7 +3887,9 @@ fn repair_arith_expr(e: &CExpr, types: &HashMap<String, CType>) -> CExpr {
         CExpr::Unary(op, inner) => {
             let inner = repair_arith_expr(inner, types);
             // `-ptr` and `~ptr` are invalid C; cast the pointer operand to long (Deref/AddrOf/Not are valid on pointers and left alone).
-            let inner = if matches!(op, UnaryOp::Neg | UnaryOp::BitNot) && cexpr_is_pointer(&inner, types) {
+            let inner = if matches!(op, UnaryOp::Neg | UnaryOp::BitNot)
+                && cexpr_is_pointer(&inner, types)
+            {
                 CExpr::Cast(CType::long(), Box::new(inner))
             } else {
                 inner
@@ -3485,7 +3916,9 @@ fn repair_arith_expr(e: &CExpr, types: &HashMap<String, CType>) -> CExpr {
             Box::new(repair_arith_expr(f, types)),
             args.iter().map(|a| repair_arith_expr(a, types)).collect(),
         ),
-        CExpr::Cast(ty, inner) => CExpr::Cast(ty.clone(), Box::new(repair_arith_expr(inner, types))),
+        CExpr::Cast(ty, inner) => {
+            CExpr::Cast(ty.clone(), Box::new(repair_arith_expr(inner, types)))
+        }
         CExpr::Member(inner, fld) => {
             // `e.field` where e is a pointer must be `e->field`; type recovery sometimes declares the base as a pointer while emitting a value member access ("X is a pointer; use ->").
             let inner = repair_arith_expr(inner, types);
@@ -3495,7 +3928,9 @@ fn repair_arith_expr(e: &CExpr, types: &HashMap<String, CType>) -> CExpr {
                 CExpr::Member(Box::new(inner), fld.clone())
             }
         }
-        CExpr::MemberPtr(inner, fld) => CExpr::MemberPtr(Box::new(repair_arith_expr(inner, types)), fld.clone()),
+        CExpr::MemberPtr(inner, fld) => {
+            CExpr::MemberPtr(Box::new(repair_arith_expr(inner, types)), fld.clone())
+        }
         CExpr::Index(a, i) => CExpr::Index(
             Box::new(repair_arith_expr(a, types)),
             Box::new(repair_arith_expr(i, types)),
@@ -3526,7 +3961,9 @@ fn repair_arith_stmt(stmt: &CStmt, types: &HashMap<String, CType>) -> CStmt {
         CStmt::If(cond, then_s, else_s) => CStmt::If(
             repair_arith_expr(cond, types),
             Box::new(repair_arith_stmt(then_s, types)),
-            else_s.as_ref().map(|e| Box::new(repair_arith_stmt(e, types))),
+            else_s
+                .as_ref()
+                .map(|e| Box::new(repair_arith_stmt(e, types))),
         ),
         CStmt::While(cond, body) => CStmt::While(
             repair_arith_expr(cond, types),
@@ -3553,8 +3990,12 @@ fn repair_arith_stmt(stmt: &CStmt, types: &HashMap<String, CType>) -> CStmt {
             };
             CStmt::Switch(e, Box::new(repair_arith_stmt(body, types)))
         }
-        CStmt::Labeled(lbl, inner) => CStmt::Labeled(lbl.clone(), Box::new(repair_arith_stmt(inner, types))),
-        CStmt::Sequence(stmts) => CStmt::Sequence(stmts.iter().map(|s| repair_arith_stmt(s, types)).collect()),
+        CStmt::Labeled(lbl, inner) => {
+            CStmt::Labeled(lbl.clone(), Box::new(repair_arith_stmt(inner, types)))
+        }
+        CStmt::Sequence(stmts) => {
+            CStmt::Sequence(stmts.iter().map(|s| repair_arith_stmt(s, types)).collect())
+        }
         other => other.clone(),
     }
 }
@@ -3564,7 +4005,10 @@ fn normalize_call_arity_expr(e: &CExpr, counts: &HashMap<String, usize>) -> CExp
     match e {
         CExpr::Call(func, args) => {
             let nf = normalize_call_arity_expr(func, counts);
-            let mut nargs: Vec<CExpr> = args.iter().map(|a| normalize_call_arity_expr(a, counts)).collect();
+            let mut nargs: Vec<CExpr> = args
+                .iter()
+                .map(|a| normalize_call_arity_expr(a, counts))
+                .collect();
             if let CExpr::Var(name) = &nf {
                 if let Some(&pc) = counts.get(name) {
                     if nargs.len() > pc {
@@ -3579,17 +4023,41 @@ fn normalize_call_arity_expr(e: &CExpr, counts: &HashMap<String, usize>) -> CExp
             CExpr::Call(Box::new(nf), nargs)
         }
         CExpr::Unary(op, i) => CExpr::Unary(*op, Box::new(normalize_call_arity_expr(i, counts))),
-        CExpr::Binary(op, l, r) => CExpr::Binary(*op, Box::new(normalize_call_arity_expr(l, counts)), Box::new(normalize_call_arity_expr(r, counts))),
-        CExpr::Assign(op, l, r) => CExpr::Assign(*op, Box::new(normalize_call_arity_expr(l, counts)), Box::new(normalize_call_arity_expr(r, counts))),
-        CExpr::Ternary(c, t, f) => CExpr::Ternary(Box::new(normalize_call_arity_expr(c, counts)), Box::new(normalize_call_arity_expr(t, counts)), Box::new(normalize_call_arity_expr(f, counts))),
-        CExpr::Cast(ty, i) => CExpr::Cast(ty.clone(), Box::new(normalize_call_arity_expr(i, counts))),
-        CExpr::Member(i, f) => CExpr::Member(Box::new(normalize_call_arity_expr(i, counts)), f.clone()),
-        CExpr::MemberPtr(i, f) => CExpr::MemberPtr(Box::new(normalize_call_arity_expr(i, counts)), f.clone()),
-        CExpr::Index(a, i) => CExpr::Index(Box::new(normalize_call_arity_expr(a, counts)), Box::new(normalize_call_arity_expr(i, counts))),
+        CExpr::Binary(op, l, r) => CExpr::Binary(
+            *op,
+            Box::new(normalize_call_arity_expr(l, counts)),
+            Box::new(normalize_call_arity_expr(r, counts)),
+        ),
+        CExpr::Assign(op, l, r) => CExpr::Assign(
+            *op,
+            Box::new(normalize_call_arity_expr(l, counts)),
+            Box::new(normalize_call_arity_expr(r, counts)),
+        ),
+        CExpr::Ternary(c, t, f) => CExpr::Ternary(
+            Box::new(normalize_call_arity_expr(c, counts)),
+            Box::new(normalize_call_arity_expr(t, counts)),
+            Box::new(normalize_call_arity_expr(f, counts)),
+        ),
+        CExpr::Cast(ty, i) => {
+            CExpr::Cast(ty.clone(), Box::new(normalize_call_arity_expr(i, counts)))
+        }
+        CExpr::Member(i, f) => {
+            CExpr::Member(Box::new(normalize_call_arity_expr(i, counts)), f.clone())
+        }
+        CExpr::MemberPtr(i, f) => {
+            CExpr::MemberPtr(Box::new(normalize_call_arity_expr(i, counts)), f.clone())
+        }
+        CExpr::Index(a, i) => CExpr::Index(
+            Box::new(normalize_call_arity_expr(a, counts)),
+            Box::new(normalize_call_arity_expr(i, counts)),
+        ),
         CExpr::SizeofExpr(i) => CExpr::SizeofExpr(Box::new(normalize_call_arity_expr(i, counts))),
         CExpr::Paren(i) => CExpr::Paren(Box::new(normalize_call_arity_expr(i, counts))),
         CExpr::StmtExpr(stmts, i) => CExpr::StmtExpr(
-            stmts.iter().map(|s| normalize_call_arity_stmt(s, counts)).collect(),
+            stmts
+                .iter()
+                .map(|s| normalize_call_arity_stmt(s, counts))
+                .collect(),
             Box::new(normalize_call_arity_expr(i, counts)),
         ),
         other => other.clone(),
@@ -3599,17 +4067,29 @@ fn normalize_call_arity_expr(e: &CExpr, counts: &HashMap<String, usize>) -> CExp
 fn normalize_call_arity_stmt(stmt: &CStmt, counts: &HashMap<String, usize>) -> CStmt {
     match stmt {
         CStmt::Expr(e) => CStmt::Expr(normalize_call_arity_expr(e, counts)),
-        CStmt::Block(items) => CStmt::Block(items.iter().map(|item| match item {
-            CBlockItem::Stmt(s) => CBlockItem::Stmt(normalize_call_arity_stmt(s, counts)),
-            other => other.clone(),
-        }).collect()),
+        CStmt::Block(items) => CStmt::Block(
+            items
+                .iter()
+                .map(|item| match item {
+                    CBlockItem::Stmt(s) => CBlockItem::Stmt(normalize_call_arity_stmt(s, counts)),
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
         CStmt::If(c, t, e) => CStmt::If(
             normalize_call_arity_expr(c, counts),
             Box::new(normalize_call_arity_stmt(t, counts)),
-            e.as_ref().map(|x| Box::new(normalize_call_arity_stmt(x, counts))),
+            e.as_ref()
+                .map(|x| Box::new(normalize_call_arity_stmt(x, counts))),
         ),
-        CStmt::While(c, b) => CStmt::While(normalize_call_arity_expr(c, counts), Box::new(normalize_call_arity_stmt(b, counts))),
-        CStmt::DoWhile(b, c) => CStmt::DoWhile(Box::new(normalize_call_arity_stmt(b, counts)), normalize_call_arity_expr(c, counts)),
+        CStmt::While(c, b) => CStmt::While(
+            normalize_call_arity_expr(c, counts),
+            Box::new(normalize_call_arity_stmt(b, counts)),
+        ),
+        CStmt::DoWhile(b, c) => CStmt::DoWhile(
+            Box::new(normalize_call_arity_stmt(b, counts)),
+            normalize_call_arity_expr(c, counts),
+        ),
         CStmt::For(init, c, u, b) => CStmt::For(
             init.clone(),
             c.as_ref().map(|x| normalize_call_arity_expr(x, counts)),
@@ -3617,9 +4097,20 @@ fn normalize_call_arity_stmt(stmt: &CStmt, counts: &HashMap<String, usize>) -> C
             Box::new(normalize_call_arity_stmt(b, counts)),
         ),
         CStmt::Return(Some(e)) => CStmt::Return(Some(normalize_call_arity_expr(e, counts))),
-        CStmt::Switch(e, b) => CStmt::Switch(normalize_call_arity_expr(e, counts), Box::new(normalize_call_arity_stmt(b, counts))),
-        CStmt::Labeled(lbl, inner) => CStmt::Labeled(lbl.clone(), Box::new(normalize_call_arity_stmt(inner, counts))),
-        CStmt::Sequence(stmts) => CStmt::Sequence(stmts.iter().map(|s| normalize_call_arity_stmt(s, counts)).collect()),
+        CStmt::Switch(e, b) => CStmt::Switch(
+            normalize_call_arity_expr(e, counts),
+            Box::new(normalize_call_arity_stmt(b, counts)),
+        ),
+        CStmt::Labeled(lbl, inner) => CStmt::Labeled(
+            lbl.clone(),
+            Box::new(normalize_call_arity_stmt(inner, counts)),
+        ),
+        CStmt::Sequence(stmts) => CStmt::Sequence(
+            stmts
+                .iter()
+                .map(|s| normalize_call_arity_stmt(s, counts))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -3651,13 +4142,18 @@ fn cexpr_scalar_class(
 ) -> ScalarClass {
     match e {
         CExpr::Cast(ty, _) => ctype_scalar_class(ty),
-        CExpr::Var(name) => types.get(name).map(ctype_scalar_class).unwrap_or(ScalarClass::Other),
+        CExpr::Var(name) => types
+            .get(name)
+            .map(ctype_scalar_class)
+            .unwrap_or(ScalarClass::Other),
         CExpr::Paren(inner) => cexpr_scalar_class(inner, types, callee_ret),
         CExpr::IntLit(_) => ScalarClass::Int,
         CExpr::FloatLit(_) => ScalarClass::Float,
         CExpr::StringLit(_) => ScalarClass::Ptr,
         CExpr::Unary(UnaryOp::AddrOf, _) => ScalarClass::Ptr,
-        CExpr::Unary(UnaryOp::Neg | UnaryOp::BitNot | UnaryOp::Not | UnaryOp::Plus, _) => ScalarClass::Int,
+        CExpr::Unary(UnaryOp::Neg | UnaryOp::BitNot | UnaryOp::Not | UnaryOp::Plus, _) => {
+            ScalarClass::Int
+        }
         CExpr::Binary(BinaryOp::Add | BinaryOp::Sub, l, r) => {
             if cexpr_scalar_class(l, types, callee_ret) == ScalarClass::Ptr
                 || cexpr_scalar_class(r, types, callee_ret) == ScalarClass::Ptr
@@ -3669,7 +4165,10 @@ fn cexpr_scalar_class(
         }
         CExpr::Binary(..) => ScalarClass::Int,
         CExpr::Call(f, _) => match f.as_ref() {
-            CExpr::Var(n) => callee_ret.get(n).map(ctype_scalar_class).unwrap_or(ScalarClass::Other),
+            CExpr::Var(n) => callee_ret
+                .get(n)
+                .map(ctype_scalar_class)
+                .unwrap_or(ScalarClass::Other),
             _ => ScalarClass::Other,
         },
         _ => ScalarClass::Other,
@@ -3687,6 +4186,9 @@ fn cexpr_known_ctype(
         CExpr::Cast(ty, _) => Some(ty.clone()),
         CExpr::Var(name) => types.get(name).cloned(),
         CExpr::Paren(inner) => cexpr_known_ctype(inner, types, callee_ret),
+        CExpr::Unary(UnaryOp::AddrOf, inner) => {
+            cexpr_known_ctype(inner, types, callee_ret).map(CType::ptr)
+        }
         CExpr::Call(f, _) => match f.as_ref() {
             CExpr::Var(name) => callee_ret.get(name).cloned(),
             _ => None,
@@ -3822,7 +4324,10 @@ fn insert_casts_expr(
             }
             CExpr::Assign(*op, Box::new(nlhs), Box::new(nrhs))
         }
-        CExpr::Unary(op, i) => CExpr::Unary(*op, Box::new(insert_casts_expr(i, types, callee_params, callee_ret))),
+        CExpr::Unary(op, i) => CExpr::Unary(
+            *op,
+            Box::new(insert_casts_expr(i, types, callee_params, callee_ret)),
+        ),
         CExpr::Binary(op, l, r) => CExpr::Binary(
             *op,
             Box::new(insert_casts_expr(l, types, callee_params, callee_ret)),
@@ -3833,17 +4338,39 @@ fn insert_casts_expr(
             Box::new(insert_casts_expr(t, types, callee_params, callee_ret)),
             Box::new(insert_casts_expr(f, types, callee_params, callee_ret)),
         ),
-        CExpr::Cast(ty, i) => CExpr::Cast(ty.clone(), Box::new(insert_casts_expr(i, types, callee_params, callee_ret))),
-        CExpr::Member(i, fld) => CExpr::Member(Box::new(insert_casts_expr(i, types, callee_params, callee_ret)), fld.clone()),
-        CExpr::MemberPtr(i, fld) => CExpr::MemberPtr(Box::new(insert_casts_expr(i, types, callee_params, callee_ret)), fld.clone()),
+        CExpr::Cast(ty, i) => CExpr::Cast(
+            ty.clone(),
+            Box::new(insert_casts_expr(i, types, callee_params, callee_ret)),
+        ),
+        CExpr::Member(i, fld) => CExpr::Member(
+            Box::new(insert_casts_expr(i, types, callee_params, callee_ret)),
+            fld.clone(),
+        ),
+        CExpr::MemberPtr(i, fld) => CExpr::MemberPtr(
+            Box::new(insert_casts_expr(i, types, callee_params, callee_ret)),
+            fld.clone(),
+        ),
         CExpr::Index(a, i) => CExpr::Index(
             Box::new(insert_casts_expr(a, types, callee_params, callee_ret)),
             Box::new(insert_casts_expr(i, types, callee_params, callee_ret)),
         ),
-        CExpr::SizeofExpr(i) => CExpr::SizeofExpr(Box::new(insert_casts_expr(i, types, callee_params, callee_ret))),
-        CExpr::Paren(i) => CExpr::Paren(Box::new(insert_casts_expr(i, types, callee_params, callee_ret))),
+        CExpr::SizeofExpr(i) => CExpr::SizeofExpr(Box::new(insert_casts_expr(
+            i,
+            types,
+            callee_params,
+            callee_ret,
+        ))),
+        CExpr::Paren(i) => CExpr::Paren(Box::new(insert_casts_expr(
+            i,
+            types,
+            callee_params,
+            callee_ret,
+        ))),
         CExpr::StmtExpr(stmts, i) => CExpr::StmtExpr(
-            stmts.iter().map(|s| insert_casts_stmt(s, types, callee_params, callee_ret, &CType::Void)).collect(),
+            stmts
+                .iter()
+                .map(|s| insert_casts_stmt(s, types, callee_params, callee_ret, &CType::Void))
+                .collect(),
             Box::new(insert_casts_expr(i, types, callee_params, callee_ret)),
         ),
         other => other.clone(),
@@ -3863,39 +4390,102 @@ fn insert_casts_stmt(
             items
                 .iter()
                 .map(|item| match item {
-                    CBlockItem::Stmt(s) => CBlockItem::Stmt(insert_casts_stmt(s, types, callee_params, callee_ret, ret_type)),
+                    CBlockItem::Stmt(s) => CBlockItem::Stmt(insert_casts_stmt(
+                        s,
+                        types,
+                        callee_params,
+                        callee_ret,
+                        ret_type,
+                    )),
                     other => other.clone(),
                 })
                 .collect(),
         ),
         CStmt::If(c, t, e) => CStmt::If(
             insert_casts_expr(c, types, callee_params, callee_ret),
-            Box::new(insert_casts_stmt(t, types, callee_params, callee_ret, ret_type)),
-            e.as_ref().map(|x| Box::new(insert_casts_stmt(x, types, callee_params, callee_ret, ret_type))),
+            Box::new(insert_casts_stmt(
+                t,
+                types,
+                callee_params,
+                callee_ret,
+                ret_type,
+            )),
+            e.as_ref().map(|x| {
+                Box::new(insert_casts_stmt(
+                    x,
+                    types,
+                    callee_params,
+                    callee_ret,
+                    ret_type,
+                ))
+            }),
         ),
         CStmt::While(c, b) => CStmt::While(
             insert_casts_expr(c, types, callee_params, callee_ret),
-            Box::new(insert_casts_stmt(b, types, callee_params, callee_ret, ret_type)),
+            Box::new(insert_casts_stmt(
+                b,
+                types,
+                callee_params,
+                callee_ret,
+                ret_type,
+            )),
         ),
         CStmt::DoWhile(b, c) => CStmt::DoWhile(
-            Box::new(insert_casts_stmt(b, types, callee_params, callee_ret, ret_type)),
+            Box::new(insert_casts_stmt(
+                b,
+                types,
+                callee_params,
+                callee_ret,
+                ret_type,
+            )),
             insert_casts_expr(c, types, callee_params, callee_ret),
         ),
         CStmt::For(init, c, u, b) => CStmt::For(
             init.clone(),
-            c.as_ref().map(|x| insert_casts_expr(x, types, callee_params, callee_ret)),
-            u.as_ref().map(|x| insert_casts_expr(x, types, callee_params, callee_ret)),
-            Box::new(insert_casts_stmt(b, types, callee_params, callee_ret, ret_type)),
+            c.as_ref()
+                .map(|x| insert_casts_expr(x, types, callee_params, callee_ret)),
+            u.as_ref()
+                .map(|x| insert_casts_expr(x, types, callee_params, callee_ret)),
+            Box::new(insert_casts_stmt(
+                b,
+                types,
+                callee_params,
+                callee_ret,
+                ret_type,
+            )),
         ),
         CStmt::Switch(e, b) => CStmt::Switch(
             insert_casts_expr(e, types, callee_params, callee_ret),
-            Box::new(insert_casts_stmt(b, types, callee_params, callee_ret, ret_type)),
+            Box::new(insert_casts_stmt(
+                b,
+                types,
+                callee_params,
+                callee_ret,
+                ret_type,
+            )),
         ),
-        CStmt::Labeled(lbl, inner) => CStmt::Labeled(lbl.clone(), Box::new(insert_casts_stmt(inner, types, callee_params, callee_ret, ret_type))),
-        CStmt::Sequence(ss) => CStmt::Sequence(ss.iter().map(|s| insert_casts_stmt(s, types, callee_params, callee_ret, ret_type)).collect()),
+        CStmt::Labeled(lbl, inner) => CStmt::Labeled(
+            lbl.clone(),
+            Box::new(insert_casts_stmt(
+                inner,
+                types,
+                callee_params,
+                callee_ret,
+                ret_type,
+            )),
+        ),
+        CStmt::Sequence(ss) => CStmt::Sequence(
+            ss.iter()
+                .map(|s| insert_casts_stmt(s, types, callee_params, callee_ret, ret_type))
+                .collect(),
+        ),
         CStmt::Return(Some(e)) => {
             let ne = insert_casts_expr(e, types, callee_params, callee_ret);
-            let ne = if matches!(ret_type, CType::Void) { ne } else { coerce_scalar(ret_type, ne, types.variables, callee_ret) };
+            let ne = if matches!(ret_type, CType::Void) {
+                ne
+            } else {
+                coerce_scalar(ret_type, ne, types.variables, callee_ret)
+            };
             CStmt::Return(Some(ne))
         }
         other => other.clone(),
@@ -3943,20 +4533,16 @@ fn convert_binary_op(op: &clight::ClightBinaryOp) -> BinaryOp {
 
 pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> CExpr {
     match expr {
-        clight::ClightExpr::EconstInt(val, _ty) => {
-            CExpr::IntLit(IntLiteral {
-                value: *val as i128,
-                suffix: IntLiteralSuffix::None,
-                base: IntLiteralBase::Decimal,
-            })
-        }
-        clight::ClightExpr::EconstLong(val, _ty) => {
-            CExpr::IntLit(IntLiteral {
-                value: *val as i128,
-                suffix: IntLiteralSuffix::L,
-                base: IntLiteralBase::Decimal,
-            })
-        }
+        clight::ClightExpr::EconstInt(val, _ty) => CExpr::IntLit(IntLiteral {
+            value: *val as i128,
+            suffix: IntLiteralSuffix::None,
+            base: IntLiteralBase::Decimal,
+        }),
+        clight::ClightExpr::EconstLong(val, _ty) => CExpr::IntLit(IntLiteral {
+            value: *val as i128,
+            suffix: IntLiteralSuffix::L,
+            base: IntLiteralBase::Decimal,
+        }),
         clight::ClightExpr::EconstFloat(val, _ty) => CExpr::FloatLit(FloatLiteral {
             value: val.0,
             suffix: FloatLiteralSuffix::None,
@@ -4078,10 +4664,9 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
                     // A void pointee means byte-add, so scale through char *; a composite base realizes its own annotation faithfully except void *, which C cannot scale or deref through.
                     let is_void = matches!(p.as_ref(), clight::ClightType::Tvoid);
                     // The OFFSET operand of pointer arithmetic must print as an integer, since a pointer-annotated rhs is a byte count wearing the wrong type; Osub keeps a pointer rhs as legal pointer difference.
-                    let rhs_is_ptr = matches!(
-                        clight_expr_ctype(rhs),
-                        clight::ClightType::Tpointer(..)
-                    ) && matches!(op, clight::ClightBinaryOp::Oadd);
+                    let rhs_is_ptr =
+                        matches!(clight_expr_ctype(rhs), clight::ClightType::Tpointer(..))
+                            && matches!(op, clight::ClightBinaryOp::Oadd);
                     let rhs_field_int = matches!(rhs.as_ref(), clight::ClightExpr::Efield(..))
                         && matches!(
                             clight_expr_ctype(rhs),
@@ -4100,11 +4685,8 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
                         } else {
                             convert_expr(rhs, ctx)
                         };
-                        let sum = CExpr::Binary(
-                            convert_binary_op(op),
-                            Box::new(base),
-                            Box::new(offset),
-                        );
+                        let sum =
+                            CExpr::Binary(convert_binary_op(op), Box::new(base), Box::new(offset));
                         // In C the sum already has the base cast's type; an outer cast only adds information when the annotated result type differs.
                         let result_cty = convert_clight_type(_ty);
                         return if result_cty == base_cty {
@@ -4131,7 +4713,11 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
             let lhs_expr = convert_expr(lhs, ctx);
             let rhs_expr = convert_expr(rhs, ctx);
             ctx.suppress_string_literals = prev_suppress;
-            CExpr::Binary(convert_binary_op(op), Box::new(lhs_expr), Box::new(rhs_expr))
+            CExpr::Binary(
+                convert_binary_op(op),
+                Box::new(lhs_expr),
+                Box::new(rhs_expr),
+            )
         }
         clight::ClightExpr::Ecast(inner, ty) => {
             CExpr::Cast(convert_clight_type(ty), Box::new(convert_expr(inner, ctx)))
@@ -4165,10 +4751,8 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
                                 Box::new(CExpr::Cast(char_ptr, ptr_expr.clone())),
                                 Box::new(CExpr::int(offset)),
                             );
-                            let field_ptr = CType::Pointer(
-                                Box::new(field_ctype),
-                                TypeQualifiers::none(),
-                            );
+                            let field_ptr =
+                                CType::Pointer(Box::new(field_ctype), TypeQualifiers::none());
                             CExpr::Unary(
                                 UnaryOp::Deref,
                                 Box::new(CExpr::Cast(field_ptr, Box::new(byte_addr))),
@@ -4188,7 +4772,6 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
         ),
     }
 }
-
 
 /// For known varargs functions (printf, fprintf, etc.), narrow the argument list by counting format specifiers in the format string.
 fn narrow_varargs_args(func_expr: &CExpr, mut args: Vec<CExpr>) -> Vec<CExpr> {
@@ -4221,7 +4804,9 @@ fn narrow_varargs_args(func_expr: &CExpr, mut args: Vec<CExpr>) -> Vec<CExpr> {
             while let Some(ch) = chars.next() {
                 if ch == '%' {
                     match chars.peek() {
-                        Some('%') => { chars.next(); } // %% is literal
+                        Some('%') => {
+                            chars.next();
+                        } // %% is literal
                         Some(_) => count += 1,
                         None => {}
                     }
@@ -4277,34 +4862,37 @@ fn eliminate_dead_code(stmt: &CStmt) -> CStmt {
             }
         }
         CStmt::Sequence(stmts) => {
-            let items: Vec<CBlockItem> = stmts.iter().map(|s| CBlockItem::Stmt(s.clone())).collect();
+            let items: Vec<CBlockItem> =
+                stmts.iter().map(|s| CBlockItem::Stmt(s.clone())).collect();
             let pruned = prune_block_items(&items);
-            let stmts: Vec<CStmt> = pruned.into_iter().filter_map(|item| match item {
-                CBlockItem::Stmt(s) => Some(s),
-                _ => None,
-            }).collect();
+            let stmts: Vec<CStmt> = pruned
+                .into_iter()
+                .filter_map(|item| match item {
+                    CBlockItem::Stmt(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
             match stmts.len() {
                 0 => CStmt::Empty,
                 1 => stmts.into_iter().next().unwrap(),
                 _ => CStmt::Sequence(stmts),
             }
         }
-        CStmt::If(cond, then_s, else_s) => {
-            CStmt::If(
-                cond.clone(),
-                Box::new(eliminate_dead_code(then_s)),
-                else_s.as_ref().map(|e| Box::new(eliminate_dead_code(e))),
-            )
-        }
-        CStmt::While(cond, body) => {
-            CStmt::While(cond.clone(), Box::new(eliminate_dead_code(body)))
-        }
+        CStmt::If(cond, then_s, else_s) => CStmt::If(
+            cond.clone(),
+            Box::new(eliminate_dead_code(then_s)),
+            else_s.as_ref().map(|e| Box::new(eliminate_dead_code(e))),
+        ),
+        CStmt::While(cond, body) => CStmt::While(cond.clone(), Box::new(eliminate_dead_code(body))),
         CStmt::DoWhile(body, cond) => {
             CStmt::DoWhile(Box::new(eliminate_dead_code(body)), cond.clone())
         }
-        CStmt::For(init, cond, update, body) => {
-            CStmt::For(init.clone(), cond.clone(), update.clone(), Box::new(eliminate_dead_code(body)))
-        }
+        CStmt::For(init, cond, update, body) => CStmt::For(
+            init.clone(),
+            cond.clone(),
+            update.clone(),
+            Box::new(eliminate_dead_code(body)),
+        ),
         CStmt::Switch(expr, body) => {
             // Don't prune inside switch bodies (all case/default labels are reachable via dispatch); only recurse into individual case bodies, not the sequential structure.
             CStmt::Switch(expr.clone(), Box::new(eliminate_dead_code_in_switch(body)))
@@ -4320,10 +4908,13 @@ fn eliminate_dead_code(stmt: &CStmt) -> CStmt {
 fn eliminate_dead_code_in_switch(stmt: &CStmt) -> CStmt {
     match stmt {
         CStmt::Block(items) => {
-            let cleaned: Vec<CBlockItem> = items.iter().map(|item| match item {
-                CBlockItem::Stmt(s) => CBlockItem::Stmt(eliminate_dead_code(s)),
-                other => other.clone(),
-            }).collect();
+            let cleaned: Vec<CBlockItem> = items
+                .iter()
+                .map(|item| match item {
+                    CBlockItem::Stmt(s) => CBlockItem::Stmt(eliminate_dead_code(s)),
+                    other => other.clone(),
+                })
+                .collect();
             CStmt::Block(cleaned)
         }
         CStmt::Sequence(stmts) => {
@@ -4372,7 +4963,9 @@ fn prune_block_items(items: &[CBlockItem]) -> Vec<CBlockItem> {
 /// True if stmt is a loop/switch that should survive DCE after a terminator.
 fn is_control_flow_construct(stmt: &CStmt) -> bool {
     match stmt {
-        CStmt::While(_, _) | CStmt::DoWhile(_, _) | CStmt::For(_, _, _, _)
+        CStmt::While(_, _)
+        | CStmt::DoWhile(_, _)
+        | CStmt::For(_, _, _, _)
         | CStmt::Switch(_, _) => true,
         CStmt::Labeled(_, inner) => is_control_flow_construct(inner),
         _ => false,
@@ -4387,16 +4980,28 @@ fn is_unconditional_exit(stmt: &CStmt) -> bool {
         CStmt::Labeled(_, inner) => is_unconditional_exit(inner),
         CStmt::Block(items) => {
             // A block exits if its last statement exits
-            items.iter().rev().find_map(|item| match item {
-                CBlockItem::Stmt(s) if !matches!(s, CStmt::Empty) => Some(is_unconditional_exit(s)),
-                _ => None,
-            }).unwrap_or(false)
+            items
+                .iter()
+                .rev()
+                .find_map(|item| match item {
+                    CBlockItem::Stmt(s) if !matches!(s, CStmt::Empty) => {
+                        Some(is_unconditional_exit(s))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(false)
         }
-        CStmt::Sequence(stmts) => {
-            stmts.iter().rev().find_map(|s| {
-                if !matches!(s, CStmt::Empty) { Some(is_unconditional_exit(s)) } else { None }
-            }).unwrap_or(false)
-        }
+        CStmt::Sequence(stmts) => stmts
+            .iter()
+            .rev()
+            .find_map(|s| {
+                if !matches!(s, CStmt::Empty) {
+                    Some(is_unconditional_exit(s))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false),
         CStmt::If(_, then_s, Some(else_s)) => {
             is_unconditional_exit(then_s) && is_unconditional_exit(else_s)
         }
@@ -4570,7 +5175,11 @@ pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> C
             let body_stmt = convert_stmt(body, ctx);
             let cont_stmt = convert_stmt(cont, ctx);
             let has_update = !matches!(cont_stmt, CStmt::Empty);
-            let update = if has_update { extract_loop_update(&cont_stmt) } else { None };
+            let update = if has_update {
+                extract_loop_update(&cont_stmt)
+            } else {
+                None
+            };
 
             if let Some((cond, rest_body, is_pre)) = extract_loop_condition(&body_stmt) {
                 if is_pre {
@@ -4628,12 +5237,13 @@ fn extract_loop_condition(body: &CStmt) -> Option<(CExpr, CStmt, bool)> {
 
     let stmts: Vec<&CStmt> = match body {
         CStmt::Sequence(stmts) if stmts.len() >= 2 => stmts.iter().collect(),
-        CStmt::Block(items) if items.len() >= 1 => {
-            items.iter().filter_map(|item| match item {
+        CStmt::Block(items) if items.len() >= 1 => items
+            .iter()
+            .filter_map(|item| match item {
                 CBlockItem::Stmt(s) => Some(s),
                 _ => None,
-            }).collect()
-        }
+            })
+            .collect(),
         _ => return None,
     };
 
@@ -4660,7 +5270,10 @@ fn extract_loop_condition(body: &CStmt) -> Option<(CExpr, CStmt, bool)> {
 
     // RB-1: last() is infallible -- is_empty() and len()==1 returns above guarantee >= 2 elements here.
     if let Some(cond) = extract_condition_break(stmts.last().unwrap()) {
-        let rest: Vec<CStmt> = stmts[..stmts.len() - 1].iter().map(|s| (*s).clone()).collect();
+        let rest: Vec<CStmt> = stmts[..stmts.len() - 1]
+            .iter()
+            .map(|s| (*s).clone())
+            .collect();
         let rest_stmt = if rest.len() == 1 {
             rest.into_iter().next().unwrap()
         } else {
@@ -4856,13 +5469,25 @@ fn try_switch_to_range_if(
     let mut condition: Option<CExpr> = None;
     for (lo, hi) in runs {
         let part = if lo == hi {
-            CExpr::Binary(BinaryOp::Eq, Box::new(scrutinee.clone()), Box::new(CExpr::int(lo)))
+            CExpr::Binary(
+                BinaryOp::Eq,
+                Box::new(scrutinee.clone()),
+                Box::new(CExpr::int(lo)),
+            )
         } else {
             // Wrap each `e>=lo && e<=hi` group in parens so a multi-range condition reads as `(e>=lo && e<=hi) || (e>=lo2 && e<=hi2)` rather than relying on C's &&-over-|| precedence.
             CExpr::Paren(Box::new(CExpr::Binary(
                 BinaryOp::And,
-                Box::new(CExpr::Binary(BinaryOp::Ge, Box::new(scrutinee.clone()), Box::new(CExpr::int(lo)))),
-                Box::new(CExpr::Binary(BinaryOp::Le, Box::new(scrutinee.clone()), Box::new(CExpr::int(hi)))),
+                Box::new(CExpr::Binary(
+                    BinaryOp::Ge,
+                    Box::new(scrutinee.clone()),
+                    Box::new(CExpr::int(lo)),
+                )),
+                Box::new(CExpr::Binary(
+                    BinaryOp::Le,
+                    Box::new(scrutinee.clone()),
+                    Box::new(CExpr::int(hi)),
+                )),
             )))
         };
         condition = Some(match condition {
@@ -4920,7 +5545,9 @@ fn external_func_name(ef: &ExternalFunction) -> String {
         ExternalFunction::EFMalloc => "malloc".into(),
         ExternalFunction::EFFree => "free".into(),
         ExternalFunction::EFMemcpy(_, _) => "memcpy".into(),
-        ExternalFunction::EFAnnot(_, n, _) | ExternalFunction::EFAnnotVal(_, n, _) => sanitize_c_symbol_name(n),
+        ExternalFunction::EFAnnot(_, n, _) | ExternalFunction::EFAnnotVal(_, n, _) => {
+            sanitize_c_symbol_name(n)
+        }
         ExternalFunction::EFDebug(_, _, _) => "__builtin_debug".into(),
     }
 }
@@ -4935,7 +5562,8 @@ fn order_nodes_dfs(
     node_innermost_loop: &HashMap<crate::x86::types::Node, crate::x86::types::Node>,
     normalize: impl Fn(crate::x86::types::Node) -> crate::x86::types::Node,
 ) -> Vec<crate::x86::types::Node> {
-    let mut adjacency: HashMap<crate::x86::types::Node, Vec<crate::x86::types::Node>> = HashMap::new();
+    let mut adjacency: HashMap<crate::x86::types::Node, Vec<crate::x86::types::Node>> =
+        HashMap::new();
     for (src, dst) in edges {
         if src != dst {
             adjacency.entry(*src).or_default().push(*dst);
@@ -5007,41 +5635,43 @@ fn order_nodes_dfs(
     let mut general_remaining: Vec<crate::x86::types::Node> = Vec::new();
     for &r in &all_remaining {
         let rk = normalize(r);
-        let anchor = loop_members.get(&rk).and_then(|body| {
-            result.iter().position(|&e| {
-                adjacency.get(&e).map_or(false, |succs| {
-                    succs.iter().any(|s| body.contains(&normalize(*s)))
+        let anchor = loop_members
+            .get(&rk)
+            .and_then(|body| {
+                result.iter().position(|&e| {
+                    adjacency.get(&e).map_or(false, |succs| {
+                        succs.iter().any(|s| body.contains(&normalize(*s)))
+                    })
                 })
             })
-        }).or_else(|| {
-            // Threaded-entry fallback: anchor to the LAST result node whose forward edge-walk reaches a body member first, the loop's immediate preheader, so preheader init is not emitted after the loop.
-            loop_members.get(&rk).and_then(|body| {
-                let result_set: HashSet<crate::x86::types::Node> = result.iter().copied().collect();
-                result.iter().rposition(|&e| {
-                    let mut stack: Vec<crate::x86::types::Node> = adjacency
-                        .get(&e)
-                        .map(|s| s.clone())
-                        .unwrap_or_default();
-                    let mut seen: HashSet<crate::x86::types::Node> = HashSet::new();
-                    while let Some(n) = stack.pop() {
-                        if !seen.insert(n) {
-                            continue;
+            .or_else(|| {
+                // Threaded-entry fallback: anchor to the LAST result node whose forward edge-walk reaches a body member first, the loop's immediate preheader, so preheader init is not emitted after the loop.
+                loop_members.get(&rk).and_then(|body| {
+                    let result_set: HashSet<crate::x86::types::Node> =
+                        result.iter().copied().collect();
+                    result.iter().rposition(|&e| {
+                        let mut stack: Vec<crate::x86::types::Node> =
+                            adjacency.get(&e).map(|s| s.clone()).unwrap_or_default();
+                        let mut seen: HashSet<crate::x86::types::Node> = HashSet::new();
+                        while let Some(n) = stack.pop() {
+                            if !seen.insert(n) {
+                                continue;
+                            }
+                            if body.contains(&normalize(n)) {
+                                return true;
+                            }
+                            // Stop at any other emitted node: control reached a different top-level statement first, so e is not the loop's entry edge.
+                            if result_set.contains(&n) {
+                                continue;
+                            }
+                            if let Some(succs) = adjacency.get(&n) {
+                                stack.extend(succs.iter().copied());
+                            }
                         }
-                        if body.contains(&normalize(n)) {
-                            return true;
-                        }
-                        // Stop at any other emitted node: control reached a different top-level statement first, so e is not the loop's entry edge.
-                        if result_set.contains(&n) {
-                            continue;
-                        }
-                        if let Some(succs) = adjacency.get(&n) {
-                            stack.extend(succs.iter().copied());
-                        }
-                    }
-                    false
+                        false
+                    })
                 })
-            })
-        });
+            });
         match anchor {
             Some(pos) => targeted.push((pos, r)),
             None => general_remaining.push(r),
@@ -5140,7 +5770,11 @@ fn simplify_stmt_fallthrough(stmt: &CStmt, next_label: Option<&str>, count: &mut
                 }
             }
 
-            CStmt::If(cond.clone(), Box::new(simplified_then), Some(Box::new(simplified_else)))
+            CStmt::If(
+                cond.clone(),
+                Box::new(simplified_then),
+                Some(Box::new(simplified_else)),
+            )
         }
 
         CStmt::If(cond, then_s, None) => {
@@ -5154,7 +5788,8 @@ fn simplify_stmt_fallthrough(stmt: &CStmt, next_label: Option<&str>, count: &mut
         }
 
         CStmt::Block(items) => {
-            let simplified = simplify_fallthrough_gotos_in_block_with_next(items.clone(), next_label, count);
+            let simplified =
+                simplify_fallthrough_gotos_in_block_with_next(items.clone(), next_label, count);
             CStmt::Block(simplified)
         }
 
@@ -5175,22 +5810,27 @@ fn simplify_stmt_fallthrough(stmt: &CStmt, next_label: Option<&str>, count: &mut
         }
 
         // Recurse into loop/switch bodies with next_label = None, since a goto at a loop body's end falls to the back-edge and a fall-through past a case label is meaningful.
-        CStmt::While(cond, body) => {
-            CStmt::While(cond.clone(), Box::new(simplify_stmt_fallthrough(body, None, count)))
-        }
+        CStmt::While(cond, body) => CStmt::While(
+            cond.clone(),
+            Box::new(simplify_stmt_fallthrough(body, None, count)),
+        ),
 
-        CStmt::DoWhile(body, cond) => {
-            CStmt::DoWhile(Box::new(simplify_stmt_fallthrough(body, None, count)), cond.clone())
-        }
+        CStmt::DoWhile(body, cond) => CStmt::DoWhile(
+            Box::new(simplify_stmt_fallthrough(body, None, count)),
+            cond.clone(),
+        ),
 
-        CStmt::For(init, cond, update, body) => {
-            CStmt::For(init.clone(), cond.clone(), update.clone(),
-                       Box::new(simplify_stmt_fallthrough(body, None, count)))
-        }
+        CStmt::For(init, cond, update, body) => CStmt::For(
+            init.clone(),
+            cond.clone(),
+            update.clone(),
+            Box::new(simplify_stmt_fallthrough(body, None, count)),
+        ),
 
-        CStmt::Switch(disc, body) => {
-            CStmt::Switch(disc.clone(), Box::new(simplify_stmt_fallthrough(body, None, count)))
-        }
+        CStmt::Switch(disc, body) => CStmt::Switch(
+            disc.clone(),
+            Box::new(simplify_stmt_fallthrough(body, None, count)),
+        ),
 
         other => other.clone(),
     }
@@ -5266,7 +5906,6 @@ fn negate_condition(cond: &CExpr) -> CExpr {
         other => CExpr::Unary(UnaryOp::Not, Box::new(other.clone())),
     }
 }
-
 
 fn simplify_xor_self_in_expr(expr: &mut CExpr) {
     match expr {
@@ -5362,7 +6001,6 @@ fn simplify_xor_self_in_stmt(stmt: &mut CStmt) {
         _ => {}
     }
 }
-
 
 fn strip_dead_expr_stmts(stmt: &mut CStmt) {
     if let CStmt::Expr(e) = &*stmt {
@@ -5595,7 +6233,9 @@ pub(crate) fn is_valid_c_identifier(s: &str) -> bool {
 }
 
 fn strip_dead_labels_in_block(items: &mut Vec<CBlockItem>) {
-    use crate::decompile::passes::c_pass::helpers::{collect_goto_targets, collect_all_labels, strip_dead_labels};
+    use crate::decompile::passes::c_pass::helpers::{
+        collect_all_labels, collect_goto_targets, strip_dead_labels,
+    };
 
     let mut goto_targets: HashSet<String> = HashSet::new();
     let mut all_labels: HashSet<String> = HashSet::new();
@@ -5623,10 +6263,13 @@ fn strip_dead_labels_in_block(items: &mut Vec<CBlockItem>) {
 }
 
 fn count_leaf_stmts_in_block(items: &[CBlockItem]) -> usize {
-    items.iter().map(|item| match item {
-        CBlockItem::Stmt(s) => count_leaf_stmts(s),
-        CBlockItem::Decl(_) => 1,
-    }).sum()
+    items
+        .iter()
+        .map(|item| match item {
+            CBlockItem::Stmt(s) => count_leaf_stmts(s),
+            CBlockItem::Decl(_) => 1,
+        })
+        .sum()
 }
 
 fn count_leaf_stmts(stmt: &CStmt) -> usize {
@@ -5662,7 +6305,11 @@ fn is_generated_label(name: &str) -> bool {
     false
 }
 
-fn rewrite_tailcall_gotos(body_items: &mut Vec<CBlockItem>, func_names: &HashMap<String, usize>, current_func: &str) {
+fn rewrite_tailcall_gotos(
+    body_items: &mut Vec<CBlockItem>,
+    func_names: &HashMap<String, usize>,
+    current_func: &str,
+) {
     for item in body_items.iter_mut() {
         if let CBlockItem::Stmt(stmt) = item {
             rewrite_tailcall_gotos_in_stmt(stmt, func_names, current_func);
@@ -5670,11 +6317,17 @@ fn rewrite_tailcall_gotos(body_items: &mut Vec<CBlockItem>, func_names: &HashMap
     }
 }
 
-fn rewrite_tailcall_gotos_in_stmt(stmt: &mut CStmt, func_names: &HashMap<String, usize>, current_func: &str) {
+fn rewrite_tailcall_gotos_in_stmt(
+    stmt: &mut CStmt,
+    func_names: &HashMap<String, usize>,
+    current_func: &str,
+) {
     match stmt {
-        CStmt::Goto(target) if func_names.contains_key(target.as_str())
-            && target != current_func
-            && func_names.get(target.as_str()) == Some(&0) => {
+        CStmt::Goto(target)
+            if func_names.contains_key(target.as_str())
+                && target != current_func
+                && func_names.get(target.as_str()) == Some(&0) =>
+        {
             *stmt = CStmt::Sequence(vec![
                 CStmt::Expr(CExpr::call(CExpr::var(target.clone()), vec![])),
                 CStmt::Return(None),
@@ -5715,25 +6368,37 @@ fn collect_called_names_in_stmt(stmt: &CStmt, names: &mut HashSet<String>) {
         CStmt::If(cond, then_s, else_s) => {
             collect_called_names_in_expr(cond, names);
             collect_called_names_in_stmt(then_s, names);
-            if let Some(e) = else_s { collect_called_names_in_stmt(e, names); }
+            if let Some(e) = else_s {
+                collect_called_names_in_stmt(e, names);
+            }
         }
         CStmt::While(cond, body) | CStmt::DoWhile(body, cond) => {
             collect_called_names_in_expr(cond, names);
             collect_called_names_in_stmt(body, names);
         }
         CStmt::For(_, cond, update, body) => {
-            if let Some(c) = cond { collect_called_names_in_expr(c, names); }
-            if let Some(u) = update { collect_called_names_in_expr(u, names); }
+            if let Some(c) = cond {
+                collect_called_names_in_expr(c, names);
+            }
+            if let Some(u) = update {
+                collect_called_names_in_expr(u, names);
+            }
             collect_called_names_in_stmt(body, names);
         }
         CStmt::Switch(expr, body) => {
             collect_called_names_in_expr(expr, names);
             collect_called_names_in_stmt(body, names);
         }
-        CStmt::Sequence(stmts) => { for s in stmts { collect_called_names_in_stmt(s, names); } }
+        CStmt::Sequence(stmts) => {
+            for s in stmts {
+                collect_called_names_in_stmt(s, names);
+            }
+        }
         CStmt::Block(items) => {
             for item in items {
-                if let CBlockItem::Stmt(s) = item { collect_called_names_in_stmt(s, names); }
+                if let CBlockItem::Stmt(s) = item {
+                    collect_called_names_in_stmt(s, names);
+                }
             }
         }
         CStmt::Labeled(_, inner) => collect_called_names_in_stmt(inner, names),
@@ -5748,7 +6413,9 @@ fn collect_called_names_in_expr(expr: &CExpr, names: &mut HashSet<String>) {
                 names.insert(name.clone());
             }
             collect_called_names_in_expr(callee, names);
-            for arg in args { collect_called_names_in_expr(arg, names); }
+            for arg in args {
+                collect_called_names_in_expr(arg, names);
+            }
         }
         CExpr::Assign(_, lhs, rhs) => {
             collect_called_names_in_expr(lhs, names);
@@ -5758,7 +6425,10 @@ fn collect_called_names_in_expr(expr: &CExpr, names: &mut HashSet<String>) {
             collect_called_names_in_expr(lhs, names);
             collect_called_names_in_expr(rhs, names);
         }
-        CExpr::Unary(_, inner) | CExpr::Cast(_, inner) | CExpr::Member(inner, _) | CExpr::MemberPtr(inner, _) => {
+        CExpr::Unary(_, inner)
+        | CExpr::Cast(_, inner)
+        | CExpr::Member(inner, _)
+        | CExpr::MemberPtr(inner, _) => {
             collect_called_names_in_expr(inner, names);
         }
         CExpr::Ternary(a, b, c) => {
@@ -5883,9 +6553,7 @@ fn arg_evidence_of_ctype(ty: &CType) -> ArgEvidence {
         CType::Float(_) => ArgEvidence::Float(64),
         CType::Pointer(_, _) => ArgEvidence::Ptr(Some(ty.clone())),
         // Arrays and function designators decay to pointers in argument position.
-        CType::Array(inner, _) => {
-            ArgEvidence::Ptr(Some(CType::ptr(inner.as_ref().clone())))
-        }
+        CType::Array(inner, _) => ArgEvidence::Ptr(Some(CType::ptr(inner.as_ref().clone()))),
         CType::Function(_, _, _, _) => ArgEvidence::Ptr(Some(CType::ptr(ty.clone()))),
         CType::Qualified(inner, _) => arg_evidence_of_ctype(inner),
         // void/struct/union/typedef: not a scalar class we can safely type a parameter from.
@@ -5902,7 +6570,9 @@ struct ArgEvidenceEnv<'a> {
 
 impl ArgEvidenceEnv<'_> {
     fn var_type(&self, name: &str) -> Option<&CType> {
-        self.local_types.get(name).or_else(|| self.global_types.get(name))
+        self.local_types
+            .get(name)
+            .or_else(|| self.global_types.get(name))
     }
 }
 
@@ -5911,9 +6581,7 @@ fn arg_evidence_of_expr(expr: &CExpr, env: &ArgEvidenceEnv) -> ArgEvidence {
     use crate::decompile::passes::c_pass::types::UnaryOp;
     match expr {
         CExpr::Cast(ty, _) => arg_evidence_of_ctype(ty),
-        CExpr::StringLit(_) => {
-            ArgEvidence::Ptr(Some(CType::ptr(CType::char_signed())))
-        }
+        CExpr::StringLit(_) => ArgEvidence::Ptr(Some(CType::ptr(CType::char_signed()))),
         // A literal 0 is a valid int, float, and null pointer constant.
         CExpr::IntLit(l) if l.value == 0 => ArgEvidence::Bottom,
         CExpr::IntLit(l) => {
@@ -5926,7 +6594,11 @@ fn arg_evidence_of_expr(expr: &CExpr, env: &ArgEvidenceEnv) -> ArgEvidence {
             };
             let fits32 = l.value >= i32::MIN as i128 && l.value <= u32::MAX as i128;
             let w = if suffix_wide || !fits32 { 64 } else { 32 };
-            let s = if unsigned { Signedness::Unsigned } else { Signedness::Signed };
+            let s = if unsigned {
+                Signedness::Unsigned
+            } else {
+                Signedness::Signed
+            };
             ArgEvidence::Int(w, s)
         }
         CExpr::FloatLit(l) => {
@@ -5973,10 +6645,16 @@ fn arg_evidence_of_expr(expr: &CExpr, env: &ArgEvidenceEnv) -> ArgEvidence {
                             ArgEvidence::Int(64, Signedness::Signed)
                         }
                         (p @ ArgEvidence::Ptr(_), ArgEvidence::Int(_, _) | ArgEvidence::Bottom)
-                        | (ArgEvidence::Int(_, _) | ArgEvidence::Bottom, p @ ArgEvidence::Ptr(_)) => p,
+                        | (ArgEvidence::Int(_, _) | ArgEvidence::Bottom, p @ ArgEvidence::Ptr(_)) => {
+                            p
+                        }
                         (
-                            le @ (ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom),
-                            re @ (ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom),
+                            le @ (ArgEvidence::Int(_, _)
+                            | ArgEvidence::Float(_)
+                            | ArgEvidence::Bottom),
+                            re @ (ArgEvidence::Int(_, _)
+                            | ArgEvidence::Float(_)
+                            | ArgEvidence::Bottom),
                         ) => le.join(re),
                         _ => ArgEvidence::Poison,
                     }
@@ -6033,15 +6711,21 @@ fn collect_call_arg_evidence_in_stmt(
         CStmt::If(cond, then_s, else_s) => {
             collect_call_arg_evidence_in_expr(cond, env, sites);
             collect_call_arg_evidence_in_stmt(then_s, env, sites);
-            if let Some(e) = else_s { collect_call_arg_evidence_in_stmt(e, env, sites); }
+            if let Some(e) = else_s {
+                collect_call_arg_evidence_in_stmt(e, env, sites);
+            }
         }
         CStmt::While(cond, body) | CStmt::DoWhile(body, cond) => {
             collect_call_arg_evidence_in_expr(cond, env, sites);
             collect_call_arg_evidence_in_stmt(body, env, sites);
         }
         CStmt::For(_, cond, update, body) => {
-            if let Some(c) = cond { collect_call_arg_evidence_in_expr(c, env, sites); }
-            if let Some(u) = update { collect_call_arg_evidence_in_expr(u, env, sites); }
+            if let Some(c) = cond {
+                collect_call_arg_evidence_in_expr(c, env, sites);
+            }
+            if let Some(u) = update {
+                collect_call_arg_evidence_in_expr(u, env, sites);
+            }
             collect_call_arg_evidence_in_stmt(body, env, sites);
         }
         CStmt::Switch(expr, body) => {
@@ -6049,11 +6733,15 @@ fn collect_call_arg_evidence_in_stmt(
             collect_call_arg_evidence_in_stmt(body, env, sites);
         }
         CStmt::Sequence(stmts) => {
-            for s in stmts { collect_call_arg_evidence_in_stmt(s, env, sites); }
+            for s in stmts {
+                collect_call_arg_evidence_in_stmt(s, env, sites);
+            }
         }
         CStmt::Block(items) => {
             for item in items {
-                if let CBlockItem::Stmt(s) = item { collect_call_arg_evidence_in_stmt(s, env, sites); }
+                if let CBlockItem::Stmt(s) = item {
+                    collect_call_arg_evidence_in_stmt(s, env, sites);
+                }
             }
         }
         CStmt::Labeled(_, inner) => collect_call_arg_evidence_in_stmt(inner, env, sites),
@@ -6074,7 +6762,9 @@ fn collect_call_arg_evidence_in_expr(
                 sites.entry(name.clone()).or_default().push(evidence);
             }
             collect_call_arg_evidence_in_expr(callee, env, sites);
-            for arg in args { collect_call_arg_evidence_in_expr(arg, env, sites); }
+            for arg in args {
+                collect_call_arg_evidence_in_expr(arg, env, sites);
+            }
         }
         CExpr::Assign(_, lhs, rhs) | CExpr::Binary(_, lhs, rhs) => {
             collect_call_arg_evidence_in_expr(lhs, env, sites);
@@ -6123,7 +6813,10 @@ fn join_call_site_evidence(
         for ev in &acc {
             match ev.to_ctype() {
                 Some(t) => param_types.push(t),
-                None => { ok = false; break; }
+                None => {
+                    ok = false;
+                    break;
+                }
             }
         }
         if ok {
@@ -6175,17 +6868,26 @@ fn count_labels_in_stmt(
         }
         CStmt::If(_, then_s, else_s) => {
             count_labels_in_stmt(then_s, counts, rename_map);
-            if let Some(e) = else_s { count_labels_in_stmt(e, counts, rename_map); }
+            if let Some(e) = else_s {
+                count_labels_in_stmt(e, counts, rename_map);
+            }
         }
-        CStmt::While(_, body) | CStmt::DoWhile(body, _) | CStmt::For(_, _, _, body) | CStmt::Switch(_, body) => {
+        CStmt::While(_, body)
+        | CStmt::DoWhile(body, _)
+        | CStmt::For(_, _, _, body)
+        | CStmt::Switch(_, body) => {
             count_labels_in_stmt(body, counts, rename_map);
         }
         CStmt::Sequence(stmts) => {
-            for s in stmts { count_labels_in_stmt(s, counts, rename_map); }
+            for s in stmts {
+                count_labels_in_stmt(s, counts, rename_map);
+            }
         }
         CStmt::Block(items) => {
             for item in items {
-                if let CBlockItem::Stmt(s) = item { count_labels_in_stmt(s, counts, rename_map); }
+                if let CBlockItem::Stmt(s) = item {
+                    count_labels_in_stmt(s, counts, rename_map);
+                }
             }
         }
         _ => {}
@@ -6202,7 +6904,8 @@ fn rename_duplicate_labels_in_stmt(
             let occ = occurrence.entry(name.clone()).or_insert(0);
             *occ += 1;
             let new_name = if *occ > 1 {
-                rename_map.get(&(name.clone(), *occ))
+                rename_map
+                    .get(&(name.clone(), *occ))
                     .cloned()
                     .unwrap_or_else(|| name.clone())
             } else {
@@ -6216,20 +6919,63 @@ fn rename_duplicate_labels_in_stmt(
             CStmt::Goto(target.clone())
         }
         CStmt::If(cond, then_s, else_s) => {
-            let then_s = Box::new(rename_duplicate_labels_in_stmt(then_s, rename_map, occurrence));
-            let else_s = else_s.as_ref().map(|e| Box::new(rename_duplicate_labels_in_stmt(e, rename_map, occurrence)));
+            let then_s = Box::new(rename_duplicate_labels_in_stmt(
+                then_s, rename_map, occurrence,
+            ));
+            let else_s = else_s
+                .as_ref()
+                .map(|e| Box::new(rename_duplicate_labels_in_stmt(e, rename_map, occurrence)));
             CStmt::If(cond.clone(), then_s, else_s)
         }
-        CStmt::While(cond, body) => CStmt::While(cond.clone(), Box::new(rename_duplicate_labels_in_stmt(body, rename_map, occurrence))),
-        CStmt::DoWhile(body, cond) => CStmt::DoWhile(Box::new(rename_duplicate_labels_in_stmt(body, rename_map, occurrence)), cond.clone()),
-        CStmt::For(i, c, u, body) => CStmt::For(i.clone(), c.clone(), u.clone(), Box::new(rename_duplicate_labels_in_stmt(body, rename_map, occurrence))),
-        CStmt::Switch(expr, body) => CStmt::Switch(expr.clone(), Box::new(rename_duplicate_labels_in_stmt(body, rename_map, occurrence))),
-        CStmt::Sequence(stmts) => CStmt::Sequence(stmts.iter().map(|s| rename_duplicate_labels_in_stmt(s, rename_map, occurrence)).collect()),
-        CStmt::Block(items) => CStmt::Block(items.iter().map(|item| match item {
-            CBlockItem::Stmt(s) => CBlockItem::Stmt(rename_duplicate_labels_in_stmt(s, rename_map, occurrence)),
-            other => other.clone(),
-        }).collect()),
-        CStmt::Labeled(label, inner) => CStmt::Labeled(label.clone(), Box::new(rename_duplicate_labels_in_stmt(inner, rename_map, occurrence))),
+        CStmt::While(cond, body) => CStmt::While(
+            cond.clone(),
+            Box::new(rename_duplicate_labels_in_stmt(
+                body, rename_map, occurrence,
+            )),
+        ),
+        CStmt::DoWhile(body, cond) => CStmt::DoWhile(
+            Box::new(rename_duplicate_labels_in_stmt(
+                body, rename_map, occurrence,
+            )),
+            cond.clone(),
+        ),
+        CStmt::For(i, c, u, body) => CStmt::For(
+            i.clone(),
+            c.clone(),
+            u.clone(),
+            Box::new(rename_duplicate_labels_in_stmt(
+                body, rename_map, occurrence,
+            )),
+        ),
+        CStmt::Switch(expr, body) => CStmt::Switch(
+            expr.clone(),
+            Box::new(rename_duplicate_labels_in_stmt(
+                body, rename_map, occurrence,
+            )),
+        ),
+        CStmt::Sequence(stmts) => CStmt::Sequence(
+            stmts
+                .iter()
+                .map(|s| rename_duplicate_labels_in_stmt(s, rename_map, occurrence))
+                .collect(),
+        ),
+        CStmt::Block(items) => CStmt::Block(
+            items
+                .iter()
+                .map(|item| match item {
+                    CBlockItem::Stmt(s) => {
+                        CBlockItem::Stmt(rename_duplicate_labels_in_stmt(s, rename_map, occurrence))
+                    }
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
+        CStmt::Labeled(label, inner) => CStmt::Labeled(
+            label.clone(),
+            Box::new(rename_duplicate_labels_in_stmt(
+                inner, rename_map, occurrence,
+            )),
+        ),
         _ => stmt.clone(),
     }
 }
@@ -6265,7 +7011,9 @@ fn remove_gotos_to_missing_labels(stmt: &CStmt, missing: &HashSet<String>) -> CS
         CStmt::If(cond, then_s, else_s) => CStmt::If(
             cond.clone(),
             Box::new(remove_gotos_to_missing_labels(then_s, missing)),
-            else_s.as_ref().map(|e| Box::new(remove_gotos_to_missing_labels(e, missing))),
+            else_s
+                .as_ref()
+                .map(|e| Box::new(remove_gotos_to_missing_labels(e, missing))),
         ),
         CStmt::While(cond, body) => CStmt::While(
             cond.clone(),
@@ -6286,13 +7034,21 @@ fn remove_gotos_to_missing_labels(stmt: &CStmt, missing: &HashSet<String>) -> CS
             Box::new(remove_gotos_to_missing_labels(body, missing)),
         ),
         CStmt::Sequence(stmts) => CStmt::Sequence(
-            stmts.iter().map(|s| remove_gotos_to_missing_labels(s, missing)).collect(),
+            stmts
+                .iter()
+                .map(|s| remove_gotos_to_missing_labels(s, missing))
+                .collect(),
         ),
         CStmt::Block(items) => CStmt::Block(
-            items.iter().map(|item| match item {
-                CBlockItem::Stmt(s) => CBlockItem::Stmt(remove_gotos_to_missing_labels(s, missing)),
-                other => other.clone(),
-            }).collect(),
+            items
+                .iter()
+                .map(|item| match item {
+                    CBlockItem::Stmt(s) => {
+                        CBlockItem::Stmt(remove_gotos_to_missing_labels(s, missing))
+                    }
+                    other => other.clone(),
+                })
+                .collect(),
         ),
         CStmt::Labeled(l, inner) => CStmt::Labeled(
             l.clone(),
@@ -6310,12 +7066,16 @@ fn forward_return_value(stmt: &CStmt) -> CStmt {
             CStmt::Block(new_items)
         }
         CStmt::Sequence(stmts) => {
-            let items: Vec<CBlockItem> = stmts.iter().map(|s| CBlockItem::Stmt(s.clone())).collect();
+            let items: Vec<CBlockItem> =
+                stmts.iter().map(|s| CBlockItem::Stmt(s.clone())).collect();
             let new_items = forward_return_in_block_items(&items);
-            let new_stmts: Vec<CStmt> = new_items.into_iter().filter_map(|i| match i {
-                CBlockItem::Stmt(s) => Some(s),
-                _ => None,
-            }).collect();
+            let new_stmts: Vec<CStmt> = new_items
+                .into_iter()
+                .filter_map(|i| match i {
+                    CBlockItem::Stmt(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
             if new_stmts.len() == 1 {
                 new_stmts.into_iter().next().unwrap()
             } else {
@@ -6327,10 +7087,21 @@ fn forward_return_value(stmt: &CStmt) -> CStmt {
             Box::new(forward_return_value(then_s)),
             else_s.as_ref().map(|s| Box::new(forward_return_value(s))),
         ),
-        CStmt::While(cond, body) => CStmt::While(cond.clone(), Box::new(forward_return_value(body))),
-        CStmt::DoWhile(body, cond) => CStmt::DoWhile(Box::new(forward_return_value(body)), cond.clone()),
-        CStmt::For(init, cond, upd, body) => CStmt::For(init.clone(), cond.clone(), upd.clone(), Box::new(forward_return_value(body))),
-        CStmt::Labeled(l, inner) => CStmt::Labeled(l.clone(), Box::new(forward_return_value(inner))),
+        CStmt::While(cond, body) => {
+            CStmt::While(cond.clone(), Box::new(forward_return_value(body)))
+        }
+        CStmt::DoWhile(body, cond) => {
+            CStmt::DoWhile(Box::new(forward_return_value(body)), cond.clone())
+        }
+        CStmt::For(init, cond, upd, body) => CStmt::For(
+            init.clone(),
+            cond.clone(),
+            upd.clone(),
+            Box::new(forward_return_value(body)),
+        ),
+        CStmt::Labeled(l, inner) => {
+            CStmt::Labeled(l.clone(), Box::new(forward_return_value(inner)))
+        }
         _ => stmt.clone(),
     }
 }
@@ -6341,8 +7112,10 @@ fn forward_return_in_block_items(items: &[CBlockItem]) -> Vec<CBlockItem> {
     let mut i = 0;
     while i + 1 < result.len() {
         let var_match = match (&result[i], &result[i + 1]) {
-            (CBlockItem::Stmt(if_stmt @ CStmt::If(_, _, Some(_))),
-             CBlockItem::Stmt(CStmt::Return(Some(CExpr::Var(ret_var))))) => {
+            (
+                CBlockItem::Stmt(if_stmt @ CStmt::If(_, _, Some(_))),
+                CBlockItem::Stmt(CStmt::Return(Some(CExpr::Var(ret_var)))),
+            ) => {
                 if all_branches_assign_last(if_stmt, ret_var) {
                     Some(ret_var.clone())
                 } else {
@@ -6385,15 +7158,15 @@ fn last_stmt_assigns(stmt: &CStmt, var: &str) -> bool {
             matches!(lhs.as_ref(), CExpr::Var(v) if v == var)
         }
         CStmt::If(_, _, Some(_)) => all_branches_assign_last(stmt, var),
-        CStmt::Block(items) => {
-            items.iter().rev().find_map(|i| match i {
+        CStmt::Block(items) => items
+            .iter()
+            .rev()
+            .find_map(|i| match i {
                 CBlockItem::Stmt(s) if !matches!(s, CStmt::Empty) => Some(s),
                 _ => None,
-            }).map_or(false, |s| last_stmt_assigns(s, var))
-        }
-        CStmt::Sequence(stmts) => {
-            stmts.last().map_or(false, |s| last_stmt_assigns(s, var))
-        }
+            })
+            .map_or(false, |s| last_stmt_assigns(s, var)),
+        CStmt::Sequence(stmts) => stmts.last().map_or(false, |s| last_stmt_assigns(s, var)),
         _ => false,
     }
 }
@@ -6411,9 +7184,13 @@ fn replace_last_assign_with_return(stmt: &CStmt, var: &str) -> CStmt {
         }
         CStmt::Block(items) => {
             let mut new_items = items.clone();
-            if let Some(last_stmt_idx) = new_items.iter().rposition(|i| matches!(i, CBlockItem::Stmt(s) if !matches!(s, CStmt::Empty))) {
+            if let Some(last_stmt_idx) = new_items
+                .iter()
+                .rposition(|i| matches!(i, CBlockItem::Stmt(s) if !matches!(s, CStmt::Empty)))
+            {
                 if let CBlockItem::Stmt(s) = &new_items[last_stmt_idx] {
-                    new_items[last_stmt_idx] = CBlockItem::Stmt(replace_last_assign_with_return(s, var));
+                    new_items[last_stmt_idx] =
+                        CBlockItem::Stmt(replace_last_assign_with_return(s, var));
                 }
             }
             CStmt::Block(new_items)
@@ -6434,12 +7211,24 @@ mod arg_evidence_tests {
     use super::*;
     use crate::decompile::passes::c_pass::types::{FloatSize, IntSize};
 
-    fn i32_() -> ArgEvidence { ArgEvidence::Int(32, Signedness::Signed) }
-    fn i64_() -> ArgEvidence { ArgEvidence::Int(64, Signedness::Signed) }
-    fn u32_() -> ArgEvidence { ArgEvidence::Int(32, Signedness::Unsigned) }
-    fn f64_() -> ArgEvidence { ArgEvidence::Float(64) }
-    fn ptr_char() -> ArgEvidence { ArgEvidence::Ptr(Some(CType::ptr(CType::char_signed()))) }
-    fn ptr_int() -> ArgEvidence { ArgEvidence::Ptr(Some(CType::ptr(CType::int()))) }
+    fn i32_() -> ArgEvidence {
+        ArgEvidence::Int(32, Signedness::Signed)
+    }
+    fn i64_() -> ArgEvidence {
+        ArgEvidence::Int(64, Signedness::Signed)
+    }
+    fn u32_() -> ArgEvidence {
+        ArgEvidence::Int(32, Signedness::Unsigned)
+    }
+    fn f64_() -> ArgEvidence {
+        ArgEvidence::Float(64)
+    }
+    fn ptr_char() -> ArgEvidence {
+        ArgEvidence::Ptr(Some(CType::ptr(CType::char_signed())))
+    }
+    fn ptr_int() -> ArgEvidence {
+        ArgEvidence::Ptr(Some(CType::ptr(CType::int())))
+    }
 
     #[test]
     fn join_int_widths() {
@@ -6548,9 +7337,16 @@ mod arg_evidence_tests {
             joined.get("f"),
             Some(&vec![CType::Int(IntSize::Long, Signedness::Signed)])
         );
-        assert!(!joined.contains_key("g"), "arity mismatch must fall back to K&R");
+        assert!(
+            !joined.contains_key("g"),
+            "arity mismatch must fall back to K&R"
+        );
         assert!(!joined.contains_key("h"), "poison must fall back to K&R");
-        assert_eq!(joined.get("z"), Some(&vec![]), "consistent zero-arity -> (void)");
+        assert_eq!(
+            joined.get("z"),
+            Some(&vec![]),
+            "consistent zero-arity -> (void)"
+        );
     }
 }
 
@@ -6631,5 +7427,29 @@ mod cast_insertion_tests {
             *rhs,
             CExpr::Cast(pointer, Box::new(CExpr::Var("p0".to_string())))
         );
+    }
+
+    #[test]
+    fn address_of_uses_final_declared_type_for_pointer_cast() {
+        let declared = CType::ptr(CType::Struct("struct_6".to_string()));
+        let variables = HashMap::from([("var_0".to_string(), declared.clone())]);
+        let struct_fields = HashMap::new();
+        let types = CastTypes {
+            variables: &variables,
+            struct_fields: &struct_fields,
+        };
+        let address_of = CExpr::Unary(UnaryOp::AddrOf, Box::new(CExpr::Var("var_0".to_string())));
+        let expr = CExpr::Assign(
+            AssignOp::Assign,
+            Box::new(CExpr::Var("var_0".to_string())),
+            Box::new(address_of.clone()),
+        );
+
+        let actual = insert_casts_expr(&expr, &types, &HashMap::new(), &HashMap::new());
+
+        let CExpr::Assign(_, _, rhs) = actual else {
+            panic!("assignment was not preserved");
+        };
+        assert_eq!(*rhs, CExpr::Cast(declared, Box::new(address_of)));
     }
 }
