@@ -1824,8 +1824,7 @@ ascent_par! {
         if Mreg::x86(r2) == Mreg::SP,
         if *idx == "NONE",
         if *msize != 1 && *msize != 2,
-        stack_offset(_, addr, rsp_ofs),
-        let ofs_adjusted = *disp + rsp_ofs.0,
+        stack_offset(_, addr, _rsp_ofs),
         ireg_hold_type(srcstr.to_string(), typ);
 
     mach_inst(addr, MachInst::Msetstack(src_reg, *disp, *typ)) <--
@@ -1851,8 +1850,7 @@ ascent_par! {
         if Mreg::x86(r2) == Mreg::SP,
         if *idx == "NONE",
         if *msize == 4 || *msize == 8,
-        stack_offset(_, addr, rsp_ofs),
-        let ofs_adjusted = *disp + rsp_ofs.0,
+        stack_offset(_, addr, _rsp_ofs),
         let typ = if *msize == 4 { Typ::Tsingle } else { Typ::Tfloat };
 
     mach_inst(addr, MachInst::Msetstack(src_reg, *disp, typ)) <--
@@ -1878,8 +1876,7 @@ ascent_par! {
         if Mreg::x86(r2) == Mreg::SP,
         if *idx == "NONE",
         if *msize > 8,
-        stack_offset(_, addr, rsp_ofs),
-        let ofs_adjusted = *disp + rsp_ofs.0;
+        stack_offset(_, addr, _rsp_ofs);
 
     mach_inst(addr, MachInst::Msetstack(src_reg, *disp, Typ::Tany64)) <--
         pmov(addr, dst, src),
@@ -1930,14 +1927,16 @@ ascent_par! {
         let ty = if *sz <= 4 { Typ::Tint } else { Typ::Tany64 },
         let imm_int = *imm_sym as i64;
 
-    mach_imm_stack_init(addr, ofs_adjusted, imm_int, ty) <--
+    // Keep the raw instruction displacement, matching Msetstack/Mgetstack and
+    // disassembly stack def-use keys. Entry-frame offsets are derived only at
+    // ABI boundaries, not in the local-slot identity.
+    mach_imm_stack_init(addr, *disp, imm_int, ty) <--
         pmov(addr, dst, src),
         op_immediate(src, imm_sym, _),
         op_indirect(dst, _, base, idx, _, disp, sz),
         if Mreg::x86(base) == Mreg::SP,
         if *idx == "NONE" || idx.is_empty(),
-        stack_offset(_, addr, rsp_ofs),
-        let ofs_adjusted = *disp + rsp_ofs.0,
+        stack_offset(_, addr, _rsp_ofs),
         let ty = if *sz <= 4 { Typ::Tint } else { Typ::Tany64 },
         let imm_int = *imm_sym as i64;
 
@@ -1959,8 +1958,7 @@ ascent_par! {
         if Mreg::x86(r2) == Mreg::SP,
         if *idx == "NONE",
         op_register(dst, dststr),
-        stack_offset(_, addr, rsp_ofs),
-        let ofs_adjusted = *disp + rsp_ofs.0,
+        stack_offset(_, addr, _rsp_ofs),
         ireg_hold_type(dststr.to_string(), typ);
 
     mach_inst(addr, MachInst::Mgetstack(*disp, *typ, Mreg::x86(dststr))) <--
@@ -1972,6 +1970,53 @@ ascent_par! {
         instr_in_function(addr, func),
         func_has_frame_pointer(func),
         ireg_hold_type(dststr.to_string(), typ);
+
+    // SP-relative indexed store: unlike an index-free store, this is an array
+    // element write rather than an Msetstack scalar slot. Preserve both the
+    // stack base and the index so RTL can expand it through Ainstack.
+    mach_inst(addr, MachInst::Mstore(mc, addressing, Arc::new(args), src_reg)) <--
+        pmov(addr, dst, src),
+        op_register(src, srcstr),
+        !reg_xmm(srcstr),
+        let src_reg = Mreg::x86(srcstr),
+        op_indirect(dst, _, base_str, idx_str, scale, disp, msize),
+        if Mreg::x86(base_str) == Mreg::SP,
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        ireg_hold_type(srcstr.to_string(), typ),
+        type_to_memchunk(typ, chunk),
+        ireg_of(preg_of_idx, Ireg::from(idx_str)),
+        preg_of(idx_arg, preg_of_idx),
+        let mc = refine_chunk_with_size(*chunk, *msize),
+        let (addressing, args) = if *scale > 1 {
+            (Addressing::Aindexed2scaled(*scale, *disp), vec![Mreg::SP, *idx_arg])
+        } else {
+            (Addressing::Aindexed2(*disp), vec![Mreg::SP, *idx_arg])
+        };
+
+    // XMM scalar stores take their type from the memory access width, not the
+    // register's Tany64 hold type.
+    mach_inst(addr, MachInst::Mstore(mc, addressing, Arc::new(args), src_reg)) <--
+        pmov(addr, dst, src),
+        op_register(src, srcstr),
+        reg_xmm(srcstr),
+        let src_reg = Mreg::x86(srcstr),
+        op_indirect(dst, _, base_str, idx_str, scale, disp, msize),
+        if Mreg::x86(base_str) == Mreg::SP,
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        ireg_of(preg_of_idx, Ireg::from(idx_str)),
+        preg_of(idx_arg, preg_of_idx),
+        let mc = if *msize == 4 {
+            MemoryChunk::MFloat32
+        } else if *msize == 8 {
+            MemoryChunk::MFloat64
+        } else {
+            MemoryChunk::MAny64
+        },
+        let (addressing, args) = if *scale > 1 {
+            (Addressing::Aindexed2scaled(*scale, *disp), vec![Mreg::SP, *idx_arg])
+        } else {
+            (Addressing::Aindexed2(*disp), vec![Mreg::SP, *idx_arg])
+        };
 
     // SP-relative indexed load: treat as Mload with Aindexed2scaled addressing
     mach_inst(addr, MachInst::Mload(*mc, addressing, Arc::new(args), Mreg::x86(dststr))) <--

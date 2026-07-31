@@ -1184,7 +1184,7 @@ ascent_par! {
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, _),
-        if *base_mreg == Mreg::BP,
+        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
         let nop = RTLInst::Inop;
 
     rtl_inst_candidate(synthetic_addr, op_inst) <--
@@ -1193,20 +1193,16 @@ ascent_par! {
         reg_rtl(addr, *dst_mreg, dst_rtl),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
-        if *base_mreg == Mreg::BP,
+        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
         let synthetic_addr = *addr | (1u64 << 62),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, *stack_rtl]), *dst_rtl);
 
-    // ABI-1: the per-function rank of an incoming-stack-arg offset (ascending offset = ascending SysV position), matching the index the signature side uses when it allocates fresh_stack_param_reg for positions 6+. Tiny per-function sets, not a pairwise blowup.
-    #[local] relation stack_param_lower(Address, i64, i64);
-    stack_param_lower(func, ofs, o2) <--
-        stack_passed_param(func, ofs),
-        stack_passed_param(func, o2),
-        if *o2 < *ofs;
-    #[local] relation stack_param_idx(Address, i64, usize);
-    stack_param_idx(func, ofs, idx) <--
-        stack_passed_param(func, ofs),
-        agg idx = ascent::aggregators::count() in stack_param_lower(func, ofs, _);
+    // A concrete read of an incoming stack parameter and its ABI slot ordinal
+    // (zero is the first stack-passed argument). Keeping the access address in
+    // the key avoids compacting sparse parameters or conflating raw SP
+    // displacements observed at different prologue depths.
+    relation stack_param_access(Node, Address, i64, usize);
+    relation stack_param_ordinal(Address, usize);
 
     // ABI-1: memory-source arithmetic reading an INCOMING stack argument binds to the function's synthetic stack-param reg, so the body references pN instead of a fresh-RTEMP fallback.
     #[local] relation arith_load_uses_stack_param(Node);
@@ -1215,7 +1211,7 @@ ascent_par! {
         !has_ltl_op(addr),
         if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
         instr_in_function(addr, func_start),
-        stack_param_idx(func_start, disp, _);
+        stack_param_access(addr, func_start, disp, _);
 
     // Keep the original node as a transparent Inop anchor while the stack-param arithmetic lives at the synthetic successor, or rtl_optimize's liveness cannot carry the RMW destination across it.
     rtl_inst_candidate(addr, nop) <--
@@ -1228,19 +1224,20 @@ ascent_par! {
         if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
         reg_rtl(addr, *dst_mreg, dst_rtl),
         instr_in_function(addr, func_start),
-        stack_param_idx(func_start, disp, idx),
+        stack_param_access(addr, func_start, disp, idx),
         !arith_load_uses_stack_var(addr),
         let param_reg = fresh_stack_param_reg(*func_start, *idx),
         let synthetic_addr = *addr | (1u64 << 62),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*dst_rtl, param_reg]), *dst_rtl);
 
-    // TR-5: the load's memory chunk supplies TYPE evidence for stack-passed positions, which previously had no evidence path at all and defaulted to Xany64 in prototypes (the int_pos register caps are correct - only 6 int arg regs exist - but positions 6+ never received types).
+    // TR-5: the load's memory chunk supplies TYPE evidence for stack-passed
+    // positions, which previously had no evidence path and defaulted to Xany64.
     emit_function_param_type_candidate(func_start, param_reg, xt) <--
         arith_load_op(addr, _, chunk, base_mreg, disp, _),
         !has_ltl_op(addr),
         if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
         instr_in_function(addr, func_start),
-        stack_param_idx(func_start, disp, idx),
+        stack_param_access(addr, func_start, disp, idx),
         let param_reg = fresh_stack_param_reg(*func_start, *idx),
         let xt = match chunk {
             MemoryChunk::MInt32 => XType::Xint,
@@ -1257,7 +1254,7 @@ ascent_par! {
         for base in args.iter(),
         if *base == Mreg::BP || *base == Mreg::SP,
         instr_in_function(addr, func_start),
-        stack_param_idx(func_start, disp, idx),
+        stack_param_access(addr, func_start, disp, idx),
         let param_reg = fresh_stack_param_reg(*func_start, *idx),
         let xt = match chunk {
             MemoryChunk::MInt32 => XType::Xint,
@@ -1276,7 +1273,7 @@ ascent_par! {
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, _),
-        if *base_mreg == Mreg::BP;
+        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP;
 
     rtl_inst_candidate(addr, load_inst) <--
         arith_load_op(addr, _op, chunk, base_mreg, disp, _dst_mreg),
@@ -1315,14 +1312,25 @@ ascent_par! {
         let synthetic_addr = *addr | (1u64 << 62),
         next(addr, next);
 
-    // stack_unary_load_op: the slot value is already live in stack_rtl, so
-    // the load node carries an Inop and the unary op at the synthetic address
-    // consumes stack_rtl instead of a frame Iload.
+    #[local] relation stack_unary_uses_stack_param(Node);
+    stack_unary_uses_stack_param(addr) <--
+        stack_unary_load_op(addr, _, _, disp, _),
+        instr_in_function(addr, func_start),
+        stack_param_access(addr, func_start, disp, _);
+
+    // stack_unary_load_op: a local slot is already live in stack_rtl; an
+    // incoming slot instead consumes the ABI-positioned synthetic parameter.
+    // In both cases the real node remains an Inop anchor for the synth edge.
     rtl_inst_candidate(addr, nop) <--
         stack_unary_load_op(addr, _op, _base_mreg, disp, _dst_mreg),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, _),
+        !stack_unary_uses_stack_param(addr),
+        let nop = RTLInst::Inop;
+
+    rtl_inst_candidate(addr, nop) <--
+        stack_unary_uses_stack_param(addr),
         let nop = RTLInst::Inop;
 
     // Unary op at synth: dst = op(slot). The destination is write-only, so
@@ -1332,6 +1340,7 @@ ascent_par! {
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
+        !stack_unary_uses_stack_param(addr),
         reg_rtl(addr, *dst_mreg, dst_rtl),
         let synthetic_addr = *addr | (1u64 << 62),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl]), *dst_rtl);
@@ -1341,10 +1350,42 @@ ascent_par! {
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
+        !stack_unary_uses_stack_param(addr),
         !reg_xtl(addr, *dst_mreg, _),
         let synthetic_addr = *addr | (1u64 << 62),
         let dst_rtl = fresh_xtl_reg(*addr, *dst_mreg),
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl]), dst_rtl);
+
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        stack_unary_load_op(addr, op, _base_mreg, disp, dst_mreg),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        stack_param_access(addr, func_start, disp, idx),
+        reg_rtl(addr, *dst_mreg, dst_rtl),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![param_reg]), *dst_rtl);
+
+    rtl_inst_candidate(synthetic_addr, op_inst) <--
+        stack_unary_load_op(addr, op, _base_mreg, disp, dst_mreg),
+        !has_ltl_op(addr),
+        instr_in_function(addr, func_start),
+        stack_param_access(addr, func_start, disp, idx),
+        !reg_xtl(addr, *dst_mreg, _),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let synthetic_addr = *addr | (1u64 << 62),
+        let dst_rtl = fresh_xtl_reg(*addr, *dst_mreg),
+        let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![param_reg]), dst_rtl);
+
+    emit_function_param_type_candidate(func_start, param_reg, xt) <--
+        stack_unary_load_op(addr, op, _base_mreg, disp, _dst_mreg),
+        instr_in_function(addr, func_start),
+        stack_param_access(addr, func_start, disp, idx),
+        let param_reg = fresh_stack_param_reg(*func_start, *idx),
+        let xt = match op {
+            Operation::Ofloatoflong | Operation::Osingleoflong | Operation::Omullimm(_) => XType::Xlong,
+            _ => XType::Xint,
+        };
 
     rtl_edge_negated(addr, next) <--
         stack_unary_load_op(addr, _, _, _, _),
@@ -1387,7 +1428,7 @@ ascent_par! {
     float_arith_uses_stack_param(addr) <--
         float_arith_stack_op(addr, _, _, disp, _),
         instr_in_function(addr, func_start),
-        stack_param_idx(func_start, disp, _),
+        stack_param_access(addr, func_start, disp, _),
         !stack_var(func_start, addr, disp, _);
 
     rtl_inst_candidate(addr, nop) <--
@@ -1418,7 +1459,7 @@ ascent_par! {
         float_arith_stack_op(addr, op, _base_mreg, disp, dst_mreg),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
-        stack_param_idx(func_start, disp, idx),
+        stack_param_access(addr, func_start, disp, idx),
         !stack_var(func_start, addr, disp, _),
         reg_rtl(addr, *dst_mreg, dst_rtl),
         let param_reg = fresh_stack_param_reg(*func_start, *idx),
@@ -1428,7 +1469,7 @@ ascent_par! {
     emit_function_param_type_candidate(func_start, param_reg, xt) <--
         float_arith_stack_op(addr, op, _base_mreg, disp, _dst_mreg),
         instr_in_function(addr, func_start),
-        stack_param_idx(func_start, disp, idx),
+        stack_param_access(addr, func_start, disp, idx),
         !stack_var(func_start, addr, disp, _),
         let param_reg = fresh_stack_param_reg(*func_start, *idx),
         let xt = if crate::x86::types::is_single_operation(op) {
@@ -1601,14 +1642,16 @@ ascent_par! {
 
     synth_only_addr(addr) <-- adc_carry_op(addr, _, _, _, _, _, _, _);
 
-    // arith_store_reg: memory-dest arithmetic with a register source; a BP-relative RMW operates IN-PLACE on the slot's stack_rtl so the update threads to later reads of the same slot.
+    // arith_store_reg: memory-dest arithmetic with a register source; a
+    // BP/SP-relative RMW operates IN-PLACE on the slot's stack_rtl so the
+    // update threads to later reads of the same slot.
     #[local] relation arith_store_reg_uses_stack_var(Node);
     arith_store_reg_uses_stack_var(addr) <--
         arith_store_reg(addr, _, _, base_mreg, disp, _),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, _),
-        if *base_mreg == Mreg::BP;
+        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP;
 
     // Stack-slot in-place RMW: the load/op/store triple collapses to a single in-place `slot = slot op src` writing the slot's stack_rtl (matches the Lsetstack model), no explicit memory load/store; the edge stays addr->next (no synthetic chain), see the guarded succ rules.
     rtl_inst_candidate(addr, op_inst) <--
@@ -1617,7 +1660,7 @@ ascent_par! {
         reg_rtl(addr, *src_mreg, src_rtl),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
-        if *base_mreg == Mreg::BP,
+        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl, *src_rtl]), *stack_rtl);
 
     rtl_inst_candidate(addr, load_inst) <--
@@ -1687,14 +1730,17 @@ ascent_par! {
         let synth2 = *addr | (1u64 << 63),
         next(addr, next);
 
-    // arith_store_imm: memory-dest arithmetic with immediate; only fires without a real ltl op. BP-relative read-modify-write (e.g. addl $1, -4(%rbp)) operates IN-PLACE on the slot's stack_rtl so the updated value threads to later reads of the same slot (see arith_store_reg).
+    // arith_store_imm: memory-dest arithmetic with immediate; only fires
+    // without a real ltl op. BP/SP-relative read-modify-write operates
+    // IN-PLACE on the slot's stack_rtl so the updated value threads to later
+    // reads of the same slot (see arith_store_reg).
     #[local] relation arith_store_imm_uses_stack_var(Node);
     arith_store_imm_uses_stack_var(addr) <--
         arith_store_imm(addr, _, _, base_mreg, disp),
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, _),
-        if *base_mreg == Mreg::BP;
+        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP;
 
     // Stack-slot in-place RMW: the load/op/store triple collapses to one in-place op writing the slot's stack_rtl, so the edge stays addr->next with no synthetic chain.
     rtl_inst_candidate(addr, op_inst) <--
@@ -1702,7 +1748,7 @@ ascent_par! {
         !has_ltl_op(addr),
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, disp, stack_rtl),
-        if *base_mreg == Mreg::BP,
+        if *base_mreg == Mreg::BP || *base_mreg == Mreg::SP,
         let op_inst = RTLInst::Iop(op.clone(), Arc::new(vec![*stack_rtl]), *stack_rtl);
 
     rtl_inst_candidate(addr, load_inst) <--
@@ -1884,15 +1930,28 @@ ascent_par! {
         instr_in_function(addr, func_start);
 
 
+    // A homed parameter reload can carry both Mgetstack and the historical
+    // zero-argument Olea(Ainstack) interpretation at one address. Once the
+    // home spill proves this is a value reload, suppress only that shadow LEA
+    // so candidate selection cannot replace the parameter with &stack[ofs].
+    #[local] relation home_reload_shadow_lea(Node);
+    home_reload_shadow_lea(addr) <--
+        win64_home_reload(addr, _, _, _),
+        ltl_inst(addr, ?LTLInst::Lop(op, mregs, _)),
+        if mregs.is_empty(),
+        if matches!(op, Operation::Olea(Addressing::Ainstack(_)));
+
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
         if mregs.is_empty(),
+        !home_reload_shadow_lea(addr),
         reg_rtl(addr, *dst_reg, dst_rtl),
         let inst = RTLInst::Iop(op.clone(), Arc::new(vec![]), *dst_rtl);
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lop(op, mregs, dst_reg)),
         if mregs.is_empty(),
+        !home_reload_shadow_lea(addr),
         !reg_xtl(addr, *dst_reg, _),
         let dst_rtl = fresh_xtl_reg(*addr, *dst_reg),
         let inst = RTLInst::Iop(op.clone(), Arc::new(vec![]), dst_rtl);
@@ -2092,6 +2151,7 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
         if mregs.len() == 1,
+        !win64_home_reload(addr, _, _, _),
         let arg_mreg = mregs[0],
         if arg_mreg != *dst_reg,
         reg_rtl(addr, *dst_reg, dst_rtl),
@@ -2101,6 +2161,7 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
         if mregs.len() == 1,
+        !win64_home_reload(addr, _, _, _),
         let arg_mreg = mregs[0],
         if arg_mreg == *dst_reg,
         is_def(addr, def_xtl),
@@ -2109,6 +2170,24 @@ ascent_par! {
         load_overwrite_use_id(addr, dst_reg, src_xtl),
         xtl_canonical(src_xtl, arg_rtl),
         let inst = RTLInst::Iload(*chunk, addressing.clone(), Arc::new(vec![*arg_rtl]), *dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_reload(addr, func_start, param_mreg, _),
+        ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, dst_reg)),
+        if mregs.len() == 1 && mregs[0] != *dst_reg,
+        reg_rtl(addr, *dst_reg, dst_rtl),
+        let param_rtl = fresh_xtl_reg(*func_start, *param_mreg),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![param_rtl]), *dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_reload(addr, func_start, param_mreg, _),
+        ltl_inst(addr, ?LTLInst::Lload(_, _, mregs, dst_reg)),
+        if mregs.len() == 1 && mregs[0] == *dst_reg,
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        let param_rtl = fresh_xtl_reg(*func_start, *param_mreg),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![param_rtl]), *dst_rtl);
 
     // dst_rtl binds via the load's def id, not reg_rtl(addr, dst_reg), which is multi-valued when the load reuses its destination as an address operand and previously dropped the load.
     rtl_inst_candidate(addr, inst) <--
@@ -2136,17 +2215,21 @@ ascent_par! {
         let inst = RTLInst::Iload(*chunk, addressing.clone(), Arc::new(vec![*base_rtl]), *dst_rtl);
 
     // SP-indexed load: expand [SP, idx] to Olea(Ainstack(ofs)) + Iload(Aindexed2scaled(scale, 0)).
-    rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, sp_addr_rtl) <--
+    rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, sp_addr_rtl),
+    indexed_synth_stack_base(func_start, *addr, *ofs, sp_addr_rtl) <--
+        sp_indexed_load(addr),
+        instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lload(_, addressing, mregs, _)),
-        if mregs.len() == 2 && mregs[0] == Mreg::SP,
         if let Addressing::Aindexed2scaled(_, ofs) | Addressing::Aindexed2(ofs) = addressing,
         let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
         let lea_inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*ofs)), Arc::new(vec![]), sp_addr_rtl);
 
+    // No collision: destination and index have distinct value webs.
     rtl_inst_candidate(synth, load_inst) <--
+        sp_indexed_load(addr),
         ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
-        if mregs.len() == 2 && mregs[0] == Mreg::SP,
         if let Addressing::Aindexed2scaled(scale, _) = addressing,
+        if mregs[1] != *dst_reg,
         reg_rtl(addr, *dst_reg, dst_rtl),
         reg_rtl(addr, mregs[1], idx_rtl),
         let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
@@ -2154,11 +2237,42 @@ ascent_par! {
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
 
     rtl_inst_candidate(synth, load_inst) <--
+        sp_indexed_load(addr),
         ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
-        if mregs.len() == 2 && mregs[0] == Mreg::SP,
         if let Addressing::Aindexed2(ofs) = addressing,
+        if mregs[1] != *dst_reg,
         reg_rtl(addr, *dst_reg, dst_rtl),
         reg_rtl(addr, mregs[1], idx_rtl),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2(0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
+
+    // Collision: the load overwrites its index register, so use the load's
+    // fresh def for dst and its pre-write shadow id for the index operand.
+    rtl_inst_candidate(synth, load_inst) <--
+        sp_indexed_load(addr),
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if let Addressing::Aindexed2scaled(scale, _) = addressing,
+        if mregs[1] == *dst_reg,
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        load_overwrite_use_id(addr, dst_reg, idx_xtl),
+        xtl_canonical(idx_xtl, idx_rtl),
+        let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
+        let synth = *addr | (1u64 << 62),
+        let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2scaled(*scale, 0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
+
+    rtl_inst_candidate(synth, load_inst) <--
+        sp_indexed_load(addr),
+        ltl_inst(addr, ?LTLInst::Lload(chunk, addressing, mregs, dst_reg)),
+        if let Addressing::Aindexed2(_) = addressing,
+        if mregs[1] == *dst_reg,
+        is_def(addr, def_xtl),
+        reg_xtl(addr, *dst_reg, def_xtl),
+        xtl_canonical(def_xtl, dst_rtl),
+        load_overwrite_use_id(addr, dst_reg, idx_xtl),
+        xtl_canonical(idx_xtl, idx_rtl),
         let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
         let synth = *addr | (1u64 << 62),
         let load_inst = RTLInst::Iload(*chunk, Addressing::Aindexed2(0), Arc::new(vec![sp_addr_rtl, *idx_rtl]), *dst_rtl);
@@ -2195,9 +2309,11 @@ ascent_par! {
         let synth = *addr | (1u64 << 62);
 
     // SP-indexed store: Aindexed2scaled/Aindexed2 with [SP, idx] -> expand similarly
-    rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, sp_addr_rtl) <--
+    rtl_inst_candidate(addr, lea_inst), op_produces_ptr(addr, sp_addr_rtl),
+    indexed_synth_stack_base(func_start, *addr, *ofs, sp_addr_rtl) <--
+        sp_indexed_store(addr),
+        instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lstore(_, addressing, mregs, _)),
-        if mregs.len() == 2 && mregs[0] == Mreg::SP,
         if let Addressing::Aindexed2scaled(_, ofs) | Addressing::Aindexed2(ofs) = addressing,
         let sp_addr_rtl = fresh_xtl_reg(*addr, Mreg::SP) | FRESH_NS_SP_BASE,
         let lea_inst = RTLInst::Iop(Operation::Olea(Addressing::Ainstack(*ofs)), Arc::new(vec![]), sp_addr_rtl);
@@ -2401,7 +2517,8 @@ ascent_par! {
         sp_synth_skip_to_ltl(*mid, *func_start, dst),
         let synth = *addr | (1u64 << 62);
 
-    // Give the BP-indexed synthetic Olea(Ainstack(ofs)) a per-node stack_xtl so cminor resolves it to Eaddrof(&local) instead of leaving it as the bare frame integer.
+    // Give each SP/BP-indexed synthetic Olea(Ainstack(ofs)) a per-node
+    // stack_xtl so cminor resolves it to Eaddrof(&local), not a frame integer.
     stack_xtl(func_start, addr, ofs, base_reg) <--
         indexed_synth_stack_base(func_start, addr, ofs, base_reg);
 
@@ -2786,6 +2903,7 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
         if !mregs.is_empty(),
+        !win64_home_spill(addr, _, _, _),
         !sp_indexed_store(addr),
         !bp_indexed_store(addr),
         reg_rtl(addr, *src_reg, src_rtl),
@@ -2795,6 +2913,7 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lstore(chunk, addressing, mregs, src_reg)),
         if mregs.is_empty(),
+        !win64_home_spill(addr, _, _, _),
         reg_rtl(addr, *src_reg, src_rtl),
         let inst = RTLInst::Istore(*chunk, addressing.clone(), Arc::new(vec![]), *src_rtl);
 
@@ -3604,23 +3723,22 @@ ascent_par! {
         let void_reg = crate::decompile::passes::rtl_pass::fresh_xtl_reg(*addr, Mreg::AX),
         let inst = RTLInst::Ireturn(void_reg);
 
-    // (3.2e) Extending load of an incoming stack arg binds its dst to the function's synthetic stack-param reg (position 6+idx), same as arith_load_uses_stack_param; without this, Lgetstack fallbacks fabricate an uninitialized local for the 7th+ int/short parameter.
+    // An incoming stack-argument load binds its dst to the function's
+    // synthetic stack-param reg at the actual ABI ordinal; otherwise the
+    // Lgetstack fallback fabricates an uninitialized local.
     #[local] relation lgetstack_is_stack_param(Node);
     lgetstack_is_stack_param(addr) <--
-        extending_stack_arg_load(addr, func_start, disp, _),
-        stack_param_idx(func_start, disp, _);
+        stack_param_load(addr, func_start, disp, _, _);
 
     rtl_inst_candidate(addr, inst) <--
-        extending_stack_arg_load(addr, func_start, disp, _),
-        stack_param_idx(func_start, disp, idx),
+        stack_param_load(addr, func_start, _disp, idx, _),
         ltl_inst(addr, ?LTLInst::Lgetstack(_slot, _ofs, _typ, dst)),
         reg_rtl(addr, *dst, dst_rtl),
         let param_reg = fresh_stack_param_reg(*func_start, *idx),
         let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![param_reg]), *dst_rtl);
 
     rtl_inst_candidate(addr, inst) <--
-        extending_stack_arg_load(addr, func_start, disp, _),
-        stack_param_idx(func_start, disp, idx),
+        stack_param_load(addr, func_start, _disp, idx, _),
         ltl_inst(addr, ?LTLInst::Lgetstack(_slot, _ofs, _typ, dst)),
         !reg_rtl(addr, dst, _),
         let param_reg = fresh_stack_param_reg(*func_start, *idx),
@@ -3633,6 +3751,7 @@ ascent_par! {
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, ofs, rtl_reg),
         !lgetstack_is_stack_param(addr),
+        !win64_home_reload(addr, _, _, _),
         let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*rtl_reg]), *dst_rtl);
 
     rtl_inst_candidate(addr, inst) <--
@@ -3641,6 +3760,7 @@ ascent_par! {
         instr_in_function(addr, func_start),
         !stack_var(func_start, addr, ofs, _),
         !lgetstack_is_stack_param(addr),
+        !win64_home_reload(addr, _, _, _),
         let fresh_src = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_STACK_SRC,
         let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![fresh_src]), *dst_rtl);
 
@@ -3650,6 +3770,7 @@ ascent_par! {
         instr_in_function(addr, func_start),
         stack_var(func_start, addr, ofs, rtl_reg),
         !lgetstack_is_stack_param(addr),
+        !win64_home_reload(addr, _, _, _),
         let fresh_dst = fresh_xtl_reg(*addr, *dst) | FRESH_NS_REG_DST,
         let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![*rtl_reg]), fresh_dst);
 
@@ -3659,13 +3780,37 @@ ascent_par! {
         instr_in_function(addr, func_start),
         !stack_var(func_start, addr, ofs, _),
         !lgetstack_is_stack_param(addr),
+        !win64_home_reload(addr, _, _, _),
         let fresh_src = fresh_xtl_reg(*addr, Mreg::BP) | FRESH_NS_STACK_SRC,
         let fresh_dst = fresh_xtl_reg(*addr, *dst) | FRESH_NS_REG_DST,
         let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![fresh_src]), fresh_dst);
 
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_reload(addr, func_start, param_mreg, _),
+        ltl_inst(addr, ?LTLInst::Lgetstack(_, _, _, dst)),
+        reg_rtl(addr, *dst, dst_rtl),
+        let param_rtl = fresh_xtl_reg(*func_start, *param_mreg),
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![param_rtl]), *dst_rtl);
+
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_reload(addr, func_start, param_mreg, _),
+        ltl_inst(addr, ?LTLInst::Lgetstack(_, _, _, dst)),
+        !reg_rtl(addr, dst, _),
+        let param_rtl = fresh_xtl_reg(*func_start, *param_mreg),
+        let fresh_dst = fresh_xtl_reg(*addr, *dst) | FRESH_NS_REG_DST,
+        let inst = RTLInst::Iop(Operation::Omove, Arc::new(vec![param_rtl]), fresh_dst);
+
+    // /homeparams stores are ABI bookkeeping. Their reloads above read the
+    // entry parameter directly, so retaining a local-slot assignment would
+    // fabricate an address-valued frame object.
+    rtl_inst_candidate(addr, nop) <--
+        win64_home_spill(addr, _, _, _),
+        let nop = RTLInst::Inop;
+
     // Read the spill SOURCE id at the DEF site, but bind the load's def id at a load_overwrites_base site, or the ADDRESS is spilled instead of the loaded value and the load's real def is DSE'd.
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        !win64_home_spill(addr, _, _, _),
         instr_in_function(addr, func_start),
         reg_def_used(defaddr, *src, *addr),
         !load_overwrites_base(defaddr, src),
@@ -3675,6 +3820,7 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        !win64_home_spill(addr, _, _, _),
         instr_in_function(addr, func_start),
         reg_def_used(defaddr, *src, *addr),
         load_overwrites_base(defaddr, src),
@@ -3686,6 +3832,7 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        !win64_home_spill(addr, _, _, _),
         instr_in_function(addr, func_start),
         !reg_def_used(_, src, addr),
         is_arg_reg(src),
@@ -3696,6 +3843,7 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        !win64_home_spill(addr, _, _, _),
         instr_in_function(addr, func_start),
         reg_rtl(addr, *src, src_rtl),
         !stack_var(func_start, addr, ofs, _),
@@ -3704,6 +3852,7 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        !win64_home_spill(addr, _, _, _),
         instr_in_function(addr, func_start),
         !reg_def_used(_, src, addr),
         is_arg_reg(src),
@@ -3714,6 +3863,7 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lsetstack(src, slot, ofs, typ)),
+        !win64_home_spill(addr, _, _, _),
         instr_in_function(addr, func_start),
         !reg_def_used(_, src, addr),
         !is_arg_reg(src),
@@ -5444,6 +5594,7 @@ ascent_par! {
     #[local] relation og_arg_store(Address, i64, RTLReg, Address);
     og_arg_store(*st_addr, abs_slot, *src_rtl, *func) <--
         ltl_inst(st_addr, ?LTLInst::Lstore(_, Addressing::Aindexed(ofs), args, src)),
+        !win64_home_spill(st_addr, _, _, _),
         if args.len() == 1 && args[0] == Mreg::SP,
         if *ofs >= 0,
         instr_in_function(st_addr, func),
@@ -5458,6 +5609,7 @@ ascent_par! {
     og_arg_store(*st_addr, abs_slot, *src_rtl, *func),
     og_arg_store_weak(*st_addr, abs_slot, *src_rtl) <--
         ltl_inst(st_addr, ?LTLInst::Lsetstack(src, _, ofs, _)),
+        !win64_home_spill(st_addr, _, _, _),
         pmov(st_addr, dst_sym, _),
         op_indirect(dst_sym, _, base_str, idx_str, _, disp, _),
         if Mreg::x86(*base_str) == Mreg::SP,
@@ -6238,7 +6390,7 @@ ascent_par! {
         !func_float_param_validated(func_start, _, _);
 
 
-    relation stack_passed_param(Address, i64);
+    #[local] relation incoming_stack_slot(Node, Address, Mreg, i64, usize);
 
     // ABI-1: entry-anchored SP offset per instruction, so disp + sp_ofs >= 8 places a slot above the return address regardless of prologue depth; the chain stops at non-fallthrough instructions.
     #[local] lattice sp_entry_ofs(Address, Address, Dual<i64>);
@@ -6267,6 +6419,79 @@ ascent_par! {
         instr_in_function(curaddr, func_start),
         !adjusts_stack(prevaddr, _, _);
 
+    // A direct MOV copy of SP can be used as a stable base for the compiler's
+    // Win64 /homeparams stores. Record the SP entry offset at the copy site;
+    // later SP adjustments must not change the copied base's coordinate.
+    relation sp_base_alias_at(Address, Node, Mreg, i64);
+    sp_base_alias_at(func_start, use_addr, *alias, sp_ofs.0) <--
+        ltl_inst(copy_addr, ?LTLInst::Lop(Operation::Omove, args, alias)),
+        if args.as_ref() == &[Mreg::SP],
+        if *alias != Mreg::SP && *alias != Mreg::BP,
+        instr_in_function(copy_addr, func_start),
+        instr_in_function(use_addr, func_start),
+        reg_def_used(copy_addr, *alias, use_addr),
+        sp_entry_ofs(func_start, copy_addr, sp_ofs);
+
+    #[local] relation sp_based_mem_at(Node, Address, Mreg, i64);
+    sp_based_mem_at(addr, func_start, Mreg::SP, sp_ofs.0) <--
+        instr_in_function(addr, func_start),
+        sp_entry_ofs(func_start, addr, sp_ofs);
+    sp_based_mem_at(addr, func_start, *alias, *base_ofs) <--
+        sp_base_alias_at(func_start, addr, alias, base_ofs);
+
+    #[local] relation abi_home_arg_position(Mreg, usize);
+    abi_home_arg_position(*reg, *pos) <-- abi_int_arg_position(reg, pos);
+    abi_home_arg_position(*reg, *pos) <-- abi_float_arg_position(reg, pos);
+
+    // Exact Win64 home stores: the incoming register's ABI position must match
+    // the shadow-space slot. This positive evidence prevents an arbitrary
+    // store near entry from being mistaken for /homeparams bookkeeping.
+    relation win64_home_spill(Node, Address, Mreg, usize);
+    win64_home_spill(addr, func_start, src_reg, *pos) <--
+        abi_shared_arg_slots(true),
+        pmov(addr, dst, src),
+        op_indirect(dst, _, base_str, idx_str, _, disp, _),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        op_register(src, src_str),
+        let src_reg = Mreg::x86(*src_str),
+        abi_home_arg_position(src_reg, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack,
+        sp_based_mem_at(addr, func_start, base_reg, base_ofs),
+        if *base_reg == Mreg::x86(base_str),
+        abi_incoming_sp_stack_base(incoming_base),
+        abi_outgoing_stack_base(outgoing_base),
+        abi_stack_slot_size(slot_size),
+        let home_base = *incoming_base - *outgoing_base,
+        if *base_ofs + *disp == home_base + (*pos as i64 * *slot_size),
+        arg_reg_param_live_at(func_start, addr, src_reg);
+
+    // A source-level assignment to a homed parameter turns the slot into real
+    // mutable storage. If stack def-use finds a non-home definition reaching a
+    // later read, that read must not be rewritten to the original entry value.
+    #[local] relation home_reload_clobbered(Node);
+    home_reload_clobbered(reload_addr) <--
+        stack_def_used(def_addr, _, _, reload_addr, _, _),
+        !win64_home_spill(def_addr, _, _, _);
+
+    // A reload from a proven home slot denotes the incoming parameter value,
+    // not the address or an unrelated fresh frame local.
+    relation win64_home_reload(Node, Address, Mreg, usize);
+    win64_home_reload(addr, func_start, *param_reg, *pos) <--
+        pmov(addr, _dst, src),
+        op_indirect(src, _, base_str, idx_str, _, disp, _),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        sp_based_mem_at(addr, func_start, base_reg, base_ofs),
+        if *base_reg == Mreg::x86(base_str),
+        abi_incoming_sp_stack_base(incoming_base),
+        abi_outgoing_stack_base(outgoing_base),
+        abi_stack_slot_size(slot_size),
+        let home_base = *incoming_base - *outgoing_base,
+        if *base_ofs + *disp == home_base + (*pos as i64 * *slot_size),
+        win64_home_spill(spill_addr, func_start, param_reg, pos),
+        if *spill_addr < *addr,
+        !home_reload_clobbered(addr);
+
     // BP-based arg detection requires an actual frame pointer: in frameless functions RBP is a callee-saved scratch (often a struct pointer), so a positive-offset BP load is a field deref, not an incoming arg. With a frame pointer, caller args start at BP+16 (BP+0=saved RBP, BP+8=return address).
     #[local] relation func_sets_frame_pointer(Address);
     func_sets_frame_pointer(func_start) <--
@@ -6274,102 +6499,78 @@ ascent_par! {
         if *src == "RSP" && *dst == "RBP",
         instr_in_function(addr, func_start);
 
-    stack_passed_param(func_start, *ofs) <--
+    // Normalize a raw SP displacement to its function-entry coordinate, then
+    // compute the real ABI ordinal. A missing SP-state row or an unaligned
+    // address conservatively produces no parameter claim.
+    incoming_stack_slot(addr, func_start, Mreg::SP, *disp, ordinal) <--
         instr_in_function(addr, func_start),
         function_entry_count(func_start, addr, count),
         if *count < 512,
+        sp_entry_ofs(func_start, addr, sp_ofs),
+        abi_incoming_sp_stack_base(stack_base),
+        abi_stack_slot_size(slot_size),
+        let entry_disp = *disp + sp_ofs.0,
+        if entry_disp >= *stack_base && (entry_disp - *stack_base) % *slot_size == 0,
+        let ordinal = ((entry_disp - *stack_base) / *slot_size) as usize;
+
+    // A positive BP displacement is an incoming slot only in a function that
+    // actually establishes BP as its frame pointer.
+    incoming_stack_slot(addr, func_start, Mreg::BP, *disp, ordinal) <--
+        instr_in_function(addr, func_start),
+        function_entry_count(func_start, addr, count),
+        if *count < 512,
+        func_sets_frame_pointer(func_start),
+        abi_incoming_bp_stack_base(stack_base),
+        abi_stack_slot_size(slot_size),
+        if *disp >= *stack_base && (*disp - *stack_base) % *slot_size == 0,
+        let ordinal = ((*disp - *stack_base) / *slot_size) as usize;
+
+    stack_param_access(addr, func_start, *disp, *ordinal) <--
+        incoming_stack_slot(addr, func_start, base, disp, ordinal),
         ltl_inst(addr, ?LTLInst::Lload(_, Addressing::Aindexed(ofs), args, _)),
+        if *ofs == *disp,
         for arg in args.iter(),
-        abi_incoming_bp_stack_base(stack_base),
-        if *arg == Mreg::BP && *ofs >= *stack_base,
-        func_sets_frame_pointer(func_start);
+        if *arg == *base,
+        !stack_def_used(_, _, _, addr, _, disp);
 
-    // Detect functions that use BP as an indexed-addressing base (framed functions)
-    #[local] relation func_uses_bp_base(Address);
-    func_uses_bp_base(func_start) <--
-        instr_in_function(addr, func_start),
-        ltl_inst(addr, ?LTLInst::Lload(_, Addressing::Aindexed(_), args, _)),
-        for arg in args.iter(),
-        if *arg == Mreg::BP;
-    func_uses_bp_base(func_start) <--
-        instr_in_function(addr, func_start),
-        ltl_inst(addr, ?LTLInst::Lstore(_, Addressing::Aindexed(_), args, _)),
-        for arg in args.iter(),
-        if *arg == Mreg::BP;
+    stack_param_access(addr, func_start, *disp, *ordinal) <--
+        incoming_stack_slot(addr, func_start, base, disp, ordinal),
+        arith_load_op(addr, _, _, op_base, ofs, _),
+        if *op_base == *base && *ofs == *disp,
+        !stack_def_used(_, _, _, addr, _, disp);
 
-    // SP rules use *ofs + sp_ofs.0 >= 8 (ENTRY-frame anchor); a missing sp_entry_ofs row conservatively yields no param claim.
-    stack_passed_param(func_start, *ofs) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < 512,
-        ltl_inst(addr, ?LTLInst::Lload(_, Addressing::Aindexed(ofs), args, _)),
-        sp_entry_ofs(func_start, addr, sp_ofs),
-        for arg in args.iter(),
-        abi_incoming_sp_stack_base(stack_base),
-        if *arg == Mreg::SP && *ofs + sp_ofs.0 >= *stack_base,
-        !func_uses_bp_base(func_start);
+    stack_param_access(addr, func_start, *disp, *ordinal) <--
+        incoming_stack_slot(addr, func_start, base, disp, ordinal),
+        float_arith_stack_op(addr, _, op_base, ofs, _),
+        if *op_base == *base && *ofs == *disp,
+        !stack_def_used(_, _, _, addr, _, disp);
 
-    // Memory-operand arithmetic like `add 0x8(%rsp), %eax` is lifted via arith_load_op
-    stack_passed_param(func_start, *ofs) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < 512,
-        arith_load_op(addr, _, _, base, ofs, _),
-        sp_entry_ofs(func_start, addr, sp_ofs),
-        abi_incoming_sp_stack_base(stack_base),
-        if *base == Mreg::SP && *ofs + sp_ofs.0 >= *stack_base,
-        !func_uses_bp_base(func_start);
+    stack_param_access(addr, func_start, *disp, *ordinal) <--
+        incoming_stack_slot(addr, func_start, base, disp, ordinal),
+        stack_unary_load_op(addr, _, op_base, ofs, _),
+        if *op_base == *base && *ofs == *disp,
+        !stack_def_used(_, _, _, addr, _, disp);
 
-    stack_passed_param(func_start, *ofs) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < 512,
-        arith_load_op(addr, _, _, base, ofs, _),
-        abi_incoming_bp_stack_base(stack_base),
-        if *base == Mreg::BP && *ofs >= *stack_base,
-        func_sets_frame_pointer(func_start);
+    // Sign/zero-extending stack-arg loads bypass Lload, so the capstone operand
+    // pins width and signedness. Plain MOV is included only for Win64, where
+    // the entry-anchored slot and reaching-def veto distinguish it from locals.
+    #[local] relation stack_param_load(Node, Address, i64, usize, MemoryChunk);
 
-    // Fused scalar float arithmetic with an SP/BP memory source bypasses LTL, so it needs its own incoming-parameter classification with the same entry-frame anchors.
-    stack_passed_param(func_start, *disp) <--
+    // SP-relative extending load.
+    stack_param_load(addr, *func_start, *disp, *ordinal, mc) <--
         instr_in_function(addr, func_start),
-        float_arith_stack_op(addr, _, base, disp, _),
-        if *base == Mreg::SP,
-        sp_entry_ofs(func_start, addr, sp_ofs),
-        abi_incoming_sp_stack_base(stack_base),
-        if *disp + sp_ofs.0 >= *stack_base,
-        !func_uses_bp_base(func_start);
-
-    stack_passed_param(func_start, *disp) <--
-        instr_in_function(addr, func_start),
-        float_arith_stack_op(addr, _, base, disp, _),
-        if *base == Mreg::BP,
-        abi_incoming_bp_stack_base(stack_base),
-        if *disp >= *stack_base,
-        func_sets_frame_pointer(func_start);
-
-    // Sign/zero-extending stack-arg loads bypass Lload, so the capstone operand pins base, width and signedness; restricted to extending mnemonics since plain MOV includes callee-save reloads.
-    #[local] relation extending_stack_arg_load(Node, Address, i64, MemoryChunk);
-
-    // SP-relative: disp + sp_entry_ofs >= 8 anchors to the ENTRY frame; the framed-function exclusion must be capstone-level, and !stack_var would self-defeat against the asm pass's shadow Olea.
-    extending_stack_arg_load(addr, *func_start, *disp, mc) <--
-        instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < 512,
         ltl_inst(addr, ?LTLInst::Lgetstack(_, ofs, _, _)),
         instruction(addr, _, _, mnem, src, _, _, _, _, _),
         op_indirect(src, _, base_str, idx_str, _, disp, msize),
         if *disp == *ofs,
         if *idx_str == "NONE" || idx_str.is_empty(),
         if Mreg::x86(*base_str) == Mreg::SP,
-        sp_entry_ofs(func_start, addr, sp_ofs),
-        abi_incoming_sp_stack_base(stack_base),
-        if *disp + sp_ofs.0 >= *stack_base,
-        !func_bp_mem_base(func_start),
+        incoming_stack_slot(addr, func_start, Mreg::SP, disp, ordinal),
         !stack_def_used(_, _, _, addr, _, disp),
         if let Some(mc) = extending_load_chunk(mnem, *msize);
 
     // A normal Win64 stack argument is read with plain MOV, not an extending load; entry-anchored offsets distinguish it from a local, and the reaching stack-def veto excludes an overwritten slot.
-    extending_stack_arg_load(addr, *func_start, *disp, mc) <--
+    stack_param_load(addr, *func_start, *disp, *ordinal, mc) <--
         abi_shared_arg_slots(true),
         instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lgetstack(_, ofs, typ, _)),
@@ -6379,14 +6580,11 @@ ascent_par! {
         if *disp == *ofs,
         if *idx_str == "NONE" || idx_str.is_empty(),
         if Mreg::x86(*base_str) == Mreg::SP,
-        sp_entry_ofs(func_start, addr, sp_ofs),
-        abi_incoming_sp_stack_base(stack_base),
-        if *disp + sp_ofs.0 >= *stack_base,
-        !func_bp_mem_base(func_start),
+        incoming_stack_slot(addr, func_start, Mreg::SP, disp, ordinal),
         !stack_def_used(_, _, _, addr, _, disp),
         let mc = typ_to_chunk(*typ);
 
-    extending_stack_arg_load(addr, *func_start, *disp, mc) <--
+    stack_param_load(addr, *func_start, *disp, *ordinal, mc) <--
         abi_shared_arg_slots(true),
         instr_in_function(addr, func_start),
         ltl_inst(addr, ?LTLInst::Lgetstack(_, ofs, typ, _)),
@@ -6396,49 +6594,32 @@ ascent_par! {
         if *disp == *ofs,
         if *idx_str == "NONE" || idx_str.is_empty(),
         if Mreg::x86(*base_str) == Mreg::BP,
-        abi_incoming_bp_stack_base(stack_base),
-        if *disp >= *stack_base,
-        func_sets_frame_pointer(func_start),
+        incoming_stack_slot(addr, func_start, Mreg::BP, disp, ordinal),
         !stack_def_used(_, _, _, addr, _, disp),
         let mc = typ_to_chunk(*typ);
 
     // BP-relative (framed): args at BP+16+; func_sets_frame_pointer is EXPLICIT so the rule cannot silently widen if lifting conditions change (frameless RBP is a callee-saved scratch, not a frame pointer).
-    extending_stack_arg_load(addr, *func_start, *disp, mc) <--
+    stack_param_load(addr, *func_start, *disp, *ordinal, mc) <--
         instr_in_function(addr, func_start),
-        function_entry_count(func_start, addr, count),
-        if *count < 512,
         ltl_inst(addr, ?LTLInst::Lgetstack(_, ofs, _, _)),
         instruction(addr, _, _, mnem, src, _, _, _, _, _),
         op_indirect(src, _, base_str, idx_str, _, disp, msize),
         if *disp == *ofs,
         if *idx_str == "NONE" || idx_str.is_empty(),
         if Mreg::x86(*base_str) == Mreg::BP,
-        abi_incoming_bp_stack_base(stack_base),
-        if *disp >= *stack_base,
-        func_sets_frame_pointer(func_start),
+        incoming_stack_slot(addr, func_start, Mreg::BP, disp, ordinal),
         !stack_def_used(_, _, _, addr, _, disp),
         if let Some(mc) = extending_load_chunk(mnem, *msize);
 
-    // Capstone-level framed-ness: subsumes func_uses_bp_base, which cannot see Mgetstack/Msetstack shapes.
-    #[local] relation func_bp_mem_base(Address);
-    func_bp_mem_base(func_start) <--
-        instr_in_function(addr, func_start),
-        instruction(addr, _, _, _, src, _, _, _, _, _),
-        op_indirect(src, _, base_str, _, _, _, _),
-        if Mreg::x86(*base_str) == Mreg::BP;
-    func_bp_mem_base(func_start) <--
-        instr_in_function(addr, func_start),
-        instruction(addr, _, _, _, _, dst, _, _, _, _),
-        op_indirect(dst, _, base_str, _, _, _, _),
-        if Mreg::x86(*base_str) == Mreg::BP;
+    stack_param_access(addr, func_start, *disp, *ordinal) <--
+        stack_param_load(addr, func_start, disp, ordinal, _);
 
-    stack_passed_param(func_start, *ofs) <--
-        extending_stack_arg_load(_, func_start, ofs, _);
+    stack_param_ordinal(func_start, *ordinal) <--
+        stack_param_access(_, func_start, _, ordinal);
 
     // TR-5 companion: extension width/signedness pins the sub-int XType for the synthetic stack-param reg (more precise than the arith/Lload chunk rules).
     emit_function_param_type_candidate(func_start, param_reg, xt) <--
-        extending_stack_arg_load(_, func_start, disp, chunk),
-        stack_param_idx(func_start, disp, idx),
+        stack_param_load(_, func_start, _disp, idx, chunk),
         let param_reg = fresh_stack_param_reg(*func_start, *idx),
         let xt = match chunk {
             MemoryChunk::MInt32 => XType::Xint,
@@ -6452,12 +6633,13 @@ ascent_par! {
     relation emit_function_stack_param_count(Address, usize);
 
     emit_function_stack_param_count(func_start, count) <--
-        stack_passed_param(func_start, _),
-        agg count = ascent::aggregators::count() in stack_passed_param(func_start, _);
+        stack_param_ordinal(func_start, _),
+        agg max_ordinal = ascent::aggregators::max(ordinal) in stack_param_ordinal(func_start, ordinal),
+        let count = *max_ordinal + 1;
 
     emit_function_stack_param_count(func_start, 0) <--
         emit_function(func_start, _, _),
-        !stack_passed_param(func_start, _);
+        !stack_param_ordinal(func_start, _);
 
 
     relation dx_has_non_div_use(Address);
@@ -6576,6 +6758,16 @@ ascent_par! {
         abi_float_arg_position(mreg, pos);
     func_has_param_evidence(func_start, pos) <--
         func_float_param_evidence_at(func_start, pos);
+
+    // A Win64 stack argument proves every lower shared ABI position exists even
+    // when the function never reads those lower values. Feed its absolute
+    // position into the same max-position ladder so sparse sixth/eighth accesses
+    // produce six/eight-parameter prototypes rather than only their tail width.
+    func_has_param_evidence(func_start, absolute_pos) <--
+        abi_shared_arg_slots(true),
+        stack_param_ordinal(func_start, ordinal),
+        abi_first_stack_arg_position(first_stack),
+        let absolute_pos = *first_stack + *ordinal;
 
     // Forwarded-only parameter evidence: an arg register still holding the caller value at a call the callee consumes as a parameter IS a parameter, closing the pass-through chicken-and-egg.
     func_has_param_evidence(func_start, pos) <--
