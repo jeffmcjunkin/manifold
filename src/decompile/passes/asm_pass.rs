@@ -648,11 +648,11 @@ ascent_par! {
     // use an immediate unconditional jump directly to a later landing block,
     // every intervening block must have no CFG predecessor from outside the
     // skipped region, both reachable boundaries must carry the same affine
-    // entry-RSP coordinate, every involved block must have one function
-    // owner, and neither the jump nor any instruction in the skipped region may
-    // modify RSP.  The proof consumes rsp_state directly, rather than
-    // recursively inferred frame rows, so it cannot bootstrap across an
-    // unanchored component.
+    // entry-RSP coordinate, every decoded instruction in the skipped region
+    // must have one exact in-span function owner, and neither the jump nor any
+    // instruction in the skipped region may modify RSP.  The proof consumes
+    // rsp_state directly, rather than recursively inferred frame rows, so it
+    // cannot bootstrap across an unanchored component.
     #[local] relation rsp_layout_shared_block(Address);
     rsp_layout_shared_block(*block) <--
         block_in_function(block, first),
@@ -740,22 +740,62 @@ ascent_par! {
         rsp_layout_region_block(before_last, skipped, after, block),
         rsp_layout_shared_block(block);
 
+    #[local] relation rsp_layout_region_instruction(Address, Address, Address, Address);
+    rsp_layout_region_instruction(*before_last, *skipped, *after, *addr) <--
+        rsp_layout_region_block(before_last, skipped, after, block),
+        code_in_block(addr, block);
+
+    // block_in_function is deliberately CFG-reachability based, so the blocks
+    // in a valid jump-over layout region have no such row.  instr_in_function
+    // supplies the stronger ownership fact needed here: its physical-next
+    // closure is bounded by func_span and stops at nested function entries.
+    // Require that ownership for every decoded region instruction, and reject
+    // any competing owner rather than merely dropping the old block-owner gate.
     #[local] relation rsp_layout_region_owner_gap(Address, Address, Address, Address);
     rsp_layout_region_owner_gap(*before_last, *skipped, *after, *func) <--
         rsp_layout_jump_region(before, before_last, skipped, after),
         block_in_function(before, func),
-        rsp_layout_region_block(before_last, skipped, after, block),
-        !block_in_function(block, func);
+        rsp_layout_region_instruction(before_last, skipped, after, addr),
+        !instr_in_function(addr, func);
+
+    #[local] relation rsp_layout_region_foreign_owner(Address, Address, Address, Address);
+    rsp_layout_region_foreign_owner(*before_last, *skipped, *after, *func) <--
+        rsp_layout_jump_region(before, before_last, skipped, after),
+        block_in_function(before, func),
+        rsp_layout_region_instruction(before_last, skipped, after, addr),
+        instr_in_function(addr, other_func),
+        if func != other_func;
+
+    #[local] relation rsp_layout_region_nested_entry(Address, Address, Address, Address);
+    rsp_layout_region_nested_entry(*before_last, *skipped, *after, *func) <--
+        rsp_layout_jump_region(before, before_last, skipped, after),
+        block_in_function(before, func),
+        rsp_layout_region_instruction(before_last, skipped, after, addr),
+        ddisasm_function_entry(addr),
+        if addr != func;
+
+    #[local] relation rsp_layout_region_outside_span(Address, Address, Address, Address);
+    rsp_layout_region_outside_span(*before_last, *skipped, *after, *func) <--
+        rsp_layout_jump_region(before, before_last, skipped, after),
+        block_in_function(before, func),
+        func_span(_, func, func_end),
+        rsp_layout_region_instruction(before_last, skipped, after, addr),
+        if *addr < *func || *addr >= *func_end;
 
     #[local] relation rsp_layout_sandwich(Address, Address, Address, Address, i64);
     rsp_layout_sandwich(*func, *before_last, *skipped, *after, *before_ofs) <--
         rsp_layout_jump_region(before, before_last, skipped, after),
         block_in_function(before, func),
         block_in_function(after, func),
+        func_span(_, func, func_end),
+        if *before >= *func && *after < *func_end,
         !rsp_layout_shared_block(before),
         !rsp_layout_shared_block(after),
         !rsp_layout_region_shared(before_last, skipped, after),
         !rsp_layout_region_owner_gap(before_last, skipped, after, func),
+        !rsp_layout_region_foreign_owner(before_last, skipped, after, func),
+        !rsp_layout_region_nested_entry(before_last, skipped, after, func),
+        !rsp_layout_region_outside_span(before_last, skipped, after, func),
         !rsp_layout_region_external_cfg_pred(before_last, skipped, after),
         !rsp_transfer_kill(before_last),
         !adjusts_stack(before_last, "RSP", _),
@@ -10426,6 +10466,7 @@ mod rsp_layout_sandwich_tests {
     use super::*;
 
     const FUNCTION: Address = 0x3000;
+    const BEFORE_MIDDLE: Address = 0x3002;
     const BEFORE_LAST: Address = 0x3004;
     const SKIPPED: Address = 0x3010;
     const SKIPPED_SECOND: Address = 0x3018;
@@ -10435,6 +10476,7 @@ mod rsp_layout_sandwich_tests {
     const OTHER_FUNCTION: Address = 0x4000;
     const NONE: Symbol = "rsp_layout_none";
     const RSP_MEMORY: Symbol = "rsp_layout_rsp_memory";
+    const RSP_MEMORY_SECOND: Symbol = "rsp_layout_rsp_memory_second";
     const RAX: Symbol = "rsp_layout_rax";
     const JMP_TARGET: Symbol = "rsp_layout_jmp_target";
 
@@ -10446,8 +10488,15 @@ mod rsp_layout_sandwich_tests {
         external_predecessor: bool,
         skipped_mutates_rsp: bool,
         skipped_call: bool,
+        single_skipped_block: bool,
         shared_skipped_block: bool,
-        unowned_skipped_block: bool,
+        foreign_skipped_instruction_owner: bool,
+        unowned_skipped_instruction: bool,
+        nested_skipped_entry: bool,
+        region_outside_span: bool,
+        offset_mismatch: bool,
+        offset_overflow: bool,
+        indirect_jump_operand: bool,
         ambiguous_jump: bool,
     }
 
@@ -10484,35 +10533,59 @@ mod rsp_layout_sandwich_tests {
     fn run_fixture(options: FixtureOptions) -> AsmPassProgram {
         let mut prog = AsmPassProgram::default();
 
-        prog.func_span.push(("rsp_layout_function", FUNCTION, END));
-        prog.block_boundaries
-            .push((FUNCTION, BEFORE_LAST, SKIPPED));
-        prog.block_boundaries
-            .push((SKIPPED, SKIPPED, SKIPPED_SECOND));
-        prog.block_boundaries
-            .push((SKIPPED_SECOND, SKIPPED_SECOND, AFTER));
+        let function_end = if options.region_outside_span {
+            SKIPPED_SECOND
+        } else {
+            END
+        };
+        prog.func_span
+            .push(("rsp_layout_function", FUNCTION, function_end));
+        prog.block_boundaries.push((FUNCTION, BEFORE_LAST, SKIPPED));
+        if options.single_skipped_block {
+            prog.block_boundaries.push((SKIPPED, SKIPPED, AFTER));
+        } else {
+            prog.block_boundaries
+                .push((SKIPPED, SKIPPED, SKIPPED_SECOND));
+            prog.block_boundaries
+                .push((SKIPPED_SECOND, SKIPPED_SECOND, AFTER));
+        }
         prog.block_boundaries.push((AFTER, AFTER, OUTSIDE));
         prog.block_boundaries.push((OUTSIDE, OUTSIDE, END));
 
-        for (address, block) in [
+        let mut instruction_blocks = vec![
             (FUNCTION, FUNCTION),
+            (BEFORE_MIDDLE, FUNCTION),
             (BEFORE_LAST, FUNCTION),
             (SKIPPED, SKIPPED),
-            (SKIPPED_SECOND, SKIPPED_SECOND),
             (AFTER, AFTER),
             (OUTSIDE, OUTSIDE),
-        ] {
-            prog.code_in_block.push((address, block));
-            prog.instr_in_function.push((address, FUNCTION));
+        ];
+        if !options.single_skipped_block {
+            instruction_blocks.push((SKIPPED_SECOND, SKIPPED_SECOND));
         }
-        for block in [FUNCTION, SKIPPED, SKIPPED_SECOND, AFTER, OUTSIDE] {
-            if block != SKIPPED_SECOND || !options.unowned_skipped_block {
-                prog.block_in_function.push((block, FUNCTION));
-            }
+        for (address, block) in instruction_blocks {
+            prog.code_in_block.push((address, block));
+        }
+
+        // Model the corpus topology: only the reachable boundary blocks have
+        // CFG-derived block ownership.  The physical-next closure must prove
+        // instruction ownership through the skipped region.
+        for block in [FUNCTION, AFTER, OUTSIDE] {
+            prog.block_in_function.push((block, FUNCTION));
         }
 
         prog.instruction
             .push(instruction(FUNCTION, "SUB", NONE, NONE));
+        prog.instruction.push(instruction(
+            BEFORE_MIDDLE,
+            if options.offset_overflow {
+                "ADD"
+            } else {
+                "NOP"
+            },
+            NONE,
+            NONE,
+        ));
         prog.instruction.push(instruction(
             BEFORE_LAST,
             options.jump_mnemonic.unwrap_or("JMP"),
@@ -10521,31 +10594,50 @@ mod rsp_layout_sandwich_tests {
         ));
         prog.instruction
             .push(instruction(SKIPPED, "MOV", RSP_MEMORY, RAX));
-        prog.instruction
-            .push(instruction(
-                SKIPPED_SECOND,
-                if options.skipped_mutates_rsp {
-                    "PUSH"
-                } else if options.skipped_call {
-                    "CALL"
-                } else {
-                    "NOP"
-                },
-                NONE,
-                NONE,
-            ));
-        prog.instruction
-            .push(instruction(AFTER, "RET", NONE, NONE));
-        prog.instruction
-            .push(instruction(OUTSIDE, "RET", NONE, NONE));
+        if !options.single_skipped_block {
+            let (mnemonic, op1, op2) = if options.skipped_mutates_rsp {
+                ("PUSH", NONE, NONE)
+            } else if options.skipped_call {
+                ("CALL", NONE, NONE)
+            } else {
+                ("MOV", RAX, RSP_MEMORY_SECOND)
+            };
+            prog.instruction
+                .push(instruction(SKIPPED_SECOND, mnemonic, op1, op2));
+        }
+        prog.instruction.push(instruction(AFTER, "RET", NONE, NONE));
+        prog.instruction.push(instruction(
+            OUTSIDE,
+            if options.offset_mismatch {
+                "ADD"
+            } else {
+                "RET"
+            },
+            NONE,
+            NONE,
+        ));
 
-        prog.next.push((FUNCTION, BEFORE_LAST));
+        prog.next.push((FUNCTION, BEFORE_MIDDLE));
+        prog.next.push((BEFORE_MIDDLE, BEFORE_LAST));
         prog.next.push((BEFORE_LAST, SKIPPED));
-        prog.next.push((SKIPPED, SKIPPED_SECOND));
-        prog.next.push((SKIPPED_SECOND, AFTER));
+        if options.single_skipped_block {
+            prog.next.push((SKIPPED, AFTER));
+        } else {
+            if !options.unowned_skipped_instruction {
+                prog.next.push((SKIPPED, SKIPPED_SECOND));
+            }
+            prog.next.push((SKIPPED_SECOND, AFTER));
+        }
         prog.next.push((AFTER, OUTSIDE));
-        prog.adjusts_stack.push((FUNCTION, "RSP", -40_i64));
-        prog.asm_reg_def_seed.push((FUNCTION, Mreg::SP));
+        if options.offset_overflow {
+            prog.adjusts_stack.push((FUNCTION, "RSP", i64::MAX));
+            prog.adjusts_stack.push((BEFORE_MIDDLE, "RSP", 1_i64));
+            prog.asm_reg_def_seed.push((FUNCTION, Mreg::SP));
+            prog.asm_reg_def_seed.push((BEFORE_MIDDLE, Mreg::SP));
+        } else {
+            prog.adjusts_stack.push((FUNCTION, "RSP", -40_i64));
+            prog.asm_reg_def_seed.push((FUNCTION, Mreg::SP));
+        }
 
         let memory: (
             Symbol,
@@ -10557,40 +10649,80 @@ mod rsp_layout_sandwich_tests {
             usize,
         ) = (RSP_MEMORY, "NONE", "RSP", "NONE", 1, 0x30, 8);
         prog.op_indirect.push(memory);
+        prog.op_indirect
+            .push((RSP_MEMORY_SECOND, "NONE", "RSP", "NONE", 1, 0x38, 4));
         prog.op_register.push((RAX, "RAX"));
-        prog.op_immediate.push((
-            JMP_TARGET,
-            options.jump_immediate.unwrap_or(AFTER) as i64,
-            8,
-        ));
+        if options.indirect_jump_operand {
+            prog.op_register.push((JMP_TARGET, "RAX"));
+        } else {
+            prog.op_immediate.push((
+                JMP_TARGET,
+                options.jump_immediate.unwrap_or(AFTER) as i64,
+                8,
+            ));
+        }
 
         // The normal path skips the physically interposed region. Both sides
         // therefore carry the same entry-relative RSP coordinate (-40).
-        prog.ddisasm_cfg_edge
-            .push((BEFORE_LAST, AFTER, "branch"));
+        if options.offset_mismatch {
+            // Preserve two independent constants while making them disagree:
+            // the candidate jump relation still names AFTER, but the frame CFG
+            // reaches AFTER through an alternate +8 path.
+            prog.ddisasm_cfg_edge.push((FUNCTION, OUTSIDE, "branch"));
+            prog.ddisasm_cfg_edge.push((OUTSIDE, AFTER, "branch"));
+            prog.adjusts_stack.push((OUTSIDE, "RSP", 8_i64));
+            prog.asm_reg_def_seed.push((OUTSIDE, Mreg::SP));
+        } else {
+            prog.ddisasm_cfg_edge.push((BEFORE_LAST, AFTER, "branch"));
+        }
         // Internal edges in a multi-block skipped region are allowed; only an
         // edge from outside the bounded region invalidates the layout proof.
-        prog.ddisasm_cfg_edge
-            .push((SKIPPED, SKIPPED_SECOND, "fallthrough"));
+        if options.single_skipped_block {
+            prog.ddisasm_cfg_edge.push((SKIPPED, AFTER, "fallthrough"));
+        } else {
+            prog.ddisasm_cfg_edge
+                .push((SKIPPED, SKIPPED_SECOND, "fallthrough"));
+            prog.ddisasm_cfg_edge
+                .push((SKIPPED_SECOND, AFTER, "fallthrough"));
+        }
         if options.direct_jump {
             prog.direct_jump.push((BEFORE_LAST, AFTER));
         }
         if options.external_predecessor {
-            prog.ddisasm_cfg_edge
-                .push((OUTSIDE, SKIPPED_SECOND, "branch"));
+            let target = if options.single_skipped_block {
+                SKIPPED
+            } else {
+                SKIPPED_SECOND
+            };
+            prog.ddisasm_cfg_edge.push((OUTSIDE, target, "branch"));
         }
         if options.skipped_mutates_rsp {
             prog.asm_reg_def_seed.push((SKIPPED_SECOND, Mreg::SP));
-            prog.adjusts_stack
-                .push((SKIPPED_SECOND, "RSP", -8_i64));
+            prog.adjusts_stack.push((SKIPPED_SECOND, "RSP", -8_i64));
         }
         if options.skipped_call {
             // Decoder register effects include CALL's transient RSP write.
             prog.asm_reg_def_seed.push((SKIPPED_SECOND, Mreg::SP));
         }
         if options.shared_skipped_block {
+            prog.block_in_function.push((SKIPPED_SECOND, FUNCTION));
             prog.block_in_function
                 .push((SKIPPED_SECOND, OTHER_FUNCTION));
+        }
+        if options.foreign_skipped_instruction_owner {
+            prog.instr_in_function
+                .push((SKIPPED_SECOND, OTHER_FUNCTION));
+        }
+        if options.nested_skipped_entry {
+            prog.ddisasm_function_entry.push((SKIPPED_SECOND,));
+            // Seed the outer ownership too, so the explicit nested-entry guard
+            // is tested independently of the missing-owner guard.
+            prog.instr_in_function.push((SKIPPED_SECOND, FUNCTION));
+        }
+        if options.region_outside_span {
+            // Likewise, keep ownership present so only the exact span gate can
+            // reject this malformed region instruction.
+            prog.instr_in_function.push((SKIPPED_SECOND, FUNCTION));
         }
         if options.ambiguous_jump {
             prog.direct_jump.push((BEFORE_LAST, OUTSIDE));
@@ -10606,34 +10738,58 @@ mod rsp_layout_sandwich_tests {
             .any(|row| *row == (FUNCTION, SKIPPED, -40))
     }
 
+    fn has_second_skipped_frame(prog: &AsmPassProgram) -> bool {
+        prog.rsp_frame_offset_at
+            .iter()
+            .any(|row| *row == (FUNCTION, SKIPPED_SECOND, -40))
+    }
+
     fn has_unknown_rsp_diagnostic(prog: &AsmPassProgram) -> bool {
-        prog.unsupported_address_detail_seed.iter().any(
-            |(function, address, reason)| {
-                *function == FUNCTION
-                    && *address == SKIPPED
-                    && *reason == "rsp-coordinate-unknown"
-            },
-        )
+        prog.unsupported_address_detail_seed
+            .iter()
+            .any(|(function, address, reason)| {
+                *function == FUNCTION && *address == SKIPPED && *reason == "rsp-coordinate-unknown"
+            })
     }
 
     #[test]
-    fn recovers_rsp_only_for_an_unconditional_unentered_layout_sandwich() {
+    fn recovers_rsp_for_single_and_multi_block_unowned_layout_sandwiches() {
         on_pipeline_stack(|| {
-            let prog = run_fixture(FixtureOptions {
-                direct_jump: true,
-                ..FixtureOptions::default()
-            });
+            for (name, single_skipped_block) in [("single block", true), ("two blocks", false)] {
+                let prog = run_fixture(FixtureOptions {
+                    direct_jump: true,
+                    single_skipped_block,
+                    ..FixtureOptions::default()
+                });
 
-            assert!(prog
-                .rsp_layout_sandwich
-                .iter()
-                .any(|row| *row == (FUNCTION, BEFORE_LAST, SKIPPED, AFTER, -40)));
-            assert!(has_skipped_frame(&prog));
-            assert!(prog
-                .rsp_frame_offset_at
-                .iter()
-                .any(|row| *row == (FUNCTION, SKIPPED_SECOND, -40)));
-            assert!(!has_unknown_rsp_diagnostic(&prog));
+                assert!(
+                    !prog
+                        .block_in_function
+                        .iter()
+                        .any(|(block, function)| *function == FUNCTION
+                            && (*block == SKIPPED || *block == SKIPPED_SECOND)),
+                    "fixture accidentally seeded skipped block ownership for {name}"
+                );
+                assert!(
+                    prog.instr_in_function
+                        .iter()
+                        .any(|row| *row == (SKIPPED, FUNCTION)),
+                    "physical-next ownership did not reach {name}"
+                );
+                assert!(prog
+                    .rsp_layout_sandwich
+                    .iter()
+                    .any(|row| *row == (FUNCTION, BEFORE_LAST, SKIPPED, AFTER, -40)));
+                assert!(has_skipped_frame(&prog), "did not recover {name}");
+                if !single_skipped_block {
+                    assert!(prog
+                        .instr_in_function
+                        .iter()
+                        .any(|row| *row == (SKIPPED_SECOND, FUNCTION)));
+                    assert!(has_second_skipped_frame(&prog));
+                }
+                assert!(!has_unknown_rsp_diagnostic(&prog));
+            }
         });
     }
 
@@ -10690,11 +10846,20 @@ mod rsp_layout_sandwich_tests {
                     },
                 ),
                 (
-                    "CALL region with unowned block",
+                    "CALL region with unowned instruction",
                     FixtureOptions {
                         direct_jump: true,
                         skipped_call: true,
-                        unowned_skipped_block: true,
+                        unowned_skipped_instruction: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "CALL region with foreign instruction owner",
+                    FixtureOptions {
+                        direct_jump: true,
+                        skipped_call: true,
+                        foreign_skipped_instruction_owner: true,
                         ..FixtureOptions::default()
                     },
                 ),
@@ -10703,7 +10868,10 @@ mod rsp_layout_sandwich_tests {
             for (name, options) in cases {
                 let prog = run_fixture(options);
                 assert!(!has_skipped_frame(&prog), "accepted {name}");
-                assert!(has_unknown_rsp_diagnostic(&prog), "lost diagnostic for {name}");
+                assert!(
+                    has_unknown_rsp_diagnostic(&prog),
+                    "lost diagnostic for {name}"
+                );
             }
         });
     }
@@ -10712,10 +10880,7 @@ mod rsp_layout_sandwich_tests {
     fn rejects_incomplete_or_ambiguous_layout_sandwich_proofs() {
         on_pipeline_stack(|| {
             let cases = [
-                (
-                    "missing direct target",
-                    FixtureOptions::default(),
-                ),
+                ("missing direct target", FixtureOptions::default()),
                 (
                     "conditional transfer",
                     FixtureOptions {
@@ -10725,9 +10890,25 @@ mod rsp_layout_sandwich_tests {
                     },
                 ),
                 (
+                    "indirect jump operand",
+                    FixtureOptions {
+                        direct_jump: true,
+                        indirect_jump_operand: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
                     "mismatched encoded target",
                     FixtureOptions {
                         jump_immediate: Some(OUTSIDE),
+                        direct_jump: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "encoded target outside signed immediate domain",
+                    FixtureOptions {
+                        jump_immediate: Some(Address::MAX),
                         direct_jump: true,
                         ..FixtureOptions::default()
                     },
@@ -10757,10 +10938,50 @@ mod rsp_layout_sandwich_tests {
                     },
                 ),
                 (
-                    "unowned skipped block",
+                    "foreign skipped instruction owner",
                     FixtureOptions {
                         direct_jump: true,
-                        unowned_skipped_block: true,
+                        foreign_skipped_instruction_owner: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "unowned skipped instruction",
+                    FixtureOptions {
+                        direct_jump: true,
+                        unowned_skipped_instruction: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "nested entry in skipped region",
+                    FixtureOptions {
+                        direct_jump: true,
+                        nested_skipped_entry: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "skipped instruction outside function span",
+                    FixtureOptions {
+                        direct_jump: true,
+                        region_outside_span: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "boundary offset mismatch",
+                    FixtureOptions {
+                        direct_jump: true,
+                        offset_mismatch: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "entry offset arithmetic overflow",
+                    FixtureOptions {
+                        direct_jump: true,
+                        offset_overflow: true,
                         ..FixtureOptions::default()
                     },
                 ),
@@ -10777,7 +10998,10 @@ mod rsp_layout_sandwich_tests {
             for (name, options) in cases {
                 let prog = run_fixture(options);
                 assert!(!has_skipped_frame(&prog), "accepted {name}");
-                assert!(has_unknown_rsp_diagnostic(&prog), "lost diagnostic for {name}");
+                assert!(
+                    has_unknown_rsp_diagnostic(&prog),
+                    "lost diagnostic for {name}"
+                );
             }
         });
     }
