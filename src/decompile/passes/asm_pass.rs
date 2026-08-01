@@ -662,7 +662,11 @@ ascent_par! {
     #[local] relation rsp_layout_block_mutates(Address);
     rsp_layout_block_mutates(*block) <--
         code_in_block(addr, block),
-        asm_reg_def(addr, ?&Mreg::SP);
+        asm_reg_def(addr, ?&Mreg::SP),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        // Match rsp_transfer_kill: a CALL's architectural push is undone by
+        // the callee's RET before execution resumes in this block.
+        if *mnem != "CALL";
     rsp_layout_block_mutates(*block) <--
         code_in_block(addr, block),
         adjusts_stack(addr, "RSP", _);
@@ -10438,6 +10442,7 @@ mod rsp_layout_sandwich_tests {
         direct_jump: bool,
         external_predecessor: bool,
         skipped_mutates_rsp: bool,
+        skipped_call: bool,
         shared_skipped_block: bool,
         unowned_skipped_block: bool,
         ambiguous_jump: bool,
@@ -10516,7 +10521,13 @@ mod rsp_layout_sandwich_tests {
         prog.instruction
             .push(instruction(
                 SKIPPED_SECOND,
-                if options.skipped_mutates_rsp { "PUSH" } else { "NOP" },
+                if options.skipped_mutates_rsp {
+                    "PUSH"
+                } else if options.skipped_call {
+                    "CALL"
+                } else {
+                    "NOP"
+                },
                 NONE,
                 NONE,
             ));
@@ -10570,6 +10581,10 @@ mod rsp_layout_sandwich_tests {
             prog.adjusts_stack
                 .push((SKIPPED_SECOND, "RSP", -8_i64));
         }
+        if options.skipped_call {
+            // Decoder register effects include CALL's transient RSP write.
+            prog.asm_reg_def_seed.push((SKIPPED_SECOND, Mreg::SP));
+        }
         if options.shared_skipped_block {
             prog.block_in_function
                 .push((SKIPPED_SECOND, OTHER_FUNCTION));
@@ -10616,6 +10631,77 @@ mod rsp_layout_sandwich_tests {
                 .iter()
                 .any(|row| *row == (FUNCTION, SKIPPED_SECOND, -40)));
             assert!(!has_unknown_rsp_diagnostic(&prog));
+        });
+    }
+
+    #[test]
+    fn permits_a_call_transient_rsp_write_inside_the_skipped_region() {
+        on_pipeline_stack(|| {
+            let prog = run_fixture(FixtureOptions {
+                direct_jump: true,
+                skipped_call: true,
+                ..FixtureOptions::default()
+            });
+
+            assert!(prog
+                .asm_reg_def
+                .iter()
+                .any(|row| *row == (SKIPPED_SECOND, Mreg::SP)));
+            assert!(prog
+                .rsp_layout_sandwich
+                .iter()
+                .any(|row| *row == (FUNCTION, BEFORE_LAST, SKIPPED, AFTER, -40)));
+            assert!(has_skipped_frame(&prog));
+            assert!(!has_unknown_rsp_diagnostic(&prog));
+        });
+    }
+
+    #[test]
+    fn call_exemption_preserves_cfg_owner_and_non_call_mutation_guards() {
+        on_pipeline_stack(|| {
+            let cases = [
+                (
+                    "non-CALL RSP mutation",
+                    FixtureOptions {
+                        direct_jump: true,
+                        skipped_mutates_rsp: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "CALL region with external predecessor",
+                    FixtureOptions {
+                        direct_jump: true,
+                        skipped_call: true,
+                        external_predecessor: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "CALL region with shared block",
+                    FixtureOptions {
+                        direct_jump: true,
+                        skipped_call: true,
+                        shared_skipped_block: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "CALL region with unowned block",
+                    FixtureOptions {
+                        direct_jump: true,
+                        skipped_call: true,
+                        unowned_skipped_block: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+            ];
+
+            for (name, options) in cases {
+                let prog = run_fixture(options);
+                assert!(!has_skipped_frame(&prog), "accepted {name}");
+                assert!(has_unknown_rsp_diagnostic(&prog), "lost diagnostic for {name}");
+            }
         });
     }
 
