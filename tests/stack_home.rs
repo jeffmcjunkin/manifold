@@ -62,6 +62,7 @@ fn build_fixture() -> PathBuf {
         .text
         .extern __imp_home_tailcall
         .extern typed_slot_tailcall
+        .extern home_local_sink
         .def typed_slot_tailcall; .scl 2; .type 32; .endef
         .globl sp_indexed_alias_collision
         .def sp_indexed_alias_collision; .scl 2; .type 32; .endef
@@ -165,6 +166,49 @@ home_reassigned_cmp:
         retq
 home_reassigned_cmp_nonzero:
         movl $1, %eax
+        retq
+
+        .globl home_local_call_adjacent_cmp
+        .def home_local_call_adjacent_cmp; .scl 2; .type 32; .endef
+home_local_call_adjacent_cmp:
+        movq %rsp, %rax
+        movq %rcx, 8(%rax)
+        movq %rdx, 16(%rax)
+        movq %r8, 24(%rax)
+        movq %r9, 32(%rax)
+        pushq %rbx
+        subq $64, %rsp
+        leaq 32(%rsp), %rcx
+        callq home_local_sink
+        cmpq $0, 104(%rsp)
+        je home_local_call_adjacent_cmp_zero
+        movl $1, %eax
+        jmp home_local_call_adjacent_cmp_done
+home_local_call_adjacent_cmp_zero:
+        xorl %eax, %eax
+home_local_call_adjacent_cmp_done:
+        addq $64, %rsp
+        popq %rbx
+        retq
+
+        .globl home_prologue_snapshot_cmp_void
+        .def home_prologue_snapshot_cmp_void; .scl 2; .type 32; .endef
+home_prologue_snapshot_cmp_void:
+        movq %rsp, %rax
+        movq %rcx, 8(%rax)
+        movq %rdx, 16(%rax)
+        movq %r8, 24(%rax)
+        movq %r9, 32(%rax)
+        pushq %rbx
+        subq $48, %rsp
+        cmpq $0, 88(%rsp)
+        je home_prologue_snapshot_cmp_void_zero
+        addq $48, %rsp
+        popq %rbx
+        retq
+home_prologue_snapshot_cmp_void_zero:
+        addq $48, %rsp
+        popq %rbx
         retq
 
         .globl home_reassigned_add
@@ -3998,6 +4042,67 @@ fn assert_canonical_unsafe_home_storage(db: &DecompileDB) {
         3,
     );
 
+    for name in [
+        "home_local_call_adjacent_cmp",
+        "home_prologue_snapshot_cmp_void",
+    ] {
+        let (span, slot) = canonical_home_storage_at_position_with_type(
+            db,
+            name,
+            3,
+            XType::Xany64,
+        );
+        assert_home_accesses_use_slot_at_position(db, name, span, slot, 3);
+        let compare = db
+            .rel_iter::<(Address, Address, Symbol, Mreg, i64, usize, i64, usize)>(
+                "win64_home_scalar_cmp_read",
+            )
+            .find(|(_, func, _, _, _, pos, _, _)| *func == span.0 && *pos == 3)
+            .unwrap_or_else(|| panic!("{name} lost its adjacent home comparison"));
+        let plans: Vec<_> = db
+            .rel_iter::<(Address, Address, Address, Address, Address)>(
+                "win64_home_cmp_jcc_plan",
+            )
+            .filter(|(root, func, _, _, _)| (*root, *func) == (compare.0, span.0))
+            .copied()
+            .collect();
+        assert_eq!(plans.len(), 1, "{name} lost its unique Jcc plan");
+        let (_, _, jcc, target, fallthrough) = plans[0];
+        let candidates = rtl_candidates(db, compare.0);
+        assert!(
+            candidates.iter().any(|inst| matches!(
+                inst,
+                RTLInst::Icond(
+                    _,
+                    args,
+                    either::Either::Right(if_true),
+                    either::Either::Right(if_false),
+                ) if args.contains(&slot)
+                    && (*if_true, *if_false) == (target, fallthrough)
+            )),
+            "{name} did not retain its canonical-cell Icond: {candidates:#x?}"
+        );
+        let successors: HashSet<_> = db
+            .rel_iter::<(Address, Address)>("rtl_succ_candidate")
+            .filter_map(|(source, destination)| (*source == compare.0).then_some(*destination))
+            .collect();
+        assert_eq!(
+            successors,
+            HashSet::from([target, fallthrough]),
+            "{name} did not atomically restore the fused branch CFG"
+        );
+        assert!(
+            db.rel_iter::<(Address, Address)>("rtl_edge_negated")
+                .any(|edge| *edge == (compare.0, jcc)),
+            "{name} did not suppress its consumed adjacent Jcc"
+        );
+        assert!(
+            !db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+                .any(|(func, _, _)| *func == span.0),
+            "{name} retained an unsupported stack-address reason"
+        );
+    }
+
     for (name, expected_type, expected_op) in [
         (
             "home_reassigned_movsxd",
@@ -4385,6 +4490,8 @@ fn assert_optimized_canonical_homes(db: &DecompileDB) {
         ("home_reassigned_cmp_reg_setcc", 0, XType::Xany64),
         ("home_reassigned_cmp_loop", 0, XType::Xany64),
         ("home_cmp_after_alias_clobber", 3, XType::Xany64),
+        ("home_local_call_adjacent_cmp", 3, XType::Xany64),
+        ("home_prologue_snapshot_cmp_void", 3, XType::Xany64),
         ("home_reassigned_add", 0, XType::Xany64),
         ("home_mixed_base_clobber", 0, XType::Xany64),
         ("home_alias_call_escape", 0, XType::Xany64),
@@ -6032,6 +6139,8 @@ fn assert_final_output_compiles(object: &Path) {
         "home_reassigned_cmp_reg_setcc",
         "home_reassigned_cmp_loop",
         "home_cmp_after_alias_clobber",
+        "home_local_call_adjacent_cmp",
+        "home_prologue_snapshot_cmp_void",
         "home_reassigned_movsxd",
         "home_reassigned_movsx",
         "home_reassigned_movzx",
@@ -6086,6 +6195,10 @@ fn assert_final_output_compiles(object: &Path) {
         .replace(
             "int coff_ext_typed_slot_tailcall();",
             "int coff_ext_typed_slot_tailcall(...);",
+        )
+        .replace(
+            "int coff_ext_home_local_sink();",
+            "int coff_ext_home_local_sink(...);",
         );
     let output = object.with_extension("generated.cpp");
     std::fs::write(&output, &syntax_text).expect("failed to write stack/home generated C++");

@@ -7540,6 +7540,28 @@ ascent_par! {
     sp_based_mem_at(addr, func_start, *alias, *base_ofs) <--
         sp_base_alias_at(func_start, addr, alias, base_ofs);
 
+    // Under defined C object semantics, an opaque call receiving a pointer to
+    // a proved local wholly below the entry-RSP return-address boundary cannot
+    // expose a Win64 home cell above that boundary.  Keep this proof
+    // definition-local: an ambiguous affine coordinate, entry RSP itself, or
+    // any coordinate in the incoming/home region remains fail-closed.
+    #[local] relation sp_alias_def_coordinate_conflict(Address, Node, Mreg);
+    sp_alias_def_coordinate_conflict(func_start, def_addr, *alias) <--
+        sp_alias_def(func_start, def_addr, alias, first),
+        sp_alias_def(func_start, def_addr, alias, other),
+        if first != other;
+
+    #[local] relation win64_home_disjoint_local_alias_def(Address, Node, Mreg);
+    win64_home_disjoint_local_alias_def(func_start, def_addr, *alias) <--
+        abi_shared_arg_slots(true),
+        sp_alias_def(func_start, def_addr, alias, base_ofs),
+        !sp_alias_def_coordinate_conflict(func_start, def_addr, alias),
+        abi_incoming_sp_stack_base(incoming_base),
+        abi_outgoing_stack_base(outgoing_base),
+        abi_stack_slot_size(slot_size),
+        let home_base = *incoming_base - *outgoing_base,
+        if *base_ofs <= -*slot_size && *base_ofs < home_base;
+
     #[local] relation abi_home_arg_position(Mreg, usize);
     abi_home_arg_position(*reg, *pos) <-- abi_int_arg_position(reg, pos);
     abi_home_arg_position(*reg, *pos) <-- abi_float_arg_position(reg, pos);
@@ -7782,6 +7804,47 @@ ascent_par! {
         if *base_ofs == 0,
         arg_reg_param_live_at(func_start, addr, src_reg);
 
+    // VS2013 commonly starts a four-register /homeparams prologue with
+    // `mov rax,rsp`.  In a void function that untouched snapshot can reach a
+    // RET merely because AX is otherwise dead.  It is not a returned stack
+    // address when every explicit reached use is one of the four proved
+    // initial home spills.  Any later copy/arithmetic/use, missing spill, or
+    // later stack-address definition keeps the ordinary return-escape veto.
+    #[local] relation win64_home_prologue_sp_snapshot(Address, Node);
+    win64_home_prologue_sp_snapshot(func_start, *def_addr) <--
+        abi_shared_arg_slots(true),
+        pmov(def_addr, dst, src),
+        op_register(src, "RSP"),
+        op_register(dst, dst_str),
+        if Mreg::x86(*dst_str) == Mreg::AX,
+        sp_alias_def(func_start, def_addr, Mreg::AX, base_ofs),
+        if *base_ofs == 0 && *def_addr == *func_start;
+
+    #[local] relation win64_home_prologue_sp_snapshot_spill_pos(Address, Node, usize);
+    win64_home_prologue_sp_snapshot_spill_pos(func_start, def_addr, *pos) <--
+        win64_home_prologue_sp_snapshot(func_start, def_addr),
+        raw_reg_def_used(def_addr, Mreg::AX, use_addr),
+        win64_home_spill_candidate(use_addr, func_start, _, pos);
+
+    #[local] relation win64_home_prologue_sp_snapshot_nonspill_use(Address, Node);
+    win64_home_prologue_sp_snapshot_nonspill_use(func_start, def_addr) <--
+        win64_home_prologue_sp_snapshot(func_start, def_addr),
+        raw_reg_def_used(def_addr, Mreg::AX, use_addr),
+        !win64_home_spill_candidate(use_addr, func_start, _, _);
+
+    #[local] relation win64_home_prologue_sp_snapshot_only(Address, Node);
+    win64_home_prologue_sp_snapshot_only(func_start, def_addr) <--
+        win64_home_prologue_sp_snapshot(func_start, def_addr),
+        win64_home_prologue_sp_snapshot_spill_pos(func_start, def_addr, pos0),
+        if *pos0 == 0,
+        win64_home_prologue_sp_snapshot_spill_pos(func_start, def_addr, pos1),
+        if *pos1 == 1,
+        win64_home_prologue_sp_snapshot_spill_pos(func_start, def_addr, pos2),
+        if *pos2 == 2,
+        win64_home_prologue_sp_snapshot_spill_pos(func_start, def_addr, pos3),
+        if *pos3 == 3,
+        !win64_home_prologue_sp_snapshot_nonspill_use(func_start, def_addr);
+
     // The candidate spill must dominate a reload; address ordering alone is
     // not a control-flow proof. Within one basic block, instruction order is
     // sufficient. Across blocks, use the existing dominator lattice.
@@ -7959,6 +8022,7 @@ ascent_par! {
         abi_int_arg_position(alias, _),
         def_reaches_call(call_addr, alias_def, alias),
         real_addr_in_func(call_addr, func_start),
+        !win64_home_disjoint_local_alias_def(func_start, alias_def, alias),
         abi_home_arg_position(_, pos),
         abi_first_stack_arg_position(first_stack),
         if *pos < *first_stack;
@@ -7969,6 +8033,7 @@ ascent_par! {
         real_addr_in_func(ret_addr, func_start),
         instruction(ret_addr, _, _, mnem, _, _, _, _, _, _),
         if matches!(*mnem, "RET" | "RETF" | "RETFQ"),
+        !win64_home_prologue_sp_snapshot_only(func_start, alias_def),
         abi_home_arg_position(_, pos),
         abi_first_stack_arg_position(first_stack),
         if *pos < *first_stack;
@@ -9367,6 +9432,28 @@ ascent_par! {
             Operation::Ocmp(cond), Arc::new(vec![*slot]), *destination
         );
 
+    // The first unsupported-address barrier may remove the public candidate
+    // before the imperative all-access selector has proved the mutable home
+    // cell complete.  Retain an evidence-only snapshot across that barrier;
+    // the selector republishes it only after the whole cell passes its closed
+    // shape, ownership, and uniqueness checks.
+    relation win64_home_cmp_candidate_snapshot(Node, RTLInst);
+    win64_home_cmp_candidate_snapshot(addr, inst.clone()) <--
+        win64_home_cmp_read(addr, func_start, _, _, _, pos, _, _),
+        win64_home_storage(func_start, pos, _),
+        rtl_inst_candidate(addr, inst);
+
+    // Likewise retain the exact consumed Jcc and its two destinations.  CFG
+    // mutation remains imperative and atomic with successful cell selection;
+    // rejected candidates never suppress or bypass the original branch.
+    relation win64_home_cmp_jcc_plan(Node, Address, Node, Address, Address);
+    win64_home_cmp_jcc_plan(
+        *addr, *func_start, *jcc_addr, *target_addr, *fallthrough
+    ) <--
+        win64_home_cmp_jcc_consumer(
+            addr, func_start, jcc_addr, _, target_addr, fallthrough
+        );
+
     #[local] relation win64_home_scalar_access(Node, Address, usize);
     win64_home_scalar_access(addr, func, pos) <--
         win64_home_scalar_store(addr, func, _, _, pos, _, _, _, _);
@@ -9549,7 +9636,8 @@ ascent_par! {
         !win64_home_exact_addr_call(func_start, call_addr, alias, pos),
         !win64_home_descriptor_call(
             func_start, call_addr, pos, alias_def, alias
-        );
+        ),
+        !win64_home_disjoint_local_alias_def(func_start, alias_def, alias);
     win64_home_canonical_veto(func_start, *pos) <--
         abi_shared_arg_slots(true),
         sp_may_alias_def(func_start, alias_def, ?&Mreg::AX),
@@ -9557,7 +9645,8 @@ ascent_par! {
         real_addr_in_func(ret_addr, func_start),
         instruction(ret_addr, _, _, mnem, _, _, _, _, _, _),
         if matches!(*mnem, "RET" | "RETF" | "RETFQ"),
-        win64_home_storage_signature(func_start, pos, _, _);
+        win64_home_storage_signature(func_start, pos, _, _),
+        !win64_home_prologue_sp_snapshot_only(func_start, alias_def);
     win64_home_canonical_veto(func_start, *pos) <--
         win64_home_spill_candidate(first_addr, func_start, first_reg, pos),
         win64_home_spill_candidate(other_addr, func_start, other_reg, pos),
@@ -13970,35 +14059,33 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
     let rewrite_args = |args: &Arc<Vec<RTLReg>>| {
         Arc::new(args.iter().map(|value| rewrite(*value)).collect::<Vec<_>>())
     };
+    let normalize_candidate = |inst: &RTLInst| match inst {
+        RTLInst::Iop(op, args, destination) => {
+            RTLInst::Iop(op.clone(), rewrite_args(args), rewrite(*destination))
+        }
+        RTLInst::Iload(chunk, addressing, args, destination) => RTLInst::Iload(
+            *chunk,
+            addressing.clone(),
+            rewrite_args(args),
+            rewrite(*destination),
+        ),
+        RTLInst::Istore(chunk, addressing, args, source) => RTLInst::Istore(
+            *chunk,
+            addressing.clone(),
+            rewrite_args(args),
+            rewrite(*source),
+        ),
+        RTLInst::Icond(condition, args, if_true, if_false) => RTLInst::Icond(
+            condition.clone(),
+            rewrite_args(args),
+            if_true.clone(),
+            if_false.clone(),
+        ),
+        _ => inst.clone(),
+    };
     let mut candidates: Vec<(Node, RTLInst)> = db
         .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
-        .map(|(node, inst)| {
-            let normalized = match inst {
-                RTLInst::Iop(op, args, destination) => {
-                    RTLInst::Iop(op.clone(), rewrite_args(args), rewrite(*destination))
-                }
-                RTLInst::Iload(chunk, addressing, args, destination) => RTLInst::Iload(
-                    *chunk,
-                    addressing.clone(),
-                    rewrite_args(args),
-                    rewrite(*destination),
-                ),
-                RTLInst::Istore(chunk, addressing, args, source) => RTLInst::Istore(
-                    *chunk,
-                    addressing.clone(),
-                    rewrite_args(args),
-                    rewrite(*source),
-                ),
-                RTLInst::Icond(condition, args, if_true, if_false) => RTLInst::Icond(
-                    condition.clone(),
-                    rewrite_args(args),
-                    if_true.clone(),
-                    if_false.clone(),
-                ),
-                _ => inst.clone(),
-            };
-            (*node, normalized)
-        })
+        .map(|(node, inst)| (*node, normalize_candidate(inst)))
         .collect();
     // Partial home-cell MOVs and extension-invariant register-source RMWs are
     // intentionally outside ordinary stack lowering after the strict first
@@ -14109,6 +14196,18 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
             candidates.push(projected);
         }
     }
+    // CMP snapshots are selector-only evidence too, but keep them out of the
+    // backing projection map: a distinct ordinary candidate at the same node
+    // must not make an otherwise complete byte-backing class ambiguous.
+    for retained in db
+        .rel_iter::<(Node, RTLInst)>("win64_home_cmp_candidate_snapshot")
+        .map(|(node, inst)| (*node, normalize_candidate(inst)))
+    {
+        if !candidates.contains(&retained) {
+            private_home_candidates.push(retained.clone());
+            candidates.push(retained);
+        }
+    }
     candidates.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
     candidates.dedup();
     let mut candidates_at: BTreeMap<Node, Vec<&RTLInst>> = BTreeMap::new();
@@ -14144,6 +14243,33 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                 .insert(*destination);
         }
     }
+    type HomeJccPlan = (Address, Node, Address, Address);
+    let mut home_jcc_plans: BTreeMap<Node, BTreeSet<HomeJccPlan>> = BTreeMap::new();
+    for (root, func, jcc, target, fallthrough) in db
+        .rel_iter::<(Node, Address, Node, Address, Address)>("win64_home_cmp_jcc_plan")
+    {
+        home_jcc_plans
+            .entry(*root)
+            .or_default()
+            .insert((*func, *jcc, *target, *fallthrough));
+    }
+    let mut raw_predecessors: BTreeMap<Node, BTreeSet<Node>> = BTreeMap::new();
+    for (source, destination) in db.rel_iter::<(Node, Node)>("next") {
+        raw_predecessors
+            .entry(*destination)
+            .or_default()
+            .insert(*source);
+    }
+    for (source, destination, edge_type) in
+        db.rel_iter::<(Address, Address, Symbol)>("ddisasm_cfg_edge")
+    {
+        if !matches!(*edge_type, "call" | "indirect" | "indirect_call") {
+            raw_predecessors
+                .entry(*destination)
+                .or_default()
+                .insert(*source);
+        }
+    }
 
     let mut storage = BTreeMap::new();
     let mut rewrites = BTreeMap::new();
@@ -14154,6 +14280,8 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
     let mut backing_validated_candidates: BTreeMap<Node, RTLInst> = BTreeMap::new();
     let mut backing_candidate_nodes = BTreeSet::new();
     let mut resolved_backing_sites = BTreeSet::new();
+    let mut selected_home_jcc_plans: BTreeSet<(Node, Node, Address, Address)> =
+        BTreeSet::new();
 
     for (key @ (func, pos), slot) in seeded_storage {
         if vetoed.contains(&key) {
@@ -14222,6 +14350,7 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         let mut cell_addresses = BTreeSet::new();
         let mut cell_bridge_nodes = BTreeSet::new();
         let mut cell_candidate_class: BTreeMap<Node, RTLInst> = BTreeMap::new();
+        let mut cell_jcc_plans: BTreeSet<(Node, Node, Address, Address)> = BTreeSet::new();
         let mut signature: Option<(usize, usize)> = None;
         let mut complete = true;
 
@@ -14804,16 +14933,51 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                         complete = false;
                         break;
                     }
-                    if matches!(
-                        candidates.first(),
-                        Some(RTLInst::Iop(Operation::Ocmp(_), _, _))
-                    ) {
-                        let consumers = adjacent_setcc.get(&node);
-                        if !consumers.is_some_and(|nodes| nodes.len() == 1) {
+                    match candidates.first() {
+                        Some(RTLInst::Iop(Operation::Ocmp(_), _, _)) => {
+                            let consumers = adjacent_setcc.get(&node);
+                            if !consumers.is_some_and(|nodes| nodes.len() == 1) {
+                                complete = false;
+                                break;
+                            }
+                            cell_setcc_nodes.extend(consumers.unwrap().iter().copied());
+                        }
+                        Some(RTLInst::Icond(
+                            _,
+                            _,
+                            Either::Right(if_true),
+                            Either::Right(if_false),
+                        )) => {
+                            let Some(plans) = home_jcc_plans.get(&node) else {
+                                complete = false;
+                                break;
+                            };
+                            if plans.len() != 1 {
+                                complete = false;
+                                break;
+                            }
+                            let &(plan_func, jcc, target, fallthrough) =
+                                plans.iter().next().expect("one checked home Jcc plan");
+                            let branch_is_isolated = raw_predecessors
+                                .get(&jcc)
+                                .is_some_and(|predecessors| {
+                                    !predecessors.is_empty()
+                                        && predecessors.iter().all(|source| *source == node)
+                                });
+                            if plan_func != func
+                                || *if_true != target
+                                || *if_false != fallthrough
+                                || !branch_is_isolated
+                            {
+                                complete = false;
+                                break;
+                            }
+                            cell_jcc_plans.insert((node, jcc, target, fallthrough));
+                        }
+                        _ => {
                             complete = false;
                             break;
                         }
-                        cell_setcc_nodes.extend(consumers.unwrap().iter().copied());
                     }
                     cell_rewrites.insert(
                         node,
@@ -14902,6 +15066,46 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         backing_candidate_nodes.extend(cell_candidate_class.keys().copied());
         backing_validated_candidates.extend(cell_candidate_class);
         rewritten_setcc_nodes.extend(cell_setcc_nodes);
+        selected_home_jcc_plans.extend(cell_jcc_plans);
+    }
+
+    // A comparison candidate retained across the first safety scrub must
+    // regain the exact fused-branch CFG at the same moment it is selected.
+    // Remove every provisional outgoing edge from the CMP root, suppress the
+    // consumed adjacent Jcc, and publish only the two destinations embedded
+    // in the uniquely selected Icond.  No rejected cell reaches this block.
+    if !selected_home_jcc_plans.is_empty() {
+        let roots: BTreeSet<Node> = selected_home_jcc_plans
+            .iter()
+            .map(|(root, _, _, _)| *root)
+            .collect();
+        let mut negated: BTreeSet<(Node, Node)> = db
+            .rel_iter::<(Node, Node)>("rtl_edge_negated")
+            .copied()
+            .collect();
+        negated.extend(
+            selected_home_jcc_plans
+                .iter()
+                .map(|(root, jcc, _, _)| (*root, *jcc)),
+        );
+        db.rel_set(
+            "rtl_edge_negated",
+            negated.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+
+        let mut successors: BTreeSet<(Node, Node)> = db
+            .rel_iter::<(Node, Node)>("rtl_succ_candidate")
+            .filter(|(source, _)| !roots.contains(source))
+            .copied()
+            .collect();
+        for (root, _, target, fallthrough) in &selected_home_jcc_plans {
+            successors.insert((*root, *target));
+            successors.insert((*root, *fallthrough));
+        }
+        db.rel_set(
+            "rtl_succ_candidate",
+            successors.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
     }
 
     // The positive relation above keeps the Datalog fixed point stratified;
