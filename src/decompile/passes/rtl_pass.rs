@@ -7562,6 +7562,41 @@ ascent_par! {
         let home_base = *incoming_base - *outgoing_base,
         if *base_ofs <= -*slot_size && *base_ofs < home_base;
 
+    // Storing a full-width pointer to a proved below-entry local into another
+    // proved below-entry slot cannot expose or modify an incoming Win64 home
+    // cell.  This is the common VS2013 fifth-argument setup where `&local` is
+    // first written into shadow-space-relative memory.  Keep the proof tied
+    // to one dominating affine definition and two exact non-indexed stack
+    // coordinates; partial stores, unknown destinations, and any store that
+    // reaches the return-address/home region remain vetoes.
+    #[local] relation win64_home_disjoint_local_alias_store(
+        Address, Node, Mreg
+    );
+    win64_home_disjoint_local_alias_store(func_start, *store_addr, *alias) <--
+        win64_home_disjoint_local_alias_def(func_start, def_addr, alias),
+        raw_reg_def_used(*def_addr, *alias, store_addr),
+        reg_def_dominates_use(func_start, def_addr, store_addr),
+        !competing_reaching_reg_def(def_addr, *alias, store_addr),
+        pmov(store_addr, destination, source),
+        op_register(source, source_name),
+        if Mreg::x86(*source_name) == *alias,
+        op_indirect(
+            destination, segment, base_name, index_name, _, displacement,
+            memory_size
+        ),
+        if (*segment == "NONE" || segment.is_empty())
+            && (*index_name == "NONE" || index_name.is_empty()),
+        let destination_base = Mreg::x86(*base_name),
+        sp_based_mem_at(
+            store_addr, func_start, seen_destination_base,
+            destination_base_ofs
+        ),
+        if *seen_destination_base == destination_base,
+        abi_stack_slot_size(slot_size),
+        if *memory_size as i64 == *slot_size,
+        let destination_entry_ofs = *destination_base_ofs + *displacement,
+        if destination_entry_ofs <= -*slot_size;
+
     #[local] relation abi_home_arg_position(Mreg, usize);
     abi_home_arg_position(*reg, *pos) <-- abi_int_arg_position(reg, pos);
     abi_home_arg_position(*reg, *pos) <-- abi_float_arg_position(reg, pos);
@@ -7804,11 +7839,14 @@ ascent_par! {
         if *base_ofs == 0,
         arg_reg_param_live_at(func_start, addr, src_reg);
 
-    // VS2013 commonly starts a four-register /homeparams prologue with
-    // `mov rax,rsp`.  In a void function that untouched snapshot can reach a
-    // RET merely because AX is otherwise dead.  It is not a returned stack
-    // address when every explicit reached use is one of the four proved
-    // initial home spills.  Any later copy/arithmetic/use, missing spill, or
+    // VS2013 commonly starts a /homeparams prologue with `mov rax,rsp`.  In a
+    // void function that untouched snapshot can reach a RET merely because AX
+    // is otherwise dead.  It is not a returned stack address when every
+    // explicit reached use is a bounded direct store into one of the four home
+    // cells and all four cells are written.  The compiler may reuse an unused
+    // argument home for a nonvolatile-register save, so do not require each
+    // source to be its ABI argument register.  Any load, partial coordinate,
+    // index, segment, missing home-cell write, later copy/arithmetic/use, or
     // later stack-address definition keeps the ordinary return-escape veto.
     #[local] relation win64_home_prologue_sp_snapshot(Address, Node);
     win64_home_prologue_sp_snapshot(func_start, *def_addr) <--
@@ -7820,30 +7858,53 @@ ascent_par! {
         sp_alias_def(func_start, def_addr, Mreg::AX, base_ofs),
         if *base_ofs == 0 && *def_addr == *func_start;
 
-    #[local] relation win64_home_prologue_sp_snapshot_spill_pos(Address, Node, usize);
-    win64_home_prologue_sp_snapshot_spill_pos(func_start, def_addr, *pos) <--
+    #[local] relation win64_home_prologue_sp_snapshot_store_pos(
+        Address, Node, Node, usize
+    );
+    win64_home_prologue_sp_snapshot_store_pos(
+        func_start, def_addr, *use_addr, *pos
+    ) <--
         win64_home_prologue_sp_snapshot(func_start, def_addr),
         raw_reg_def_used(def_addr, Mreg::AX, use_addr),
-        win64_home_spill_candidate(use_addr, func_start, _, pos);
+        pmov(use_addr, dst, _),
+        op_indirect(dst, segment, base_str, idx_str, _, disp, mem_size),
+        if (*segment == "NONE" || segment.is_empty())
+            && (*idx_str == "NONE" || idx_str.is_empty()),
+        let base_reg = Mreg::x86(*base_str),
+        if base_reg == Mreg::AX,
+        abi_stack_slot_size(slot_size),
+        if *mem_size > 0 && (*mem_size as i64) <= *slot_size,
+        win64_home_cell(use_addr, func_start, seen_base, seen_disp, pos),
+        if *seen_base == base_reg && *seen_disp == *disp;
 
-    #[local] relation win64_home_prologue_sp_snapshot_nonspill_use(Address, Node);
-    win64_home_prologue_sp_snapshot_nonspill_use(func_start, def_addr) <--
+    #[local] relation win64_home_prologue_sp_snapshot_nonstore_use(Address, Node);
+    win64_home_prologue_sp_snapshot_nonstore_use(func_start, def_addr) <--
         win64_home_prologue_sp_snapshot(func_start, def_addr),
         raw_reg_def_used(def_addr, Mreg::AX, use_addr),
-        !win64_home_spill_candidate(use_addr, func_start, _, _);
+        !win64_home_prologue_sp_snapshot_store_pos(
+            func_start, def_addr, use_addr, _
+        );
 
     #[local] relation win64_home_prologue_sp_snapshot_only(Address, Node);
     win64_home_prologue_sp_snapshot_only(func_start, def_addr) <--
         win64_home_prologue_sp_snapshot(func_start, def_addr),
-        win64_home_prologue_sp_snapshot_spill_pos(func_start, def_addr, pos0),
+        win64_home_prologue_sp_snapshot_store_pos(
+            func_start, def_addr, _, pos0
+        ),
         if *pos0 == 0,
-        win64_home_prologue_sp_snapshot_spill_pos(func_start, def_addr, pos1),
+        win64_home_prologue_sp_snapshot_store_pos(
+            func_start, def_addr, _, pos1
+        ),
         if *pos1 == 1,
-        win64_home_prologue_sp_snapshot_spill_pos(func_start, def_addr, pos2),
+        win64_home_prologue_sp_snapshot_store_pos(
+            func_start, def_addr, _, pos2
+        ),
         if *pos2 == 2,
-        win64_home_prologue_sp_snapshot_spill_pos(func_start, def_addr, pos3),
+        win64_home_prologue_sp_snapshot_store_pos(
+            func_start, def_addr, _, pos3
+        ),
         if *pos3 == 3,
-        !win64_home_prologue_sp_snapshot_nonspill_use(func_start, def_addr);
+        !win64_home_prologue_sp_snapshot_nonstore_use(func_start, def_addr);
 
     // The candidate spill must dominate a reload; address ordering alone is
     // not a control-flow proof. Within one basic block, instruction order is
@@ -9582,6 +9643,7 @@ ascent_par! {
     win64_home_canonical_veto(func_start, *pos) <--
         direct_stack_operand(addr, Mreg::BP, _, _),
         real_addr_in_func(addr, func_start),
+        func_ever_sets_frame_pointer(func_start),
         !bp_base_at(func_start, addr, _),
         win64_home_storage_signature(func_start, pos, _, _);
     win64_home_canonical_veto(func_start, *pos) <--
@@ -9611,7 +9673,8 @@ ascent_par! {
         win64_home_storage_signature(func_start, pos, _, _),
         !win64_home_exact_addr_copy_use(func_start, addr, alias, pos),
         !win64_home_exact_addr_store_use(func_start, addr, alias, pos),
-        !win64_home_exact_addr_call(func_start, addr, alias, pos);
+        !win64_home_exact_addr_call(func_start, addr, alias, pos),
+        !win64_home_disjoint_local_alias_store(func_start, addr, alias);
     // A proved exact-home address web receives the stricter policy even when
     // the instruction also happens to create another affine SP alias.  This
     // closes the ADD/LEA exemption above without disabling the independently

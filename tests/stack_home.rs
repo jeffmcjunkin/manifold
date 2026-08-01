@@ -211,6 +211,108 @@ home_prologue_snapshot_cmp_void_zero:
         popq %rbx
         retq
 
+        .globl home_prologue_snapshot_mixed_home_writes
+        .def home_prologue_snapshot_mixed_home_writes; .scl 2; .type 32; .endef
+home_prologue_snapshot_mixed_home_writes:
+        movq %rsp, %rax
+        movq %rbx, 32(%rax)
+        movl %r8d, 24(%rax)
+        movl %edx, 16(%rax)
+        movq %rcx, 8(%rax)
+        subq $40, %rsp
+        cmpl $0, 56(%rsp)
+        je home_prologue_snapshot_mixed_home_writes_zero
+        addq $40, %rsp
+        retq
+home_prologue_snapshot_mixed_home_writes_zero:
+        addq $40, %rsp
+        retq
+
+        .globl home_prologue_snapshot_extra_use_rejected
+        .def home_prologue_snapshot_extra_use_rejected; .scl 2; .type 32; .endef
+home_prologue_snapshot_extra_use_rejected:
+        movq %rsp, %rax
+        movq %rbx, 32(%rax)
+        movl %r8d, 24(%rax)
+        movl %edx, 16(%rax)
+        movq %rcx, 8(%rax)
+        movq %rax, %r10
+        subq $40, %rsp
+        cmpl $0, 56(%rsp)
+        je home_prologue_snapshot_extra_use_rejected_zero
+        addq $40, %rsp
+        retq
+home_prologue_snapshot_extra_use_rejected_zero:
+        addq $40, %rsp
+        retq
+
+        .globl home_prologue_snapshot_partial_cell_rejected
+        .def home_prologue_snapshot_partial_cell_rejected; .scl 2; .type 32; .endef
+home_prologue_snapshot_partial_cell_rejected:
+        movq %rsp, %rax
+        movl %ebx, 28(%rax)
+        movl %r8d, 24(%rax)
+        movl %edx, 16(%rax)
+        movq %rcx, 8(%rax)
+        subq $40, %rsp
+        cmpl $0, 56(%rsp)
+        je home_prologue_snapshot_partial_cell_rejected_zero
+        addq $40, %rsp
+        retq
+home_prologue_snapshot_partial_cell_rejected_zero:
+        addq $40, %rsp
+        retq
+
+        .globl home_frameless_rbp_field
+        .def home_frameless_rbp_field; .scl 2; .type 32; .endef
+home_frameless_rbp_field:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movq 0(%rbp), %r9
+        cmpq $0, 8(%rsp)
+        je home_frameless_rbp_field_zero
+        movq %r9, %rax
+        retq
+home_frameless_rbp_field_zero:
+        xorl %eax, %eax
+        retq
+
+        .globl home_disjoint_local_alias_store
+        .def home_disjoint_local_alias_store; .scl 2; .type 32; .endef
+home_disjoint_local_alias_store:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        subq $64, %rsp
+        leaq 48(%rsp), %rax
+        movq %rax, 32(%rsp)
+        cmpq $0, 72(%rsp)
+        je home_disjoint_local_alias_store_zero
+        addq $64, %rsp
+        movl $1, %eax
+        retq
+home_disjoint_local_alias_store_zero:
+        addq $64, %rsp
+        xorl %eax, %eax
+        retq
+
+        .globl home_disjoint_local_alias_partial_store_rejected
+        .def home_disjoint_local_alias_partial_store_rejected; .scl 2; .type 32; .endef
+home_disjoint_local_alias_partial_store_rejected:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        subq $64, %rsp
+        leaq 48(%rsp), %rax
+        movl %eax, 32(%rsp)
+        cmpq $0, 72(%rsp)
+        je home_disjoint_local_alias_partial_store_rejected_zero
+        addq $64, %rsp
+        movl $1, %eax
+        retq
+home_disjoint_local_alias_partial_store_rejected_zero:
+        addq $64, %rsp
+        xorl %eax, %eax
+        retq
+
         .globl home_reassigned_add
         .def home_reassigned_add; .scl 2; .type 32; .endef
 home_reassigned_add:
@@ -4042,22 +4144,31 @@ fn assert_canonical_unsafe_home_storage(db: &DecompileDB) {
         3,
     );
 
-    for name in [
-        "home_local_call_adjacent_cmp",
-        "home_prologue_snapshot_cmp_void",
+    for (name, pos, expected_type) in [
+        ("home_local_call_adjacent_cmp", 3, XType::Xany64),
+        ("home_prologue_snapshot_cmp_void", 3, XType::Xany64),
+        (
+            "home_prologue_snapshot_mixed_home_writes",
+            1,
+            XType::Xint,
+        ),
+        ("home_frameless_rbp_field", 0, XType::Xany64),
+        ("home_disjoint_local_alias_store", 0, XType::Xany64),
     ] {
         let (span, slot) = canonical_home_storage_at_position_with_type(
             db,
             name,
-            3,
-            XType::Xany64,
+            pos,
+            expected_type,
         );
-        assert_home_accesses_use_slot_at_position(db, name, span, slot, 3);
+        assert_home_accesses_use_slot_at_position(db, name, span, slot, pos);
         let compare = db
             .rel_iter::<(Address, Address, Symbol, Mreg, i64, usize, i64, usize)>(
                 "win64_home_scalar_cmp_read",
             )
-            .find(|(_, func, _, _, _, pos, _, _)| *func == span.0 && *pos == 3)
+            .find(|(_, func, _, _, _, seen_pos, _, _)| {
+                *func == span.0 && *seen_pos == pos
+            })
             .unwrap_or_else(|| panic!("{name} lost its adjacent home comparison"));
         let plans: Vec<_> = db
             .rel_iter::<(Address, Address, Address, Address, Address)>(
@@ -4102,6 +4213,26 @@ fn assert_canonical_unsafe_home_storage(db: &DecompileDB) {
             "{name} retained an unsupported stack-address reason"
         );
     }
+
+    let mixed_span = function_span(db, "home_prologue_snapshot_mixed_home_writes");
+    let mut abi_spill_positions: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill_candidate")
+        .filter_map(|(_, func, _, pos)| (*func == mixed_span.0).then_some(*pos))
+        .collect();
+    abi_spill_positions.sort_unstable();
+    abi_spill_positions.dedup();
+    assert_eq!(
+        abi_spill_positions,
+        vec![0, 1, 2],
+        "mixed /homeparams fixture must recover despite its non-ABI RBX home save"
+    );
+
+    let frameless_rbp = function_span(db, "home_frameless_rbp_field");
+    assert!(
+        !db.rel_iter::<(Address,)>("func_ever_sets_frame_pointer")
+            .any(|(func,)| *func == frameless_rbp.0),
+        "frameless RBP fixture unexpectedly established a frame pointer"
+    );
 
     for (name, expected_type, expected_op) in [
         (
@@ -4492,6 +4623,13 @@ fn assert_optimized_canonical_homes(db: &DecompileDB) {
         ("home_cmp_after_alias_clobber", 3, XType::Xany64),
         ("home_local_call_adjacent_cmp", 3, XType::Xany64),
         ("home_prologue_snapshot_cmp_void", 3, XType::Xany64),
+        (
+            "home_prologue_snapshot_mixed_home_writes",
+            1,
+            XType::Xint,
+        ),
+        ("home_frameless_rbp_field", 0, XType::Xany64),
+        ("home_disjoint_local_alias_store", 0, XType::Xany64),
         ("home_reassigned_add", 0, XType::Xany64),
         ("home_mixed_base_clobber", 0, XType::Xany64),
         ("home_alias_call_escape", 0, XType::Xany64),
@@ -5404,6 +5542,7 @@ fn assert_home_safety_vetoes(db: &DecompileDB) {
         ("home_backing_partial_pointer_store_rejected", Mreg::CX),
         ("home_backing_segmented_store_rejected", Mreg::CX),
         ("home_backing_segmented_load_rejected", Mreg::CX),
+        ("home_disjoint_local_alias_partial_store_rejected", Mreg::CX),
     ] {
         let span = function_span(db, name);
         assert!(
@@ -5460,6 +5599,7 @@ fn assert_home_safety_vetoes(db: &DecompileDB) {
         "home_backing_partial_pointer_store_rejected",
         "home_backing_segmented_store_rejected",
         "home_backing_segmented_load_rejected",
+        "home_disjoint_local_alias_partial_store_rejected",
     ] {
         let span = function_span(db, name);
         let mut rejected_sites: Vec<_> = db
@@ -5692,6 +5832,36 @@ fn assert_home_safety_vetoes(db: &DecompileDB) {
             !db.rel_iter::<(Address, usize, u64)>("win64_home_storage")
                 .any(|(func, _, _)| *func == span.0),
             "{name} unexpectedly received canonical home storage"
+        );
+    }
+}
+
+fn assert_home_prologue_snapshot_safety(db: &DecompileDB) {
+    for name in [
+        "home_prologue_snapshot_extra_use_rejected",
+        "home_prologue_snapshot_partial_cell_rejected",
+    ] {
+        let span = function_span(db, name);
+        let mut positions: Vec<_> = db
+            .rel_iter::<(Address, Address, Mreg, usize)>("win64_home_spill_candidate")
+            .filter_map(|(_, func, _, pos)| (*func == span.0).then_some(*pos))
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+        assert_eq!(
+            positions,
+            vec![0, 1, 2],
+            "{name} lost its three ordinary ABI spill witnesses"
+        );
+        assert!(
+            db.rel_iter::<(Address, usize)>("win64_home_canonical_veto")
+                .any(|(func, _)| *func == span.0),
+            "{name} lost its canonical-home safety veto"
+        );
+        assert!(
+            !db.rel_iter::<(Address, usize, u64)>("win64_home_storage")
+                .any(|(func, _, _)| *func == span.0),
+            "{name} received canonical storage despite an escaped snapshot"
         );
     }
 }
@@ -6141,6 +6311,9 @@ fn assert_final_output_compiles(object: &Path) {
         "home_cmp_after_alias_clobber",
         "home_local_call_adjacent_cmp",
         "home_prologue_snapshot_cmp_void",
+        "home_prologue_snapshot_mixed_home_writes",
+        "home_frameless_rbp_field",
+        "home_disjoint_local_alias_store",
         "home_reassigned_movsxd",
         "home_reassigned_movsx",
         "home_reassigned_movzx",
@@ -6258,6 +6431,7 @@ fn coff_stack_and_home_relations_preserve_values_and_abi_ordinals() {
             assert_bp_provenance_preserves_pointer_memory(&db);
             assert_bp_shortcuts_and_narrow_bases_stay_pointer_memory(&db);
             assert_home_safety_vetoes(&db);
+            assert_home_prologue_snapshot_safety(&db);
             assert_alias_coordinate_provenance(&db);
             assert_unknown_sp_indexed_accesses_are_rejected(&db);
             RTLOptimizePass.run(&mut db);

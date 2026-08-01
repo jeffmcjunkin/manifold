@@ -24,8 +24,17 @@ pub fn infer_functions(db: &mut DecompileDB, insns: &[DecodedInsn]) {
         }
     }
 
+    // A direct-call immediate is only function-boundary evidence when it names
+    // a decoded instruction start.  Delinked COFF can retain an unrelocated
+    // image-relative displacement after section compaction; such a stale
+    // target may land in the middle of an instruction and must not split the
+    // containing function.
+    let instruction_starts: HashSet<u64> =
+        insns.iter().map(|insn| insn.address).collect();
     for (_, callee) in db.rel_iter::<(Address, Address)>("direct_call") {
-        entries.insert(*callee);
+        if instruction_starts.contains(callee) {
+            entries.insert(*callee);
+        }
     }
 
     // main_function is seeded earlier by detect_main_via_libc_start_main so main becomes a block leader and named entry.
