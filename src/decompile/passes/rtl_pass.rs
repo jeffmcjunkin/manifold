@@ -47,6 +47,21 @@ fn extending_load_chunk(mnem: &str, size: usize) -> Option<MemoryChunk> {
     }
 }
 
+// Scalar replacement of a mutable Win64 home cell must retain the explicit
+// sign/zero extension performed by the load.  The ordinary stack path carries
+// this in MemoryChunk; once the backing memory is replaced by one canonical
+// scalar, make that conversion explicit instead of degrading it to Omove.
+fn extending_load_operation(mnem: &str, size: usize) -> Option<Operation> {
+    match extending_load_chunk(mnem, size)? {
+        MemoryChunk::MInt8Signed => Some(Operation::Ocast8signed),
+        MemoryChunk::MInt8Unsigned => Some(Operation::Ocast8unsigned),
+        MemoryChunk::MInt16Signed => Some(Operation::Ocast16signed),
+        MemoryChunk::MInt16Unsigned => Some(Operation::Ocast16unsigned),
+        MemoryChunk::MInt32 => Some(Operation::Ocast32signed),
+        _ => None,
+    }
+}
+
 fn is_x86_64_gp_register_name(name: &str) -> bool {
     matches!(
         name,
@@ -7857,6 +7872,48 @@ ascent_par! {
         if (*move_class == 0 && !is_float_mreg(&dst_reg))
             || (*move_class != 0 && is_float_mreg(&dst_reg));
 
+    // MOVSX/MOVSXD/MOVZX are scalar reads too, but they are intentionally not
+    // members of win64_home_move_class: treating them as plain MOV reloads
+    // would erase their signedness.  Accept only an access whose source width
+    // exactly matches the authoritative initial-spill signature, and publish
+    // an explicit cast over the canonical cell.  Mixed-width cell access
+    // remains rejected until its truncation/type interactions are audited.
+    relation win64_home_scalar_extend_load(
+        Node, Address, Mreg, i64, usize, i64, Mreg, usize, Operation
+    );
+    win64_home_scalar_extend_load(
+        addr, func_start, *base_reg, *raw_disp, *pos, *entry_ofs,
+        dst_reg, *width, op
+    ) <--
+        win64_unsafe_home_access(
+            addr, func_start, base_reg, raw_disp, pos, entry_ofs
+        ),
+        win64_home_storage_signature(func_start, pos, move_class, width),
+        if *move_class == 0,
+        pmov(addr, dst, src),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        op_register(dst, dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        if !is_float_mreg(&dst_reg),
+        op_indirect(src, _, base_str, idx_str, _, asm_disp, mem_size),
+        if is_x86_64_gp_register_name(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg && *asm_disp == *raw_disp,
+        if *mem_size == *width,
+        if let Some(op) = extending_load_operation(mnem, *mem_size);
+
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_scalar_extend_load(
+            addr, func_start, _, _, pos, _, dst_reg, _, op
+        ),
+        win64_home_storage(func_start, pos, slot),
+        is_def(addr, def_id),
+        reg_xtl(addr, dst_reg, def_id),
+        xtl_canonical(def_id, destination),
+        let inst = RTLInst::Iop(
+            op.clone(), Arc::new(vec![*slot]), *destination
+        );
+
     relation win64_home_scalar_lea(Node, Address, Mreg, i64, usize, i64, Mreg);
     win64_home_scalar_lea(addr, func_start, *base_reg, *raw_disp, *pos, *entry_ofs, dst_reg) <--
         win64_unsafe_home_access(addr, func_start, base_reg, raw_disp, pos, entry_ofs),
@@ -7939,6 +7996,58 @@ ascent_par! {
         if Mreg::x86(*base_str) == *base_reg && *asm_disp == *raw_disp,
         if *mem_size == *width;
 
+    // Keep the branch fusion explicitly adjacent.  A scheduled CMP -> Jcc
+    // pair needs a snapshot at CMP and the Icond at Jcc so intervening
+    // flag-preserving operations still execute on both paths; moving the
+    // branch to CMP would silently skip those operations.
+    #[local] relation win64_home_cmp_jcc_consumer(
+        Node, Address, Node, TestCond, Address, Address
+    );
+    win64_home_cmp_jcc_consumer(
+        addr, func_start, jcc_addr, *testcond, *target_addr, *fallthrough
+    ) <--
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        // Function ranges are immutable Asm inputs.  Carry the owner through
+        // this projected relation so a backward edge is accepted exactly like
+        // a forward edge, while cross-function targets/fallthroughs cannot be
+        // fused into this function's canonical home-cell branch.
+        real_addr_in_func(addr, func_start),
+        real_addr_in_func(jcc_addr, func_start),
+        real_addr_in_func(target_addr, func_start),
+        real_addr_in_func(fallthrough, func_start);
+
+    // SETcc is a value-producing consumer of the same comparison flags.  Its
+    // destination is defined at the SETcc address, while the fused RTL
+    // operation remains keyed at CMP (the same convention used by Asm's
+    // register-only cmp_setcc_link).  Start with the exact adjacent shape;
+    // scheduled SETcc chains need an explicit flag-provenance relation rather
+    // than an unconstrained instruction walk.
+    #[local] relation win64_home_cmp_setcc_consumer(Node, Node, TestCond, RTLReg);
+    win64_home_cmp_setcc_consumer(addr, setcc_addr, *test_cond, destination) <--
+        next(addr, setcc_addr),
+        setcc_testcond(setcc_addr, test_cond),
+        instruction(setcc_addr, _, _, _, dst, _, _, _, _, _),
+        op_register(dst, dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        is_def(setcc_addr, def_id),
+        reg_xtl(setcc_addr, dst_reg, def_id),
+        xtl_canonical(def_id, destination),
+        instr_in_function(addr, func_start),
+        instr_in_function(setcc_addr, func_start);
+
+    // The fused value is now defined at CMP, so its semantic successor is the
+    // instruction after the consumed adjacent SETcc.  This is explicit rather
+    // than relying on whether Linear happened to give the otherwise-unlowered
+    // memory CMP an LTL fallthrough edge.
+    rtl_edge_negated(addr, setcc_addr) <--
+        win64_home_cmp_setcc_consumer(addr, setcc_addr, _, _);
+    rtl_succ_candidate(addr, fallthrough) <--
+        win64_home_cmp_setcc_consumer(addr, setcc_addr, _, _),
+        next(setcc_addr, fallthrough);
+
     rtl_inst_candidate(addr, inst) <--
         win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
         win64_home_storage(func_start, pos, slot),
@@ -7946,10 +8055,9 @@ ascent_par! {
         op_register(other, reg_str),
         let other_reg = Mreg::x86(*reg_str),
         reaching_use_rtl(addr, other_reg, other_rtl),
-        next(addr, jcc_addr),
-        pjcc(jcc_addr, testcond, target_sym),
-        symbol_resolved_addr(*target_sym, target_addr),
-        next(jcc_addr, fallthrough),
+        win64_home_cmp_jcc_consumer(
+            addr, func_start, jcc_addr, testcond, target_addr, fallthrough
+        ),
         let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
         let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *width),
         let inst = RTLInst::Icond(cond, Arc::new(vec![*slot, *other_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough));
@@ -7960,10 +8068,9 @@ ascent_par! {
         op_register(other, reg_str),
         let other_reg = Mreg::x86(*reg_str),
         reaching_use_rtl(addr, other_reg, other_rtl),
-        next(addr, jcc_addr),
-        pjcc(jcc_addr, testcond, target_sym),
-        symbol_resolved_addr(*target_sym, target_addr),
-        next(jcc_addr, fallthrough),
+        win64_home_cmp_jcc_consumer(
+            addr, func_start, jcc_addr, testcond, target_addr, fallthrough
+        ),
         let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
         let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *width),
         let inst = RTLInst::Icond(cond, Arc::new(vec![*other_rtl, *slot]), Either::Right(*target_addr), Either::Right(*fallthrough));
@@ -7972,10 +8079,9 @@ ascent_par! {
         win64_home_storage(func_start, pos, slot),
         pcmp(addr, mem, other),
         op_immediate(other, imm, _),
-        next(addr, jcc_addr),
-        pjcc(jcc_addr, testcond, target_sym),
-        symbol_resolved_addr(*target_sym, target_addr),
-        next(jcc_addr, fallthrough),
+        win64_home_cmp_jcc_consumer(
+            addr, func_start, jcc_addr, testcond, target_addr, fallthrough
+        ),
         let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
         let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *width),
         let cond = match sized_cond {
@@ -7991,10 +8097,9 @@ ascent_par! {
         win64_home_storage(func_start, pos, slot),
         pcmp(addr, other, mem),
         op_immediate(other, imm, _),
-        next(addr, jcc_addr),
-        pjcc(jcc_addr, testcond, target_sym),
-        symbol_resolved_addr(*target_sym, target_addr),
-        next(jcc_addr, fallthrough),
+        win64_home_cmp_jcc_consumer(
+            addr, func_start, jcc_addr, testcond, target_addr, fallthrough
+        ),
         let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
         let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *width),
         let cond = match sized_cond {
@@ -8006,11 +8111,76 @@ ascent_par! {
         },
         let inst = RTLInst::Icond(cond, Arc::new(vec![*slot]), Either::Right(*target_addr), Either::Right(*fallthrough));
 
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_storage(func_start, pos, slot),
+        pcmp(addr, mem, other),
+        op_register(other, reg_str),
+        let other_reg = Mreg::x86(*reg_str),
+        reaching_use_rtl(addr, other_reg, other_rtl),
+        win64_home_cmp_setcc_consumer(addr, setcc_addr, testcond, destination),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *width),
+        let inst = RTLInst::Iop(
+            Operation::Ocmp(cond), Arc::new(vec![*slot, *other_rtl]), *destination
+        );
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_storage(func_start, pos, slot),
+        pcmp(addr, other, mem),
+        op_register(other, reg_str),
+        let other_reg = Mreg::x86(*reg_str),
+        reaching_use_rtl(addr, other_reg, other_rtl),
+        win64_home_cmp_setcc_consumer(addr, setcc_addr, testcond, destination),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *width),
+        let inst = RTLInst::Iop(
+            Operation::Ocmp(cond), Arc::new(vec![*other_rtl, *slot]), *destination
+        );
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_storage(func_start, pos, slot),
+        pcmp(addr, mem, other),
+        op_immediate(other, imm, _),
+        win64_home_cmp_setcc_consumer(addr, setcc_addr, testcond, destination),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *width),
+        let cond = match sized_cond {
+            Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, *imm),
+            Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, *imm),
+            Condition::Ccompl(cmp) => Condition::Ccomplimm(cmp, *imm),
+            Condition::Ccomplu(cmp) => Condition::Ccompluimm(cmp, *imm),
+            other => other,
+        },
+        let inst = RTLInst::Iop(
+            Operation::Ocmp(cond), Arc::new(vec![*slot]), *destination
+        );
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_storage(func_start, pos, slot),
+        pcmp(addr, other, mem),
+        op_immediate(other, imm, _),
+        win64_home_cmp_setcc_consumer(addr, setcc_addr, testcond, destination),
+        let raw_cond = crate::x86::types::condition_for_testcond(*testcond),
+        let sized_cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *width),
+        let cond = match sized_cond {
+            Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, *imm),
+            Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, *imm),
+            Condition::Ccompl(cmp) => Condition::Ccomplimm(cmp, *imm),
+            Condition::Ccomplu(cmp) => Condition::Ccompluimm(cmp, *imm),
+            other => other,
+        },
+        let inst = RTLInst::Iop(
+            Operation::Ocmp(cond), Arc::new(vec![*slot]), *destination
+        );
+
     #[local] relation win64_home_scalar_access(Node, Address, usize);
     win64_home_scalar_access(addr, func, pos) <--
         win64_home_scalar_store(addr, func, _, _, pos, _, _, _, _);
     win64_home_scalar_access(addr, func, pos) <--
         win64_home_scalar_load(addr, func, _, _, pos, _, _, _, _);
+    win64_home_scalar_access(addr, func, pos) <--
+        win64_home_scalar_extend_load(addr, func, _, _, pos, _, _, _, _);
     win64_home_scalar_access(addr, func, pos) <--
         win64_home_scalar_lea(addr, func, _, _, pos, _, _),
         // A bare/numerically-used LEA is not enough: replacing RSP+k with
@@ -10187,6 +10357,14 @@ enum UnsafeHomeShape {
         move_class: usize,
         width: usize,
     },
+    ExtendLoad {
+        base: Mreg,
+        raw_ofs: i64,
+        entry_ofs: i64,
+        peer: Mreg,
+        width: usize,
+        op: Operation,
+    },
     Lea {
         base: Mreg,
         raw_ofs: i64,
@@ -10213,6 +10391,11 @@ enum UnsafeHomeShape {
 enum UnsafeHomeRewrite {
     Store { source: RTLReg, slot: RTLReg },
     Load { slot: RTLReg, destination: RTLReg },
+    ExtendLoad {
+        slot: RTLReg,
+        destination: RTLReg,
+        op: Operation,
+    },
     Lea { entry_ofs: i64, destination: RTLReg },
     ArithRead {
         slot: RTLReg,
@@ -11777,6 +11960,32 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                 width,
             });
     }
+    for (node, func, base, raw_ofs, pos, entry_ofs, peer, width, op) in db.rel_iter::<(
+        Node,
+        Address,
+        Mreg,
+        i64,
+        usize,
+        i64,
+        Mreg,
+        usize,
+        Operation,
+    )>("win64_home_scalar_extend_load")
+    {
+        shapes
+            .entry((*func, *pos))
+            .or_default()
+            .entry(*node)
+            .or_default()
+            .insert(UnsafeHomeShape::ExtendLoad {
+                base: *base,
+                raw_ofs: *raw_ofs,
+                entry_ofs: *entry_ofs,
+                peer: *peer,
+                width: *width,
+                op: op.clone(),
+            });
+    }
     for &(node, func, base, raw_ofs, pos, entry_ofs, peer) in
         db.rel_iter::<(Node, Address, Mreg, i64, usize, i64, Mreg)>("win64_home_scalar_lea")
     {
@@ -11861,9 +12070,47 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         .filter_map(|(node, cells)| (cells.len() != 1).then_some(node))
         .collect();
 
+    // `xtl_canonical` is a decreasing lattice, so relations retain candidates
+    // built from historical representatives.  The reaching-use relation was
+    // already collapsed to its final representative above, but home-cell
+    // candidates are deliberately outside the indexed-stack site set and can
+    // still differ only by a stale loop value.  Normalize this selector's
+    // private candidate snapshot before proving uniqueness; conditions and
+    // control-flow targets are copied unchanged.
+    let final_canonical = final_xtl_canonical_map(db);
+    let rewrite = |value: RTLReg| final_canonical.get(&value).copied().unwrap_or(value);
+    let rewrite_args = |args: &Arc<Vec<RTLReg>>| {
+        Arc::new(args.iter().map(|value| rewrite(*value)).collect::<Vec<_>>())
+    };
     let mut candidates: Vec<(Node, RTLInst)> = db
         .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
-        .map(|(node, inst)| (*node, inst.clone()))
+        .map(|(node, inst)| {
+            let normalized = match inst {
+                RTLInst::Iop(op, args, destination) => {
+                    RTLInst::Iop(op.clone(), rewrite_args(args), rewrite(*destination))
+                }
+                RTLInst::Iload(chunk, addressing, args, destination) => RTLInst::Iload(
+                    *chunk,
+                    addressing.clone(),
+                    rewrite_args(args),
+                    rewrite(*destination),
+                ),
+                RTLInst::Istore(chunk, addressing, args, source) => RTLInst::Istore(
+                    *chunk,
+                    addressing.clone(),
+                    rewrite_args(args),
+                    rewrite(*source),
+                ),
+                RTLInst::Icond(condition, args, if_true, if_false) => RTLInst::Icond(
+                    condition.clone(),
+                    rewrite_args(args),
+                    if_true.clone(),
+                    if_false.clone(),
+                ),
+                _ => inst.clone(),
+            };
+            (*node, normalized)
+        })
         .collect();
     candidates.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
     candidates.dedup();
@@ -11878,9 +12125,23 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
             .or_default()
             .insert(*value);
     }
+    let setcc_nodes: BTreeSet<Node> = db
+        .rel_iter::<(Address, TestCond)>("setcc_testcond")
+        .map(|(node, _)| *node)
+        .collect();
+    let mut adjacent_setcc: BTreeMap<Node, BTreeSet<Node>> = BTreeMap::new();
+    for (source, destination) in db.rel_iter::<(Node, Node)>("next") {
+        if setcc_nodes.contains(destination) {
+            adjacent_setcc
+                .entry(*source)
+                .or_default()
+                .insert(*destination);
+        }
+    }
 
     let mut storage = BTreeMap::new();
     let mut rewrites = BTreeMap::new();
+    let mut rewritten_setcc_nodes = BTreeSet::new();
     let mut home_addresses = BTreeSet::new();
     let mut home_escaped = BTreeSet::new();
     let mut cell_types = BTreeMap::new();
@@ -11914,6 +12175,7 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                 UnsafeHomeShape::Lea { .. } => true,
                 UnsafeHomeShape::ArithRead { .. } => true,
                 UnsafeHomeShape::Compare { .. } => true,
+                UnsafeHomeShape::ExtendLoad { .. } => true,
                 UnsafeHomeShape::Load {
                     raw_ofs, entry_ofs, ..
                 } => raw_ofs != entry_ofs,
@@ -11924,6 +12186,7 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         }
 
         let mut cell_rewrites = BTreeMap::new();
+        let mut cell_setcc_nodes = BTreeSet::new();
         let mut cell_addresses = BTreeSet::new();
         let mut signature: Option<(usize, usize)> = None;
         let mut complete = true;
@@ -12015,6 +12278,37 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                     let destination = *peers.iter().next().unwrap();
                     cell_rewrites.insert(node, UnsafeHomeRewrite::Load { slot, destination });
                 }
+                UnsafeHomeShape::ExtendLoad { width, op, .. } => {
+                    if signature.is_some_and(|seen| seen != (0, width)) {
+                        complete = false;
+                        break;
+                    }
+                    signature = Some((0, width));
+                    let peers: BTreeSet<RTLReg> = node_candidates
+                        .iter()
+                        .filter_map(|inst| match inst {
+                            RTLInst::Iop(candidate_op, args, destination)
+                                if candidate_op == &op && args.as_ref() == &[slot] =>
+                            {
+                                Some(*destination)
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if peers.len() != 1 {
+                        complete = false;
+                        break;
+                    }
+                    let destination = *peers.iter().next().unwrap();
+                    cell_rewrites.insert(
+                        node,
+                        UnsafeHomeRewrite::ExtendLoad {
+                            slot,
+                            destination,
+                            op,
+                        },
+                    );
+                }
                 UnsafeHomeShape::Lea {
                     raw_ofs, entry_ofs, ..
                 } => {
@@ -12102,6 +12396,11 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                             {
                                 Some((*inst).clone())
                             }
+                            RTLInst::Iop(Operation::Ocmp(_), args, _)
+                                if args.iter().filter(|arg| **arg == slot).count() == 1 =>
+                            {
+                                Some((*inst).clone())
+                            }
                             _ => None,
                         })
                         .collect();
@@ -12110,6 +12409,17 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                     if candidates.len() != 1 {
                         complete = false;
                         break;
+                    }
+                    if matches!(
+                        candidates.first(),
+                        Some(RTLInst::Iop(Operation::Ocmp(_), _, _))
+                    ) {
+                        let consumers = adjacent_setcc.get(&node);
+                        if !consumers.is_some_and(|nodes| nodes.len() == 1) {
+                            complete = false;
+                            break;
+                        }
+                        cell_setcc_nodes.extend(consumers.unwrap().iter().copied());
                     }
                     cell_rewrites.insert(
                         node,
@@ -12139,6 +12449,15 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         }) {
             continue;
         }
+        if cell_setcc_nodes.iter().any(|node| {
+            colliding_shape_nodes.contains(node)
+                || match node_functions.get(node) {
+                    Some(owners) => owners.len() != 1 || !owners.contains(&func),
+                    None => true,
+                }
+        }) {
+            continue;
+        }
 
         storage.insert(key, slot);
         cell_types.insert(slot, primary_type);
@@ -12147,6 +12466,7 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
             home_escaped.insert((func, slot));
         }
         rewrites.extend(cell_rewrites);
+        rewritten_setcc_nodes.extend(cell_setcc_nodes);
     }
 
     // The positive relation above keeps the Datalog fixed point stratified;
@@ -12163,6 +12483,7 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                 let detail = match shape {
                     UnsafeHomeShape::ArithRead { .. } => "home-arith-rewrite-incomplete",
                     UnsafeHomeShape::Compare { .. } => "home-compare-rewrite-incomplete",
+                    UnsafeHomeShape::ExtendLoad { .. } => "home-extend-rewrite-incomplete",
                     _ => continue,
                 };
                 failed_scalar_sites.insert((cell.0, node, detail));
@@ -12227,6 +12548,7 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
 
     let rewritten_nodes: BTreeSet<Node> = rewrites.keys().copied().collect();
     let mut rewritten_candidate_nodes = rewritten_nodes.clone();
+    rewritten_candidate_nodes.extend(rewritten_setcc_nodes);
     for (node, rewrite) in &rewrites {
         if matches!(rewrite, UnsafeHomeRewrite::ArithRead { .. }) {
             rewritten_candidate_nodes.insert(*node | (1u64 << 62));
@@ -12327,6 +12649,11 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
             UnsafeHomeRewrite::Load { slot, destination } => {
                 Some(RTLInst::Iop(Operation::Omove, Arc::new(vec![slot]), destination))
             }
+            UnsafeHomeRewrite::ExtendLoad {
+                slot,
+                destination,
+                op,
+            } => Some(RTLInst::Iop(op, Arc::new(vec![slot]), destination)),
             UnsafeHomeRewrite::Lea {
                 entry_ofs,
                 destination,

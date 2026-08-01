@@ -17,6 +17,7 @@ use manifold::decompile::passes::pass::IRPass;
 use manifold::decompile::passes::rtl_optimize_pass::RTLOptimizePass;
 use manifold::decompile::passes::rtl_pass::RTLPass;
 use manifold::mreg::Mreg;
+use manifold::x86::asm::TestCond;
 use manifold::x86::op::{Addressing, Operation};
 use manifold::x86::types::{
     Address, CsharpminorExpr, CsharpminorStmt, LTLInst, MachInst, MemoryChunk, RTLInst, Symbol,
@@ -180,6 +181,117 @@ home_reassigned_cmp_reg:
         xorl %eax, %eax
         retq
 home_reassigned_cmp_reg_nonzero:
+        movl $1, %eax
+        retq
+
+        .globl home_reassigned_cmp_setcc
+        .def home_reassigned_cmp_setcc; .scl 2; .type 32; .endef
+home_reassigned_cmp_setcc:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        cmpq $0, 8(%rsp)
+        setne %al
+        movzbl %al, %eax
+        retq
+
+        .globl home_reassigned_cmp_reg_setcc
+        .def home_reassigned_cmp_reg_setcc; .scl 2; .type 32; .endef
+home_reassigned_cmp_reg_setcc:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        cmpq %r8, 8(%rsp)
+        sete %al
+        movzbl %al, %eax
+        retq
+
+        .globl home_reassigned_cmp_loop
+        .def home_reassigned_cmp_loop; .scl 2; .type 32; .endef
+home_reassigned_cmp_loop:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movq %r8, %rax
+home_reassigned_cmp_loop_again:
+        addq $1, %rax
+        cmpq 8(%rsp), %rax
+        jne home_reassigned_cmp_loop_again
+        retq
+
+        .globl home_cmp_after_alias_clobber
+        .def home_cmp_after_alias_clobber; .scl 2; .type 32; .endef
+home_cmp_after_alias_clobber:
+        movq %rsp, %rax
+        movq %r9, 32(%rax)
+        movq %r8, 24(%rax)
+        movq %rdx, 16(%rax)
+        movq %rcx, 8(%rax)
+        pushq %rbx
+        movq 8(%rax), %rax
+        xorl %ebx, %ebx
+home_cmp_after_alias_clobber_again:
+        incl %ebx
+        cmpq 40(%rsp), %rbx
+        jne home_cmp_after_alias_clobber_again
+        popq %rbx
+        retq
+
+        .globl home_reassigned_movsxd
+        .def home_reassigned_movsxd; .scl 2; .type 32; .endef
+home_reassigned_movsxd:
+        movl %ecx, 8(%rsp)
+        movl %edx, 8(%rsp)
+        movslq 8(%rsp), %rax
+        retq
+
+        .globl home_reassigned_movsx
+        .def home_reassigned_movsx; .scl 2; .type 32; .endef
+home_reassigned_movsx:
+        movw %cx, 8(%rsp)
+        movw %dx, 8(%rsp)
+        movswl 8(%rsp), %eax
+        retq
+
+        .globl home_reassigned_movzx
+        .def home_reassigned_movzx; .scl 2; .type 32; .endef
+home_reassigned_movzx:
+        movw %cx, 8(%rsp)
+        movw %dx, 8(%rsp)
+        movzwl 8(%rsp), %eax
+        retq
+
+        .globl home_partial_movzx_rejected
+        .def home_partial_movzx_rejected; .scl 2; .type 32; .endef
+home_partial_movzx_rejected:
+        movl %ecx, 8(%rsp)
+        movl %edx, 8(%rsp)
+        movzwl 8(%rsp), %eax
+        retq
+
+        .globl home_cmp_flag_clobber_rejected
+        .def home_cmp_flag_clobber_rejected; .scl 2; .type 32; .endef
+home_cmp_flag_clobber_rejected:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        cmpq $0, 8(%rsp)
+        addq $1, %r8
+        jne home_cmp_flag_clobber_rejected_nonzero
+        xorl %eax, %eax
+        retq
+home_cmp_flag_clobber_rejected_nonzero:
+        movl $1, %eax
+        retq
+
+        .globl home_cmp_scheduled_rejected
+        .def home_cmp_scheduled_rejected; .scl 2; .type 32; .endef
+home_cmp_scheduled_rejected:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        cmpq $0, 8(%rsp)
+        movq %r8, %r9
+        movq %rdx, %r8
+        jne home_cmp_scheduled_rejected_nonzero
+        xorl %eax, %eax
+        retq
+home_cmp_scheduled_rejected_nonzero:
         movl $1, %eax
         retq
 
@@ -2187,7 +2299,12 @@ fn assert_unsafe_home_cells_remain_storage(db: &DecompileDB) {
         .any(|(_, func, _, _)| *func == disjoint.0));
 }
 
-fn canonical_home_storage(db: &DecompileDB, name: &str) -> ((Address, Address), u64) {
+fn canonical_home_storage_at_position_with_type(
+    db: &DecompileDB,
+    name: &str,
+    expected_position: usize,
+    expected_type: XType,
+) -> ((Address, Address), u64) {
     let span = function_span(db, name);
     let storage: Vec<_> = db
         .rel_iter::<(Address, usize, u64)>("win64_home_storage")
@@ -2242,15 +2359,101 @@ fn canonical_home_storage(db: &DecompileDB, name: &str) -> ((Address, Address), 
         .iter()
         .map(|(node, ..)| (*node, rtl_candidates(db, *node)))
         .collect();
+    let cmp_reads: Vec<_> = db
+        .rel_iter::<(Address, Address, Symbol, Mreg, i64, usize, i64, usize)>(
+            "win64_home_scalar_cmp_read",
+        )
+        .filter(|(_, func, _, _, _, _, _, _)| *func == span.0)
+        .cloned()
+        .collect();
+    let branches: Vec<_> = db
+        .rel_iter::<(Address, TestCond, Symbol)>("pjcc")
+        .filter(|(node, _, _)| *node >= span.0 && *node < span.1)
+        .cloned()
+        .collect();
+    let next_edges: Vec<_> = db
+        .rel_iter::<(Address, Address)>("next")
+        .filter(|(source, _)| *source >= span.0 && *source < span.1)
+        .copied()
+        .collect();
+    let resolved_symbols: Vec<_> = db
+        .rel_iter::<(Symbol, Address)>("symbol_resolved_addr")
+        .filter(|(_, address)| *address >= span.0 && *address < span.1)
+        .cloned()
+        .collect();
+    let cmp_consumers: Vec<_> = db
+        .rel_iter::<(Address, Address)>("win64_home_cmp_jcc_consumer")
+        .filter(|(source, _)| *source >= span.0 && *source < span.1)
+        .copied()
+        .collect();
+    let owners: Vec<_> = db
+        .rel_iter::<(Address, Address)>("instr_in_function")
+        .filter(|(node, _)| *node >= span.0 && *node < span.1)
+        .copied()
+        .collect();
+    let cmp_operands: Vec<_> = db
+        .rel_iter::<(Address, Symbol, Symbol)>("pcmp")
+        .filter(|(node, _, _)| *node >= span.0 && *node < span.1)
+        .cloned()
+        .collect();
+    let operand_symbols: HashSet<_> = cmp_operands
+        .iter()
+        .flat_map(|(_, left, right)| [*left, *right])
+        .collect();
+    let register_operands: Vec<_> = db
+        .rel_iter::<(Symbol, &'static str)>("op_register")
+        .filter(|(symbol, _)| operand_symbols.contains(symbol))
+        .cloned()
+        .collect();
+    let immediate_operands: Vec<_> = db
+        .rel_iter::<(Symbol, i64, usize)>("op_immediate")
+        .filter(|(symbol, _, _)| operand_symbols.contains(symbol))
+        .cloned()
+        .collect();
+    let unsupported: Vec<_> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .filter(|(func, _, _)| *func == span.0)
+        .cloned()
+        .collect();
+    let unsupported_details: Vec<_> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail")
+        .filter(|(func, _, _)| *func == span.0)
+        .cloned()
+        .collect();
+    let overlaps: Vec<_> = db
+        .rel_iter::<(Address, Address, usize)>("win64_home_overlap")
+        .filter(|(_, func, pos)| *func == span.0 && *pos == 0)
+        .copied()
+        .collect();
+    let owned_blocks: HashSet<_> = db
+        .rel_iter::<(Address, Address)>("block_in_function")
+        .filter_map(|(block, func)| (*func == span.0).then_some(*block))
+        .collect();
+    let block_code: Vec<_> = db
+        .rel_iter::<(Address, Address)>("code_in_block")
+        .filter(|(_, block)| owned_blocks.contains(block))
+        .copied()
+        .collect();
     assert_eq!(
         storage.len(),
         1,
         "{name} must have one canonical mutable home cell: {storage:#x?}; \
          vetoes={vetoes:#x?}; accesses={accesses:#x?}; stores={stores:#x?}; \
          loads={loads:#x?}; arith={arith:#x?}; reaching={reaching:#x?}; \
-         candidates={candidate_rows:#x?}"
+         candidates={candidate_rows:#x?}; cmp_reads={cmp_reads:#x?}; \
+         branches={branches:#x?}; next={next_edges:#x?}; \
+         resolved_symbols={resolved_symbols:#x?}; \
+         cmp_consumers={cmp_consumers:#x?}; owners={owners:#x?}; \
+         cmp_operands={cmp_operands:#x?}; register_operands={register_operands:#x?}; \
+         immediate_operands={immediate_operands:#x?}; unsupported={unsupported:#x?}; \
+         unsupported_details={unsupported_details:#x?}; \
+         overlaps={overlaps:#x?}; owned_blocks={owned_blocks:#x?}; \
+         block_code={block_code:#x?}"
     );
-    assert_eq!(storage[0].0, 0, "{name} used the wrong home ordinal");
+    assert_eq!(
+        storage[0].0, expected_position,
+        "{name} used the wrong home ordinal"
+    );
     assert!(
         !db.rel_iter::<(Address, Address, i64, u64)>("stack_var")
             .any(|(func, _, _, reg)| *func == span.0 && *reg == storage[0].1),
@@ -2262,17 +2465,30 @@ fn canonical_home_storage(db: &DecompileDB, name: &str) -> ((Address, Address), 
         .collect();
     assert_eq!(
         types,
-        HashSet::from([XType::Xany64]),
-        "{name} canonical qword cell inherited a narrow/incompatible peer type"
+        HashSet::from([expected_type]),
+        "{name} canonical cell inherited an incompatible peer type"
     );
     (span, storage[0].1)
 }
 
-fn assert_home_accesses_use_slot(
+fn canonical_home_storage_with_type(
+    db: &DecompileDB,
+    name: &str,
+    expected_type: XType,
+) -> ((Address, Address), u64) {
+    canonical_home_storage_at_position_with_type(db, name, 0, expected_type)
+}
+
+fn canonical_home_storage(db: &DecompileDB, name: &str) -> ((Address, Address), u64) {
+    canonical_home_storage_with_type(db, name, XType::Xany64)
+}
+
+fn assert_home_accesses_use_slot_at_position(
     db: &DecompileDB,
     name: &str,
     span: (Address, Address),
     slot: u64,
+    expected_position: usize,
 ) {
     let accesses: Vec<_> = db
         .rel_iter::<(Address, Address, Mreg, i64, usize, i64)>("win64_unsafe_home_access")
@@ -2284,9 +2500,13 @@ fn assert_home_accesses_use_slot(
         "{name} lost unsafe-home access evidence"
     );
     for (address, _, _, _, pos, entry_offset) in accesses {
-        assert_eq!(pos, 0, "{name} access used the wrong home ordinal");
         assert_eq!(
-            entry_offset, 8,
+            pos, expected_position,
+            "{name} access used the wrong home ordinal"
+        );
+        assert_eq!(
+            entry_offset,
+            8 + expected_position as i64 * 8,
             "{name} access was not normalized to entry-SP coordinates"
         );
         let rtl = rtl_candidates(db, address);
@@ -2299,6 +2519,16 @@ fn assert_home_accesses_use_slot(
             RTLInst::Iop(Operation::Omove, args, destination) => {
                 *destination == slot || args.as_ref() == &[slot]
             }
+            RTLInst::Iop(
+                Operation::Ocast8signed
+                | Operation::Ocast8unsigned
+                | Operation::Ocast16signed
+                | Operation::Ocast16unsigned
+                | Operation::Ocast32signed,
+                args,
+                _,
+            ) => args.as_ref() == &[slot],
+            RTLInst::Iop(Operation::Ocmp(_), args, _) => args.contains(&slot),
             RTLInst::Iop(Operation::Oleal(Addressing::Ainstack(8)), args, _) => {
                 args.is_empty()
                     && db
@@ -2321,6 +2551,15 @@ fn assert_home_accesses_use_slot(
             "{name} retained stale raw stack_var evidence at rewritten node {address:#x}"
         );
     }
+}
+
+fn assert_home_accesses_use_slot(
+    db: &DecompileDB,
+    name: &str,
+    span: (Address, Address),
+    slot: u64,
+) {
+    assert_home_accesses_use_slot_at_position(db, name, span, slot, 0);
 }
 
 fn assert_canonical_unsafe_home_storage(db: &DecompileDB) {
@@ -2356,6 +2595,119 @@ fn assert_canonical_unsafe_home_storage(db: &DecompileDB) {
         reassigned_cmp_reg,
         reassigned_cmp_reg_slot,
     );
+
+    for name in [
+        "home_reassigned_cmp_setcc",
+        "home_reassigned_cmp_reg_setcc",
+    ] {
+        let (span, slot) = canonical_home_storage(db, name);
+        assert_home_accesses_use_slot(db, name, span, slot);
+        let compare = db
+            .rel_iter::<(Address, Address, Symbol, Mreg, i64, usize, i64, usize)>(
+                "win64_home_scalar_cmp_read",
+            )
+            .find(|(_, func, _, _, _, _, _, _)| *func == span.0)
+            .unwrap_or_else(|| panic!("{name} lost its structured comparison shape"));
+        assert!(
+            rtl_candidates(db, compare.0).iter().any(|inst| match inst {
+                RTLInst::Iop(Operation::Ocmp(_), args, _) => args.contains(&slot),
+                _ => false,
+            }),
+            "{name} SETcc comparison did not consume canonical storage"
+        );
+        let setcc = db
+            .rel_iter::<(Address, Address)>("next")
+            .find_map(|(source, destination)| {
+                (*source == compare.0
+                    && db
+                        .rel_iter::<(Address, TestCond)>("setcc_testcond")
+                        .any(|(node, _)| node == destination))
+                .then_some(*destination)
+            })
+            .unwrap_or_else(|| panic!("{name} lost its adjacent SETcc consumer"));
+        assert!(
+            rtl_candidates(db, setcc).is_empty(),
+            "{name} retained a stale SETcc candidate after fusing its home comparison"
+        );
+        let fallthrough = db
+            .rel_iter::<(Address, Address)>("next")
+            .find_map(|(source, destination)| (*source == setcc).then_some(*destination))
+            .unwrap_or_else(|| panic!("{name} SETcc lost its decoded fallthrough"));
+        let successors: HashSet<_> = db
+            .rel_iter::<(Address, Address)>("rtl_succ_candidate")
+            .filter_map(|(source, destination)| (*source == compare.0).then_some(*destination))
+            .collect();
+        assert!(
+            successors.contains(&fallthrough) && !successors.contains(&setcc),
+            "{name} did not bypass its consumed adjacent SETcc: {successors:#x?}"
+        );
+    }
+
+    let (cmp_loop_span, cmp_loop_slot) =
+        canonical_home_storage(db, "home_reassigned_cmp_loop");
+    assert_home_accesses_use_slot(
+        db,
+        "home_reassigned_cmp_loop",
+        cmp_loop_span,
+        cmp_loop_slot,
+    );
+    let (alias_cmp_span, alias_cmp_slot) = canonical_home_storage_at_position_with_type(
+        db,
+        "home_cmp_after_alias_clobber",
+        3,
+        XType::Xany64,
+    );
+    assert_home_accesses_use_slot_at_position(
+        db,
+        "home_cmp_after_alias_clobber",
+        alias_cmp_span,
+        alias_cmp_slot,
+        3,
+    );
+
+    for (name, expected_type, expected_op) in [
+        (
+            "home_reassigned_movsxd",
+            XType::Xint,
+            Operation::Ocast32signed,
+        ),
+        (
+            "home_reassigned_movsx",
+            XType::Xint16unsigned,
+            Operation::Ocast16signed,
+        ),
+        (
+            "home_reassigned_movzx",
+            XType::Xint16unsigned,
+            Operation::Ocast16unsigned,
+        ),
+    ] {
+        let (span, slot) = canonical_home_storage_with_type(db, name, expected_type);
+        assert_home_accesses_use_slot(db, name, span, slot);
+        let extend = db
+            .rel_iter::<(
+                Address,
+                Address,
+                Mreg,
+                i64,
+                usize,
+                i64,
+                Mreg,
+                usize,
+                Operation,
+            )>("win64_home_scalar_extend_load")
+            .find(|(_, func, _, _, _, _, _, _, op)| {
+                *func == span.0 && op == &expected_op
+            })
+            .unwrap_or_else(|| panic!("{name} lost its extending-load shape"));
+        assert!(
+            rtl_candidates(db, extend.0).iter().any(|inst| {
+                matches!(inst, RTLInst::Iop(op, args, _)
+                    if op == &expected_op && args.as_ref() == &[slot])
+            }),
+            "{name} did not cast from canonical storage"
+        );
+    }
 
     let (reassigned_add, reassigned_add_slot) =
         canonical_home_storage(db, "home_reassigned_add");
@@ -2682,19 +3034,25 @@ fn assert_postsub_escaped_offset_keeps_ordinary_origin(db: &DecompileDB) {
 }
 
 fn assert_optimized_canonical_homes(db: &DecompileDB) {
-    for name in [
-        "home_reassigned",
-        "home_reassigned_cmp",
-        "home_reassigned_cmp_reg",
-        "home_reassigned_add",
-        "home_mixed_base_clobber",
-        "home_alias_call_escape",
-        "home_alias_arith_clobber",
+    for (name, position) in [
+        ("home_reassigned", 0),
+        ("home_reassigned_cmp", 0),
+        ("home_reassigned_cmp_reg", 0),
+        ("home_reassigned_cmp_setcc", 0),
+        ("home_reassigned_cmp_reg_setcc", 0),
+        ("home_reassigned_cmp_loop", 0),
+        ("home_cmp_after_alias_clobber", 3),
+        ("home_reassigned_add", 0),
+        ("home_mixed_base_clobber", 0),
+        ("home_alias_call_escape", 0),
+        ("home_alias_arith_clobber", 0),
     ] {
         let span = function_span(db, name);
         let slot = db
             .rel_iter::<(Address, usize, u64)>("win64_home_storage")
-            .find_map(|(func, pos, slot)| (*func == span.0 && *pos == 0).then_some(*slot))
+            .find_map(|(func, pos, slot)| {
+                (*func == span.0 && *pos == position).then_some(*slot)
+            })
             .unwrap_or_else(|| panic!("{name} lost canonical storage after RTLOptimize"));
         let types: HashSet<_> = db
             .rel_iter::<(u64, XType)>("emit_var_type_candidate")
@@ -2730,6 +3088,10 @@ fn assert_optimized_canonical_homes(db: &DecompileDB) {
                     // That is safe; only a reintroduced raw stack identity is not.
                     || matches!(inst,
                         RTLInst::Icond(_, args, _, _)
+                            if args.contains(&slot)
+                                || args.iter().all(|arg| !raw_stack_regs.contains(arg)))
+                    || matches!(inst,
+                        RTLInst::Iop(Operation::Ocmp(_), args, _)
                             if args.contains(&slot)
                                 || args.iter().all(|arg| !raw_stack_regs.contains(arg))),
                 "{name} reintroduced split/raw storage at {node:#x}: {inst:#x?}"
@@ -2790,14 +3152,14 @@ fn assert_post_type_canonical_homes(db: &DecompileDB) {
             .rel_iter::<(u64, XType)>("win64_home_slot_type")
             .filter_map(|(reg, xtype)| (*reg == slot).then_some(*xtype))
             .collect();
-        assert_eq!(locked, vec![XType::Xany64], "wrong qword home type lock");
+        assert_eq!(locked.len(), 1, "canonical home must have one type lock");
         let candidates: HashSet<_> = db
             .rel_iter::<(u64, XType)>("emit_var_type_candidate")
             .filter_map(|(reg, xtype)| (*reg == slot).then_some(*xtype))
             .collect();
         assert_eq!(
             candidates,
-            HashSet::from([XType::Xany64]),
+            HashSet::from([locked[0]]),
             "TypePass Omove propagation contaminated canonical home slot {slot:#x}"
         );
     }
@@ -3377,6 +3739,9 @@ fn assert_home_safety_vetoes(db: &DecompileDB) {
         ("home_conditional_spill_reload", Mreg::CX),
         ("home_wide_overlap", Mreg::CX),
         ("home_escape_numeric_use", Mreg::CX),
+        ("home_partial_movzx_rejected", Mreg::CX),
+        ("home_cmp_flag_clobber_rejected", Mreg::CX),
+        ("home_cmp_scheduled_rejected", Mreg::CX),
     ] {
         let span = function_span(db, name);
         assert!(
@@ -3407,6 +3772,9 @@ fn assert_home_safety_vetoes(db: &DecompileDB) {
         "home_partial_reload",
         "home_xchg_mutation",
         "home_wide_overlap",
+        "home_partial_movzx_rejected",
+        "home_cmp_flag_clobber_rejected",
+        "home_cmp_scheduled_rejected",
     ] {
         let span = function_span(db, name);
         let unsafe_overlaps: Vec<_> = db
@@ -3710,6 +4078,13 @@ fn assert_final_output_compiles(object: &Path) {
         "home_escape_mutated",
         "home_reassigned_cmp",
         "home_reassigned_cmp_reg",
+        "home_reassigned_cmp_setcc",
+        "home_reassigned_cmp_reg_setcc",
+        "home_reassigned_cmp_loop",
+        "home_cmp_after_alias_clobber",
+        "home_reassigned_movsxd",
+        "home_reassigned_movsx",
+        "home_reassigned_movzx",
         "home_reassigned_add",
         "home_import_tailcall",
         "fifth_inc",
