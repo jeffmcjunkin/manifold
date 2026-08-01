@@ -23,6 +23,8 @@ __builtin_ctzll
 __builtin_nop
 __builtin_unreachable
 __readcr8
+__readgsdword
+__readgsqword
 __int2c
 __fastfail
 __compcert_i64_umulh

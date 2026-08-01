@@ -1314,19 +1314,32 @@ pub(crate) fn default_void_ptr_type() -> ClightType {
 }
 
 /// Give ABI-significant compiler intrinsics an actual callable Clight type.
-/// Most historical builtins retain the existing untyped representation; the
-/// fast-fail intrinsic is special because its implicit ECX input and void,
-/// noreturn result are architectural semantics rather than a guessed C call.
+/// Most historical builtins retain the existing untyped representation.
+/// Fast-fail needs its implicit ECX input and void result, while the GS reads
+/// need their width-specific result and unsigned 32-bit offset argument.
 fn builtin_callee_type(name: &str) -> ClightType {
-    if name == "__fastfail" {
-        clight_function_pointer_type(&Signature {
+    let signature = match name {
+        "__fastfail" => Some(Signature {
             sig_args: Arc::new(vec![XType::Xint]),
             sig_res: XType::Xvoid,
             sig_cc: CallConv::default(),
-        })
-    } else {
-        default_void_ptr_type()
-    }
+        }),
+        "__readgsdword" => Some(Signature {
+            sig_args: Arc::new(vec![XType::Xintunsigned]),
+            sig_res: XType::Xintunsigned,
+            sig_cc: CallConv::default(),
+        }),
+        "__readgsqword" => Some(Signature {
+            sig_args: Arc::new(vec![XType::Xintunsigned]),
+            sig_res: XType::Xlongunsigned,
+            sig_cc: CallConv::default(),
+        }),
+        _ => None,
+    };
+    signature
+        .as_ref()
+        .map(clight_function_pointer_type)
+        .unwrap_or_else(default_void_ptr_type)
 }
 
 fn extract_vars_from_csharp_expr(expr: &CsharpminorExpr, vars: &mut Vec<RTLReg>) {

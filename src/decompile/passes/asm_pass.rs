@@ -96,6 +96,14 @@ fn is_unmodeled_segment(name: &str) -> bool {
     matches!(name, "FS" | "GS")
 }
 
+fn readgs_builtin_for_size(size: usize) -> Option<&'static str> {
+    match size {
+        4 => Some("__readgsdword"),
+        8 => Some("__readgsqword"),
+        _ => None,
+    }
+}
+
 fn chunk_from_mnem(mnem: &str) -> MemoryChunk {
     let m = mnem.to_ascii_uppercase();
     if m.contains("MOVB") || m.ends_with('B') {
@@ -750,6 +758,36 @@ ascent_par! {
 
     #[local] relation unsafe_stack_access(Address, Address, Symbol);
 
+    // MSVC exposes an exact, width-preserving lowering for the one segment
+    // form whose full address is representable in source: a read-only MOV
+    // from GS:[constant] into a full general-purpose register.  Only dword and
+    // qword MOVs qualify: the Mach register file collapses AL/AX into AX, so a
+    // byte/word MOV would incorrectly discard the preserved upper bits.  Keep
+    // the proof on the decoded operand itself so an instruction with any
+    // additional segmented operand remains rejected.  FS, a base/index
+    // register, stores/RMW operations, negative offsets, and non-MOV forms
+    // deliberately stay on the structured unsupported path below.
+    relation lowered_gs_absolute_read(Address, Symbol);
+    mach_inst(addr, MachInst::Mbuiltin(
+        (*name).to_string(),
+        vec![BuiltinArg::BAInt(*disp)],
+        BuiltinArg::BA(dst_reg),
+    )),
+    lowered_gs_absolute_read(*addr, *src) <--
+        instruction(addr, _, _, "MOV", src, dst, _, _, _, _),
+        op_indirect(src, "GS", base, index, scale, disp, size),
+        if is_no_address_register(base) && is_no_address_register(index),
+        if *scale == 1,
+        // BAInt is rendered as a signed Clight int.  Keep the immediate in
+        // that lossless range rather than allowing its conversion helper to
+        // clamp a larger unsigned offset.
+        if *disp >= 0 && *disp <= i32::MAX as i64,
+        op_register(dst, dst_name),
+        let dst_reg = Mreg::x86(dst_name),
+        if dst_reg != Mreg::Unknown && dst_reg != Mreg::SP,
+        if let Some(name) = readgs_builtin_for_size(*size),
+        builtins(name);
+
     // Only these binary integer memory-source forms have the dedicated
     // three-node indexed-RSP lowering in RTL. A frame proof establishes the
     // coordinate, not support for every opcode or for RSP as index/destination.
@@ -780,17 +818,18 @@ ascent_par! {
         if args.len() == 2 && args[0] == Mreg::SP && args[1] != Mreg::SP,
         if matches!(addressing, Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _));
 
-    // FS/GS contribute a segment base that none of the Mach/RTL addressing
-    // forms represent.  In particular, an operand such as fs:[rsp+N] is not
-    // the ordinary stack/home cell at [rsp+N].  Reject every explicit FS/GS
-    // memory operand at the shared structured-address boundary until segment
-    // bases become first-class, rather than allowing a lowering rule that
-    // ignores the segment column to scalarize it.
+    // FS/GS contribute a segment base that ordinary Mach/RTL addressing does
+    // not represent.  In particular, an operand such as fs:[rsp+N] is not the
+    // ordinary stack/home cell at [rsp+N].  The exact GS:[constant] MOV-read
+    // intrinsic above is the sole exception; reject every other explicit
+    // segment form rather than allowing a generic lowering rule to ignore the
+    // segment column and scalarize it.
     unsafe_stack_access(*func, *addr, "unmodeled-segment") <--
         instr_in_function(addr, func),
         raw_operand_at(addr, operand),
         op_indirect(operand, segment, _, _, _, _, _),
-        if is_unmodeled_segment(segment);
+        if is_unmodeled_segment(segment),
+        !lowered_gs_absolute_read(addr, operand);
 
     unsafe_stack_access(*func, *addr, "rsp-coordinate-unknown") <--
         instr_in_function(addr, func),
@@ -9208,10 +9247,12 @@ fn normalize_addr32_asm_outputs(db: &mut DecompileDB) {
     db.rel_set("float_load_op", float_loads);
 }
 
-// Segment-relative memory cannot be represented by Mach addressing.  The
-// declarative seed above makes the site structured-unsupported; removing its
-// Mach interpretation here also prevents a direct FS/GS stack MOV from first
-// becoming Mgetstack/Msetstack (and later an ordinary scalar/home-slot move).
+// Generic segment-relative memory cannot be represented by Mach addressing.
+// The declarative seed above makes unsupported forms structured-unsupported;
+// removing their Mach interpretations here also prevents a direct FS/GS stack
+// MOV from first becoming Mgetstack/Msetstack.  At the one proved
+// GS:[constant] read form, retain only the dedicated intrinsic and discard any
+// competing generic Mload inferred while rules ignored the segment column.
 fn suppress_unmodeled_segment_mach_outputs(db: &mut DecompileDB) {
     let segmented_operands: BTreeSet<Symbol> = db
         .rel_iter::<(
@@ -9228,6 +9269,11 @@ fn suppress_unmodeled_segment_mach_outputs(db: &mut DecompileDB) {
     if segmented_operands.is_empty() {
         return;
     }
+
+    let lowered_reads: BTreeSet<Address> = db
+        .rel_iter::<(Address, Symbol)>("lowered_gs_absolute_read")
+        .map(|(address, _)| *address)
+        .collect();
 
     let segmented_addresses: BTreeSet<Address> = db
         .rel_iter::<(
@@ -9252,7 +9298,13 @@ fn suppress_unmodeled_segment_mach_outputs(db: &mut DecompileDB) {
 
     let mach: ascent::boxcar::Vec<(Address, MachInst)> = db
         .rel_iter::<(Address, MachInst)>("mach_inst")
-        .filter(|(address, _)| !segmented_addresses.contains(address))
+        .filter(|(address, inst)| {
+            if !segmented_addresses.contains(address) {
+                return true;
+            }
+            lowered_reads.contains(address)
+                && matches!(inst, MachInst::Mbuiltin(name, _, _) if name.starts_with("__readgs"))
+        })
         .cloned()
         .collect();
     db.rel_set("mach_inst", mach);
@@ -9931,6 +9983,174 @@ mod privileged_instruction_tests {
         assert!(db
             .rel_iter::<(Address, Mreg)>("reg_use")
             .any(|row| *row == (INT29_ADDR, Mreg::CX)));
+        });
+    }
+
+    #[test]
+    fn only_absolute_read_only_gs_moves_lower_to_msvc_intrinsics() {
+        on_pipeline_stack(|| {
+            const FUNCTION: Address = 0x2000;
+            const END: Address = 0x2100;
+            const UNSAFE_PARTIAL_BYTE: Address = 0x2010;
+            const UNSAFE_PARTIAL_WORD: Address = 0x2020;
+            const SAFE_DWORD: Address = 0x2030;
+            const SAFE_QWORD: Address = 0x2040;
+            const UNSAFE_FS: Address = 0x2050;
+            const UNSAFE_BASE: Address = 0x2060;
+            const UNSAFE_STORE: Address = 0x2070;
+            const UNSAFE_NEGATIVE: Address = 0x2080;
+            const UNSAFE_RSP_DST: Address = 0x2090;
+            const UNSAFE_RMW: Address = 0x20a0;
+            const UNSAFE_LARGE_OFFSET: Address = 0x20b0;
+
+            let mut db = DecompileDB::default();
+            db.target_abi = Some(crate::abi::AbiConfig::win64());
+            for name in ["__readgsdword", "__readgsqword"] {
+                db.rel_push("builtins", (name,));
+            }
+
+            let registers = [
+                ("gs_test_al", "AL"),
+                ("gs_test_ax", "AX"),
+                ("gs_test_eax", "EAX"),
+                ("gs_test_rax", "RAX"),
+                ("gs_test_rsp", "RSP"),
+            ];
+            for (operand, name) in registers {
+                db.rel_push("op_register", (operand, name));
+            }
+
+            let memories: [
+                (
+                    Symbol,
+                    &'static str,
+                    &'static str,
+                    &'static str,
+                    i64,
+                    i64,
+                    usize,
+                );
+                11
+            ] = [
+                ("gs_test_byte", "GS", "NONE", "NONE", 1, 0x20, 1),
+                ("gs_test_word", "GS", "NONE", "NONE", 1, 0x30, 2),
+                ("gs_test_dword", "GS", "NONE", "NONE", 1, 0x60, 4),
+                ("gs_test_qword", "GS", "NONE", "NONE", 1, 0x188, 8),
+                ("gs_test_fs", "FS", "NONE", "NONE", 1, 0x188, 8),
+                ("gs_test_base", "GS", "RAX", "NONE", 1, 8, 8),
+                ("gs_test_store", "GS", "NONE", "NONE", 1, 0x188, 8),
+                ("gs_test_negative", "GS", "NONE", "NONE", 1, -8, 8),
+                ("gs_test_rsp_dst", "GS", "NONE", "NONE", 1, 0x188, 8),
+                ("gs_test_rmw", "GS", "NONE", "NONE", 1, 0x188, 8),
+                (
+                    "gs_test_large_offset",
+                    "GS",
+                    "NONE",
+                    "NONE",
+                    1,
+                    i32::MAX as i64 + 1,
+                    8,
+                ),
+            ];
+            for memory in memories {
+                db.rel_push("op_indirect", memory);
+            }
+
+            let instructions = [
+                instruction(
+                    UNSAFE_PARTIAL_BYTE,
+                    9,
+                    "MOV",
+                    "gs_test_byte",
+                    "gs_test_al",
+                ),
+                instruction(
+                    UNSAFE_PARTIAL_WORD,
+                    9,
+                    "MOV",
+                    "gs_test_word",
+                    "gs_test_ax",
+                ),
+                instruction(SAFE_DWORD, 9, "MOV", "gs_test_dword", "gs_test_eax"),
+                instruction(SAFE_QWORD, 9, "MOV", "gs_test_qword", "gs_test_rax"),
+                instruction(UNSAFE_FS, 9, "MOV", "gs_test_fs", "gs_test_rax"),
+                instruction(UNSAFE_BASE, 5, "MOV", "gs_test_base", "gs_test_rax"),
+                instruction(UNSAFE_STORE, 9, "MOV", "gs_test_rax", "gs_test_store"),
+                instruction(UNSAFE_NEGATIVE, 9, "MOV", "gs_test_negative", "gs_test_rax"),
+                instruction(UNSAFE_RSP_DST, 9, "MOV", "gs_test_rsp_dst", "gs_test_rsp"),
+                instruction(UNSAFE_RMW, 9, "ADD", "gs_test_rax", "gs_test_rmw"),
+                instruction(
+                    UNSAFE_LARGE_OFFSET,
+                    9,
+                    "MOV",
+                    "gs_test_large_offset",
+                    "gs_test_rax",
+                ),
+            ];
+            db.rel_push("func_span", ("gs_test_function", FUNCTION, END));
+            for row in instructions {
+                let address = row.0;
+                db.rel_push("instruction", row);
+                db.rel_push("instr_in_function", (address, FUNCTION));
+            }
+
+            AsmPass.run(&mut db);
+
+            let expected = [
+                (SAFE_DWORD, "__readgsdword", 0x60, Mreg::AX),
+                (SAFE_QWORD, "__readgsqword", 0x188, Mreg::AX),
+            ];
+            for (address, name, offset, result) in expected {
+                assert_eq!(
+                    db.rel_iter::<(Address, MachInst)>("mach_inst")
+                        .filter(|(row_address, _)| *row_address == address)
+                        .map(|(_, inst)| inst.clone())
+                        .collect::<Vec<_>>(),
+                    vec![MachInst::Mbuiltin(
+                        name.to_string(),
+                        vec![BuiltinArg::BAInt(offset)],
+                        BuiltinArg::BA(result),
+                    )]
+                );
+                assert!(db
+                    .rel_iter::<(Address, Symbol)>("lowered_gs_absolute_read")
+                    .any(|(row_address, _)| *row_address == address));
+                assert!(!db
+                    .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address_seed")
+                    .any(|(_, row_address, _)| *row_address == address));
+                assert!(!db
+                    .rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail_seed")
+                    .any(|(_, row_address, _)| *row_address == address));
+            }
+
+            for address in [
+                UNSAFE_PARTIAL_BYTE,
+                UNSAFE_PARTIAL_WORD,
+                UNSAFE_FS,
+                UNSAFE_BASE,
+                UNSAFE_STORE,
+                UNSAFE_NEGATIVE,
+                UNSAFE_RSP_DST,
+                UNSAFE_RMW,
+                UNSAFE_LARGE_OFFSET,
+            ] {
+                assert!(!db
+                    .rel_iter::<(Address, MachInst)>("mach_inst")
+                    .any(|(row_address, inst)| {
+                        *row_address == address
+                            && matches!(inst, MachInst::Mbuiltin(name, _, _) if name.starts_with("__readgs"))
+                    }));
+                assert!(db
+                    .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address_seed")
+                    .any(|(_, row_address, reason)| {
+                        *row_address == address && *reason == "unsupported-stack-address"
+                    }));
+                assert!(db
+                    .rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail_seed")
+                    .any(|(_, row_address, reason)| {
+                        *row_address == address && *reason == "unmodeled-segment"
+                    }));
+            }
         });
     }
 

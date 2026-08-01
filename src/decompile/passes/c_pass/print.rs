@@ -833,25 +833,62 @@ impl Printer {
         let emit_readcr8 = self.config.integer_model == IntegerModel::MsvcLlp64
             && invoked_names.contains("__readcr8")
             && !has_local_definition("__readcr8");
+        let readgs_specs = [
+            ("__readgsdword", "unsigned long __readgsdword(unsigned long);"),
+            ("__readgsqword", "unsigned __int64 __readgsqword(unsigned long);"),
+        ];
+        let emit_readgs: Vec<_> = readgs_specs
+            .iter()
+            .copied()
+            .filter(|(name, _)| {
+                self.config.integer_model == IntegerModel::MsvcLlp64
+                    && invoked_names.contains(*name)
+                    && !has_local_definition(name)
+            })
+            .collect();
         let emit_int2c = self.config.integer_model == IntegerModel::MsvcLlp64
             && invoked_names.contains("__int2c")
             && !has_local_definition("__int2c");
         let emit_fastfail = self.config.integer_model == IntegerModel::MsvcLlp64
             && invoked_names.contains("__fastfail")
             && !has_local_definition("__fastfail");
-        if emit_readcr8 {
-            self.writeln("unsigned __int64 __readcr8(void);");
-            self.writeln("#pragma intrinsic(__readcr8)");
-        }
-        if emit_int2c {
-            self.writeln("void __int2c(void);");
-            self.writeln("#pragma intrinsic(__int2c)");
-        }
-        if emit_fastfail {
-            self.writeln("__declspec(noreturn) void __fastfail(unsigned int);");
-            self.writeln("#pragma intrinsic(__fastfail)");
-        }
-        if emit_readcr8 || emit_int2c || emit_fastfail {
+        let emit_privileged =
+            emit_readcr8 || !emit_readgs.is_empty() || emit_int2c || emit_fastfail;
+        if emit_privileged {
+            // VS2013's #pragma intrinsic lookup requires a C-linkage
+            // declaration even when the candidate is compiled as C++.  The
+            // preprocessor guard preserves the identical C declaration.
+            self.writeln("#ifdef __cplusplus");
+            self.writeln("extern \"C\" {");
+            self.writeln("#endif");
+            if emit_readcr8 {
+                self.writeln("unsigned __int64 __readcr8(void);");
+            }
+            for (_, declaration) in &emit_readgs {
+                self.writeln(declaration);
+            }
+            if emit_int2c {
+                self.writeln("void __int2c(void);");
+            }
+            if emit_fastfail {
+                self.writeln("__declspec(noreturn) void __fastfail(unsigned int);");
+            }
+            self.writeln("#ifdef __cplusplus");
+            self.writeln("}");
+            self.writeln("#endif");
+
+            if emit_readcr8 {
+                self.writeln("#pragma intrinsic(__readcr8)");
+            }
+            for (name, _) in &emit_readgs {
+                self.writeln(&format!("#pragma intrinsic({name})"));
+            }
+            if emit_int2c {
+                self.writeln("#pragma intrinsic(__int2c)");
+            }
+            if emit_fastfail {
+                self.writeln("#pragma intrinsic(__fastfail)");
+            }
             self.newline();
         }
 
@@ -885,6 +922,7 @@ impl Printer {
             let decl = &tu.decls[i];
             if matches!(decl, TopLevelDecl::FuncDecl(f)
                 if (emit_readcr8 && f.name == "__readcr8")
+                    || emit_readgs.iter().any(|(name, _)| f.name == *name)
                     || (emit_int2c && f.name == "__int2c")
                     || (emit_fastfail && f.name == "__fastfail"))
             {
@@ -1367,7 +1405,9 @@ mod tests {
             &translation_unit_calling(&["__int2c"]),
             crate::abi::BinaryFormat::Coff,
         );
-        assert!(output.contains("void __int2c(void);\n#pragma intrinsic(__int2c)\n"));
+        assert!(output.contains("void __int2c(void);"));
+        assert!(output.contains("#pragma intrinsic(__int2c)"));
+        assert!(output.contains("extern \"C\" {"));
         assert!(!output.contains("__readcr8"));
         assert!(!output.contains("__fastfail"));
         assert!(!output.contains("__assume(0);"));
@@ -1376,11 +1416,24 @@ mod tests {
     #[test]
     fn coff_emits_exact_privileged_intrinsic_preamble_once() {
         let output = print_translation_unit_for_format(
-            &translation_unit_calling(&["__readcr8", "__int2c", "__fastfail"]),
+            &translation_unit_calling(&[
+                "__readcr8",
+                "__readgsdword",
+                "__readgsqword",
+                "__int2c",
+                "__fastfail",
+            ]),
             crate::abi::BinaryFormat::Coff,
         );
         assert_eq!(output.matches("unsigned __int64 __readcr8(void);").count(), 1);
         assert_eq!(output.matches("#pragma intrinsic(__readcr8)").count(), 1);
+        assert_eq!(output.matches("unsigned long __readgsdword(unsigned long);").count(), 1);
+        assert_eq!(output.matches("unsigned __int64 __readgsqword(unsigned long);").count(), 1);
+        for name in ["__readgsdword", "__readgsqword"] {
+            assert_eq!(output.matches(&format!("#pragma intrinsic({name})")).count(), 1);
+        }
+        assert_eq!(output.matches("extern \"C\" {").count(), 1);
+        assert_eq!(output.matches("#ifdef __cplusplus").count(), 2);
         assert_eq!(output.matches("void __int2c(void);").count(), 1);
         assert_eq!(output.matches("#pragma intrinsic(__int2c)").count(), 1);
         assert_eq!(output.matches("__declspec(noreturn) void __fastfail(unsigned int);").count(), 1);
@@ -1391,11 +1444,17 @@ mod tests {
     #[test]
     fn privileged_intrinsic_preamble_is_msvc_only() {
         let output = print_translation_unit_for_format(
-            &translation_unit_calling(&["__readcr8", "__int2c", "__fastfail"]),
+            &translation_unit_calling(&[
+                "__readcr8",
+                "__readgsqword",
+                "__int2c",
+                "__fastfail",
+            ]),
             crate::abi::BinaryFormat::Elf,
         );
         assert!(!output.contains("#pragma intrinsic"));
         assert!(!output.contains("unsigned __int64 __readcr8(void);"));
+        assert!(!output.contains("unsigned __int64 __readgsqword(unsigned long);"));
         assert!(!output.contains("void __int2c(void);"));
         assert!(!output.contains("void __fastfail(unsigned int);"));
         assert!(!output.contains("__assume(0);"));
