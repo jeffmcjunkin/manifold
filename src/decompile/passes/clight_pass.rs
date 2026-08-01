@@ -1041,7 +1041,7 @@ impl IRPass for ClightFieldPass {
 
     fn run(&self, db: &mut DecompileDB) {
         rewrite_clight_stmts_with_struct_fields(db);
-        crate::decompile::passes::rtl_pass::enforce_win64_home_slot_types(db);
+        crate::decompile::passes::rtl_pass::enforce_win64_home_types(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -1063,6 +1063,9 @@ impl IRPass for ClightFieldPass {
             "stack_var",
             "emit_var_type_candidate",
             "win64_home_slot_type",
+            "win64_home_backing_access",
+            "win64_home_backing_selected_candidate",
+            "is_ptr",
         ]
     }
 
@@ -1075,6 +1078,7 @@ impl IRPass for ClightFieldPass {
             "reg_to_struct_id",
             "emit_struct_fields",
             "emit_var_type_candidate",
+            "is_ptr",
         ]
     }
 }

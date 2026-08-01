@@ -1321,7 +1321,10 @@ ascent_par! {
     pcmp(addr, dst, src)<--
         instruction(addr, _, _, "CMP", src, dst, _, _, _, _);
 
-    #[local] relation pcmov(Address, TestCond, Symbol, Symbol);
+    // Export the normalized condition/source form so RTL can attach a
+    // byte-addressable canonical stack object to a memory-source CMOV without
+    // repeating the decoder's mnemonic aliases.
+    relation pcmov(Address, TestCond, Symbol, Symbol);
 
     pcmov(addr, TestCond::CondE, dst, src) <--
         instruction(addr, _, _, inst, src, dst, _, _, _, _),
@@ -9738,7 +9741,7 @@ fn arith_result_testcond_ok(c: TestCond) -> bool {
 }
 
 // Returns true if the mnemonic modifies CPU flags; conservative (true when uncertain); used by gap-bridging rules to detect flag-safe instructions between CMP/TEST and CMOV.
-fn is_flag_setting(mnem: &str) -> bool {
+pub(crate) fn is_flag_setting(mnem: &str) -> bool {
     !matches!(
         mnem,
         "MOV"

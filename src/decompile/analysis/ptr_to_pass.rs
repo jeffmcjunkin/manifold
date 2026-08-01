@@ -237,7 +237,7 @@ impl IRPass for PtrToPass {
 
         run_pass!(db, PtrToPassProgram);
         emit_provenance_ptr_types(db);
-        crate::decompile::passes::rtl_pass::enforce_win64_home_slot_types(db);
+        crate::decompile::passes::rtl_pass::enforce_win64_home_types(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -248,7 +248,11 @@ impl IRPass for PtrToPass {
             "allocation_site",
             "call_site",
             "call_return_reg",
+            "emit_var_type_candidate",
             "win64_home_slot_type",
+            "win64_home_backing_access",
+            "win64_home_backing_selected_candidate",
+            "is_ptr",
         ];
         INPUTS
     }
@@ -260,6 +264,7 @@ impl IRPass for PtrToPass {
             "provenance_root",
             "provenance_edge",
             "provenance_chain",
+            "is_ptr",
         ];
         OUTPUTS
     }

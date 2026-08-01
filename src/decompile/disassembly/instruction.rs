@@ -158,6 +158,7 @@ fn disassemble_x86_sections(
     // operand ID preserves the full base/index/displacement/width row in
     // op_indirect so later stack-provenance analysis need not guess writes
     // from mnemonic position.
+    let mut decoded_memory_reads: Vec<(u64, &'static str)> = Vec::new();
     let mut decoded_memory_writes: Vec<(u64, &'static str)> = Vec::new();
     let mut reg_defs: Vec<(u64, Mreg)> = Vec::new();
     let mut reg_uses: Vec<(u64, Mreg)> = Vec::new();
@@ -322,8 +323,13 @@ fn disassemble_x86_sections(
                         op_indirects.push((id, seg, base, index, scale, disp, op.size as usize));
                         op_ids[i] = id;
 
-                        if !is_nop && op.access.map_or(false, |a| a.is_writable()) {
-                            decoded_memory_writes.push((addr, id));
+                        if !is_nop {
+                            if op.access.map_or(false, |a| a.is_readable()) {
+                                decoded_memory_reads.push((addr, id));
+                            }
+                            if op.access.map_or(false, |a| a.is_writable()) {
+                                decoded_memory_writes.push((addr, id));
+                            }
                         }
 
                         // Memory operand base/index registers count as reg_use
@@ -584,6 +590,13 @@ fn disassemble_x86_sections(
     db.rel_set(
         "stack_use",
         stack_uses.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    db.rel_set(
+        "decoded_memory_read_operand",
+        decoded_memory_reads
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
     );
 
     db.rel_set(

@@ -264,7 +264,7 @@ impl IRPass for StructuringPass {
             scond_no_join_rel.push(tuple);
         }
         db.rel_set("emit_scond_no_join", scond_no_join_rel);
-        crate::decompile::passes::rtl_pass::enforce_win64_home_slot_types(db);
+        crate::decompile::passes::rtl_pass::enforce_win64_home_types(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -283,6 +283,10 @@ impl IRPass for StructuringPass {
             "slot_escaped_canonical",
             "win64_home_escaped",
             "win64_home_slot_type",
+            "win64_home_backing_access",
+            "win64_home_backing_selected_candidate",
+            "rtl_inst",
+            "is_ptr",
         ]
     }
 
@@ -298,6 +302,7 @@ impl IRPass for StructuringPass {
             "emit_join_point",
             "emit_scond_no_join",
             "emit_var_type_candidate",
+            "is_ptr",
         ]
     }
 }

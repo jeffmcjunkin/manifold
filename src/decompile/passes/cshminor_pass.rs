@@ -3,7 +3,7 @@ use crate::decompile::passes::pass::IRPass;
 use crate::{declare_io_from, run_pass};
 
 use crate::decompile::passes::cminor_pass::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::mreg::Mreg;
@@ -60,6 +60,356 @@ pub enum LoopType {
 }
 use either::Either;
 
+const SYNTHETIC_NODE_MASK: Node = (1u64 << 62) | (1u64 << 63);
+
+// Keep byte offsets byte-scaled regardless of the backing local's declared
+// scalar type.  Csharpminor has no cast node dedicated to char pointers, so
+// carry &local through the existing 64-bit integer address path; Eload/Sstore
+// subsequently cast that numeric byte address to the authoritative chunk's
+// pointer type.
+fn home_backing_address(slot: RTLReg, byte_ofs: i64) -> CsharpminorExpr {
+    let base = CsharpminorExpr::Eunop(
+        CminorUnop::Olongofintu,
+        Box::new(CsharpminorExpr::Eaddrof(ident_from_reg(slot))),
+    );
+    if byte_ofs == 0 {
+        base
+    } else {
+        CsharpminorExpr::Ebinop(
+            CminorBinop::Oaddl,
+            Box::new(base),
+            Box::new(CsharpminorExpr::Econst(Constant::Olongconst(byte_ofs))),
+        )
+    }
+}
+
+fn rewrite_home_backing_expr(
+    expr: &CsharpminorExpr,
+    slot: RTLReg,
+    chunk: MemoryChunk,
+    address: &CsharpminorExpr,
+) -> CsharpminorExpr {
+    match expr {
+        CsharpminorExpr::Evar(reg) if *reg == slot => {
+            CsharpminorExpr::Eload(chunk, Box::new(address.clone()))
+        }
+        // One x86 instruction has at most one decoded memory operand.  At an
+        // authenticated backing-access node, an explicit load is that operand
+        // even when ordinary stack lowering did not first scalarize it.
+        CsharpminorExpr::Eload(_, _) => {
+            CsharpminorExpr::Eload(chunk, Box::new(address.clone()))
+        }
+        CsharpminorExpr::Eunop(op, inner) => CsharpminorExpr::Eunop(
+            op.clone(),
+            Box::new(rewrite_home_backing_expr(inner, slot, chunk, address)),
+        ),
+        CsharpminorExpr::Ebinop(op, left, right) => CsharpminorExpr::Ebinop(
+            op.clone(),
+            Box::new(rewrite_home_backing_expr(left, slot, chunk, address)),
+            Box::new(rewrite_home_backing_expr(right, slot, chunk, address)),
+        ),
+        CsharpminorExpr::Econdition(condition, if_true, if_false) => {
+            CsharpminorExpr::Econdition(
+                Box::new(rewrite_home_backing_expr(
+                    condition, slot, chunk, address,
+                )),
+                Box::new(rewrite_home_backing_expr(if_true, slot, chunk, address)),
+                Box::new(rewrite_home_backing_expr(if_false, slot, chunk, address)),
+            )
+        }
+        _ => expr.clone(),
+    }
+}
+
+fn rewrite_home_backing_builtin(
+    arg: &BuiltinArg<CsharpminorExpr>,
+    slot: RTLReg,
+    chunk: MemoryChunk,
+    address: &CsharpminorExpr,
+) -> BuiltinArg<CsharpminorExpr> {
+    match arg {
+        BuiltinArg::BA(expr) => BuiltinArg::BA(rewrite_home_backing_expr(
+            expr, slot, chunk, address,
+        )),
+        BuiltinArg::BASplitLong(left, right) => BuiltinArg::BASplitLong(
+            Box::new(rewrite_home_backing_builtin(left, slot, chunk, address)),
+            Box::new(rewrite_home_backing_builtin(right, slot, chunk, address)),
+        ),
+        BuiltinArg::BAAddPtr(left, right) => BuiltinArg::BAAddPtr(
+            Box::new(rewrite_home_backing_builtin(left, slot, chunk, address)),
+            Box::new(rewrite_home_backing_builtin(right, slot, chunk, address)),
+        ),
+        _ => arg.clone(),
+    }
+}
+
+fn rewrite_home_backing_stmt(
+    stmt: &CsharpminorStmt,
+    slot: RTLReg,
+    byte_ofs: i64,
+    chunk: MemoryChunk,
+    read: bool,
+    write: bool,
+    address_only: bool,
+) -> CsharpminorStmt {
+    let address = home_backing_address(slot, byte_ofs);
+    if address_only {
+        return match stmt {
+            CsharpminorStmt::Sset(destination, _) => {
+                let value = if byte_ofs == 0 {
+                    CsharpminorExpr::Eaddrof(ident_from_reg(slot))
+                } else {
+                    address
+                };
+                CsharpminorStmt::Sset(*destination, value)
+            }
+            _ => stmt.clone(),
+        };
+    }
+
+    let expr = |value: &CsharpminorExpr| {
+        if read {
+            rewrite_home_backing_expr(value, slot, chunk, &address)
+        } else {
+            value.clone()
+        }
+    };
+    match stmt {
+        CsharpminorStmt::Sset(destination, value) if write && *destination == slot => {
+            CsharpminorStmt::Sstore(chunk, address.clone(), expr(value))
+        }
+        CsharpminorStmt::Sset(destination, value) => {
+            CsharpminorStmt::Sset(*destination, expr(value))
+        }
+        CsharpminorStmt::Sstore(_, _, value) => {
+            CsharpminorStmt::Sstore(chunk, address.clone(), expr(value))
+        }
+        CsharpminorStmt::Scall(destination, signature, callee, args) => {
+            let callee = match callee {
+                Either::Left(value) => Either::Left(expr(value)),
+                other => other.clone(),
+            };
+            CsharpminorStmt::Scall(
+                *destination,
+                signature.clone(),
+                callee,
+                args.iter().map(expr).collect(),
+            )
+        }
+        CsharpminorStmt::Stailcall(signature, callee, args) => {
+            let callee = match callee {
+                Either::Left(value) => Either::Left(expr(value)),
+                other => other.clone(),
+            };
+            CsharpminorStmt::Stailcall(
+                signature.clone(),
+                callee,
+                args.iter().map(expr).collect(),
+            )
+        }
+        CsharpminorStmt::Sbuiltin(destination, name, args, result) => {
+            CsharpminorStmt::Sbuiltin(
+                *destination,
+                name.clone(),
+                args.iter()
+                    .map(|arg| rewrite_home_backing_builtin(arg, slot, chunk, &address))
+                    .collect(),
+                rewrite_home_backing_builtin(result, slot, chunk, &address),
+            )
+        }
+        CsharpminorStmt::Scond(condition, args, if_true, if_false) => {
+            CsharpminorStmt::Scond(
+                condition.clone(),
+                args.iter().map(expr).collect(),
+                *if_true,
+                *if_false,
+            )
+        }
+        CsharpminorStmt::Sjumptable(value, targets) => {
+            CsharpminorStmt::Sjumptable(expr(value), targets.clone())
+        }
+        CsharpminorStmt::Sreturn(value) => CsharpminorStmt::Sreturn(expr(value)),
+        CsharpminorStmt::Sseq(statements) => CsharpminorStmt::Sseq(
+            statements
+                .iter()
+                .map(|statement| {
+                    rewrite_home_backing_stmt(
+                        statement,
+                        slot,
+                        byte_ofs,
+                        chunk,
+                        read,
+                        write,
+                        address_only,
+                    )
+                })
+                .collect(),
+        ),
+        CsharpminorStmt::Sifthenelse(condition, args, if_true, if_false) => {
+            CsharpminorStmt::Sifthenelse(
+                condition.clone(),
+                args.iter().map(expr).collect(),
+                Box::new(rewrite_home_backing_stmt(
+                    if_true,
+                    slot,
+                    byte_ofs,
+                    chunk,
+                    read,
+                    write,
+                    address_only,
+                )),
+                Box::new(rewrite_home_backing_stmt(
+                    if_false,
+                    slot,
+                    byte_ofs,
+                    chunk,
+                    read,
+                    write,
+                    address_only,
+                )),
+            )
+        }
+        CsharpminorStmt::Sloop(body) => CsharpminorStmt::Sloop(Box::new(
+            rewrite_home_backing_stmt(
+                body,
+                slot,
+                byte_ofs,
+                chunk,
+                read,
+                write,
+                address_only,
+            ),
+        )),
+        _ => stmt.clone(),
+    }
+}
+
+fn home_backing_candidate_reads(inst: &RTLInst, slot: RTLReg) -> bool {
+    match inst {
+        RTLInst::Iload(..) => true,
+        RTLInst::Iop(_, args, _) | RTLInst::Icond(_, args, _, _) => args.contains(&slot),
+        RTLInst::Istore(_, _, args, source) => {
+            args.contains(&slot) || *source == slot
+        }
+        _ => false,
+    }
+}
+
+fn home_backing_candidate_writes(inst: &RTLInst, slot: RTLReg) -> bool {
+    matches!(inst, RTLInst::Istore(..))
+        || matches!(inst, RTLInst::Iop(_, _, destination) if *destination == slot)
+}
+
+fn home_backing_candidate_takes_address(inst: &RTLInst) -> bool {
+    matches!(
+        inst,
+        RTLInst::Iop(
+            Operation::Olea(Addressing::Ainstack(_))
+                | Operation::Oleal(Addressing::Ainstack(_)),
+            _,
+            _
+        )
+    )
+}
+
+fn materialize_win64_home_backing(db: &mut DecompileDB) {
+    let mut accesses: BTreeMap<
+        Node,
+        BTreeSet<(RTLReg, i64, usize, MemoryChunk, bool, bool, bool)>,
+    > = BTreeMap::new();
+    for (node, slot, byte_ofs, width, chunk, read, write, address) in db
+        .rel_iter::<(
+            Node,
+            RTLReg,
+            i64,
+            usize,
+            MemoryChunk,
+            bool,
+            bool,
+            bool,
+        )>("win64_home_backing_access")
+    {
+        accesses.entry(*node).or_default().insert((
+            *slot,
+            *byte_ofs,
+            *width,
+            *chunk,
+            *read,
+            *write,
+            *address,
+        ));
+    }
+    if accesses.is_empty() {
+        return;
+    }
+    let mut selected: BTreeMap<Node, Vec<RTLInst>> = BTreeMap::new();
+    for (_, candidate, inst) in db.rel_iter::<(Node, Node, RTLInst)>(
+        "win64_home_backing_selected_candidate",
+    ) {
+        selected.entry(*candidate).or_default().push(inst.clone());
+    }
+    for rows in selected.values_mut() {
+        rows.sort_by_cached_key(|inst| format!("{inst:?}"));
+        rows.dedup();
+    }
+
+    let mut rewritten = Vec::new();
+    for (node, stmt) in db.rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt_candidate") {
+        let real = *node & !SYNTHETIC_NODE_MASK;
+        let Some(rows) = accesses.get(&real) else {
+            rewritten.push((*node, stmt.clone()));
+            continue;
+        };
+        // RTL selection admitted a backing cell only after proving exactly
+        // one cell/access interpretation at this real instruction.
+        let Some(&(slot, byte_ofs, _width, chunk, read, write, address)) =
+            rows.iter().next()
+        else {
+            rewritten.push((*node, stmt.clone()));
+            continue;
+        };
+        if rows.len() != 1 {
+            rewritten.push((*node, stmt.clone()));
+            continue;
+        }
+        let Some(candidate_rows) = selected.get(node) else {
+            rewritten.push((*node, stmt.clone()));
+            continue;
+        };
+        let Some(candidate) = candidate_rows.iter().next() else {
+            rewritten.push((*node, stmt.clone()));
+            continue;
+        };
+        if candidate_rows.len() != 1 {
+            rewritten.push((*node, stmt.clone()));
+            continue;
+        }
+        let candidate_read = read && home_backing_candidate_reads(candidate, slot);
+        let candidate_write = write && home_backing_candidate_writes(candidate, slot);
+        let candidate_address = address && home_backing_candidate_takes_address(candidate);
+        rewritten.push((
+            *node,
+            rewrite_home_backing_stmt(
+                stmt,
+                slot,
+                byte_ofs,
+                chunk,
+                candidate_read,
+                candidate_write,
+                candidate_address,
+            ),
+        ));
+    }
+    rewritten.sort_by_cached_key(|(node, stmt)| (*node, format!("{stmt:?}")));
+    rewritten.dedup();
+    db.rel_set(
+        "csharp_stmt_candidate",
+        rewritten
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+}
+
 ascent_par! {
     #![measure_rule_times]
 
@@ -91,6 +441,13 @@ ascent_par! {
     // rtl_pass export: node-keyed proof that this stack-address expression is
     // &one canonical Win64 home slot.  It intentionally carries no raw offset.
     relation win64_home_address(Node, RTLReg);
+    // rtl_pass export: a selected byte-range access through one canonical
+    // eight-byte home backing local.  The final booleans are
+    // (memory-readable, memory-writable, address-only).
+    relation win64_home_backing_access(
+        Node, RTLReg, i64, usize, MemoryChunk, bool, bool, bool
+    );
+    relation win64_home_backing_selected_candidate(Node, Node, RTLInst);
     // rtl_pass export: the single escaped canonical local per (func, offset), used to resolve synthetic-only stack loads that have no per-node stack_var.
     relation slot_escaped_canonical(Address, i64, RTLReg);
     // Noreturn recognition inputs: the always-noreturn symbol set, single-def constants for resolving an error-family status arg, and function_noreturn for user-defined wrappers.
@@ -1078,6 +1435,7 @@ impl IRPass for CshminorPass {
         Self::prepare_jump_tables(db);
 
         run_pass!(db, CshminorPassProgram);
+        materialize_win64_home_backing(db);
     }
 
     fn extra_reads(&self) -> &'static [&'static str] {
@@ -1087,6 +1445,8 @@ impl IRPass for CshminorPass {
             "jump_table_cmp",
             "jump_table_index_reg",
             "reg_rtl",
+            "win64_home_backing_access",
+            "win64_home_backing_selected_candidate",
         ]
     }
 

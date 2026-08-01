@@ -1,7 +1,7 @@
 use crate::decompile::elevator::DecompileDB;
 use crate::run_pass;
 
-use crate::decompile::passes::asm_pass::transl_addressing_rev_sized;
+use crate::decompile::passes::asm_pass::{is_flag_setting, transl_addressing_rev_sized};
 use crate::decompile::passes::cminor_pass::*;
 use crate::decompile::passes::csh_pass::*;
 use crate::decompile::passes::pass::IRPass;
@@ -62,6 +62,86 @@ fn extending_load_operation(mnem: &str, size: usize) -> Option<Operation> {
     }
 }
 
+fn win64_home_natural_integer_chunk(width: usize) -> Option<MemoryChunk> {
+    match width {
+        1 => Some(MemoryChunk::MInt8Unsigned),
+        2 => Some(MemoryChunk::MInt16Unsigned),
+        4 => Some(MemoryChunk::MInt32),
+        8 => Some(MemoryChunk::MInt64),
+        _ => None,
+    }
+}
+
+fn win64_home_signed_integer_chunk(width: usize) -> Option<MemoryChunk> {
+    match width {
+        1 => Some(MemoryChunk::MInt8Signed),
+        2 => Some(MemoryChunk::MInt16Signed),
+        4 => Some(MemoryChunk::MInt32),
+        8 => Some(MemoryChunk::MInt64),
+        _ => None,
+    }
+}
+
+fn win64_home_integer_chunk_width(chunk: &MemoryChunk) -> Option<usize> {
+    match chunk {
+        MemoryChunk::MBool | MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned => Some(1),
+        MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned => Some(2),
+        MemoryChunk::MInt32 | MemoryChunk::MAny32 => Some(4),
+        MemoryChunk::MInt64 | MemoryChunk::MAny64 => Some(8),
+        MemoryChunk::MFloat32 | MemoryChunk::MFloat64 | MemoryChunk::Unknown => None,
+    }
+}
+
+fn win64_home_condition_is_signed(condition: &Condition) -> bool {
+    matches!(
+        condition,
+        Condition::Ccomp(_)
+            | Condition::Ccompimm(_, _)
+            | Condition::Ccompl(_)
+            | Condition::Ccomplimm(_, _)
+    )
+}
+
+fn win64_home_inst_signed_condition(inst: &RTLInst) -> bool {
+    match inst {
+        RTLInst::Icond(condition, _, _, _)
+        | RTLInst::Iop(Operation::Ocmp(condition) | Operation::Osel(condition, _), _, _) => {
+            win64_home_condition_is_signed(condition)
+        }
+        _ => false,
+    }
+}
+
+fn win64_home_flag_consumer_mnemonic(mnem: &str) -> bool {
+    let mnem = mnem.strip_prefix("LOCK ").unwrap_or(mnem);
+    matches!(mnem, "ADC" | "SBB" | "RCL" | "RCR")
+        || mnem.starts_with("SET")
+        || mnem.starts_with("CMOV")
+        || (mnem.starts_with('J') && !win64_home_flag_independent_jump_mnemonic(mnem))
+}
+
+fn win64_home_flag_independent_jump_mnemonic(mnem: &str) -> bool {
+    let mnem = mnem.strip_prefix("LOCK ").unwrap_or(mnem);
+    matches!(mnem, "JMP" | "JMPQ" | "JCXZ" | "JECXZ" | "JRCXZ")
+}
+
+fn win64_home_flag_preserving_mnemonic(mnem: &str) -> bool {
+    let mnem = mnem.strip_prefix("LOCK ").unwrap_or(mnem);
+    !is_flag_setting(mnem)
+        || win64_home_flag_independent_jump_mnemonic(mnem)
+        || mnem.starts_with("SET")
+        || mnem.starts_with("CMOV")
+        || mnem.starts_with('J')
+}
+
+fn win64_home_flags_definitely_overwritten(mnem: &str) -> bool {
+    let mnem = mnem.strip_prefix("LOCK ").unwrap_or(mnem);
+    matches!(
+        mnem,
+        "ADD" | "SUB" | "CMP" | "TEST" | "AND" | "OR" | "XOR" | "NEG"
+    )
+}
+
 fn is_x86_64_gp_register_name(name: &str) -> bool {
     matches!(
         name,
@@ -82,6 +162,64 @@ fn is_x86_64_gp_register_name(name: &str) -> bool {
             | "R14"
             | "R15"
     )
+}
+
+fn x86_gp_value_width(name: &str) -> Option<usize> {
+    if is_x86_64_gp_register_name(name) {
+        return Some(8);
+    }
+    matches!(
+        name,
+        "EAX"
+            | "EBX"
+            | "ECX"
+            | "EDX"
+            | "ESI"
+            | "EDI"
+            | "EBP"
+            | "ESP"
+            | "R8D"
+            | "R9D"
+            | "R10D"
+            | "R11D"
+            | "R12D"
+            | "R13D"
+            | "R14D"
+            | "R15D"
+    )
+    .then_some(4)
+}
+
+// Complete decoded GP operand width.  Unlike x86_gp_value_width, whose
+// existing users intentionally accept only the C value widths represented by
+// RTL registers, this helper preserves byte/word spellings for instruction
+// evidence.  Callers which cannot represent AH/BH/CH/DH must reject those
+// explicitly before collapsing the name to Mreg.
+fn x86_gp_operand_width(name: &str) -> Option<usize> {
+    if let Some(width) = x86_gp_value_width(name) {
+        return Some(width);
+    }
+    if matches!(
+        name,
+        "AX" | "BX" | "CX" | "DX" | "SI" | "DI" | "BP" | "SP"
+            | "R8W" | "R9W" | "R10W" | "R11W" | "R12W" | "R13W"
+            | "R14W" | "R15W"
+    ) {
+        return Some(2);
+    }
+    matches!(
+        name,
+        "AL" | "BL" | "CL" | "DL" | "AH" | "BH" | "CH" | "DH"
+            | "SIL" | "DIL" | "BPL" | "SPL" | "R8B" | "R9B" | "R10B"
+            | "R11B" | "R12B" | "R13B" | "R14B" | "R15B"
+    )
+    .then_some(1)
+}
+
+fn win64_home_rmw_source_width(name: &str) -> Option<usize> {
+    (!matches!(name, "AH" | "BH" | "CH" | "DH"))
+        .then(|| x86_gp_operand_width(name))
+        .flatten()
 }
 
 // Operand decoding collapses subregister spellings into one Mreg family. That
@@ -189,6 +327,8 @@ ascent_par! {
     relation op_produces_ptr(Node, RTLReg);
     relation padd(Address, Symbol, Symbol);
     relation pcmp(Address, Symbol, Symbol);
+    relation ptest(Address, Symbol, Symbol);
+    relation pcmov(Address, TestCond, Symbol, Symbol);
     // osel_compare_site(cmov_addr, compare_addr): from asm_pass; the compare whose flags this cmov consumes, so condition operands resolve at the compare site rather than the (possibly register-reusing) cmov site.
     relation osel_compare_site(Address, Address);
     relation pdiv(Address, Symbol, Symbol);
@@ -206,6 +346,7 @@ ascent_par! {
     relation reg_def_used(Address, Mreg, Address);
     relation reg_use(Address, Mreg);
     relation stack_def(Address, Symbol, i64);
+    relation decoded_memory_read_operand(Address, Symbol);
     relation decoded_memory_write_operand(Address, Symbol);
     relation trim_instruction(Address);
     relation stack_def_used(Address, Symbol, i64, Address, Symbol, i64);
@@ -7431,6 +7572,10 @@ ascent_par! {
     #[local] relation win64_home_exact_addr_at(Address, Node, Mreg, usize);
     #[local] relation win64_home_exact_addr_call(Address, Node, Mreg, usize);
     #[local] relation win64_home_exact_addr_copy_use(Address, Node, Mreg, usize);
+    #[local] relation win64_home_exact_addr_store_use(Address, Node, Mreg, usize);
+    #[local] relation win64_home_descriptor_call(
+        Address, Node, usize, Node, Mreg
+    );
     #[local] relation win64_home_addr_origin_def(Address, Node, Node, Mreg, usize);
     #[local] relation win64_home_addr_origin_at(Address, Node, Node, Mreg, usize);
     #[local] relation win64_home_lea_address_taken(Node, Address, usize);
@@ -7485,6 +7630,74 @@ ascent_par! {
         if Mreg::x86(*src_str) == *src_reg,
         op_register(dst, dst_str),
         if is_x86_64_gp_register_name(dst_str);
+
+    // Storing an exact home address as an eight-byte pointer value preserves
+    // its C meaning just like a register copy.  VS2013 commonly builds a local
+    // descriptor containing &home[pos] and passes the descriptor to a callee.
+    // This does not authorize arithmetic, comparisons, returns, partial
+    // stores, or use of the address as the store's base/index.
+    win64_home_exact_addr_store_use(func_start, *store_addr, *src_reg, *pos) <--
+        win64_home_exact_addr_at(func_start, store_addr, src_reg, pos),
+        pmov(store_addr, dst, src),
+        instruction(store_addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "MOV" | "MOVQ"),
+        op_register(src, src_str),
+        if Mreg::x86(*src_str) == *src_reg,
+        op_indirect(dst, _, base_str, idx_str, _, _, mem_size),
+        if *mem_size == 8,
+        if Mreg::x86(*base_str) != *src_reg,
+        if (*idx_str == "NONE" || idx_str.is_empty())
+            || Mreg::x86(*idx_str) != *src_reg;
+
+    // A common VS2013 descriptor shape stores &home[pos] in one exact local
+    // pointer slot, immediately takes that slot's address, and passes the
+    // descriptor to a callee.  The generic may-alias call veto below cannot
+    // otherwise distinguish this disjoint local object from a direct home
+    // escape.  Keep the exemption deliberately narrow: full-width exact-home
+    // store, identical entry-SP coordinate, and adjacent store -> LEA -> CALL.
+    win64_home_descriptor_call(
+        func_start, *call_addr, *pos, *descriptor_lea, argument_reg
+    ) <--
+        win64_home_exact_addr_store_use(
+            func_start, store_addr, source_reg, pos
+        ),
+        pmov(store_addr, destination, source),
+        op_register(source, source_name),
+        if Mreg::x86(*source_name) == *source_reg,
+        op_indirect(
+            destination, segment, store_base, store_index, _,
+            store_disp, store_width
+        ),
+        if (*segment == "NONE" || segment.is_empty())
+            && (*store_index == "NONE" || store_index.is_empty())
+            && *store_width == 8,
+        let store_base_reg = Mreg::x86(*store_base),
+        sp_based_mem_at(
+            store_addr, func_start, seen_store_base, store_base_ofs
+        ),
+        if *seen_store_base == store_base_reg,
+        let descriptor_entry_ofs = *store_base_ofs + *store_disp,
+        next(store_addr, descriptor_lea),
+        plea(descriptor_lea, descriptor_destination, descriptor_source),
+        op_register(descriptor_destination, argument_name),
+        let argument_reg = Mreg::x86(*argument_name),
+        op_indirect(
+            descriptor_source, descriptor_segment, descriptor_base,
+            descriptor_index, _, descriptor_disp, _
+        ),
+        if (*descriptor_segment == "NONE" || descriptor_segment.is_empty())
+            && (*descriptor_index == "NONE" || descriptor_index.is_empty()),
+        let descriptor_base_reg = Mreg::x86(*descriptor_base),
+        sp_based_mem_at(
+            descriptor_lea, func_start, seen_descriptor_base,
+            descriptor_base_ofs
+        ),
+        if *seen_descriptor_base == descriptor_base_reg
+            && *descriptor_base_ofs + *descriptor_disp
+                == descriptor_entry_ofs,
+        next(descriptor_lea, call_addr),
+        arg_setup_candidate(descriptor_lea, argument_reg, call_addr),
+        real_addr_in_func(call_addr, func_start);
 
     win64_home_addr_origin_def(func_start, *lea_addr, *lea_addr, *reg, *pos) <--
         win64_home_exact_addr_def(func_start, lea_addr, reg, pos),
@@ -7815,6 +8028,940 @@ ascent_par! {
         abi_stack_slot_size(slot_size),
         let entry_ofs = *incoming_base - *outgoing_base + (*pos as i64 * *slot_size);
 
+    // A byte-range view of one mutable Win64 home cell.  Unlike
+    // win64_unsafe_home_access this relation deliberately admits a nonzero
+    // sub-cell offset, but only after the decoded access has one known width,
+    // one affine entry-SP coordinate, and is wholly contained in exactly one
+    // eight-byte ABI cell.  It is the opcode-independent bridge used when the
+    // scalar closed-shape selector below cannot represent a cell.
+    relation win64_home_segmented_memory_access(Node);
+    win64_home_segmented_memory_access(addr) <--
+        decoded_memory_read_operand(addr, mem),
+        op_indirect(mem, segment, _, _, _, _, _),
+        if *segment != "NONE" && !segment.is_empty();
+    win64_home_segmented_memory_access(addr) <--
+        decoded_memory_write_operand(addr, mem),
+        op_indirect(mem, segment, _, _, _, _, _),
+        if *segment != "NONE" && !segment.is_empty();
+    win64_home_segmented_memory_access(addr) <--
+        plea(addr, _, mem),
+        op_indirect(mem, segment, _, _, _, _, _),
+        if *segment != "NONE" && !segment.is_empty();
+
+    relation win64_home_bounded_access(
+        Node, Address, Mreg, i64, usize, i64, i64, usize
+    );
+    win64_home_bounded_access(
+        addr, func_start, *base_reg, *raw_disp, *pos,
+        cell_entry_ofs, byte_ofs, *mem_size
+    ) <--
+        abi_shared_arg_slots(true),
+        direct_stack_operand(addr, base_reg, raw_disp, mem_size),
+        !win64_home_segmented_memory_access(addr),
+        if matches!(*mem_size, 1 | 2 | 4 | 8),
+        sp_based_mem_at(addr, func_start, seen_base, base_ofs),
+        if *seen_base == *base_reg,
+        abi_home_arg_position(_, pos),
+        abi_first_stack_arg_position(first_stack),
+        if *pos < *first_stack,
+        abi_incoming_sp_stack_base(incoming_base),
+        abi_outgoing_stack_base(outgoing_base),
+        abi_stack_slot_size(slot_size),
+        let cell_entry_ofs = *incoming_base - *outgoing_base
+            + (*pos as i64 * *slot_size),
+        let access_entry_ofs = *base_ofs + *raw_disp,
+        let access_end = access_entry_ofs + *mem_size as i64,
+        if access_entry_ofs >= cell_entry_ofs
+            && access_end <= cell_entry_ofs + *slot_size,
+        let byte_ofs = access_entry_ofs - cell_entry_ofs;
+
+    // Once one overlap in a cell falls outside the scalar closed set, move the
+    // whole cell (including its initial spill and otherwise-scalar accesses)
+    // to one backing-memory representation.  Mixing a promoted eight-byte
+    // object with a narrower scalar rewrite would manufacture or discard the
+    // untouched bytes of a partial home spill.
+    relation win64_home_backing_required(Address, usize);
+    win64_home_backing_required(func_start, *pos) <--
+        win64_home_storage(func_start, pos, _),
+        win64_home_overlap(addr, func_start, pos),
+        !win64_home_scalar_access(addr, func_start, pos);
+
+    relation win64_home_backing_candidate(
+        Node, Address, Mreg, i64, usize, i64, i64, usize
+    );
+    win64_home_backing_candidate(
+        addr, func_start, *base_reg, *raw_disp, *pos,
+        *cell_entry_ofs, *byte_ofs, *mem_size
+    ) <--
+        win64_home_backing_required(func_start, pos),
+        win64_home_bounded_access(
+            addr, func_start, base_reg, raw_disp, pos,
+            cell_entry_ofs, byte_ofs, mem_size
+        );
+
+    // The backing adapter is an integer byte-object model.  Keep floating
+    // register files and float-seeded homes on their pre-existing rejection
+    // path: reinterpreting an XMM operation as an integer C load/store would
+    // preserve bits but not the operation's value/type semantics.
+    #[local] relation win64_home_backing_float_access(Node);
+    win64_home_backing_float_access(addr) <--
+        asm_reg_use(addr, reg),
+        if is_float_mreg(reg);
+    win64_home_backing_float_access(addr) <--
+        asm_reg_def(addr, reg),
+        if is_float_mreg(reg);
+
+    // A memory-writing instruction which also reads and defines the same
+    // architectural register has exchange/atomic-style semantics.  A plain
+    // load/store expression cannot preserve that register result or atomicity,
+    // even if one ordinary candidate happens to model the memory half.
+    #[local] relation win64_home_backing_readwrite_reg(Node);
+    win64_home_backing_readwrite_reg(addr) <--
+        decoded_memory_write_operand(addr, _),
+        // TEST is architecturally read-only even when decoder operand-access
+        // metadata conservatively includes WRITE.
+        !ptest(addr, _, _),
+        asm_reg_use(addr, reg),
+        asm_reg_def(addr, reg);
+
+    // LOCK is a decoder-owned prefix fact, not an opcode spelling convention.
+    // No backing-local load/store sequence is atomic, so every prefixed access
+    // fails closed even when an ordinary non-atomic RTL candidate also exists.
+    relation win64_home_backing_lock_access(Node);
+    win64_home_backing_lock_access(addr) <--
+        instruction(addr, _, prefix, _, _, _, _, _, _, _),
+        if *prefix == "LOCK";
+    // Capstone versions have also exposed LOCK as part of the mnemonic.  The
+    // prefix row above is authoritative; this redundant spelling check keeps
+    // older decoder fixtures on the same fail-closed path.
+    win64_home_backing_lock_access(addr) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if mnem.starts_with("LOCK ");
+
+    // CPU flags are not RTL registers.  Recover their liveness directly from
+    // immutable instruction order: a memory RMW producer reaches through any
+    // number of flag-preserving instructions until a definite flag setter.
+    // Every raw Jcc, SETcc and CMOVcc spelling is a consumer, including
+    // conditions which the normalized Asm relations cannot represent (PF/OF
+    // in particular).  Counter-tested and unconditional jumps do not read
+    // flags, but are still treated as escaping a live value rather than
+    // guessing which target instruction overwrites it.
+    #[local] relation win64_home_backing_flag_consumer(Node);
+    win64_home_backing_flag_consumer(addr) <-- pjcc(addr, _, _);
+    win64_home_backing_flag_consumer(addr) <-- setcc_testcond(addr, _);
+    win64_home_backing_flag_consumer(addr) <-- pcmov(addr, _, _, _);
+    win64_home_backing_flag_consumer(addr) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if win64_home_flag_consumer_mnemonic(mnem);
+
+    #[local] relation win64_home_backing_flag_live_at(Node, Address, Node);
+    win64_home_backing_flag_live_at(producer, func_start, *successor) <--
+        win64_home_backing_candidate(
+            producer, func_start, _, _, _, _, _, _
+        ),
+        decoded_memory_write_operand(producer, _),
+        !ptest(producer, _, _),
+        instruction(producer, _, _, producer_mnem, _, _, _, _, _, _),
+        if is_flag_setting(producer_mnem),
+        next(producer, successor),
+        instr_in_function(successor, func_start);
+    win64_home_backing_flag_live_at(producer, func_start, *successor) <--
+        win64_home_backing_flag_live_at(producer, func_start, current),
+        !win64_home_backing_flag_consumer(current),
+        instruction(current, _, _, current_mnem, _, _, _, _, _, _),
+        if win64_home_flag_preserving_mnemonic(current_mnem),
+        next(current, successor),
+        instr_in_function(successor, func_start);
+
+    // Ordinary memory RMW candidates model the stored value, not physical
+    // flag state.  Reject a live consumer at any scheduling distance, an
+    // incoming-carry/rotate RMW itself, and a live value escaping through a
+    // flag-independent jump.
+    relation win64_home_backing_flagged_write(Node);
+    win64_home_backing_flagged_write(addr) <--
+        win64_home_backing_flag_live_at(addr, _, consumer),
+        win64_home_backing_flag_consumer(consumer);
+    win64_home_backing_flagged_write(addr) <--
+        decoded_memory_write_operand(addr, _),
+        !ptest(addr, _, _),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if win64_home_flag_consumer_mnemonic(mnem);
+    win64_home_backing_flagged_write(addr) <--
+        win64_home_backing_flag_live_at(addr, _, escape),
+        instruction(escape, _, _, escape_mnem, _, _, _, _, _, _),
+        if win64_home_flag_independent_jump_mnemonic(escape_mnem);
+    win64_home_backing_flagged_write(addr) <--
+        win64_home_backing_flag_live_at(addr, _, uncertain),
+        !win64_home_backing_flag_consumer(uncertain),
+        instruction(uncertain, _, _, mnem, _, _, _, _, _, _),
+        if !win64_home_flag_preserving_mnemonic(mnem)
+            && !win64_home_flags_definitely_overwritten(mnem)
+            && *mnem != "RET"
+            && *mnem != "RETQ";
+
+    // Semantic candidates for direct memory TEST/CMOV are separate from the
+    // storage proof.  They do not make a cell admissible by themselves: the
+    // imperative selector below still requires one unique candidate which
+    // reads the canonical slot.  Keeping these as normalized relation rules
+    // also avoids a second mnemonic allowlist in RTL.
+    relation win64_home_backing_test_imm(
+        Node, Address, usize, i64, usize
+    );
+    win64_home_backing_test_imm(addr, func_start, *pos, *mask, *width) <--
+        win64_home_backing_candidate(
+            addr, func_start, base_reg, raw_disp, pos, _, _, width
+        ),
+        ptest(addr, mem, immediate),
+        op_indirect(mem, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg
+            && *disp == *raw_disp
+            && *mem_size == *width,
+        op_immediate(immediate, mask, _);
+
+    // Edge plans are applied only after the imperative selector accepts the
+    // whole cell.  Publishing provisional rtl_edge_negated rows here would
+    // strand the original instruction if candidate uniqueness later failed.
+    relation win64_home_backing_semantic_edge_negated(Node, Node);
+    relation win64_home_backing_semantic_succ(Node, Node);
+    relation win64_home_backing_semantic_consumed(Node, Node);
+    relation win64_home_backing_semantic_bridge(Node, Node, Node);
+    win64_home_backing_test_imm(addr, func_start, *pos, *mask, *width) <--
+        win64_home_backing_candidate(
+            addr, func_start, base_reg, raw_disp, pos, _, _, width
+        ),
+        ptest(addr, immediate, mem),
+        op_indirect(mem, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg
+            && *disp == *raw_disp
+            && *mem_size == *width,
+        op_immediate(immediate, mask, _);
+
+    #[local] relation win64_home_backing_test_jcc(
+        Node, Address, usize, Node, Condition, Address, Address
+    );
+    win64_home_backing_test_jcc(
+        addr, func_start, *pos, *jcc_addr, condition,
+        *target_addr, *fallthrough
+    ) <--
+        win64_home_backing_test_imm(addr, func_start, pos, mask, width),
+        next(addr, jcc_addr),
+        pjcc(jcc_addr, test_cond, target),
+        symbol_resolved_addr(*target, target_addr),
+        next(jcc_addr, fallthrough),
+        real_addr_in_func(addr, func_start),
+        real_addr_in_func(jcc_addr, func_start),
+        real_addr_in_func(target_addr, func_start),
+        real_addr_in_func(fallthrough, func_start),
+        if let Some(condition) = win64_home_test_mask_condition(
+            *test_cond, *mask, *width, false
+        );
+
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_backing_test_jcc(
+            addr, func_start, pos, _, condition, target, fallthrough
+        ),
+        win64_home_storage(func_start, pos, slot),
+        let inst = RTLInst::Icond(
+            condition.clone(),
+            Arc::new(vec![*slot]),
+            Either::Right(*target),
+            Either::Right(*fallthrough),
+        );
+    win64_home_backing_semantic_edge_negated(addr, *jcc_addr) <--
+        win64_home_backing_test_jcc(
+            addr, _, _, jcc_addr, _, _, _
+        );
+    win64_home_backing_semantic_succ(addr, *target) <--
+        win64_home_backing_test_jcc(addr, _, _, _, _, target, _);
+    win64_home_backing_semantic_succ(addr, *fallthrough) <--
+        win64_home_backing_test_jcc(addr, _, _, _, _, _, fallthrough);
+    win64_home_backing_semantic_consumed(addr, *jcc_addr) <--
+        win64_home_backing_test_jcc(addr, _, _, jcc_addr, _, _, _);
+    win64_home_backing_semantic_bridge(addr, *predecessor, *jcc_addr) <--
+        win64_home_backing_test_jcc(addr, func_start, _, jcc_addr, _, _, _),
+        ltl_succ(predecessor, jcc_addr),
+        if predecessor != addr,
+        next(predecessor, addr),
+        ltl_inst(predecessor, predecessor_inst),
+        if crate::decompile::passes::linear_pass::has_fallthrough(
+            predecessor_inst, *predecessor
+        ),
+        instr_in_function(predecessor, func_start);
+    win64_home_backing_semantic_bridge(addr, *addr, *addr) <--
+        win64_home_backing_test_jcc(addr, func_start, _, jcc_addr, _, _, _),
+        instr_in_function(addr, func_start),
+        ltl_succ(addr, jcc_addr);
+    // Linear can discard both a memory TEST and its adjacent conditional
+    // branch.  In that shape there is no LTL edge into the branch to reuse,
+    // but the decoded predecessor still gives us an exact insertion point.
+    // Keep this fallback disjoint from the retained-LTL rules above so the
+    // imperative selector continues to require one unique bridge witness.
+    win64_home_backing_semantic_bridge(addr, *predecessor, *jcc_addr) <--
+        win64_home_backing_test_jcc(
+            addr, func_start, _, jcc_addr, _, _, _
+        ),
+        next(predecessor, addr),
+        if predecessor != addr,
+        ltl_inst(predecessor, predecessor_inst),
+        if crate::decompile::passes::linear_pass::has_fallthrough(
+            predecessor_inst, *predecessor
+        ),
+        instr_in_function(predecessor, func_start),
+        instr_in_function(addr, func_start),
+        !ltl_inst(addr, _),
+        !ltl_inst(jcc_addr, _),
+        !rtl_succ_candidate(predecessor, _),
+        !ltl_succ(_, jcc_addr);
+
+    #[local] relation win64_home_backing_test_setcc(
+        Node, Address, usize, Node, Condition, RTLReg
+    );
+    win64_home_backing_test_setcc(
+        addr, func_start, *pos, *setcc_addr, condition, destination
+    ) <--
+        win64_home_backing_test_imm(addr, func_start, pos, mask, width),
+        next(addr, setcc_addr),
+        setcc_testcond(setcc_addr, test_cond),
+        instruction(setcc_addr, _, _, _, dst, _, _, _, _, _),
+        op_register(dst, dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        is_def(setcc_addr, def_id),
+        reg_xtl(setcc_addr, dst_reg, def_id),
+        xtl_canonical(def_id, destination),
+        instr_in_function(addr, func_start),
+        instr_in_function(setcc_addr, func_start),
+        if let Some(condition) = win64_home_test_mask_condition(
+            *test_cond, *mask, *width, false
+        );
+
+    rtl_inst_candidate(addr, inst) <--
+        win64_home_backing_test_setcc(
+            addr, func_start, pos, _, condition, destination
+        ),
+        win64_home_storage(func_start, pos, slot),
+        let inst = RTLInst::Iop(
+            Operation::Ocmp(condition.clone()),
+            Arc::new(vec![*slot]),
+            *destination,
+        );
+    win64_home_backing_semantic_edge_negated(addr, *setcc_addr) <--
+        win64_home_backing_test_setcc(
+            addr, _, _, setcc_addr, _, _
+        );
+    win64_home_backing_semantic_succ(addr, *fallthrough) <--
+        win64_home_backing_test_setcc(addr, _, _, setcc_addr, _, _),
+        next(setcc_addr, fallthrough);
+    win64_home_backing_semantic_consumed(addr, *setcc_addr) <--
+        win64_home_backing_test_setcc(addr, _, _, setcc_addr, _, _);
+    win64_home_backing_semantic_bridge(addr, *predecessor, *fallthrough) <--
+        win64_home_backing_test_setcc(
+            addr, func_start, _, setcc_addr, _, _
+        ),
+        next(setcc_addr, fallthrough),
+        ltl_succ(predecessor, fallthrough),
+        if predecessor != addr,
+        next(predecessor, addr),
+        ltl_inst(predecessor, predecessor_inst),
+        if crate::decompile::passes::linear_pass::has_fallthrough(
+            predecessor_inst, *predecessor
+        ),
+        instr_in_function(predecessor, func_start),
+        instr_in_function(fallthrough, func_start),
+        !rtl_succ_candidate(_, setcc_addr);
+    win64_home_backing_semantic_bridge(addr, *addr, *addr) <--
+        win64_home_backing_test_setcc(
+            addr, func_start, _, setcc_addr, _, _
+        ),
+        next(setcc_addr, fallthrough),
+        instr_in_function(fallthrough, func_start),
+        ltl_succ(addr, fallthrough),
+        !rtl_succ_candidate(_, setcc_addr);
+    // As with TEST/Jcc, Linear can discard both the memory TEST and its
+    // adjacent SETcc.  Reinsert that exact decoded pair only at a retained,
+    // otherwise-successorless fallthrough predecessor.  Reject any live
+    // incoming edge to the consumed SETcc.
+    win64_home_backing_semantic_bridge(addr, *predecessor, *fallthrough) <--
+        win64_home_backing_test_setcc(
+            addr, func_start, _, setcc_addr, _, _
+        ),
+        next(predecessor, addr),
+        next(setcc_addr, fallthrough),
+        if predecessor != addr,
+        ltl_inst(predecessor, predecessor_inst),
+        if crate::decompile::passes::linear_pass::has_fallthrough(
+            predecessor_inst, *predecessor
+        ),
+        instr_in_function(predecessor, func_start),
+        instr_in_function(addr, func_start),
+        instr_in_function(setcc_addr, func_start),
+        instr_in_function(fallthrough, func_start),
+        !ltl_inst(addr, _),
+        !ltl_inst(setcc_addr, _),
+        !rtl_succ_candidate(predecessor, _),
+        !rtl_succ_candidate(_, setcc_addr);
+
+    #[local] relation win64_home_backing_cmov_source(
+        Node, Address, usize, Mreg, usize
+    );
+    win64_home_backing_cmov_source(
+        addr, func_start, *pos, dst_reg, *width
+    ) <--
+        win64_home_backing_candidate(
+            addr, func_start, base_reg, raw_disp, pos, _, _, width
+        ),
+        pcmov(addr, _, dst, source),
+        // CMOVS/CMOVNS consume SF, which is not representable by the integer
+        // comparison/test predicates modeled by this adapter.
+        instruction(addr, _, _, cmov_mnem, _, _, _, _, _, _),
+        if *cmov_mnem != "CMOVS" && *cmov_mnem != "CMOVNS",
+        op_register(dst, dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        if x86_gp_value_width(dst_str) == Some(*width),
+        op_indirect(source, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg
+            && *disp == *raw_disp
+            && *mem_size == *width,
+        if win64_home_cmov_typ(*width).is_some();
+
+    relation win64_home_backing_cmov_sf(Node);
+    win64_home_backing_cmov_sf(addr) <--
+        win64_home_backing_candidate(
+            addr, _, base_reg, raw_disp, _, _, _, width
+        ),
+        pcmov(addr, _, _, source),
+        instruction(addr, _, _, cmov_mnem, _, _, _, _, _, _),
+        if *cmov_mnem == "CMOVS" || *cmov_mnem == "CMOVNS",
+        op_indirect(source, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg
+            && *disp == *raw_disp
+            && *mem_size == *width;
+
+    // Every memory-source CMOV reads its old destination on the
+    // false/preserve arm and defines the same architectural register.  Some
+    // decoder versions report only the write.  Seed that architectural fact
+    // directly from Asm's normalized CMOV relation, independently of home
+    // selection, so it cannot participate in the backing-required negation.
+    reg_use(addr, dst_reg) <--
+        pcmov(addr, _, dst, source),
+        op_register(dst, dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        op_indirect(source, _, _, _, _, _, _);
+    reg_def_site(addr, dst_reg) <--
+        pcmov(addr, _, dst, source),
+        op_register(dst, dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        op_indirect(source, _, _, _, _, _, _);
+
+    #[local] relation win64_home_backing_cmov_values(
+        Node, Address, usize, usize, RTLReg, RTLReg, RTLReg, Typ
+    );
+    win64_home_backing_cmov_values(
+        addr, func_start, *pos, *width,
+        *old_destination, destination, *slot, typ
+    ) <--
+        win64_home_backing_cmov_source(
+            addr, func_start, pos, dst_reg, width
+        ),
+        win64_home_storage(func_start, pos, slot),
+        reaching_use_rtl(addr, dst_reg, old_destination),
+        is_def(addr, def_id),
+        reg_xtl(addr, dst_reg, def_id),
+        xtl_canonical(def_id, destination),
+        if let Some(typ) = win64_home_cmov_typ(*width);
+
+    relation win64_home_backing_cmov_flag(Node, Node);
+
+    #[local] relation win64_home_reg_test_imm(Node, Mreg, i64, usize);
+    win64_home_reg_test_imm(addr, test_reg, *mask, width) <--
+        ptest(addr, tested, immediate),
+        op_register(tested, tested_str),
+        let test_reg = Mreg::x86(*tested_str),
+        op_immediate(immediate, mask, _),
+        if let Some(width) = x86_gp_value_width(tested_str);
+    win64_home_reg_test_imm(addr, test_reg, *mask, width) <--
+        ptest(addr, immediate, tested),
+        op_register(tested, tested_str),
+        let test_reg = Mreg::x86(*tested_str),
+        op_immediate(immediate, mask, _),
+        if let Some(width) = x86_gp_value_width(tested_str);
+
+    // CMP reg, imm -> CMOV dst, [home].  Osel's condition selects the old
+    // destination, so use the negated CMOV predicate.
+    rtl_inst_candidate(cmov_addr, inst),
+    win64_home_backing_cmov_flag(*cmov_addr, *compare_addr) <--
+        win64_home_backing_cmov_values(
+            cmov_addr, func_start, _, _, old_destination,
+            destination, slot, typ
+        ),
+        next(compare_addr, cmov_addr),
+        instr_in_function(compare_addr, func_start),
+        pcmp(compare_addr, compared, immediate),
+        op_register(compared, compared_str),
+        let compared_reg = Mreg::x86(*compared_str),
+        reaching_use_rtl(compare_addr, compared_reg, compared_value),
+        op_immediate(immediate, value, _),
+        pcmov(cmov_addr, cmov_test, _, _),
+        if let Some(compare_width) = x86_gp_value_width(compared_str),
+        if let Some(condition) = win64_home_cmov_cmp_condition(
+            *cmov_test, compare_width, Some(*value)
+        ),
+        let inst = RTLInst::Iop(
+            Operation::Osel(condition, *typ),
+            Arc::new(vec![*old_destination, *slot, *compared_value]),
+            *destination,
+        );
+
+    // CMP reg, reg -> CMOV dst, [home].
+    rtl_inst_candidate(cmov_addr, inst),
+    win64_home_backing_cmov_flag(*cmov_addr, *compare_addr) <--
+        win64_home_backing_cmov_values(
+            cmov_addr, func_start, _, _, old_destination,
+            destination, slot, typ
+        ),
+        next(compare_addr, cmov_addr),
+        instr_in_function(compare_addr, func_start),
+        pcmp(compare_addr, left, right),
+        op_register(left, left_str),
+        op_register(right, right_str),
+        let left_reg = Mreg::x86(*left_str),
+        let right_reg = Mreg::x86(*right_str),
+        reaching_use_rtl(compare_addr, left_reg, left_value),
+        reaching_use_rtl(compare_addr, right_reg, right_value),
+        pcmov(cmov_addr, cmov_test, _, _),
+        if let Some(compare_width) = x86_gp_value_width(left_str),
+        if x86_gp_value_width(right_str) == Some(compare_width),
+        if let Some(condition) = win64_home_cmov_cmp_condition(
+            *cmov_test, compare_width, None
+        ),
+        let inst = RTLInst::Iop(
+            Operation::Osel(condition, *typ),
+            Arc::new(vec![
+                *old_destination, *slot, *left_value, *right_value
+            ]),
+            *destination,
+        );
+
+    // TEST reg, imm -> CMOV dst, [home].
+    rtl_inst_candidate(cmov_addr, inst),
+    win64_home_backing_cmov_flag(*cmov_addr, *test_addr) <--
+        win64_home_backing_cmov_values(
+            cmov_addr, func_start, _, _, old_destination,
+            destination, slot, typ
+        ),
+        next(test_addr, cmov_addr),
+        instr_in_function(test_addr, func_start),
+        win64_home_reg_test_imm(test_addr, test_reg, mask, test_width),
+        reaching_use_rtl(test_addr, test_reg, tested_value),
+        pcmov(cmov_addr, cmov_test, _, _),
+        if let Some(condition) = win64_home_test_mask_condition(
+            *cmov_test, *mask, *test_width, true
+        ),
+        let inst = RTLInst::Iop(
+            Operation::Osel(condition, *typ),
+            Arc::new(vec![*old_destination, *slot, *tested_value]),
+            *destination,
+        );
+
+    win64_home_backing_semantic_consumed(cmov_addr, *flag_addr) <--
+        win64_home_backing_cmov_flag(cmov_addr, flag_addr);
+    #[local] relation win64_home_backing_cmov_other_incoming(Node, Node);
+    win64_home_backing_cmov_other_incoming(cmov_addr, authenticated) <--
+        ltl_succ(authenticated, cmov_addr),
+        rtl_succ_candidate(other, cmov_addr),
+        if other != authenticated;
+    // If Linear already retained the CMOV node, no incoming surgery is
+    // needed; encode access->access as the no-op bridge witness.  Otherwise
+    // replace the edge which skipped the adjacent flag producer and CMOV.
+    win64_home_backing_semantic_bridge(
+        cmov_addr, *predecessor, *cmov_addr
+    ) <--
+        win64_home_backing_cmov_flag(cmov_addr, flag_addr),
+        next(predecessor, flag_addr),
+        next(flag_addr, cmov_addr),
+        ltl_inst(predecessor, predecessor_inst),
+        if crate::decompile::passes::linear_pass::has_fallthrough(
+            predecessor_inst, *predecessor
+        ),
+        instr_in_function(predecessor, func_start),
+        instr_in_function(flag_addr, func_start),
+        instr_in_function(cmov_addr, func_start),
+        ltl_succ(predecessor, cmov_addr),
+        !ltl_inst(flag_addr, _),
+        !rtl_succ_candidate(_, flag_addr),
+        !win64_home_backing_cmov_other_incoming(cmov_addr, predecessor);
+    win64_home_backing_semantic_bridge(
+        cmov_addr, *predecessor, *fallthrough
+    ) <--
+        win64_home_backing_cmov_flag(cmov_addr, flag_addr),
+        next(predecessor, flag_addr),
+        instr_in_function(flag_addr, func_start),
+        instr_in_function(cmov_addr, func_start),
+        next(cmov_addr, fallthrough),
+        instr_in_function(fallthrough, func_start),
+        ltl_succ(predecessor, fallthrough),
+        if predecessor != cmov_addr,
+        ltl_inst(predecessor, predecessor_inst),
+        if crate::decompile::passes::linear_pass::has_fallthrough(
+            predecessor_inst, *predecessor
+        ),
+        instr_in_function(predecessor, func_start),
+        !ltl_inst(flag_addr, _),
+        !ltl_inst(cmov_addr, _),
+        !rtl_succ_candidate(_, flag_addr),
+        !rtl_succ_candidate(_, cmov_addr);
+    // Linear can also stop at the instruction before the flag producer,
+    // leaving neither a bypass edge nor either member of the fused pair.
+    // Insert the authenticated flag+CMOV semantics only from that retained,
+    // fallthrough-capable, otherwise-successorless predecessor.
+    win64_home_backing_semantic_bridge(
+        cmov_addr, *predecessor, *fallthrough
+    ) <--
+        win64_home_backing_cmov_flag(cmov_addr, flag_addr),
+        next(predecessor, flag_addr),
+        next(flag_addr, cmov_addr),
+        next(cmov_addr, fallthrough),
+        if predecessor != cmov_addr,
+        ltl_inst(predecessor, predecessor_inst),
+        if crate::decompile::passes::linear_pass::has_fallthrough(
+            predecessor_inst, *predecessor
+        ),
+        instr_in_function(predecessor, func_start),
+        instr_in_function(flag_addr, func_start),
+        instr_in_function(cmov_addr, func_start),
+        instr_in_function(fallthrough, func_start),
+        !ltl_inst(flag_addr, _),
+        !ltl_inst(cmov_addr, _),
+        !rtl_succ_candidate(predecessor, _),
+        !rtl_succ_candidate(_, flag_addr),
+        !rtl_succ_candidate(_, cmov_addr);
+    win64_home_backing_semantic_succ(cmov_addr, *fallthrough) <--
+        win64_home_backing_cmov_values(
+            cmov_addr, func_start, _, _, _, _, _, _
+        ),
+        win64_home_backing_cmov_flag(cmov_addr, _),
+        next(cmov_addr, fallthrough),
+        instr_in_function(fallthrough, func_start);
+
+    relation win64_home_backing_semantic_access(Node);
+    win64_home_backing_semantic_access(addr) <--
+        win64_home_backing_test_imm(addr, _, _, _, _);
+    win64_home_backing_semantic_access(addr) <--
+        win64_home_backing_cmov_source(addr, _, _, _, _);
+
+    #[local] relation win64_home_backing_read(Node);
+    win64_home_backing_read(addr) <--
+        decoded_memory_read_operand(addr, _);
+
+    #[local] relation win64_home_backing_write(Node);
+    win64_home_backing_write(addr) <--
+        decoded_memory_write_operand(addr, _),
+        // TEST consumes memory and flags but never modifies memory; prefer
+        // exact opcode semantics over conservative decoder access flags.
+        !ptest(addr, _, _);
+
+    #[local] relation win64_home_backing_address(Node);
+    win64_home_backing_address(addr) <--
+        plea(addr, _, _);
+
+    // Decoder-authenticated memory mode.  The read bit is independent of the
+    // write bit so a memory RMW cannot pass merely because its store half has
+    // an RTL witness.  LEA is address materialization, not a memory access.
+    // Retained rule output: the imperative post-fixed-point selector consumes
+    // these rows through DecompileDB.  The decoder read/write/address helper
+    // relations above can remain SCC-local, but making this projection local
+    // would clear every mode before selection.
+    relation win64_home_backing_mode(Node, bool, bool, bool);
+    win64_home_backing_mode(addr, false, false, true) <--
+        win64_home_backing_address(addr);
+    win64_home_backing_mode(addr, true, true, false) <--
+        win64_home_backing_read(addr),
+        win64_home_backing_write(addr),
+        !win64_home_backing_address(addr);
+    win64_home_backing_mode(addr, true, false, false) <--
+        win64_home_backing_read(addr),
+        !win64_home_backing_write(addr),
+        !win64_home_backing_address(addr);
+    win64_home_backing_mode(addr, false, true, false) <--
+        win64_home_backing_write(addr),
+        !win64_home_backing_read(addr),
+        !win64_home_backing_address(addr);
+
+    // Plain integer MOVs at a nonzero byte offset do not necessarily acquire
+    // stack_var identity: stack def-use is exact-offset, while a partial write
+    // at home+2 overlaps but does not define the later whole-cell home+0 read.
+    // Project the decoded MOV directly onto the canonical backing slot.  The
+    // Cshminor backing adapter materializes the authenticated byte-range
+    // load/store; RTL keeps Omove so full-cell rows structurally deduplicate
+    // the ordinary post-alias candidate.  Multiple reaching sources or
+    // destination representatives deliberately remain multiple candidates
+    // and make the imperative selector fail closed.
+    relation win64_home_backing_move_store(
+        Node, Address, i64, usize, RTLReg, RTLReg
+    );
+    win64_home_backing_move_store(
+        addr, func_start, *raw_disp, *width, *source, *slot
+    ) <--
+        win64_home_backing_candidate(
+            addr, func_start, base_reg, raw_disp, pos, _, _, width
+        ),
+        win64_home_backing_mode(addr, false, true, false),
+        win64_home_move_class(addr, move_class),
+        if *move_class == 0,
+        pmov(addr, mem, src),
+        op_indirect(mem, segment, base_str, idx_str, _, asm_disp, mem_size),
+        if *segment == "NONE" || segment.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg
+            && *asm_disp == *raw_disp
+            && *mem_size == *width,
+        op_register(src, src_str),
+        let src_reg = Mreg::x86(*src_str),
+        if !is_float_mreg(&src_reg),
+        reaching_use_rtl(addr, src_reg, source),
+        win64_home_storage(func_start, pos, slot);
+
+    relation win64_home_backing_move_load(
+        Node, Address, i64, usize, RTLReg, RTLReg
+    );
+    win64_home_backing_move_load(
+        addr, func_start, *raw_disp, *width, *slot, *destination
+    ) <--
+        win64_home_backing_candidate(
+            addr, func_start, base_reg, raw_disp, pos, _, _, width
+        ),
+        win64_home_backing_mode(addr, true, false, false),
+        win64_home_move_class(addr, move_class),
+        if *move_class == 0,
+        pmov(addr, dst, mem),
+        op_register(dst, dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        if !is_float_mreg(&dst_reg),
+        op_indirect(mem, segment, base_str, idx_str, _, asm_disp, mem_size),
+        if *segment == "NONE" || segment.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg
+            && *asm_disp == *raw_disp
+            && *mem_size == *width,
+        is_def(addr, def_id),
+        reg_xtl(addr, dst_reg, def_id),
+        xtl_canonical(def_id, destination),
+        win64_home_storage(func_start, pos, slot);
+
+    // The first unsupported-address barrier removes the generic three-node
+    // load/op/store lowering before home selection.  Retain one exact,
+    // selector-private in-place projection for register-source integer RMWs
+    // whose low-width result is invariant under sign/zero extension.  The
+    // decoded base/displacement/width, operand direction, unique reaching
+    // source, and canonical slot are all explicit relation fields; live flags,
+    // prefixes, segmented/indexed operands, and incomplete cells remain
+    // independently vetoed by the backing proof.
+    relation win64_home_backing_rmw_reg(
+        Node, Address, i64, usize, Operation, RTLReg, RTLReg
+    );
+    win64_home_backing_rmw_reg(
+        addr, func_start, *raw_disp, *width, op.clone(), *source, *slot
+    ) <--
+        win64_home_backing_candidate(
+            addr, func_start, base_reg, raw_disp, pos, _, _, width
+        ),
+        win64_home_backing_mode(addr, true, true, false),
+        instruction(
+            addr, _, _, mnemonic, source_operand, memory_operand, _, _, _, _
+        ),
+        if matches!(*mnemonic, "ADD" | "SUB" | "AND" | "OR" | "XOR" | "XORL"),
+        op_register(source_operand, source_name),
+        if win64_home_rmw_source_width(source_name) == Some(*width),
+        op_indirect(
+            memory_operand, segment, memory_base, memory_index, _,
+            memory_disp, memory_width
+        ),
+        if (*segment == "NONE" || segment.is_empty())
+            && (*memory_index == "NONE" || memory_index.is_empty())
+            && Mreg::x86(*memory_base) == *base_reg
+            && *memory_disp == *raw_disp
+            && *memory_width == *width,
+        arith_store_reg(addr, op, chunk, seen_base, seen_disp, source_reg),
+        if *seen_base == *base_reg
+            && *seen_disp == *raw_disp
+            && Mreg::x86(*source_name) == *source_reg
+            // Asm's legacy carrier is MInt32 for every non-64-bit GP
+            // source, including byte/word operations.  The decoded backing
+            // operand above is the authoritative memory width; require only
+            // that the carrier is integer and wide enough to hold those
+            // exact low bits.
+            && win64_home_integer_chunk_width(chunk)
+                .is_some_and(|carrier_width| carrier_width >= *width),
+        reaching_use_rtl(addr, source_reg, source),
+        win64_home_storage(func_start, pos, slot);
+
+    // A promoted home cell no longer participates in ordinary stack_var
+    // lowering, so a memory-divisor DIV/IDIV needs an exact selector-private
+    // projection just like partial MOV and in-place RMW.  Keep the decoded
+    // operand identity, signedness, width, live result, and reaching dividend
+    // explicit; ambiguous reaching values or two live results remain multiple
+    // candidates and make the whole cell fail closed.
+    #[local] relation win64_home_div_high_ready(
+        Node, Address, usize, bool
+    );
+    // Unsigned DIV's implicit high half is exactly zero after an adjacent
+    // same-register XOR of EDX or RDX.  A 32-bit EDX write zero-extends to
+    // RDX, so either spelling is sufficient for both supported widths.
+    win64_home_div_high_ready(addr, func_start, 4, false) <--
+        next(setup, addr),
+        instr_in_function(setup, func_start),
+        instruction(
+            setup, _, _, mnemonic, left, right, _, _, _, _
+        ),
+        if matches!(*mnemonic, "XOR" | "XORL" | "XORQ"),
+        op_register(left, left_name),
+        op_register(right, right_name),
+        if left_name == right_name
+            && win64_home_unsigned_div_high_zero_register(
+                left_name, 4
+            );
+    win64_home_div_high_ready(addr, func_start, 8, false) <--
+        next(setup, addr),
+        instr_in_function(setup, func_start),
+        instruction(
+            setup, _, _, mnemonic, left, right, _, _, _, _
+        ),
+        if matches!(*mnemonic, "XOR" | "XORL" | "XORQ"),
+        op_register(left, left_name),
+        op_register(right, right_name),
+        if left_name == right_name
+            && win64_home_unsigned_div_high_zero_register(
+                left_name, 8
+            );
+    // Signed IDIV's AX-only IR abstraction is exact only when the immediately
+    // preceding width-matched sign-extension established DX:AX.
+    win64_home_div_high_ready(addr, func_start, 4, true) <--
+        next(setup, addr),
+        instr_in_function(setup, func_start),
+        instruction(setup, _, _, "CDQ", _, _, _, _, _, _);
+    win64_home_div_high_ready(addr, func_start, 8, true) <--
+        next(setup, addr),
+        instr_in_function(setup, func_start),
+        instruction(setup, _, _, "CQO", _, _, _, _, _, _);
+
+    #[local] relation win64_home_backing_div_source(
+        Node, Address, usize, usize, bool, RTLReg
+    );
+    win64_home_backing_div_source(
+        addr, func_start, *pos, *width, true, *slot
+    ) <--
+        win64_home_backing_candidate(
+            addr, func_start, base_reg, raw_disp, pos, _, _, width
+        ),
+        win64_home_backing_mode(addr, true, false, false),
+        win64_home_div_high_ready(addr, func_start, width, true),
+        pidiv(addr, divisor, _),
+        op_indirect(
+            divisor, segment, memory_base, memory_index, _,
+            memory_disp, memory_width
+        ),
+        if (*segment == "NONE" || segment.is_empty())
+            && (*memory_index == "NONE" || memory_index.is_empty())
+            && Mreg::x86(*memory_base) == *base_reg
+            && *memory_disp == *raw_disp
+            && *memory_width == *width,
+        instr_in_function(addr, func_start),
+        win64_home_storage(func_start, pos, slot);
+    win64_home_backing_div_source(
+        addr, func_start, *pos, *width, false, *slot
+    ) <--
+        win64_home_backing_candidate(
+            addr, func_start, base_reg, raw_disp, pos, _, _, width
+        ),
+        win64_home_backing_mode(addr, true, false, false),
+        win64_home_div_high_ready(addr, func_start, width, false),
+        pudiv(addr, divisor, _),
+        op_indirect(
+            divisor, segment, memory_base, memory_index, _,
+            memory_disp, memory_width
+        ),
+        if (*segment == "NONE" || segment.is_empty())
+            && (*memory_index == "NONE" || memory_index.is_empty())
+            && Mreg::x86(*memory_base) == *base_reg
+            && *memory_disp == *raw_disp
+            && *memory_width == *width,
+        instr_in_function(addr, func_start),
+        win64_home_storage(func_start, pos, slot);
+
+    relation win64_home_backing_div(
+        Node, Address, usize, Operation, RTLReg, RTLReg, RTLReg
+    );
+    win64_home_backing_div(
+        addr, func_start, *width, operation, *dividend, *slot, *result
+    ) <--
+        win64_home_backing_div_source(
+            addr, func_start, _, width, signed, slot
+        ),
+        reaching_use_rtl(addr, Mreg::AX, dividend),
+        is_def(addr, result_def),
+        reg_xtl(addr, Mreg::AX, result_def),
+        xtl_canonical(result_def, result),
+        !div_result_dead(addr, Mreg::AX),
+        if let Some(operation) = win64_home_div_operation(*signed, false, *width);
+    win64_home_backing_div(
+        addr, func_start, *width, operation, *dividend, *slot, *result
+    ) <--
+        win64_home_backing_div_source(
+            addr, func_start, _, width, signed, slot
+        ),
+        reaching_use_rtl(addr, Mreg::AX, dividend),
+        is_def(addr, result_def),
+        reg_xtl(addr, Mreg::DX, result_def),
+        xtl_canonical(result_def, result),
+        !div_result_dead(addr, Mreg::DX),
+        if let Some(operation) = win64_home_div_operation(*signed, true, *width);
+
+    // Address-taking LEAs are also removed by the first unsupported-address
+    // barrier.  Retain one exact full-cell projection privately; Cshminor
+    // later resolves the selected Oleal+Ainstack row through the exported
+    // win64_home_address(node, slot) proof, never through this raw displacement.
+    relation win64_home_backing_lea(
+        Node, Address, i64, usize, RTLReg, RTLReg
+    );
+    win64_home_backing_lea(
+        addr, func_start, *raw_disp, *width, *slot, *destination
+    ) <--
+        win64_home_backing_candidate(
+            addr, func_start, base_reg, raw_disp, pos, _, byte_ofs, width
+        ),
+        if *byte_ofs == 0 && *width == 8,
+        win64_home_backing_mode(addr, false, false, true),
+        plea(addr, destination_operand, source_operand),
+        op_register(destination_operand, destination_name),
+        if x86_gp_value_width(destination_name) == Some(8),
+        let destination_reg = Mreg::x86(*destination_name),
+        op_indirect(
+            source_operand, segment, memory_base, memory_index, _,
+            memory_disp, memory_width
+        ),
+        if (*segment == "NONE" || segment.is_empty())
+            && (*memory_index == "NONE" || memory_index.is_empty())
+            && Mreg::x86(*memory_base) == *base_reg
+            && *memory_disp == *raw_disp
+            && *memory_width == *width,
+        is_def(addr, destination_def),
+        reg_xtl(addr, destination_reg, destination_def),
+        xtl_canonical(destination_def, destination),
+        win64_home_storage(func_start, pos, slot);
+
+    // Imperatively authenticated by select_canonical_unsafe_home_rewrites.
+    // Fields after byte offset are (decoded width, exact semantic chunk,
+    // memory-readable, memory-writable, address-only).
+    relation win64_home_backing_access(
+        Node, RTLReg, i64, usize, MemoryChunk, bool, bool, bool
+    );
+    // Exact retained RTL equivalence class: (real access, real/synthetic
+    // candidate node, selected instruction).  Later adapters never have to
+    // rediscover which candidate survived canonical selection.
+    relation win64_home_backing_selected_candidate(Node, Node, RTLInst);
     // Closed set of scalar-storage shapes.  A cell is canonicalized only when
     // every possibly overlapping access is represented by exactly one of
     // these rows and all moves agree with the initial spill's class and width.
@@ -7985,6 +9132,7 @@ ascent_par! {
         if *idx_str == "NONE" || idx_str.is_empty(),
         if Mreg::x86(*base_str) == *base_reg && *asm_disp == *raw_disp,
         if *mem_size == *width;
+
     win64_home_scalar_cmp_read(
         addr, func_start, *mem, *base_reg, *raw_disp, *pos, *entry_ofs, *width
     ) <--
@@ -7998,6 +9146,48 @@ ascent_par! {
         if *idx_str == "NONE" || idx_str.is_empty(),
         if Mreg::x86(*base_str) == *base_reg && *asm_disp == *raw_disp,
         if *mem_size == *width;
+
+    // A byte-addressable backing cell may be compared through any exact,
+    // bounded subrange.  Keep this projection separate from the scalar closed
+    // set: its width is the decoded access width, not the initial spill width,
+    // and it is admissible only because win64_home_backing_candidate proved
+    // the operand lies wholly inside one promoted home cell.
+    relation win64_home_backing_cmp_read(
+        Node, Address, Symbol, Mreg, i64, usize, i64, usize
+    );
+    win64_home_backing_cmp_read(
+        addr, func_start, *mem, *base_reg, *raw_disp, *pos, *entry_ofs, *width
+    ) <--
+        win64_home_backing_candidate(
+            addr, func_start, base_reg, raw_disp, pos, entry_ofs, _, width
+        ),
+        pcmp(addr, mem, _),
+        op_indirect(mem, _, base_str, idx_str, _, asm_disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg && *asm_disp == *raw_disp,
+        if *mem_size == *width;
+    win64_home_backing_cmp_read(
+        addr, func_start, *mem, *base_reg, *raw_disp, *pos, *entry_ofs, *width
+    ) <--
+        win64_home_backing_candidate(
+            addr, func_start, base_reg, raw_disp, pos, entry_ofs, _, width
+        ),
+        pcmp(addr, _, mem),
+        op_indirect(mem, _, base_str, idx_str, _, asm_disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if Mreg::x86(*base_str) == *base_reg && *asm_disp == *raw_disp,
+        if *mem_size == *width;
+
+    // Candidate construction is shared so full-cell scalar comparisons and
+    // bounded backing-subrange comparisons preserve identical operand order,
+    // condition sizing, adjacency, and SETcc consumption.
+    #[local] relation win64_home_cmp_read(
+        Node, Address, Symbol, Mreg, i64, usize, i64, usize
+    );
+    win64_home_cmp_read(addr, func, mem, base, raw, pos, entry, width) <--
+        win64_home_scalar_cmp_read(addr, func, mem, base, raw, pos, entry, width);
+    win64_home_cmp_read(addr, func, mem, base, raw, pos, entry, width) <--
+        win64_home_backing_cmp_read(addr, func, mem, base, raw, pos, entry, width);
 
     // Keep the branch fusion explicitly adjacent.  A scheduled CMP -> Jcc
     // pair needs a snapshot at CMP and the Icond at Jcc so intervening
@@ -8052,7 +9242,7 @@ ascent_par! {
         next(setcc_addr, fallthrough);
 
     rtl_inst_candidate(addr, inst) <--
-        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_cmp_read(addr, func_start, mem, _, _, pos, _, width),
         win64_home_storage(func_start, pos, slot),
         pcmp(addr, mem, other),
         op_register(other, reg_str),
@@ -8065,7 +9255,7 @@ ascent_par! {
         let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *width),
         let inst = RTLInst::Icond(cond, Arc::new(vec![*slot, *other_rtl]), Either::Right(*target_addr), Either::Right(*fallthrough));
     rtl_inst_candidate(addr, inst) <--
-        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_cmp_read(addr, func_start, mem, _, _, pos, _, width),
         win64_home_storage(func_start, pos, slot),
         pcmp(addr, other, mem),
         op_register(other, reg_str),
@@ -8078,7 +9268,7 @@ ascent_par! {
         let cond = crate::decompile::passes::rtl_pass::adjust_condition_size(raw_cond, *width),
         let inst = RTLInst::Icond(cond, Arc::new(vec![*other_rtl, *slot]), Either::Right(*target_addr), Either::Right(*fallthrough));
     rtl_inst_candidate(addr, inst) <--
-        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_cmp_read(addr, func_start, mem, _, _, pos, _, width),
         win64_home_storage(func_start, pos, slot),
         pcmp(addr, mem, other),
         op_immediate(other, imm, _),
@@ -8096,7 +9286,7 @@ ascent_par! {
         },
         let inst = RTLInst::Icond(cond, Arc::new(vec![*slot]), Either::Right(*target_addr), Either::Right(*fallthrough));
     rtl_inst_candidate(addr, inst) <--
-        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_cmp_read(addr, func_start, mem, _, _, pos, _, width),
         win64_home_storage(func_start, pos, slot),
         pcmp(addr, other, mem),
         op_immediate(other, imm, _),
@@ -8115,7 +9305,7 @@ ascent_par! {
         let inst = RTLInst::Icond(cond, Arc::new(vec![*slot]), Either::Right(*target_addr), Either::Right(*fallthrough));
 
     rtl_inst_candidate(addr, inst) <--
-        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_cmp_read(addr, func_start, mem, _, _, pos, _, width),
         win64_home_storage(func_start, pos, slot),
         pcmp(addr, mem, other),
         op_register(other, reg_str),
@@ -8128,7 +9318,7 @@ ascent_par! {
             Operation::Ocmp(cond), Arc::new(vec![*slot, *other_rtl]), *destination
         );
     rtl_inst_candidate(addr, inst) <--
-        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_cmp_read(addr, func_start, mem, _, _, pos, _, width),
         win64_home_storage(func_start, pos, slot),
         pcmp(addr, other, mem),
         op_register(other, reg_str),
@@ -8141,7 +9331,7 @@ ascent_par! {
             Operation::Ocmp(cond), Arc::new(vec![*other_rtl, *slot]), *destination
         );
     rtl_inst_candidate(addr, inst) <--
-        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_cmp_read(addr, func_start, mem, _, _, pos, _, width),
         win64_home_storage(func_start, pos, slot),
         pcmp(addr, mem, other),
         op_immediate(other, imm, _),
@@ -8159,7 +9349,7 @@ ascent_par! {
             Operation::Ocmp(cond), Arc::new(vec![*slot]), *destination
         );
     rtl_inst_candidate(addr, inst) <--
-        win64_home_scalar_cmp_read(addr, func_start, mem, _, _, pos, _, width),
+        win64_home_cmp_read(addr, func_start, mem, _, _, pos, _, width),
         win64_home_storage(func_start, pos, slot),
         pcmp(addr, other, mem),
         op_immediate(other, imm, _),
@@ -8195,6 +9385,17 @@ ascent_par! {
     win64_home_scalar_access(addr, func, pos) <--
         win64_home_scalar_cmp_read(addr, func, _, _, _, pos, _, _);
 
+    // Scalar cells retain the narrow closed set above.  A cell promoted to
+    // backing-memory mode is all-or-nothing: every overlap must have one
+    // bounded byte-range witness, including accesses which were independently
+    // scalar-expressible.
+    #[local] relation win64_home_supported_access(Node, Address, usize);
+    win64_home_supported_access(addr, func, pos) <--
+        win64_home_scalar_access(addr, func, pos),
+        !win64_home_backing_required(func, pos);
+    win64_home_supported_access(addr, func, pos) <--
+        win64_home_backing_candidate(addr, func, _, _, pos, _, _, _);
+
     unsupported_stack_address(*func, *addr, "unsupported-stack-address") <--
         // A storage signature exists for every ordinary /homeparams spill,
         // including safe immutable spill/reload pairs.  Only cells already
@@ -8202,11 +9403,11 @@ ascent_par! {
         // overlaps are intentionally consumed by the entry-parameter fold.
         win64_home_storage(func, pos, _),
         win64_home_overlap(addr, func, pos),
-        !win64_home_scalar_access(addr, func, pos);
+        !win64_home_supported_access(addr, func, pos);
     unsupported_address_detail(*func, *addr, "home-cell-shape-unrepresentable") <--
         win64_home_storage(func, pos, _),
         win64_home_overlap(addr, func, pos),
-        !win64_home_scalar_access(addr, func, pos);
+        !win64_home_supported_access(addr, func, pos);
 
     // Reasons that make scalar replacement incomplete or ambiguous.  These
     // rows are separate from win64_home_slot_unsafe: "unsafe" merely means the
@@ -8216,18 +9417,57 @@ ascent_par! {
     win64_home_canonical_veto(func_start, *pos) <--
         win64_home_storage_signature(func_start, pos, _, _),
         win64_home_overlap(addr, func_start, pos),
-        !win64_home_scalar_access(addr, func_start, pos);
+        !win64_home_supported_access(addr, func_start, pos);
     win64_home_canonical_veto(func_start, *pos) <--
         win64_home_storage_signature(func_start, pos, _, _),
         win64_unsafe_home_access(addr, func_start, _, _, pos, _),
-        !win64_home_scalar_access(addr, func_start, pos);
+        !win64_home_supported_access(addr, func_start, pos);
+    win64_home_canonical_veto(func_start, *pos) <--
+        win64_home_backing_required(func_start, pos),
+        win64_home_storage_signature(func_start, pos, move_class, _),
+        if *move_class != 0;
+    win64_home_canonical_veto(func_start, *pos) <--
+        win64_home_backing_candidate(addr, func_start, _, _, pos, _, _, _),
+        win64_home_backing_float_access(addr);
+    win64_home_canonical_veto(func_start, *pos) <--
+        win64_home_backing_candidate(addr, func_start, _, _, pos, _, _, _),
+        win64_home_backing_readwrite_reg(addr);
+    win64_home_canonical_veto(func_start, *pos) <--
+        win64_home_backing_candidate(addr, func_start, _, _, pos, _, _, _),
+        win64_home_backing_flagged_write(addr);
+    win64_home_canonical_veto(func_start, *pos) <--
+        win64_home_backing_candidate(addr, func_start, _, _, pos, _, _, _),
+        win64_home_backing_lock_access(addr);
+    win64_home_canonical_veto(func_start, *pos) <--
+        win64_home_backing_candidate(addr, func_start, _, _, pos, _, _, _),
+        win64_home_backing_cmov_sf(addr);
     win64_home_canonical_veto(func_start, *pos) <--
         win64_home_scalar_lea(_, func_start, _, _, pos, _, _),
+        !win64_home_backing_required(func_start, pos),
         win64_home_storage_signature(func_start, pos, _, width),
         // An escaped home address exposes the ABI's whole eight-byte cell.
         // A narrower scalar would not provide safe backing for an opaque
         // callee, so retain the original stack storage instead.
         if *width != 8;
+
+    // Preserve an exact instruction responsible for a hard indexed-address
+    // failure only when the normalized base coordinate is the affected home
+    // slot itself.  The broader function-level rules below must still veto
+    // canonicalizing every home cell when an indexed address is ambiguous,
+    // but a disjoint post-prologue local array remains ordinary emittable RTL.
+    relation win64_home_hard_veto_site(Node, Address, usize);
+    win64_home_hard_veto_site(*addr, func_start, *pos) <--
+        indexed_stack_operand(addr, base_reg, raw_disp, _),
+        real_addr_in_func(addr, func_start),
+        sp_based_mem_at(addr, func_start, seen_base, base_ofs),
+        if *seen_base == *base_reg,
+        win64_home_storage_signature(func_start, pos, _, _),
+        abi_incoming_sp_stack_base(incoming_base),
+        abi_outgoing_stack_base(outgoing_base),
+        abi_stack_slot_size(slot_size),
+        let home_base = *incoming_base - *outgoing_base,
+        if *base_ofs + *raw_disp
+            == home_base + (*pos as i64 * *slot_size);
 
     win64_home_canonical_veto(func_start, *pos) <--
         indexed_stack_operand(addr, base_reg, _, _),
@@ -8245,6 +9485,8 @@ ascent_par! {
         func_ever_sets_frame_pointer(func_start),
         !bp_base_at(func_start, addr, _),
         win64_home_storage_signature(func_start, pos, _, _);
+    win64_home_canonical_veto(*func_start, *pos) <--
+        win64_home_hard_veto_site(_, func_start, pos);
     win64_home_canonical_veto(func_start, *pos) <--
         direct_stack_operand(addr, Mreg::SP, _, _),
         real_addr_in_func(addr, func_start),
@@ -8281,6 +9523,7 @@ ascent_par! {
         !sp_alias_def(func_start, addr, _, _),
         win64_home_storage_signature(func_start, pos, _, _),
         !win64_home_exact_addr_copy_use(func_start, addr, alias, pos),
+        !win64_home_exact_addr_store_use(func_start, addr, alias, pos),
         !win64_home_exact_addr_call(func_start, addr, alias, pos);
     // A proved exact-home address web receives the stricter policy even when
     // the instruction also happens to create another affine SP alias.  This
@@ -8293,6 +9536,7 @@ ascent_par! {
         !indexed_stack_operand(addr, alias, _, _),
         win64_home_storage_signature(func_start, pos, _, _),
         !win64_home_exact_addr_copy_use(func_start, addr, alias, pos),
+        !win64_home_exact_addr_store_use(func_start, addr, alias, pos),
         !win64_home_exact_addr_call(func_start, addr, alias, pos);
     win64_home_canonical_veto(func_start, *pos) <--
         abi_shared_arg_slots(true),
@@ -8302,7 +9546,10 @@ ascent_par! {
         real_addr_in_func(call_addr, func_start),
         win64_home_storage_signature(func_start, pos, _, _),
         !win64_home_exact_addr_at(func_start, call_addr, alias, pos),
-        !win64_home_exact_addr_call(func_start, call_addr, alias, pos);
+        !win64_home_exact_addr_call(func_start, call_addr, alias, pos),
+        !win64_home_descriptor_call(
+            func_start, call_addr, pos, alias_def, alias
+        );
     win64_home_canonical_veto(func_start, *pos) <--
         abi_shared_arg_slots(true),
         sp_may_alias_def(func_start, alias_def, ?&Mreg::AX),
@@ -10322,6 +11569,111 @@ pub fn chunk_size_bits(chunk: &MemoryChunk) -> u8 {
     }
 }
 
+fn win64_home_mask_value(mask: i64, width: usize) -> Option<i64> {
+    match width {
+        1 => Some((mask as u8) as i64),
+        2 => Some((mask as u16) as i64),
+        4 => Some((mask as u32) as i64),
+        8 => Some(mask),
+        _ => None,
+    }
+}
+
+// TEST exposes only the flags derived from a bitwise AND.  Zero/nonzero are
+// the two conditions representable without inventing a flag register.  When
+// `preserve` is true this is the negated predicate used by Osel: Osel chooses
+// its first (old destination) value when the condition holds.
+fn win64_home_test_mask_condition(
+    test: TestCond,
+    mask: i64,
+    width: usize,
+    preserve: bool,
+) -> Option<Condition> {
+    let mask = win64_home_mask_value(mask, width)?;
+    match (test, preserve) {
+        (TestCond::CondE, false) | (TestCond::CondNe, true) => {
+            Some(Condition::Cmaskzero(mask))
+        }
+        (TestCond::CondNe, false) | (TestCond::CondE, true) => {
+            Some(Condition::Cmasknotzero(mask))
+        }
+        _ => None,
+    }
+}
+
+fn win64_home_cmov_cmp_condition(
+    test: TestCond,
+    width: usize,
+    immediate: Option<i64>,
+) -> Option<Condition> {
+    if !matches!(width, 2 | 4 | 8) {
+        return None;
+    }
+    let condition = crate::x86::types::condition_for_testcond_sized(
+        crate::x86::types::negate_testcond(test),
+        width == 8,
+    );
+    match immediate {
+        None => match condition {
+            Condition::Ccomp(_)
+            | Condition::Ccompu(_)
+            | Condition::Ccompl(_)
+            | Condition::Ccomplu(_) => Some(condition),
+            _ => None,
+        },
+        Some(value) => match condition {
+            Condition::Ccomp(cmp) => Some(Condition::Ccompimm(cmp, value)),
+            Condition::Ccompu(cmp) => Some(Condition::Ccompuimm(cmp, value)),
+            Condition::Ccompl(cmp) => Some(Condition::Ccomplimm(cmp, value)),
+            Condition::Ccomplu(cmp) => Some(Condition::Ccompluimm(cmp, value)),
+            _ => None,
+        },
+    }
+}
+
+fn win64_home_cmov_typ(width: usize) -> Option<Typ> {
+    match width {
+        // A 16-bit CMOV preserves the destination's upper bits, which the
+        // provider's Tint Osel cannot express as one assignment.
+        4 => Some(Typ::Tint),
+        8 => Some(Typ::Tany64),
+        _ => None,
+    }
+}
+
+fn win64_home_div_operation_width(op: &Operation) -> Option<usize> {
+    match op {
+        Operation::Odiv | Operation::Odivu | Operation::Omod | Operation::Omodu => Some(4),
+        Operation::Odivl | Operation::Odivlu | Operation::Omodl | Operation::Omodlu => Some(8),
+        _ => None,
+    }
+}
+
+fn win64_home_div_operation(
+    signed: bool,
+    remainder: bool,
+    width: usize,
+) -> Option<Operation> {
+    match (signed, remainder, width) {
+        (true, false, 4) => Some(Operation::Odiv),
+        (true, true, 4) => Some(Operation::Omod),
+        (false, false, 4) => Some(Operation::Odivu),
+        (false, true, 4) => Some(Operation::Omodu),
+        (true, false, 8) => Some(Operation::Odivl),
+        (true, true, 8) => Some(Operation::Omodl),
+        (false, false, 8) => Some(Operation::Odivlu),
+        (false, true, 8) => Some(Operation::Omodlu),
+        _ => None,
+    }
+}
+
+fn win64_home_unsigned_div_high_zero_register(
+    register: &str,
+    width: usize,
+) -> bool {
+    matches!(width, 4 | 8) && matches!(register, "EDX" | "RDX")
+}
+
 pub(crate) fn build_xtype_vec<'a>(
     inp: impl Iterator<Item = (&'a usize, &'a XType)>,
 ) -> impl Iterator<Item = Arc<Vec<XType>>> {
@@ -10344,6 +11696,16 @@ pub(crate) fn build_xtype_vec<'a>(
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum UnsafeHomeShape {
+    Backing {
+        base: Mreg,
+        raw_ofs: i64,
+        entry_ofs: i64,
+        byte_ofs: i64,
+        width: usize,
+        read: bool,
+        write: bool,
+        address: bool,
+    },
     Store {
         base: Mreg,
         raw_ofs: i64,
@@ -10392,6 +11754,15 @@ enum UnsafeHomeShape {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum UnsafeHomeRewrite {
+    Backing {
+        slot: RTLReg,
+        byte_ofs: i64,
+        width: usize,
+        chunk: MemoryChunk,
+        read: bool,
+        write: bool,
+        address: bool,
+    },
     Store { source: RTLReg, slot: RTLReg },
     Load { slot: RTLReg, destination: RTLReg },
     ExtendLoad {
@@ -10420,16 +11791,157 @@ fn home_move_xtype(move_class: usize, width: usize) -> Option<XType> {
     }
 }
 
-// Reassert exact canonical-home backing types after a type-producing pass.
-// These synthetic storage IDs are deliberately not value-web peers: copying a
-// source's narrower/pointer refinement onto the addressable cell changes its
-// width or class and can make final C declarations disagree with the rewritten
-// full-cell loads/stores.
-pub(crate) fn enforce_win64_home_slot_types(db: &mut DecompileDB) {
-    let locked: BTreeMap<RTLReg, XType> = db
+fn win64_home_scalar_result_xtype(chunk: MemoryChunk) -> Option<XType> {
+    match chunk {
+        MemoryChunk::MBool => Some(XType::Xbool),
+        MemoryChunk::MInt8Signed => Some(XType::Xint8signed),
+        MemoryChunk::MInt8Unsigned => Some(XType::Xint8unsigned),
+        MemoryChunk::MInt16Signed => Some(XType::Xint16signed),
+        MemoryChunk::MInt16Unsigned => Some(XType::Xint16unsigned),
+        MemoryChunk::MInt32 | MemoryChunk::MAny32 => Some(XType::Xint),
+        MemoryChunk::MFloat32 => Some(XType::Xsingle),
+        MemoryChunk::MFloat64 => Some(XType::Xfloat),
+        // A full-width integer load may genuinely carry a Win64 pointer.
+        MemoryChunk::MInt64 | MemoryChunk::MAny64 | MemoryChunk::Unknown => None,
+    }
+}
+
+fn collect_rtl_builtin_result_regs(arg: &BuiltinArg<RTLReg>, regs: &mut BTreeSet<RTLReg>) {
+    match arg {
+        BuiltinArg::BA(reg) => {
+            regs.insert(*reg);
+        }
+        BuiltinArg::BASplitLong(left, right) | BuiltinArg::BAAddPtr(left, right) => {
+            collect_rtl_builtin_result_regs(left, regs);
+            collect_rtl_builtin_result_regs(right, regs);
+        }
+        _ => {}
+    }
+}
+
+fn rtl_inst_defined_regs(inst: &RTLInst) -> BTreeSet<RTLReg> {
+    let mut regs = BTreeSet::new();
+    match inst {
+        RTLInst::Iop(_, _, destination) | RTLInst::Iload(_, _, _, destination) => {
+            regs.insert(*destination);
+        }
+        RTLInst::Icall(_, _, _, Some(destination), _) => {
+            regs.insert(*destination);
+        }
+        RTLInst::Ibuiltin(_, _, result) => collect_rtl_builtin_result_regs(result, &mut regs),
+        _ => {}
+    }
+    regs
+}
+
+// Reassert exact canonical-home storage and authenticated scalar-result types
+// after a type-producing pass.  Synthetic storage IDs are deliberately not
+// value-web peers, while a selected sub-64-bit/float Iload is definitionally a
+// scalar even if the original register web retained stale pointer evidence.
+// Full-width integer results remain unconstrained because they may genuinely
+// carry Win64 pointers.
+pub(crate) fn enforce_win64_home_types(db: &mut DecompileDB) {
+    let mut locked: BTreeMap<RTLReg, XType> = db
         .rel_iter::<(RTLReg, XType)>("win64_home_slot_type")
         .map(|(reg, xtype)| (*reg, *xtype))
         .collect();
+
+    let mut backing_accesses: BTreeMap<
+        Node,
+        Vec<(RTLReg, MemoryChunk, bool, bool, bool)>,
+    > = BTreeMap::new();
+    for (node, slot, _, _, chunk, read, write, address) in db
+        .rel_iter::<(
+            Node,
+            RTLReg,
+            i64,
+            usize,
+            MemoryChunk,
+            bool,
+            bool,
+            bool,
+        )>("win64_home_backing_access")
+    {
+        backing_accesses.entry(*node).or_default().push((
+            *slot, *chunk, *read, *write, *address,
+        ));
+    }
+
+    let mut authenticated_results: BTreeMap<RTLReg, Vec<(Node, RTLInst, XType)>> =
+        BTreeMap::new();
+    for (real, candidate, inst) in db.rel_iter::<(Node, Node, RTLInst)>(
+        "win64_home_backing_selected_candidate",
+    ) {
+        let (destination, xtype) = match inst {
+            RTLInst::Iload(chunk, _, _, destination) => {
+                let Some(xtype) = win64_home_scalar_result_xtype(*chunk) else {
+                    continue;
+                };
+                (*destination, xtype)
+            }
+            // Canonical backing selection represents a scalar memory source
+            // as the home-slot value in RTL.  Cshminor later materializes that
+            // exact operand as Eload(access_chunk); a direct Omove therefore
+            // defines the scalar load result even though the selected RTL row
+            // is not syntactically Iload.
+            RTLInst::Iop(Operation::Omove, args, destination) => {
+                let Some(accesses) = backing_accesses.get(real) else {
+                    continue;
+                };
+                let [(slot, chunk, read, write, address)] = accesses.as_slice() else {
+                    continue;
+                };
+                if !read || *write || *address || args.as_ref() != &[*slot] {
+                    continue;
+                }
+                let Some(xtype) = win64_home_scalar_result_xtype(*chunk) else {
+                    continue;
+                };
+                (*destination, xtype)
+            }
+            _ => continue,
+        };
+        authenticated_results.entry(destination).or_default().push((
+            *candidate,
+            inst.clone(),
+            xtype,
+        ));
+    }
+    let mut surviving_definitions: BTreeMap<RTLReg, Vec<(Node, RTLInst)>> = BTreeMap::new();
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        for reg in rtl_inst_defined_regs(inst) {
+            surviving_definitions
+                .entry(reg)
+                .or_default()
+                .push((*node, inst.clone()));
+        }
+    }
+    for (reg, authenticated) in authenticated_results {
+        let types: BTreeSet<XType> = authenticated.iter().map(|(_, _, xtype)| *xtype).collect();
+        let Some(xtype) = (types.len() == 1)
+            .then(|| *types.iter().next().expect("one checked home result type"))
+        else {
+            continue;
+        };
+        let Some(definitions) = surviving_definitions.get(&reg) else {
+            continue;
+        };
+        if definitions.is_empty()
+            || !definitions.iter().all(|(node, inst)| {
+                authenticated.iter().any(|(candidate, selected, selected_type)| {
+                    node == candidate && inst == selected && *selected_type == xtype
+                })
+            })
+        {
+            continue;
+        }
+        if locked
+            .get(&reg)
+            .map_or(true, |locked_type| *locked_type == xtype)
+        {
+            locked.insert(reg, xtype);
+        }
+    }
     if locked.is_empty() {
         return;
     }
@@ -10439,11 +11951,17 @@ pub(crate) fn enforce_win64_home_slot_types(db: &mut DecompileDB) {
         .filter(|(reg, xtype)| locked.get(reg).map_or(true, |exact| *exact == *xtype))
         .copied()
         .collect();
-    filtered.extend(locked);
+    filtered.extend(locked.iter().map(|(reg, xtype)| (*reg, *xtype)));
     db.rel_set(
         "emit_var_type_candidate",
         filtered.into_iter().collect::<ascent::boxcar::Vec<_>>(),
     );
+    let pointer_rows: ascent::boxcar::Vec<(RTLReg,)> = db
+        .rel_iter::<(RTLReg,)>("is_ptr")
+        .filter(|(reg,)| !locked.contains_key(reg))
+        .copied()
+        .collect();
+    db.rel_set("is_ptr", pointer_rows);
 }
 
 fn collect_builtin_uses(arg: &BuiltinArg<RTLReg>, used: &mut BTreeSet<RTLReg>) {
@@ -10486,6 +12004,225 @@ fn collect_rtl_uses(inst: &RTLInst, used: &mut BTreeSet<RTLReg>) {
         RTLInst::Ijumptable(reg, _) | RTLInst::Ireturn(reg) => {
             used.insert(*reg);
         }
+    }
+}
+
+fn win64_home_backing_candidate_matches_mode(
+    inst: &RTLInst,
+    slot: RTLReg,
+    raw_ofs: i64,
+    read: bool,
+    write: bool,
+    address: bool,
+) -> bool {
+    let exact_address = matches!(
+        inst,
+        RTLInst::Iop(
+            Operation::Olea(Addressing::Ainstack(ofs))
+                | Operation::Oleal(Addressing::Ainstack(ofs)),
+            _,
+            _,
+        ) if *ofs == raw_ofs
+    );
+    let mut uses = BTreeSet::new();
+    collect_rtl_uses(inst, &mut uses);
+    let witnessed_read = matches!(inst, RTLInst::Iload(..)) || uses.contains(&slot);
+    let witnessed_write = matches!(inst, RTLInst::Istore(..))
+        || matches!(inst, RTLInst::Iop(_, _, destination) if *destination == slot);
+    exact_address == address && witnessed_read == read && witnessed_write == write
+}
+
+const WIN64_HOME_BACKING_RESOLVABLE_DETAIL: Symbol = "stack-parameter-partial-write";
+
+fn win64_home_backing_has_only_resolvable_details(
+    details: Option<&BTreeSet<Symbol>>,
+) -> bool {
+    details.is_some_and(|details| {
+        !details.is_empty()
+            && details
+                .iter()
+                .all(|detail| *detail == WIN64_HOME_BACKING_RESOLVABLE_DETAIL)
+    })
+}
+
+fn win64_home_backing_site_diagnostics_are_safe(
+    has_unsupported_reason: bool,
+    details: Option<&BTreeSet<Symbol>>,
+) -> bool {
+    let has_hard_detail = details.is_some_and(|details| {
+        details
+            .iter()
+            .any(|detail| *detail != WIN64_HOME_BACKING_RESOLVABLE_DETAIL)
+    });
+    !has_hard_detail
+        && (!has_unsupported_reason || win64_home_backing_has_only_resolvable_details(details))
+}
+
+fn rewrite_home_backing_builtin(
+    arg: &BuiltinArg<RTLReg>,
+    old: RTLReg,
+    slot: RTLReg,
+) -> BuiltinArg<RTLReg> {
+    match arg {
+        BuiltinArg::BA(reg) => BuiltinArg::BA(if *reg == old { slot } else { *reg }),
+        BuiltinArg::BASplitLong(left, right) => BuiltinArg::BASplitLong(
+            Box::new(rewrite_home_backing_builtin(left, old, slot)),
+            Box::new(rewrite_home_backing_builtin(right, old, slot)),
+        ),
+        BuiltinArg::BAAddPtr(left, right) => BuiltinArg::BAAddPtr(
+            Box::new(rewrite_home_backing_builtin(left, old, slot)),
+            Box::new(rewrite_home_backing_builtin(right, old, slot)),
+        ),
+        _ => arg.clone(),
+    }
+}
+
+// Replace one ordinary stack-cell value with the canonical backing local in
+// an already-selected instruction.  This is deliberately structural rather
+// than mnemonic-based; Cshminor later interprets a use/definition of `slot`
+// at the authenticated access node as a typed memory read/write.
+fn rewrite_home_backing_inst(inst: &RTLInst, old: RTLReg, slot: RTLReg) -> RTLInst {
+    let reg = |value: RTLReg| if value == old { slot } else { value };
+    let args = |values: &Arc<Vec<RTLReg>>| {
+        Arc::new(values.iter().map(|value| reg(*value)).collect::<Vec<_>>())
+    };
+    match inst {
+        RTLInst::Inop => RTLInst::Inop,
+        RTLInst::Iop(op, values, destination) => {
+            RTLInst::Iop(op.clone(), args(values), reg(*destination))
+        }
+        RTLInst::Iload(chunk, addressing, values, destination) => RTLInst::Iload(
+            *chunk,
+            addressing.clone(),
+            args(values),
+            reg(*destination),
+        ),
+        RTLInst::Istore(chunk, addressing, values, source) => RTLInst::Istore(
+            *chunk,
+            addressing.clone(),
+            args(values),
+            reg(*source),
+        ),
+        RTLInst::Icall(signature, callee, values, destination, successor) => {
+            let callee = match callee {
+                Either::Left(value) => Either::Left(reg(*value)),
+                other => other.clone(),
+            };
+            RTLInst::Icall(
+                signature.clone(),
+                callee,
+                args(values),
+                destination.map(reg),
+                *successor,
+            )
+        }
+        RTLInst::Itailcall(signature, callee, values) => {
+            let callee = match callee {
+                Either::Left(value) => Either::Left(reg(*value)),
+                other => other.clone(),
+            };
+            RTLInst::Itailcall(signature.clone(), callee, args(values))
+        }
+        RTLInst::Ibuiltin(name, values, result) => RTLInst::Ibuiltin(
+            name.clone(),
+            values
+                .iter()
+                .map(|value| rewrite_home_backing_builtin(value, old, slot))
+                .collect(),
+            rewrite_home_backing_builtin(result, old, slot),
+        ),
+        RTLInst::Icond(condition, values, if_true, if_false) => RTLInst::Icond(
+            condition.clone(),
+            args(values),
+            if_true.clone(),
+            if_false.clone(),
+        ),
+        RTLInst::Ijumptable(value, targets) => {
+            RTLInst::Ijumptable(reg(*value), targets.clone())
+        }
+        RTLInst::Ibranch(target) => RTLInst::Ibranch(target.clone()),
+        RTLInst::Ireturn(value) => RTLInst::Ireturn(reg(*value)),
+    }
+}
+
+fn win64_home_normalize_integer_chunk(chunk: MemoryChunk) -> Option<MemoryChunk> {
+    match chunk {
+        MemoryChunk::MBool => Some(MemoryChunk::MInt8Unsigned),
+        MemoryChunk::MAny32 => Some(MemoryChunk::MInt32),
+        MemoryChunk::MAny64 => Some(MemoryChunk::MInt64),
+        MemoryChunk::MInt8Signed
+        | MemoryChunk::MInt8Unsigned
+        | MemoryChunk::MInt16Signed
+        | MemoryChunk::MInt16Unsigned
+        | MemoryChunk::MInt32
+        | MemoryChunk::MInt64 => Some(chunk),
+        MemoryChunk::MFloat32 | MemoryChunk::MFloat64 | MemoryChunk::Unknown => None,
+    }
+}
+
+fn win64_home_backing_semantic_chunk(
+    width: usize,
+    read: bool,
+    address: bool,
+    mnemonics: &BTreeSet<&'static str>,
+    candidates: &BTreeMap<Node, RTLInst>,
+    test_semantics: bool,
+) -> Option<MemoryChunk> {
+    if address {
+        return win64_home_natural_integer_chunk(width);
+    }
+
+    // Mnemonic-authenticated extending loads and signed comparison/select
+    // predicates are stronger than generic integer candidate chunks.  The
+    // latter often use MAny32/MAny64 merely as transport types.
+    let mut exact = BTreeSet::new();
+    for mnemonic in mnemonics {
+        if let Some(chunk) = extending_load_chunk(mnemonic, width) {
+            exact.insert(chunk);
+        }
+    }
+    if width <= 2
+        && candidates
+            .values()
+            .any(win64_home_inst_signed_condition)
+    {
+        exact.insert(win64_home_signed_integer_chunk(width)?);
+    }
+    if test_semantics {
+        exact.insert(win64_home_natural_integer_chunk(width)?);
+    }
+    if exact.len() > 1 {
+        return None;
+    }
+
+    let mut candidate_chunks = BTreeSet::new();
+    for inst in candidates.values() {
+        if let RTLInst::Iload(chunk, _, _, _) = inst {
+            let chunk = win64_home_normalize_integer_chunk(*chunk)?;
+            if win64_home_integer_chunk_width(&chunk) != Some(width) {
+                return None;
+            }
+            candidate_chunks.insert(chunk);
+        }
+    }
+    if let Some(chunk) = exact.into_iter().next() {
+        return Some(chunk);
+    }
+    if candidate_chunks.len() > 1 {
+        return None;
+    }
+    if let Some(chunk) = candidate_chunks.into_iter().next() {
+        return Some(chunk);
+    }
+
+    // Stores have no signed load semantics.  Reads which reach here have one
+    // selector-authenticated integer operation over the backing slot (TEST,
+    // CMOV, arithmetic, DIV, or plain move); its decoded width fixes the byte
+    // view and no signed cast/predicate fact was present.
+    if !read || !candidates.is_empty() {
+        win64_home_natural_integer_chunk(width)
+    } else {
+        None
     }
 }
 
@@ -11908,6 +13645,23 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         .rel_iter::<(Address, usize)>("win64_home_canonical_veto")
         .copied()
         .collect();
+    let hard_veto_sites: BTreeSet<(Node, Address, usize)> = db
+        .rel_iter::<(Node, Address, usize)>("win64_home_hard_veto_site")
+        .copied()
+        .collect();
+    let mut address_details: BTreeMap<(Address, Node), BTreeSet<Symbol>> = BTreeMap::new();
+    for (func, node, detail) in
+        db.rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail")
+    {
+        address_details
+            .entry((*func, *node))
+            .or_default()
+            .insert(*detail);
+    }
+    let unsupported_reason_sites: BTreeSet<(Address, Node)> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .map(|(func, node, _)| (*func, *node))
+        .collect();
     let unsafe_accesses: BTreeSet<(Node, Address, Mreg, i64, usize, i64)> = db
         .rel_iter::<(Node, Address, Mreg, i64, usize, i64)>("win64_unsafe_home_access")
         .copied()
@@ -11916,6 +13670,96 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         .rel_iter::<(Node, Address, Mreg, usize)>("win64_home_spill_candidate")
         .map(|(node, func, _, pos)| (*func, *pos, *node))
         .collect();
+    let backing_required: BTreeSet<Cell> = db
+        .rel_iter::<(Address, usize)>("win64_home_backing_required")
+        .copied()
+        .collect();
+    let mut compare_nodes: BTreeSet<Node> = db
+        .rel_iter::<(Node, Address, Symbol, Mreg, i64, usize, i64, usize)>(
+            "win64_home_scalar_cmp_read",
+        )
+        .map(|(node, _, _, _, _, _, _, _)| *node)
+        .collect();
+    compare_nodes.extend(
+        db.rel_iter::<(Node, Address, Symbol, Mreg, i64, usize, i64, usize)>(
+            "win64_home_backing_cmp_read",
+        )
+        .map(|(node, _, _, _, _, _, _, _)| *node),
+    );
+    let semantic_backing_nodes: BTreeSet<Node> = db
+        .rel_iter::<(Node,)>("win64_home_backing_semantic_access")
+        .map(|(node,)| *node)
+        .collect();
+    let test_backing_nodes: BTreeSet<Node> = db
+        .rel_iter::<(Node, Address, usize, i64, usize)>(
+            "win64_home_backing_test_imm",
+        )
+        .map(|(node, _, _, _, _)| *node)
+        .collect();
+    let mut instruction_mnemonics: BTreeMap<Node, BTreeSet<&'static str>> =
+        BTreeMap::new();
+    for (node, _, _, mnemonic, _, _, _, _, _, _) in db.rel_iter::<(
+        Node,
+        usize,
+        &'static str,
+        &'static str,
+        Symbol,
+        Symbol,
+        Symbol,
+        Symbol,
+        usize,
+        usize,
+    )>("instruction") {
+        instruction_mnemonics
+            .entry(*node)
+            .or_default()
+            .insert(*mnemonic);
+    }
+    let division_nodes: BTreeSet<Node> = db
+        .rel_iter::<(Address, Symbol, Symbol)>("pdiv")
+        .map(|(node, _, _)| *node)
+        .collect();
+    let semantic_bridges: BTreeMap<Node, BTreeSet<(Node, Node)>> = {
+        let mut rows: BTreeMap<Node, BTreeSet<(Node, Node)>> = BTreeMap::new();
+        for (access, predecessor, old_target) in db
+            .rel_iter::<(Node, Node, Node)>("win64_home_backing_semantic_bridge")
+        {
+            rows.entry(*access)
+                .or_default()
+                .insert((*predecessor, *old_target));
+        }
+        rows
+    };
+    let semantic_consumed: BTreeMap<Node, BTreeSet<Node>> = {
+        let mut rows: BTreeMap<Node, BTreeSet<Node>> = BTreeMap::new();
+        for (access, consumed) in db
+            .rel_iter::<(Node, Node)>("win64_home_backing_semantic_consumed")
+        {
+            rows.entry(*access).or_default().insert(*consumed);
+        }
+        rows
+    };
+    let semantic_successors: BTreeMap<Node, BTreeSet<Node>> = {
+        let mut rows: BTreeMap<Node, BTreeSet<Node>> = BTreeMap::new();
+        for (access, successor) in db
+            .rel_iter::<(Node, Node)>("win64_home_backing_semantic_succ")
+        {
+            rows.entry(*access).or_default().insert(*successor);
+        }
+        rows
+    };
+    let backing_modes: BTreeMap<Node, BTreeSet<(bool, bool, bool)>> = {
+        let mut modes: BTreeMap<Node, BTreeSet<(bool, bool, bool)>> = BTreeMap::new();
+        for (node, read, write, address) in
+            db.rel_iter::<(Node, bool, bool, bool)>("win64_home_backing_mode")
+        {
+            modes
+                .entry(*node)
+                .or_default()
+                .insert((*read, *write, *address));
+        }
+        modes
+    };
 
     let mut overlap_nodes: BTreeMap<Cell, BTreeSet<Node>> = BTreeMap::new();
     for &(node, func, pos) in db.rel_iter::<(Node, Address, usize)>("win64_home_overlap") {
@@ -12054,6 +13898,47 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
             });
     }
 
+    // If one access requires byte-addressable backing, replace the entire
+    // cell's scalar shape map with bounded memory views.  This includes the
+    // initial spill and full-width moves so a narrow spill never becomes an
+    // accidental whole-object assignment merely because a later operation is
+    // the one which triggered promotion.
+    let mut backing_shapes: BTreeMap<Cell, BTreeMap<Node, BTreeSet<UnsafeHomeShape>>> =
+        BTreeMap::new();
+    for &(node, func, base, raw_ofs, pos, entry_ofs, byte_ofs, width) in db
+        .rel_iter::<(Node, Address, Mreg, i64, usize, i64, i64, usize)>(
+            "win64_home_backing_candidate",
+        )
+    {
+        let modes = backing_modes.get(&node).cloned().unwrap_or_default();
+        for (read, write, address) in modes {
+            backing_shapes
+                .entry((func, pos))
+                .or_default()
+                .entry(node)
+                .or_default()
+                .insert(UnsafeHomeShape::Backing {
+                    base,
+                    raw_ofs,
+                    entry_ofs,
+                    byte_ofs,
+                    width,
+                    read,
+                    write,
+                    address,
+                });
+        }
+    }
+    for cell in &backing_required {
+        if let Some(by_node) = backing_shapes.remove(cell) {
+            shapes.insert(*cell, by_node);
+        } else {
+            // Preserve an empty cell entry: completeness below will reject it
+            // against the authoritative overlap set and restore diagnostics.
+            shapes.insert(*cell, BTreeMap::new());
+        }
+    }
+
     // RTL candidates and rewrite nodes are node-global, while the home facts
     // above are function-scoped.  Shared/.cold ownership or two home-cell
     // interpretations at one node therefore cannot be resolved by blindly
@@ -12115,11 +14000,129 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
             (*node, normalized)
         })
         .collect();
+    // Partial home-cell MOVs and extension-invariant register-source RMWs are
+    // intentionally outside ordinary stack lowering after the strict first
+    // unsupported-address barrier.  Their exact structured projections are
+    // selector evidence, not public candidates: materialize them only in this
+    // private snapshot so a rejected or incomplete cell cannot leak a
+    // provisional instruction past that boundary.
+    let mut projected_home_candidates = Vec::new();
+    projected_home_candidates.extend(
+        db.rel_iter::<(Node, Address, i64, usize, RTLReg, RTLReg)>(
+            "win64_home_backing_move_store",
+        )
+        .map(|(node, _, _, _, source, slot)| {
+            (
+                *node,
+                RTLInst::Iop(
+                    Operation::Omove,
+                    Arc::new(vec![rewrite(*source)]),
+                    rewrite(*slot),
+                ),
+            )
+        }),
+    );
+    projected_home_candidates.extend(
+        db.rel_iter::<(Node, Address, i64, usize, RTLReg, RTLReg)>(
+            "win64_home_backing_move_load",
+        )
+        .map(|(node, _, _, _, slot, destination)| {
+            (
+                *node,
+                RTLInst::Iop(
+                    Operation::Omove,
+                    Arc::new(vec![rewrite(*slot)]),
+                    rewrite(*destination),
+                ),
+            )
+        }),
+    );
+    projected_home_candidates.extend(
+        db.rel_iter::<(Node, Address, i64, usize, Operation, RTLReg, RTLReg)>(
+            "win64_home_backing_rmw_reg",
+        )
+        .map(|(node, _, _, _, op, source, slot)| {
+            (
+                *node,
+                RTLInst::Iop(
+                    op.clone(),
+                    Arc::new(vec![rewrite(*slot), rewrite(*source)]),
+                    rewrite(*slot),
+                ),
+            )
+        }),
+    );
+    projected_home_candidates.extend(
+        db.rel_iter::<(
+            Node,
+            Address,
+            usize,
+            Operation,
+            RTLReg,
+            RTLReg,
+            RTLReg,
+        )>("win64_home_backing_div")
+        .map(|(node, _, _, operation, dividend, slot, result)| {
+            (
+                *node,
+                RTLInst::Iop(
+                    operation.clone(),
+                    Arc::new(vec![rewrite(*dividend), rewrite(*slot)]),
+                    rewrite(*result),
+                ),
+            )
+        }),
+    );
+    projected_home_candidates.extend(
+        db.rel_iter::<(Node, Address, i64, usize, RTLReg, RTLReg)>(
+            "win64_home_backing_lea",
+        )
+        .map(|(node, _, raw_disp, _, _, destination)| {
+            (
+                *node,
+                RTLInst::Iop(
+                    Operation::Oleal(Addressing::Ainstack(*raw_disp)),
+                    Arc::new(vec![]),
+                    rewrite(*destination),
+                ),
+            )
+        }),
+    );
+    projected_home_candidates
+        .sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
+    projected_home_candidates.dedup();
+    let mut projected_home_candidates_by_node: BTreeMap<Node, Vec<RTLInst>> = BTreeMap::new();
+    for (node, inst) in &projected_home_candidates {
+        projected_home_candidates_by_node
+            .entry(*node)
+            .or_default()
+            .push(inst.clone());
+    }
+    let mut private_home_candidates = Vec::new();
+    for projected in projected_home_candidates {
+        // Preserve provenance across the private dedup boundary.  An
+        // identical ordinary candidate already present at this node must
+        // survive if the backing cell is rejected; only selector-only rows
+        // are withheld from final publication.
+        if !candidates.contains(&projected) {
+            private_home_candidates.push(projected.clone());
+            candidates.push(projected);
+        }
+    }
     candidates.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
     candidates.dedup();
     let mut candidates_at: BTreeMap<Node, Vec<&RTLInst>> = BTreeMap::new();
     for (node, inst) in &candidates {
         candidates_at.entry(*node).or_default().push(inst);
+    }
+    let mut stack_values: BTreeMap<(Address, Node, i64), BTreeSet<RTLReg>> = BTreeMap::new();
+    for (func, node, raw_ofs, value) in
+        db.rel_iter::<(Address, Node, i64, RTLReg)>("stack_var")
+    {
+        stack_values
+            .entry((*func, *node, *raw_ofs))
+            .or_default()
+            .insert(rewrite(*value));
     }
     let mut reaching_reads: BTreeMap<(Node, Mreg), BTreeSet<RTLReg>> = BTreeMap::new();
     for (node, mreg, value) in db.rel_iter::<(Node, Mreg, RTLReg)>("reaching_use_rtl") {
@@ -12148,6 +14151,9 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
     let mut home_addresses = BTreeSet::new();
     let mut home_escaped = BTreeSet::new();
     let mut cell_types = BTreeMap::new();
+    let mut backing_validated_candidates: BTreeMap<Node, RTLInst> = BTreeMap::new();
+    let mut backing_candidate_nodes = BTreeSet::new();
+    let mut resolved_backing_sites = BTreeSet::new();
 
     for (key @ (func, pos), slot) in seeded_storage {
         if vetoed.contains(&key) {
@@ -12156,12 +14162,16 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         let Some(cell_shapes) = shapes.get(&key) else {
             continue;
         };
-        let access_nodes: BTreeSet<Node> = unsafe_accesses
-            .iter()
-            .filter_map(|(node, access_func, _, _, access_pos, _)| {
-                (*access_func == func && *access_pos == pos).then_some(*node)
-            })
-            .collect();
+        let access_nodes: BTreeSet<Node> = if backing_required.contains(&key) {
+            overlap_nodes.get(&key).cloned().unwrap_or_default()
+        } else {
+            unsafe_accesses
+                .iter()
+                .filter_map(|(node, access_func, _, _, access_pos, _)| {
+                    (*access_func == func && *access_pos == pos).then_some(*node)
+                })
+                .collect()
+        };
         let shape_nodes: BTreeSet<Node> = cell_shapes.keys().copied().collect();
         if access_nodes != shape_nodes
             || overlap_nodes
@@ -12171,9 +14181,28 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         {
             continue;
         }
+        // Backing storage resolves the specific pristine-parameter failure
+        // caused by a partial overlapping write.  It must not erase a hard
+        // address-safety fact such as an unknown RSP coordinate, segment,
+        // addr32 access, shared node, or unresolved indirect predecessor.
+        // An unsupported reason without matching soft-detail provenance also
+        // remains fail-closed at the final scrub.
+        if backing_required.contains(&key)
+            && access_nodes.iter().any(|node| {
+                let site = (func, *node);
+                let details = address_details.get(&site);
+                !win64_home_backing_site_diagnostics_are_safe(
+                    unsupported_reason_sites.contains(&site),
+                    details,
+                )
+            })
+        {
+            continue;
+        }
 
         let has_storage_reason = cell_shapes.iter().any(|(node, rows)| {
             match rows.iter().next().expect("one checked home shape") {
+                UnsafeHomeShape::Backing { .. } => true,
                 UnsafeHomeShape::Store { .. } => !spill_nodes.contains(&(func, pos, *node)),
                 UnsafeHomeShape::Lea { .. } => true,
                 UnsafeHomeShape::ArithRead { .. } => true,
@@ -12191,6 +14220,8 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         let mut cell_rewrites = BTreeMap::new();
         let mut cell_setcc_nodes = BTreeSet::new();
         let mut cell_addresses = BTreeSet::new();
+        let mut cell_bridge_nodes = BTreeSet::new();
+        let mut cell_candidate_class: BTreeMap<Node, RTLInst> = BTreeMap::new();
         let mut signature: Option<(usize, usize)> = None;
         let mut complete = true;
 
@@ -12202,6 +14233,366 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                 .clone();
             let node_candidates = candidates_at.get(&node).map(Vec::as_slice).unwrap_or(&[]);
             match shape {
+                UnsafeHomeShape::Backing {
+                    raw_ofs,
+                    byte_ofs,
+                    width,
+                    read,
+                    write,
+                    address,
+                    ..
+                } => {
+                    let mnemonics = instruction_mnemonics
+                        .get(&node)
+                        .cloned()
+                        .unwrap_or_default();
+                    let authenticated_load_chunks: BTreeSet<MemoryChunk> = mnemonics
+                        .iter()
+                        .filter_map(|mnemonic| extending_load_chunk(mnemonic, width))
+                        .collect();
+                    if authenticated_load_chunks.len() > 1 {
+                        complete = false;
+                        break;
+                    }
+                    let authenticated_load_chunk =
+                        authenticated_load_chunks.iter().next().copied();
+                    let projected_candidates = projected_home_candidates_by_node.get(&node);
+                    if projected_candidates.is_some_and(|rows| rows.len() != 1) {
+                        complete = false;
+                        break;
+                    }
+                    // A decoder-authenticated MOV or extension-invariant RMW
+                    // has one exact canonical-slot projection.  Prefer that
+                    // representation over the ordinary fallback alternatives;
+                    // only the projection retains the byte-object identity
+                    // required by the backing adapter after suppression.
+                    let mut required_real_candidate: Option<RTLInst> =
+                        projected_candidates.and_then(|rows| rows.first()).cloned();
+                    // Promotion changes storage, not flag provenance.  Every
+                    // exact scalar or backing-subrange CMP must retain
+                    // the same single fused branch/value candidate and (for
+                    // Ocmp) one adjacent SETcc consumer.  Otherwise promotion
+                    // could turn a scheduled or flag-clobbered comparison into
+                    // an ordinary memory read and silently move its consumer.
+                    if compare_nodes.contains(&node) {
+                        let mut compare_candidates: Vec<RTLInst> = node_candidates
+                            .iter()
+                            .filter_map(|inst| match inst {
+                                RTLInst::Icond(_, args, _, _)
+                                    if args.iter().filter(|arg| **arg == slot).count() == 1 =>
+                                {
+                                    Some((*inst).clone())
+                                }
+                                RTLInst::Iop(Operation::Ocmp(_), args, _)
+                                    if args.iter().filter(|arg| **arg == slot).count() == 1 =>
+                                {
+                                    Some((*inst).clone())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        compare_candidates.sort_by_cached_key(|inst| format!("{inst:?}"));
+                        compare_candidates.dedup();
+                        if compare_candidates.len() != 1 {
+                            complete = false;
+                            break;
+                        }
+                        required_real_candidate = compare_candidates.first().cloned();
+                        if matches!(
+                            compare_candidates.first(),
+                            Some(RTLInst::Iop(Operation::Ocmp(_), _, _))
+                        ) {
+                            let consumers = adjacent_setcc.get(&node);
+                            if !consumers.is_some_and(|nodes| nodes.len() == 1) {
+                                complete = false;
+                                break;
+                            }
+                            cell_setcc_nodes.extend(consumers.unwrap().iter().copied());
+                        }
+                    }
+                    if semantic_backing_nodes.contains(&node) {
+                        let bridges = semantic_bridges.get(&node);
+                        let consumed = semantic_consumed.get(&node);
+                        if !bridges.is_some_and(|rows| rows.len() == 1)
+                            || !consumed.is_some_and(|rows| rows.len() == 1)
+                            || !semantic_successors
+                                .get(&node)
+                                .is_some_and(|rows| !rows.is_empty())
+                        {
+                            complete = false;
+                            break;
+                        }
+                        let mut semantic_candidates: Vec<RTLInst> = node_candidates
+                            .iter()
+                            .filter_map(|inst| match inst {
+                                RTLInst::Icond(_, args, _, _)
+                                    if args.iter().filter(|arg| **arg == slot).count() == 1 =>
+                                {
+                                    Some((*inst).clone())
+                                }
+                                RTLInst::Iop(
+                                    Operation::Ocmp(_) | Operation::Osel(_, _),
+                                    args,
+                                    _,
+                                ) if args.iter().filter(|arg| **arg == slot).count() == 1 => {
+                                    Some((*inst).clone())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        semantic_candidates.sort_by_cached_key(|inst| format!("{inst:?}"));
+                        semantic_candidates.dedup();
+                        if semantic_candidates.len() != 1 {
+                            complete = false;
+                            break;
+                        }
+                        required_real_candidate = semantic_candidates.first().cloned();
+                        if matches!(
+                            semantic_candidates.first(),
+                            Some(RTLInst::Iop(Operation::Ocmp(_), _, _))
+                        ) {
+                            let consumers = adjacent_setcc.get(&node);
+                            if !consumers.is_some_and(|nodes| nodes.len() == 1) {
+                                complete = false;
+                                break;
+                            }
+                            cell_setcc_nodes.extend(consumers.unwrap().iter().copied());
+                        }
+                        cell_setcc_nodes.extend(consumed.unwrap().iter().copied());
+                        let (predecessor, _) =
+                            *bridges.unwrap().iter().next().expect("one semantic bridge");
+                        if consumed.unwrap().contains(&predecessor) {
+                            complete = false;
+                            break;
+                        }
+                        if predecessor != node {
+                            cell_bridge_nodes.insert(predecessor);
+                        }
+                    }
+                    let aliases = stack_values
+                        .get(&(func, node, raw_ofs))
+                        .cloned()
+                        .unwrap_or_default();
+                    if aliases.len() > 1 {
+                        complete = false;
+                        break;
+                    }
+                    let alias = aliases.iter().next().copied();
+                    // Bind every real/synthetic member of this machine
+                    // instruction to one exact post-alias RTL equivalence
+                    // class.  A semantic TEST/CMOV/CMP real node has its
+                    // separately proved candidate; every other member must
+                    // already collapse to one structural candidate.  The
+                    // accepted class is later written back wholesale, so the
+                    // optimizer never sees an unwitnessed alternative.
+                    let mut variants_by_node: BTreeMap<Node, Vec<RTLInst>> =
+                        BTreeMap::new();
+                    for (candidate_node, inst) in candidates
+                        .iter()
+                        .filter(|(candidate_node, _)| {
+                            (*candidate_node & !SYNTHETIC_NODE_MASK) == node
+                        })
+                    {
+                        let transformed = alias
+                            .map(|value| rewrite_home_backing_inst(inst, value, slot))
+                            .unwrap_or_else(|| inst.clone());
+                        variants_by_node
+                            .entry(*candidate_node)
+                            .or_default()
+                            .push(transformed);
+                    }
+                    if variants_by_node.is_empty() {
+                        complete = false;
+                        break;
+                    }
+                    let mut candidate_class = BTreeMap::new();
+                    for (candidate_node, mut variants) in variants_by_node {
+                        variants.sort_by_cached_key(|inst| format!("{inst:?}"));
+                        variants.dedup();
+                        if candidate_node == node {
+                            if let Some(required) = &required_real_candidate {
+                                variants.retain(|inst| inst == required);
+                            }
+                        }
+                        if variants.len() > 1 && required_real_candidate.is_none() {
+                            let mode_matches: Vec<_> = variants
+                                .iter()
+                                .filter(|inst| {
+                                    win64_home_backing_candidate_matches_mode(
+                                        inst, slot, raw_ofs, read, write, address,
+                                    )
+                                })
+                                .cloned()
+                                .collect();
+                            if !mode_matches.is_empty() {
+                                // Exact mode is a disambiguator only for an
+                                // already-ambiguous component.  Preserve its
+                                // entire matching set: Omove versus Iload is a
+                                // real ambiguity, while the MOVSX/MOVZX chunk
+                                // twins below can collapse only when every other
+                                // field is structurally identical.
+                                variants = mode_matches;
+                                if variants.len() > 1 {
+                                    if let Some(authenticated) = authenticated_load_chunk {
+                                        variants = variants
+                                            .iter()
+                                            .map(|inst| match inst {
+                                                RTLInst::Iload(
+                                                    chunk,
+                                                    addressing,
+                                                    args,
+                                                    destination,
+                                                ) if win64_home_normalize_integer_chunk(*chunk)
+                                                    .is_some_and(|normalized| {
+                                                        win64_home_integer_chunk_width(&normalized)
+                                                            == Some(width)
+                                                    }) => RTLInst::Iload(
+                                                    authenticated,
+                                                    addressing.clone(),
+                                                    args.clone(),
+                                                    *destination,
+                                                ),
+                                                _ => inst.clone(),
+                                            })
+                                            .collect();
+                                    }
+                                    if write {
+                                        let natural = win64_home_natural_integer_chunk(width)
+                                            .expect(
+                                                "bounded backing width has an integer chunk",
+                                            );
+                                        variants = variants
+                                            .iter()
+                                            .map(|inst| match inst {
+                                                RTLInst::Istore(
+                                                    chunk,
+                                                    addressing,
+                                                    args,
+                                                    source,
+                                                ) if win64_home_normalize_integer_chunk(*chunk)
+                                                    .is_some_and(|normalized| {
+                                                        win64_home_integer_chunk_width(&normalized)
+                                                            == Some(width)
+                                                    }) => RTLInst::Istore(
+                                                    natural,
+                                                    addressing.clone(),
+                                                    args.clone(),
+                                                    *source,
+                                                ),
+                                                _ => inst.clone(),
+                                            })
+                                            .collect();
+                                    }
+                                    variants.sort_by_cached_key(|inst| format!("{inst:?}"));
+                                    variants.dedup();
+                                }
+                            }
+                        }
+                        if variants.len() != 1 {
+                            complete = false;
+                            break;
+                        }
+                        candidate_class.insert(
+                            candidate_node,
+                            variants.pop().expect("one checked backing candidate"),
+                        );
+                    }
+                    if !complete {
+                        break;
+                    }
+
+                    if division_nodes.contains(&node) {
+                        let division_widths: Vec<usize> = candidate_class
+                            .values()
+                            .filter_map(|inst| match inst {
+                                RTLInst::Iop(op, _, _) => {
+                                    win64_home_div_operation_width(op)
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if division_widths.is_empty()
+                            || division_widths.iter().any(|seen| *seen != width)
+                        {
+                            complete = false;
+                            break;
+                        }
+                    }
+                    let has_explicit_load = candidate_class
+                        .values()
+                        .any(|inst| matches!(inst, RTLInst::Iload(..)));
+                    let has_explicit_store = candidate_class
+                        .values()
+                        .any(|inst| matches!(inst, RTLInst::Istore(..)));
+                    let has_address = candidate_class.values().any(|inst| {
+                        matches!(
+                            inst,
+                            RTLInst::Iop(
+                                Operation::Olea(Addressing::Ainstack(_))
+                                    | Operation::Oleal(Addressing::Ainstack(_)),
+                                _,
+                                _
+                            )
+                        )
+                    });
+                    let canonical_slot_is_used = candidate_class.values().any(|inst| {
+                        let mut uses = BTreeSet::new();
+                        collect_rtl_uses(inst, &mut uses);
+                        uses.contains(&slot)
+                    });
+                    let canonical_slot_is_defined = candidate_class.values().any(|inst| {
+                        matches!(inst, RTLInst::Iop(_, _, destination) if *destination == slot)
+                    });
+                    let witnessed_read = has_explicit_load || canonical_slot_is_used;
+                    let witnessed_write = has_explicit_store || canonical_slot_is_defined;
+                    if address != has_address
+                        || (read && !witnessed_read)
+                        || (!read && !address && witnessed_read)
+                        || (write && !witnessed_write)
+                        || (!write && witnessed_write)
+                    {
+                        complete = false;
+                        break;
+                    }
+                    let Some(chunk) = win64_home_backing_semantic_chunk(
+                        width,
+                        read,
+                        address,
+                        &mnemonics,
+                        &candidate_class,
+                        test_backing_nodes.contains(&node),
+                    ) else {
+                        complete = false;
+                        break;
+                    };
+                    for (candidate_node, inst) in candidate_class {
+                        if cell_candidate_class
+                            .insert(candidate_node, inst.clone())
+                            .is_some_and(|seen| seen != inst)
+                        {
+                            complete = false;
+                            break;
+                        }
+                    }
+                    if !complete {
+                        break;
+                    }
+                    if address {
+                        cell_addresses.insert((node, slot));
+                    }
+                    cell_rewrites.insert(
+                        node,
+                        UnsafeHomeRewrite::Backing {
+                            slot,
+                            byte_ofs,
+                            width,
+                            chunk,
+                            read,
+                            write,
+                            address,
+                        },
+                    );
+                }
                 UnsafeHomeShape::Store {
                     raw_ofs,
                     peer,
@@ -12434,11 +14825,19 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
             }
         }
 
-        let Some((move_class, width)) = signature else {
-            continue;
-        };
-        let Some(primary_type) = home_move_xtype(move_class, width) else {
-            continue;
+        let primary_type = if backing_required.contains(&key) {
+            // ABI home cells are eight-byte objects even when the compiler's
+            // initial spill touches only a low byte/word/dword.  The actual
+            // spill remains a width-preserving memory store in Cshminor.
+            XType::Xany64
+        } else {
+            let Some((move_class, width)) = signature else {
+                continue;
+            };
+            let Some(primary_type) = home_move_xtype(move_class, width) else {
+                continue;
+            };
+            primary_type
         };
         if !complete || cell_rewrites.len() != cell_shapes.len() {
             continue;
@@ -12461,14 +14860,47 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         }) {
             continue;
         }
-
+        if cell_bridge_nodes.iter().any(|node| {
+            colliding_shape_nodes.contains(node)
+                || match node_functions.get(node) {
+                    Some(owners) => owners.len() != 1 || !owners.contains(&func),
+                    None => true,
+                }
+        }) {
+            continue;
+        }
+        if cell_candidate_class.iter().any(|(node, inst)| {
+            let owners = node_functions
+                .get(node)
+                .or_else(|| node_functions.get(&(*node & !SYNTHETIC_NODE_MASK)));
+            !owners.is_some_and(|owners| owners.len() == 1 && owners.contains(&func))
+                || backing_validated_candidates
+                    .get(node)
+                    .is_some_and(|selected| selected != inst)
+        }) {
+            continue;
+        }
         storage.insert(key, slot);
         cell_types.insert(slot, primary_type);
+        if backing_required.contains(&key) {
+            // Internal typed loads/stores take this local's address even when
+            // the original machine code did not expose it to a callee.
+            home_escaped.insert((func, slot));
+        }
         if !cell_addresses.is_empty() {
             home_addresses.extend(cell_addresses);
             home_escaped.insert((func, slot));
         }
+        if backing_required.contains(&key) {
+            resolved_backing_sites.extend(cell_rewrites.keys().filter_map(|node| {
+                let site = (func, *node);
+                win64_home_backing_has_only_resolvable_details(address_details.get(&site))
+                    .then_some(site)
+            }));
+        }
         rewrites.extend(cell_rewrites);
+        backing_candidate_nodes.extend(cell_candidate_class.keys().copied());
+        backing_validated_candidates.extend(cell_candidate_class);
         rewritten_setcc_nodes.extend(cell_setcc_nodes);
     }
 
@@ -12484,6 +14916,7 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         for (&node, rows) in by_node {
             for shape in rows {
                 let detail = match shape {
+                    UnsafeHomeShape::Backing { .. } => "home-backing-rewrite-incomplete",
                     UnsafeHomeShape::ArithRead { .. } => "home-arith-rewrite-incomplete",
                     UnsafeHomeShape::Compare { .. } => "home-compare-rewrite-incomplete",
                     UnsafeHomeShape::ExtendLoad { .. } => "home-extend-rewrite-incomplete",
@@ -12493,7 +14926,10 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
             }
         }
     }
-    if !failed_scalar_sites.is_empty() {
+    for (node, func, _) in hard_veto_sites {
+        failed_scalar_sites.insert((func, node, "home-cell-shape-unrepresentable"));
+    }
+    if !failed_scalar_sites.is_empty() || !resolved_backing_sites.is_empty() {
         let mut reasons: BTreeSet<(Address, Address, Symbol)> = db
             .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
             .copied()
@@ -12502,6 +14938,12 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
             .rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail")
             .copied()
             .collect();
+        // A successfully selected backing cell has proved every overlapping
+        // access and replaced the complete candidate class.  Clear only sites
+        // whose complete diagnostic set was the partial-write condition this
+        // model resolves; hard or unproven reasons were rejected above.
+        reasons.retain(|(func, node, _)| !resolved_backing_sites.contains(&(*func, *node)));
+        details.retain(|(func, node, _)| !resolved_backing_sites.contains(&(*func, *node)));
         for (func, node, detail) in failed_scalar_sites {
             reasons.insert((func, node, "unsupported-stack-address"));
             details.insert((func, node, detail));
@@ -12545,12 +14987,129 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
             .collect::<ascent::boxcar::Vec<_>>(),
     );
 
+    let backing_rows: Vec<(
+        Node,
+        RTLReg,
+        i64,
+        usize,
+        MemoryChunk,
+        bool,
+        bool,
+        bool,
+    )> = rewrites
+        .iter()
+        .filter_map(|(node, rewrite)| match rewrite {
+            UnsafeHomeRewrite::Backing {
+                slot,
+                byte_ofs,
+                width,
+                chunk,
+                read,
+                write,
+                address,
+                ..
+            } => Some((
+                *node,
+                *slot,
+                *byte_ofs,
+                *width,
+                *chunk,
+                *read,
+                *write,
+                *address,
+            )),
+            _ => None,
+        })
+        .collect();
+    db.rel_set(
+        "win64_home_backing_access",
+        backing_rows
+            .iter()
+            .copied()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "win64_home_backing_selected_candidate",
+        backing_validated_candidates
+            .iter()
+            .map(|(candidate, inst)| {
+                (
+                    *candidate & !SYNTHETIC_NODE_MASK,
+                    *candidate,
+                    inst.clone(),
+                )
+            })
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    // Linear intentionally skips addresses with no Mach/LTL instruction.
+    // TEST-memory and memory-source CMOV only gain an RTL instruction through
+    // the semantic relation above, so splice each accepted node back into the
+    // already-built RTL CFG atomically with selection.  Rejected/ambiguous
+    // cells leave both the original candidates and edges untouched.
+    let selected_semantic_nodes: BTreeSet<Node> = rewrites
+        .keys()
+        .filter(|node| semantic_backing_nodes.contains(node))
+        .copied()
+        .collect();
+    if !selected_semantic_nodes.is_empty() {
+        let mut planned_negated: BTreeSet<(Node, Node)> = db
+            .rel_iter::<(Node, Node)>("win64_home_backing_semantic_edge_negated")
+            .filter(|(source, _)| selected_semantic_nodes.contains(source))
+            .copied()
+            .collect();
+        let mut planned_successors: BTreeSet<(Node, Node)> = db
+            .rel_iter::<(Node, Node)>("win64_home_backing_semantic_succ")
+            .filter(|(source, _)| selected_semantic_nodes.contains(source))
+            .copied()
+            .collect();
+        for access in &selected_semantic_nodes {
+            let Some(bridges) = semantic_bridges.get(access) else {
+                continue;
+            };
+            let Some(&(predecessor, old_target)) = bridges.iter().next() else {
+                continue;
+            };
+            if old_target != *access {
+                planned_negated.insert((predecessor, old_target));
+                planned_successors.insert((predecessor, *access));
+            }
+        }
+
+        let mut negated: BTreeSet<(Node, Node)> = db
+            .rel_iter::<(Node, Node)>("rtl_edge_negated")
+            .copied()
+            .collect();
+        negated.extend(planned_negated.iter().copied());
+        db.rel_set(
+            "rtl_edge_negated",
+            negated.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+
+        let mut successors: BTreeSet<(Node, Node)> = db
+            .rel_iter::<(Node, Node)>("rtl_succ_candidate")
+            .filter(|(source, destination)| {
+                !planned_negated.contains(&(*source, *destination))
+            })
+            .copied()
+            .collect();
+        successors.extend(planned_successors);
+        db.rel_set(
+            "rtl_succ_candidate",
+            successors.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+    }
+
     if rewrites.is_empty() {
         return;
     }
 
     let rewritten_nodes: BTreeSet<Node> = rewrites.keys().copied().collect();
-    let mut rewritten_candidate_nodes = rewritten_nodes.clone();
+    let mut rewritten_candidate_nodes: BTreeSet<Node> = rewrites
+        .iter()
+        .filter_map(|(node, rewrite)| {
+            (!matches!(rewrite, UnsafeHomeRewrite::Backing { .. })).then_some(*node)
+        })
+        .collect();
     rewritten_candidate_nodes.extend(rewritten_setcc_nodes);
     for (node, rewrite) in &rewrites {
         if matches!(rewrite, UnsafeHomeRewrite::ArithRead { .. }) {
@@ -12635,17 +15194,27 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
     // registers may carry narrower or pointer refinements for unrelated uses;
     // copying those candidates lets refinement priority silently change the
     // backing cell's width/class.
-    enforce_win64_home_slot_types(db);
+    enforce_win64_home_types(db);
 
     // candidates_at borrows candidates. The unique peers have already been
     // proved; selection never chooses an arbitrary minimum RTL ID.
     drop(candidates_at);
     let mut selected: Vec<(Node, RTLInst)> = candidates
         .into_iter()
-        .filter(|(node, _)| !rewritten_candidate_nodes.contains(node))
+        .filter(|(node, inst)| {
+            !rewritten_candidate_nodes.contains(node)
+                && !backing_candidate_nodes.contains(node)
+                && !private_home_candidates
+                    .iter()
+                    .any(|(private_node, private_inst)| {
+                        private_node == node && private_inst == inst
+                    })
+        })
         .collect();
+    selected.extend(backing_validated_candidates);
     for (node, rewrite) in rewrites {
         let inst = match rewrite {
+            UnsafeHomeRewrite::Backing { .. } => None,
             UnsafeHomeRewrite::Store { source, slot } => {
                 Some(RTLInst::Iop(Operation::Omove, Arc::new(vec![source]), slot))
             }
@@ -12761,11 +15330,43 @@ impl IRPass for RTLPass {
     }
 
     fn inputs(&self) -> &'static [&'static str] {
-        RTLPassProgram::inputs_only()
+        // These two relations are rebuilt imperatively after the Ascent rules
+        // run.  The generated metadata cannot see that producer, so do not
+        // misclassify them as inputs to this pass.
+        static INPUTS: std::sync::OnceLock<Box<[&'static str]>> =
+            std::sync::OnceLock::new();
+        INPUTS.get_or_init(|| {
+            RTLPassProgram::inputs_only()
+                .iter()
+                .copied()
+                .filter(|relation| {
+                    !matches!(
+                        *relation,
+                        "win64_home_backing_access"
+                            | "win64_home_backing_selected_candidate"
+                    )
+                })
+                .collect()
+        })
     }
 
     fn outputs(&self) -> &'static [&'static str] {
-        RTLPassProgram::rule_outputs()
+        // select_canonical_unsafe_home_rewrites populates these relations via
+        // rel_set, outside the Ascent rule graph.  Declare them explicitly so
+        // the staged scheduler copies them out of RTL's isolated sub-DB and
+        // establishes the producer/consumer edge to later passes.
+        static OUTPUTS: std::sync::OnceLock<Box<[&'static str]>> =
+            std::sync::OnceLock::new();
+        OUTPUTS.get_or_init(|| {
+            RTLPassProgram::rule_outputs()
+                .iter()
+                .copied()
+                .chain([
+                    "win64_home_backing_access",
+                    "win64_home_backing_selected_candidate",
+                ])
+                .collect()
+        })
     }
 }
 
@@ -12773,6 +15374,311 @@ impl IRPass for RTLPass {
 mod encoding_tests {
     use super::*;
     use crate::aarch64::mach::A64Mreg;
+
+    #[test]
+    fn rtl_pass_declares_imperative_home_relations_as_outputs() {
+        let pass = RTLPass;
+        for relation in [
+            "win64_home_backing_access",
+            "win64_home_backing_selected_candidate",
+        ] {
+            assert!(pass.outputs().contains(&relation));
+            assert!(!pass.inputs().contains(&relation));
+        }
+    }
+
+    #[test]
+    fn home_rmw_source_width_preserves_subregister_spelling() {
+        for (name, width) in [
+            ("RAX", 8),
+            ("EAX", 4),
+            ("DX", 2),
+            ("R8W", 2),
+            ("DL", 1),
+            ("SIL", 1),
+            ("R15B", 1),
+        ] {
+            assert_eq!(win64_home_rmw_source_width(name), Some(width));
+        }
+        for name in ["AH", "BH", "CH", "DH", "XMM0", "NONE"] {
+            assert_eq!(win64_home_rmw_source_width(name), None);
+        }
+    }
+
+    #[test]
+    fn home_scalar_result_type_lock_requires_all_surviving_definitions() {
+        let mut db = DecompileDB::default();
+        let sole_scalar = 0x100u64;
+        let mixed_value = 0x200u64;
+        let full_width = 0x300u64;
+        let materialized_scalar = 0x400u64;
+        let slot = 0x900u64;
+
+        for (node, reg, chunk) in [
+            (0x10u64, sole_scalar, MemoryChunk::MInt16Unsigned),
+            (0x20u64, mixed_value, MemoryChunk::MInt16Unsigned),
+            (0x30u64, full_width, MemoryChunk::MInt64),
+        ] {
+            let inst = RTLInst::Iload(
+                chunk,
+                Addressing::Aindexed(0),
+                Arc::new(vec![slot]),
+                reg,
+            );
+            db.rel_push(
+                "win64_home_backing_selected_candidate",
+                (node, node, inst.clone()),
+            );
+            db.rel_push("rtl_inst", (node, inst));
+            db.rel_push("is_ptr", (reg,));
+            db.rel_push(
+                "win64_home_backing_access",
+                (
+                    node,
+                    slot,
+                    0i64,
+                    match chunk {
+                        MemoryChunk::MInt16Unsigned => 2usize,
+                        MemoryChunk::MInt64 => 8usize,
+                        _ => unreachable!(),
+                    },
+                    chunk,
+                    true,
+                    false,
+                    false,
+                ),
+            );
+        }
+        let materialized = RTLInst::Iop(
+            Operation::Omove,
+            Arc::new(vec![slot]),
+            materialized_scalar,
+        );
+        db.rel_push(
+            "win64_home_backing_selected_candidate",
+            (0x40u64, 0x40u64, materialized.clone()),
+        );
+        db.rel_push("rtl_inst", (0x40u64, materialized));
+        db.rel_push(
+            "win64_home_backing_access",
+            (
+                0x40u64,
+                slot,
+                2i64,
+                2usize,
+                MemoryChunk::MInt16Unsigned,
+                true,
+                false,
+                false,
+            ),
+        );
+        db.rel_push("is_ptr", (materialized_scalar,));
+        db.rel_push(
+            "rtl_inst",
+            (
+                0x21u64,
+                RTLInst::Iop(
+                    Operation::Omove,
+                    Arc::new(vec![0x901]),
+                    mixed_value,
+                ),
+            ),
+        );
+        for row in [
+            (sole_scalar, XType::Xptr),
+            (sole_scalar, XType::Xint16unsigned),
+            (mixed_value, XType::Xptr),
+            (mixed_value, XType::Xint16unsigned),
+            (full_width, XType::Xptr),
+            (full_width, XType::Xany64),
+            (materialized_scalar, XType::Xptr),
+            (materialized_scalar, XType::Xint),
+            (materialized_scalar, XType::Xint16unsigned),
+        ] {
+            db.rel_push("emit_var_type_candidate", row);
+        }
+
+        enforce_win64_home_types(&mut db);
+
+        let types_for = |reg| {
+            db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+                .filter_map(|(candidate, xtype)| (*candidate == reg).then_some(*xtype))
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(types_for(sole_scalar), BTreeSet::from([XType::Xint16unsigned]));
+        assert!(!db
+            .rel_iter::<(RTLReg,)>("is_ptr")
+            .any(|(reg,)| *reg == sole_scalar));
+        assert_eq!(
+            types_for(mixed_value),
+            BTreeSet::from([XType::Xptr, XType::Xint16unsigned])
+        );
+        assert!(db
+            .rel_iter::<(RTLReg,)>("is_ptr")
+            .any(|(reg,)| *reg == mixed_value));
+        assert_eq!(
+            types_for(full_width),
+            BTreeSet::from([XType::Xptr, XType::Xany64])
+        );
+        assert!(db
+            .rel_iter::<(RTLReg,)>("is_ptr")
+            .any(|(reg,)| *reg == full_width));
+        assert_eq!(
+            types_for(materialized_scalar),
+            BTreeSet::from([XType::Xint16unsigned])
+        );
+        assert!(!db
+            .rel_iter::<(RTLReg,)>("is_ptr")
+            .any(|(reg,)| *reg == materialized_scalar));
+    }
+
+    #[test]
+    fn home_div_operation_preserves_signedness_result_and_width() {
+        for (signed, remainder, width, expected) in [
+            (true, false, 4, Operation::Odiv),
+            (true, true, 4, Operation::Omod),
+            (false, false, 4, Operation::Odivu),
+            (false, true, 4, Operation::Omodu),
+            (true, false, 8, Operation::Odivl),
+            (true, true, 8, Operation::Omodl),
+            (false, false, 8, Operation::Odivlu),
+            (false, true, 8, Operation::Omodlu),
+        ] {
+            assert_eq!(
+                win64_home_div_operation(signed, remainder, width),
+                Some(expected)
+            );
+        }
+        for width in [0, 1, 2, 16] {
+            assert_eq!(win64_home_div_operation(false, false, width), None);
+        }
+        for register in ["EDX", "RDX"] {
+            assert!(win64_home_unsigned_div_high_zero_register(register, 4));
+            assert!(win64_home_unsigned_div_high_zero_register(register, 8));
+        }
+        for register in ["DX", "DL", "EAX", "R8D"] {
+            assert!(!win64_home_unsigned_div_high_zero_register(register, 4));
+        }
+    }
+
+    #[test]
+    fn home_backing_resolves_only_partial_write_diagnostics() {
+        let soft = BTreeSet::from([WIN64_HOME_BACKING_RESOLVABLE_DETAIL]);
+        let hard = BTreeSet::from(["unresolved-indirect-control-flow"]);
+        let mixed = BTreeSet::from([
+            WIN64_HOME_BACKING_RESOLVABLE_DETAIL,
+            "unresolved-indirect-control-flow",
+        ]);
+
+        assert!(win64_home_backing_site_diagnostics_are_safe(false, None));
+        assert!(win64_home_backing_site_diagnostics_are_safe(
+            true,
+            Some(&soft)
+        ));
+        assert!(!win64_home_backing_site_diagnostics_are_safe(true, None));
+        assert!(!win64_home_backing_site_diagnostics_are_safe(
+            false,
+            Some(&hard)
+        ));
+        assert!(!win64_home_backing_site_diagnostics_are_safe(
+            true,
+            Some(&mixed)
+        ));
+    }
+
+    #[test]
+    fn home_flag_consumer_mnemonics_are_fail_closed() {
+        for mnemonic in [
+            "SETP", "SETNP", "SETO", "SETNO", "JO", "JNO", "JP", "JNP", "CMOVO",
+            "CMOVNO", "CMOVP", "CMOVNP", "ADC", "SBB", "RCL", "RCR",
+        ] {
+            assert!(
+                win64_home_flag_consumer_mnemonic(mnemonic),
+                "{mnemonic} was not classified as a raw flag consumer"
+            );
+        }
+        for mnemonic in [
+            "JMP", "JMPQ", "JCXZ", "JECXZ", "JRCXZ", "CALL", "CALLQ",
+        ] {
+            assert!(
+                !win64_home_flag_consumer_mnemonic(mnemonic),
+                "flag-independent control transfer {mnemonic} was classified as a flag consumer"
+            );
+        }
+    }
+
+    #[test]
+    fn home_backing_candidate_modes_reject_shadow_interpretations() {
+        let slot = 0x100;
+        let value = 0x200;
+        let destination = 0x300;
+        let read = RTLInst::Iop(
+            Operation::Omove,
+            Arc::new(vec![slot]),
+            destination,
+        );
+        let write = RTLInst::Iop(Operation::Omove, Arc::new(vec![value]), slot);
+        let read_modify_write = RTLInst::Iop(
+            Operation::Oadd,
+            Arc::new(vec![slot, value]),
+            slot,
+        );
+        let shadow_address = RTLInst::Iop(
+            Operation::Olea(Addressing::Ainstack(10)),
+            Arc::new(vec![]),
+            destination,
+        );
+        let wrong_address = RTLInst::Iop(
+            Operation::Olea(Addressing::Ainstack(8)),
+            Arc::new(vec![]),
+            destination,
+        );
+
+        assert!(win64_home_backing_candidate_matches_mode(
+            &read, slot, 10, true, false, false
+        ));
+        assert!(!win64_home_backing_candidate_matches_mode(
+            &shadow_address,
+            slot,
+            10,
+            true,
+            false,
+            false,
+        ));
+        assert!(win64_home_backing_candidate_matches_mode(
+            &shadow_address,
+            slot,
+            10,
+            false,
+            false,
+            true,
+        ));
+        assert!(!win64_home_backing_candidate_matches_mode(
+            &wrong_address,
+            slot,
+            10,
+            false,
+            false,
+            true,
+        ));
+        assert!(win64_home_backing_candidate_matches_mode(
+            &write, slot, 10, false, true, false
+        ));
+        assert!(win64_home_backing_candidate_matches_mode(
+            &read_modify_write,
+            slot,
+            10,
+            true,
+            true,
+            false,
+        ));
+        assert!(!win64_home_backing_candidate_matches_mode(
+            &read, slot, 10, true, true, false
+        ));
+        assert!(!win64_home_backing_candidate_matches_mode(
+            &write, slot, 10, true, true, false
+        ));
+    }
 
     fn on_rtl_program_stack(test: impl FnOnce() + Send + 'static) {
         std::thread::Builder::new()

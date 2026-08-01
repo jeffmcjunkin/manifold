@@ -18,14 +18,26 @@ use manifold::decompile::passes::rtl_optimize_pass::RTLOptimizePass;
 use manifold::decompile::passes::rtl_pass::RTLPass;
 use manifold::mreg::Mreg;
 use manifold::x86::asm::TestCond;
-use manifold::x86::op::{Addressing, Operation};
+use manifold::x86::op::{Addressing, Comparison, Condition, Operation};
 use manifold::x86::types::{
-    Address, CsharpminorExpr, CsharpminorStmt, LTLInst, MachInst, MemoryChunk, RTLInst, Symbol,
-    RTLReg, Typ, XType,
+    Address, CminorBinop, CminorUnop, Constant, CsharpminorExpr, CsharpminorStmt, Ident, LTLInst,
+    MachInst, MemoryChunk, RTLInst, RTLReg, Symbol, Typ, XType,
 };
 
 const SYNTH1: Address = 1u64 << 62;
 const SYNTHETIC_NODE_MASK: Address = (1u64 << 62) | (1u64 << 63);
+type InstructionRow = (
+    Address,
+    usize,
+    &'static str,
+    &'static str,
+    Symbol,
+    Symbol,
+    Symbol,
+    Symbol,
+    usize,
+    usize,
+);
 
 fn command_exists(name: &str) -> bool {
     Command::new(name)
@@ -315,12 +327,149 @@ home_partial_movzx_low:
         movzwl 8(%rsp), %eax
         retq
 
-        .globl home_partial_movzx_high_rejected
-        .def home_partial_movzx_high_rejected; .scl 2; .type 32; .endef
-home_partial_movzx_high_rejected:
+        .globl home_partial_movzx_high_backing
+        .def home_partial_movzx_high_backing; .scl 2; .type 32; .endef
+home_partial_movzx_high_backing:
         movl %ecx, 8(%rsp)
         movl %edx, 8(%rsp)
         movzwl 10(%rsp), %eax
+        retq
+
+        .globl home_backing_movsx_high
+        .def home_backing_movsx_high; .scl 2; .type 32; .endef
+home_backing_movsx_high:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movswl 10(%rsp), %eax
+        retq
+
+        .globl home_backing_signed_cmp_jcc
+        .def home_backing_signed_cmp_jcc; .scl 2; .type 32; .endef
+home_backing_signed_cmp_jcc:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        cmpw $-1, 10(%rsp)
+        jl home_backing_signed_cmp_jcc_less
+        xorl %eax, %eax
+        retq
+home_backing_signed_cmp_jcc_less:
+        movl $1, %eax
+        retq
+
+        .globl home_backing_unsigned_cmp_setcc
+        .def home_backing_unsigned_cmp_setcc; .scl 2; .type 32; .endef
+home_backing_unsigned_cmp_setcc:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        cmpw $7, 10(%rsp)
+        setb %al
+        movzbl %al, %eax
+        retq
+
+        .globl home_backing_partial_load
+        .def home_backing_partial_load; .scl 2; .type 32; .endef
+home_backing_partial_load:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movw 10(%rsp), %ax
+        movzwl %ax, %eax
+        retq
+
+        .globl home_backing_partial_store
+        .def home_backing_partial_store; .scl 2; .type 32; .endef
+home_backing_partial_store:
+        movq %rcx, 8(%rsp)
+        movw %dx, 10(%rsp)
+        movq 8(%rsp), %rax
+        retq
+
+        .globl home_backing_add_high
+        .def home_backing_add_high; .scl 2; .type 32; .endef
+home_backing_add_high:
+        movq %rcx, 8(%rsp)
+        addw %dx, 10(%rsp)
+        movq 8(%rsp), %rax
+        retq
+
+        .globl home_backing_test_jcc
+        .def home_backing_test_jcc; .scl 2; .type 32; .endef
+home_backing_test_jcc:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        testb $4, 9(%rsp)
+        jne home_backing_test_jcc_nonzero
+        xorl %eax, %eax
+        retq
+home_backing_test_jcc_nonzero:
+        movl $1, %eax
+        retq
+
+        .globl home_backing_test_setcc
+        .def home_backing_test_setcc; .scl 2; .type 32; .endef
+home_backing_test_setcc:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        testw $8, 10(%rsp)
+        setne %al
+        movzbl %al, %eax
+        retq
+
+        .globl home_backing_cmov_cmp
+        .def home_backing_cmov_cmp; .scl 2; .type 32; .endef
+home_backing_cmov_cmp:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movq %r8, %rax
+        cmpq $0, %r9
+        cmovneq 8(%rsp), %rax
+        retq
+
+        .globl home_backing_cmov_test
+        .def home_backing_cmov_test; .scl 2; .type 32; .endef
+home_backing_cmov_test:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movq %r8, %rax
+        testq $1, %r9
+        cmoveq 8(%rsp), %rax
+        retq
+
+        .globl home_backing_div
+        .def home_backing_div; .scl 2; .type 32; .endef
+home_backing_div:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        pushq %rbp
+        movq %rsp, %rbp
+        movl %r8d, %eax
+        xorl %edx, %edx
+        divl 16(%rbp)
+        popq %rbp
+        retq
+
+        .globl home_backing_descriptor
+        .def home_backing_descriptor; .scl 2; .type 32; .endef
+home_backing_descriptor:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        subq $40, %rsp
+        leaq 48(%rsp), %rax
+        movq %rax, 32(%rsp)
+        leaq 32(%rsp), %rcx
+        callq *__imp_home_tailcall(%rip)
+        addq $40, %rsp
+        retq
+
+        .globl home_backing_cmp_setcc
+        .def home_backing_cmp_setcc; .scl 2; .type 32; .endef
+home_backing_cmp_setcc:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movzwl 10(%rsp), %r8d
+        cmpq $0, 8(%rsp)
+        setne %al
+        movzbl %al, %eax
+        addl %r8d, %eax
         retq
 
         .globl home_cmp_flag_clobber_rejected
@@ -350,6 +499,285 @@ home_cmp_scheduled_rejected:
         retq
 home_cmp_scheduled_rejected_nonzero:
         movl $1, %eax
+        retq
+
+        .globl home_backing_cmp_flag_clobber_rejected
+        .def home_backing_cmp_flag_clobber_rejected; .scl 2; .type 32; .endef
+home_backing_cmp_flag_clobber_rejected:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movzwl 10(%rsp), %eax
+        cmpq $0, 8(%rsp)
+        addq $1, %r8
+        jne home_backing_cmp_flag_clobber_rejected_nonzero
+        xorl %eax, %eax
+        retq
+home_backing_cmp_flag_clobber_rejected_nonzero:
+        movl $1, %eax
+        retq
+
+        .globl home_backing_test_scheduled_rejected
+        .def home_backing_test_scheduled_rejected; .scl 2; .type 32; .endef
+home_backing_test_scheduled_rejected:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        testb $4, 9(%rsp)
+        movq %r8, %r9
+        jne home_backing_test_scheduled_rejected_nonzero
+        xorl %eax, %eax
+        retq
+home_backing_test_scheduled_rejected_nonzero:
+        movl $1, %eax
+        retq
+
+        .globl home_backing_cmov_scheduled_rejected
+        .def home_backing_cmov_scheduled_rejected; .scl 2; .type 32; .endef
+home_backing_cmov_scheduled_rejected:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movq %r8, %rax
+        cmpq $0, %r9
+        movq %r10, %r11
+        cmovneq 8(%rsp), %rax
+        retq
+
+        .globl home_backing_add_jcc_rejected
+        .def home_backing_add_jcc_rejected; .scl 2; .type 32; .endef
+home_backing_add_jcc_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        addw %dx, 10(%rsp)
+        jne home_backing_add_jcc_rejected_nonzero
+        xorl %eax, %eax
+        retq
+home_backing_add_jcc_rejected_nonzero:
+        movl $1, %eax
+        retq
+
+        .globl home_backing_add_scheduled_jcc_rejected
+        .def home_backing_add_scheduled_jcc_rejected; .scl 2; .type 32; .endef
+home_backing_add_scheduled_jcc_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        addw %dx, 10(%rsp)
+        movq %r8, %r9
+        jne home_backing_add_scheduled_jcc_nonzero
+        xorl %eax, %eax
+        retq
+home_backing_add_scheduled_jcc_nonzero:
+        movl $1, %eax
+        retq
+
+        .globl home_backing_add_scheduled_setcc_rejected
+        .def home_backing_add_scheduled_setcc_rejected; .scl 2; .type 32; .endef
+home_backing_add_scheduled_setcc_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        addw %dx, 10(%rsp)
+        movq %r8, %r9
+        setne %al
+        movzbl %al, %eax
+        retq
+
+        .globl home_backing_add_scheduled_cmov_rejected
+        .def home_backing_add_scheduled_cmov_rejected; .scl 2; .type 32; .endef
+home_backing_add_scheduled_cmov_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        addw %dx, 10(%rsp)
+        movq %r10, %r11
+        cmovneq %r8, %r9
+        movq %r9, %rax
+        retq
+
+        .globl home_backing_add_scheduled_adc_rejected
+        .def home_backing_add_scheduled_adc_rejected; .scl 2; .type 32; .endef
+home_backing_add_scheduled_adc_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        addw %dx, 10(%rsp)
+        movq %r10, %r11
+        adcl $0, %eax
+        retq
+
+        .globl home_backing_add_scheduled_rcr_rejected
+        .def home_backing_add_scheduled_rcr_rejected; .scl 2; .type 32; .endef
+home_backing_add_scheduled_rcr_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        addw %dx, 10(%rsp)
+        movq %r10, %r11
+        rcrl $1, %eax
+        retq
+
+        .globl home_backing_add_scheduled_setp_rejected
+        .def home_backing_add_scheduled_setp_rejected; .scl 2; .type 32; .endef
+home_backing_add_scheduled_setp_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        addw %dx, 10(%rsp)
+        movq %r8, %r9
+        setp %al
+        movzbl %al, %eax
+        retq
+
+        .globl home_backing_add_scheduled_setnp_rejected
+        .def home_backing_add_scheduled_setnp_rejected; .scl 2; .type 32; .endef
+home_backing_add_scheduled_setnp_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        addw %dx, 10(%rsp)
+        movq %r8, %r9
+        setnp %al
+        movzbl %al, %eax
+        retq
+
+        .globl home_backing_add_scheduled_jo_rejected
+        .def home_backing_add_scheduled_jo_rejected; .scl 2; .type 32; .endef
+home_backing_add_scheduled_jo_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        addw %dx, 10(%rsp)
+        movq %r8, %r9
+        jo home_backing_add_scheduled_jo_taken
+        xorl %eax, %eax
+        retq
+home_backing_add_scheduled_jo_taken:
+        movl $1, %eax
+        retq
+
+        .globl home_backing_add_scheduled_jno_rejected
+        .def home_backing_add_scheduled_jno_rejected; .scl 2; .type 32; .endef
+home_backing_add_scheduled_jno_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        addw %dx, 10(%rsp)
+        movq %r8, %r9
+        jno home_backing_add_scheduled_jno_taken
+        xorl %eax, %eax
+        retq
+home_backing_add_scheduled_jno_taken:
+        movl $1, %eax
+        retq
+
+        .globl home_backing_add_scheduled_seto_rejected
+        .def home_backing_add_scheduled_seto_rejected; .scl 2; .type 32; .endef
+home_backing_add_scheduled_seto_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        addw %dx, 10(%rsp)
+        movq %r8, %r9
+        seto %al
+        movzbl %al, %eax
+        retq
+
+        .globl home_backing_add_scheduled_setno_rejected
+        .def home_backing_add_scheduled_setno_rejected; .scl 2; .type 32; .endef
+home_backing_add_scheduled_setno_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        addw %dx, 10(%rsp)
+        movq %r8, %r9
+        setno %al
+        movzbl %al, %eax
+        retq
+
+        .globl home_backing_add_scheduled_cmovo_rejected
+        .def home_backing_add_scheduled_cmovo_rejected; .scl 2; .type 32; .endef
+home_backing_add_scheduled_cmovo_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        addw %dx, 10(%rsp)
+        movq %r10, %r11
+        cmovoq %r8, %r9
+        movq %r9, %rax
+        retq
+
+        .globl home_backing_add_scheduled_cmovno_rejected
+        .def home_backing_add_scheduled_cmovno_rejected; .scl 2; .type 32; .endef
+home_backing_add_scheduled_cmovno_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        addw %dx, 10(%rsp)
+        movq %r10, %r11
+        cmovnoq %r8, %r9
+        movq %r9, %rax
+        retq
+
+        .globl home_backing_lock_add_rejected
+        .def home_backing_lock_add_rejected; .scl 2; .type 32; .endef
+home_backing_lock_add_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        lock addw %dx, 10(%rsp)
+        movq 8(%rsp), %rax
+        retq
+
+        .globl home_backing_cmovs_rejected
+        .def home_backing_cmovs_rejected; .scl 2; .type 32; .endef
+home_backing_cmovs_rejected:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movq %r8, %rax
+        cmpq $0, %r9
+        cmovsq 8(%rsp), %rax
+        retq
+
+        .globl home_backing_cross_cell_rejected
+        .def home_backing_cross_cell_rejected; .scl 2; .type 32; .endef
+home_backing_cross_cell_rejected:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movl 14(%rsp), %eax
+        retq
+
+        .globl home_backing_indexed_rejected
+        .def home_backing_indexed_rejected; .scl 2; .type 32; .endef
+home_backing_indexed_rejected:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movl 8(%rsp,%r8,1), %eax
+        retq
+
+        .globl home_backing_rbp_xchg_rejected
+        .def home_backing_rbp_xchg_rejected; .scl 2; .type 32; .endef
+home_backing_rbp_xchg_rejected:
+        movq %rcx, 8(%rsp)
+        movq %r8, 8(%rsp)
+        pushq %rbp
+        movq %rsp, %rbp
+        xchgq %rdx, 16(%rbp)
+        movq 16(%rbp), %rax
+        popq %rbp
+        retq
+
+        .globl home_backing_partial_pointer_store_rejected
+        .def home_backing_partial_pointer_store_rejected; .scl 2; .type 32; .endef
+home_backing_partial_pointer_store_rejected:
+        movq %rcx, 8(%rsp)
+        leaq 8(%rsp), %rax
+        subq $40, %rsp
+        movl %eax, 32(%rsp)
+        addq $40, %rsp
+        xorl %eax, %eax
+        retq
+
+        .globl home_backing_segmented_store_rejected
+        .def home_backing_segmented_store_rejected; .scl 2; .type 32; .endef
+home_backing_segmented_store_rejected:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movw %r8w, %fs:10(%rsp)
+        movq 8(%rsp), %rax
+        retq
+
+        .globl home_backing_segmented_load_rejected
+        .def home_backing_segmented_load_rejected; .scl 2; .type 32; .endef
+home_backing_segmented_load_rejected:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movw %gs:10(%rsp), %ax
+        movzwl %ax, %eax
         retq
 
         .globl sp_immediate_rmw
@@ -1069,10 +1497,44 @@ fn in_span(address: Address, span: (Address, Address)) -> bool {
     address >= span.0 && address < span.1
 }
 
+fn printed_function_definition<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{name}(");
+    for (start, _) in text.match_indices(&needle) {
+        let tail = &text[start..];
+        let Some(open_brace) = tail.find('{') else {
+            continue;
+        };
+        if tail.find(';').is_some_and(|semicolon| semicolon < open_brace) {
+            continue;
+        }
+        let end = tail.find("\n}\n").map_or(tail.len(), |end| end + 3);
+        return Some(&tail[..end]);
+    }
+    None
+}
+
 fn rtl_candidates(db: &DecompileDB, address: Address) -> Vec<RTLInst> {
     db.rel_iter::<(Address, RTLInst)>("rtl_inst_candidate")
         .filter_map(|(row_address, inst)| (*row_address == address).then_some(inst.clone()))
         .collect()
+}
+
+fn test_rtl_inst_uses(inst: &RTLInst, value: RTLReg) -> bool {
+    match inst {
+        RTLInst::Iop(_, args, _)
+        | RTLInst::Iload(_, _, args, _)
+        | RTLInst::Icond(_, args, _, _) => args.contains(&value),
+        RTLInst::Istore(_, _, args, source) => {
+            args.contains(&value) || *source == value
+        }
+        RTLInst::Icall(_, callee, args, _, _)
+        | RTLInst::Itailcall(_, callee, args) => {
+            matches!(callee, either::Either::Left(reg) if *reg == value)
+                || args.contains(&value)
+        }
+        RTLInst::Ijumptable(reg, _) | RTLInst::Ireturn(reg) => *reg == value,
+        _ => false,
+    }
 }
 
 fn address_bearing_candidates(db: &DecompileDB, address: Address) -> Vec<RTLInst> {
@@ -2540,6 +3002,820 @@ fn canonical_home_storage(db: &DecompileDB, name: &str) -> ((Address, Address), 
     canonical_home_storage_with_type(db, name, XType::Xany64)
 }
 
+fn assert_home_backing_profile(
+    db: &DecompileDB,
+    name: &str,
+    expected_rows: usize,
+    expected_profile: &[(i64, usize, MemoryChunk, bool, bool, bool)],
+) -> ((Address, Address), RTLReg) {
+    let span = function_span(db, name);
+    let storage: Vec<_> = db
+        .rel_iter::<(Address, usize, RTLReg)>("win64_home_storage")
+        .filter_map(|(func, pos, slot)| (*func == span.0).then_some((*pos, *slot)))
+        .collect();
+    let backing_required: Vec<_> = db
+        .rel_iter::<(Address, usize)>("win64_home_backing_required")
+        .filter(|(func, _)| *func == span.0)
+        .copied()
+        .collect();
+    let overlaps: Vec<_> = db
+        .rel_iter::<(Address, Address, usize)>("win64_home_overlap")
+        .filter(|(_, func, _)| *func == span.0)
+        .copied()
+        .collect();
+    let bounded: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, i64, usize, i64, i64, usize)>(
+            "win64_home_backing_candidate",
+        )
+        .filter(|(_, func, _, _, _, _, _, _)| *func == span.0)
+        .copied()
+        .collect();
+    let overlap_nodes: HashSet<_> = overlaps.iter().map(|(node, _, _)| *node).collect();
+    let decoded_reads: Vec<_> = db
+        .rel_iter::<(Address, Symbol)>("decoded_memory_read_operand")
+        .filter(|(node, _)| overlap_nodes.contains(node))
+        .copied()
+        .collect();
+    let decoded_writes: Vec<_> = db
+        .rel_iter::<(Address, Symbol)>("decoded_memory_write_operand")
+        .filter(|(node, _)| overlap_nodes.contains(node))
+        .copied()
+        .collect();
+    let modes: Vec<_> = db
+        .rel_iter::<(Address, bool, bool, bool)>("win64_home_backing_mode")
+        .filter(|(node, _, _, _)| overlap_nodes.contains(node))
+        .copied()
+        .collect();
+    let vetoes: Vec<_> = db
+        .rel_iter::<(Address, usize)>("win64_home_canonical_veto")
+        .filter(|(func, _)| *func == span.0)
+        .copied()
+        .collect();
+    let stack_aliases: Vec<_> = db
+        .rel_iter::<(Address, Address, i64, RTLReg)>("stack_var")
+        .filter(|(func, _, _, _)| *func == span.0)
+        .copied()
+        .collect();
+    let rtl_candidates: Vec<_> = db
+        .rel_iter::<(Address, RTLInst)>("rtl_inst_candidate")
+        .filter(|(node, _)| overlap_nodes.contains(&(*node & !SYNTHETIC_NODE_MASK)))
+        .cloned()
+        .collect();
+    let unsupported_reasons: Vec<_> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .filter(|(func, _, _)| *func == span.0)
+        .copied()
+        .collect();
+    let unsupported_details: Vec<_> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail")
+        .filter(|(func, _, _)| *func == span.0)
+        .copied()
+        .collect();
+    let backing_move_stores: Vec<_> = db
+        .rel_iter::<(Address, Address, i64, usize, RTLReg, RTLReg)>(
+            "win64_home_backing_move_store",
+        )
+        .filter(|(node, func, _, _, _, _)| {
+            *func == span.0 && overlap_nodes.contains(node)
+        })
+        .copied()
+        .collect();
+    let backing_move_loads: Vec<_> = db
+        .rel_iter::<(Address, Address, i64, usize, RTLReg, RTLReg)>(
+            "win64_home_backing_move_load",
+        )
+        .filter(|(node, func, _, _, _, _)| {
+            *func == span.0 && overlap_nodes.contains(node)
+        })
+        .copied()
+        .collect();
+    let semantic_accesses: Vec<_> = db
+        .rel_iter::<(Address,)>("win64_home_backing_semantic_access")
+        .filter(|(node,)| overlap_nodes.contains(node))
+        .copied()
+        .collect();
+    let semantic_bridges: Vec<_> = db
+        .rel_iter::<(Address, Address, Address)>(
+            "win64_home_backing_semantic_bridge",
+        )
+        .filter(|(access, _, _)| overlap_nodes.contains(access))
+        .copied()
+        .collect();
+    let semantic_consumed: Vec<_> = db
+        .rel_iter::<(Address, Address)>(
+            "win64_home_backing_semantic_consumed",
+        )
+        .filter(|(access, _)| overlap_nodes.contains(access))
+        .copied()
+        .collect();
+    let semantic_successors: Vec<_> = db
+        .rel_iter::<(Address, Address)>("win64_home_backing_semantic_succ")
+        .filter(|(access, _)| overlap_nodes.contains(access))
+        .copied()
+        .collect();
+    let backing_tests: Vec<_> = db
+        .rel_iter::<(Address, Address, usize, i64, usize)>(
+            "win64_home_backing_test_imm",
+        )
+        .filter(|(node, func, _, _, _)| {
+            *func == span.0 && overlap_nodes.contains(node)
+        })
+        .copied()
+        .collect();
+    let decoded_edges: Vec<_> = db
+        .rel_iter::<(Address, Address)>("next")
+        .filter(|(source, destination)| {
+            in_span(*source, span) || in_span(*destination, span)
+        })
+        .copied()
+        .collect();
+    let ltl_edges: Vec<_> = db
+        .rel_iter::<(Address, Address)>("ltl_succ")
+        .filter(|(source, destination)| {
+            in_span(*source, span) || in_span(*destination, span)
+        })
+        .copied()
+        .collect();
+    let semantic_negated: Vec<_> = db
+        .rel_iter::<(Address, Address)>(
+            "win64_home_backing_semantic_edge_negated",
+        )
+        .filter(|(access, _)| overlap_nodes.contains(access))
+        .copied()
+        .collect();
+    let exact_addr_defs: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, usize)>(
+            "win64_home_exact_addr_def",
+        )
+        .filter(|(func, node, _, _)| *func == span.0 && in_span(*node, span))
+        .copied()
+        .collect();
+    let home_cells: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, i64, usize)>("win64_home_cell")
+        .filter(|(node, func, _, _, _)| *func == span.0 && in_span(*node, span))
+        .copied()
+        .collect();
+    let lea_rows: Vec<_> = db
+        .rel_iter::<(Address, Symbol, Symbol)>("plea")
+        .filter(|(node, _, _)| in_span(*node, span))
+        .copied()
+        .collect();
+    let direct_stack_rows: Vec<_> = db
+        .rel_iter::<(Address, Mreg, i64, usize)>("direct_stack_operand")
+        .filter(|(node, _, _, _)| in_span(*node, span))
+        .copied()
+        .collect();
+    let sp_based_rows: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, i64)>("sp_based_mem_at")
+        .filter(|(node, func, _, _)| *func == span.0 && in_span(*node, span))
+        .copied()
+        .collect();
+    let exact_addr_at: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, usize)>(
+            "win64_home_exact_addr_at",
+        )
+        .filter(|(func, node, _, _)| *func == span.0 && in_span(*node, span))
+        .copied()
+        .collect();
+    let raw_reg_edges: Vec<_> = db
+        .rel_iter::<(Address, Mreg, Address)>("raw_reg_def_used")
+        .filter(|(def, _, use_node)| in_span(*def, span) || in_span(*use_node, span))
+        .copied()
+        .collect();
+    let dominating_reg_edges: Vec<_> = db
+        .rel_iter::<(Address, Address, Address)>("reg_def_dominates_use")
+        .filter(|(func, def, use_node)| {
+            *func == span.0 && (in_span(*def, span) || in_span(*use_node, span))
+        })
+        .copied()
+        .collect();
+    let competing_reg_defs: Vec<_> = db
+        .rel_iter::<(Address, Mreg, Address)>("competing_reaching_reg_def")
+        .filter(|(def, _, use_node)| in_span(*def, span) || in_span(*use_node, span))
+        .copied()
+        .collect();
+    let exact_addr_store_uses: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, usize)>(
+            "win64_home_exact_addr_store_use",
+        )
+        .filter(|(func, node, _, _)| *func == span.0 && in_span(*node, span))
+        .copied()
+        .collect();
+    let exact_addr_calls: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg, usize)>(
+            "win64_home_exact_addr_call",
+        )
+        .filter(|(func, node, _, _)| *func == span.0 && in_span(*node, span))
+        .copied()
+        .collect();
+    let address_taken: Vec<_> = db
+        .rel_iter::<(Address, Address, usize)>(
+            "win64_home_lea_address_taken",
+        )
+        .filter(|(_, func, _)| *func == span.0)
+        .copied()
+        .collect();
+    let alias_uses: Vec<_> = db
+        .rel_iter::<(Address, Address, Mreg)>("sp_may_alias_at")
+        .filter(|(func, node, _)| *func == span.0 && in_span(*node, span))
+        .copied()
+        .collect();
+    let asm_uses: Vec<_> = db
+        .rel_iter::<(Address, Mreg)>("asm_reg_use")
+        .filter(|(node, _)| in_span(*node, span))
+        .copied()
+        .collect();
+    let supported_accesses: Vec<_> = db
+        .rel_iter::<(Address, Address, usize)>(
+            "win64_home_supported_access",
+        )
+        .filter(|(_, func, _)| *func == span.0)
+        .copied()
+        .collect();
+    assert_eq!(
+        storage.len(),
+        1,
+        "{name} must select exactly one backing home cell: {storage:#x?}; \
+         required={backing_required:#x?}; overlaps={overlaps:#x?}; \
+         bounded={bounded:#x?}; reads={decoded_reads:#x?}; \
+         writes={decoded_writes:#x?}; modes={modes:#x?}; \
+         vetoes={vetoes:#x?}; aliases={stack_aliases:#x?}; \
+         backing_move_stores={backing_move_stores:#x?}; \
+         backing_move_loads={backing_move_loads:#x?}; \
+         backing_tests={backing_tests:#x?}; \
+         semantic_accesses={semantic_accesses:#x?}; \
+         semantic_bridges={semantic_bridges:#x?}; \
+         semantic_consumed={semantic_consumed:#x?}; \
+         semantic_successors={semantic_successors:#x?}; \
+         semantic_negated={semantic_negated:#x?}; \
+         exact_addr_defs={exact_addr_defs:#x?}; home_cells={home_cells:#x?}; \
+         lea_rows={lea_rows:#x?}; direct_stack_rows={direct_stack_rows:#x?}; \
+         sp_based_rows={sp_based_rows:#x?}; exact_addr_at={exact_addr_at:#x?}; \
+         raw_reg_edges={raw_reg_edges:#x?}; \
+         dominating_reg_edges={dominating_reg_edges:#x?}; \
+         competing_reg_defs={competing_reg_defs:#x?}; \
+         exact_addr_store_uses={exact_addr_store_uses:#x?}; \
+         exact_addr_calls={exact_addr_calls:#x?}; \
+         address_taken={address_taken:#x?}; alias_uses={alias_uses:#x?}; \
+         asm_uses={asm_uses:#x?}; supported_accesses={supported_accesses:#x?}; \
+         decoded_edges={decoded_edges:#x?}; ltl_edges={ltl_edges:#x?}; \
+         unsupported_reasons={unsupported_reasons:#x?}; \
+         unsupported_details={unsupported_details:#x?}; \
+         rtl_candidates={rtl_candidates:#x?}"
+    );
+    let (position, slot) = storage[0];
+    assert_eq!(position, 0, "{name} selected the wrong home position");
+    assert!(
+        db.rel_iter::<(Address, usize)>("win64_home_backing_required")
+            .any(|row| *row == (span.0, position)),
+        "{name} did not atomically promote its home cell"
+    );
+    assert!(
+        db.rel_iter::<(RTLReg, XType)>("win64_home_slot_type")
+            .any(|row| *row == (slot, XType::Xany64)),
+        "{name} backing cell lost its exact eight-byte type"
+    );
+    assert!(
+        db.rel_iter::<(Address, RTLReg)>("win64_home_escaped")
+            .any(|row| *row == (span.0, slot)),
+        "{name} backing cell is not protected from scalar propagation"
+    );
+    assert!(
+        !db.rel_iter::<(Address, usize)>("win64_home_canonical_veto")
+            .any(|(func, pos)| (*func, *pos) == (span.0, position)),
+        "{name} retained a canonicalization veto"
+    );
+
+    let rows: Vec<_> = db
+        .rel_iter::<(
+            Address,
+            RTLReg,
+            i64,
+            usize,
+            MemoryChunk,
+            bool,
+            bool,
+            bool,
+        )>("win64_home_backing_access")
+        .filter_map(|(
+            node,
+            candidate_slot,
+            byte_ofs,
+            width,
+            chunk,
+            read,
+            write,
+            address,
+        )| {
+            (in_span(*node, span) && *candidate_slot == slot).then_some((
+                *node,
+                *byte_ofs,
+                *width,
+                *chunk,
+                *read,
+                *write,
+                *address,
+            ))
+        })
+        .collect();
+    assert_eq!(
+        rows.len(),
+        expected_rows,
+        "{name} lost or duplicated a backing access: {rows:#x?}"
+    );
+    let observed: HashSet<_> = rows
+        .iter()
+        .map(|(_, byte_ofs, width, chunk, read, write, address)| {
+            (*byte_ofs, *width, *chunk, *read, *write, *address)
+        })
+        .collect();
+    let expected: HashSet<_> = expected_profile.iter().copied().collect();
+    assert_eq!(
+        observed, expected,
+        "{name} changed its byte-range/mode profile"
+    );
+    for (node, _, _, _, read, write, address) in &rows {
+        let modes: HashSet<_> = db
+            .rel_iter::<(Address, bool, bool, bool)>("win64_home_backing_mode")
+            .filter_map(|(candidate, candidate_read, candidate_write, candidate_address)| {
+                (*candidate == *node).then_some((
+                    *candidate_read,
+                    *candidate_write,
+                    *candidate_address,
+                ))
+            })
+            .collect();
+        assert_eq!(
+            modes,
+            HashSet::from([(*read, *write, *address)]),
+            "{name} did not retain one exact decoder-derived mode at {node:#x}"
+        );
+    }
+    for access in rows.iter().map(|(node, ..)| *node).collect::<HashSet<_>>() {
+        let mut selected: Vec<_> = db
+            .rel_iter::<(Address, Address, RTLInst)>(
+                "win64_home_backing_selected_candidate",
+            )
+            .filter_map(|(real, candidate, inst)| {
+                (*real == access).then_some((*candidate, inst.clone()))
+            })
+            .collect();
+        selected.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
+        selected.dedup();
+        let mut actual: Vec<_> = db
+            .rel_iter::<(Address, RTLInst)>("rtl_inst_candidate")
+            .filter_map(|(candidate, inst)| {
+                ((*candidate & !SYNTHETIC_NODE_MASK) == access)
+                    .then_some((*candidate, inst.clone()))
+            })
+            .collect();
+        actual.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
+        actual.dedup();
+        assert_eq!(
+            actual, selected,
+            "{name} retained an RTL candidate outside its selected equivalence class at {access:#x}"
+        );
+    }
+
+    let selected_nodes: HashSet<_> = rows.iter().map(|(node, ..)| *node).collect();
+    let overlap_nodes: HashSet<_> = db
+        .rel_iter::<(Address, Address, usize)>("win64_home_overlap")
+        .filter_map(|(node, func, pos)| {
+            ((*func, *pos) == (span.0, position)).then_some(*node)
+        })
+        .collect();
+    assert_eq!(
+        selected_nodes, overlap_nodes,
+        "{name} did not select every authoritative overlap atomically"
+    );
+    assert!(
+        !db.rel_iter::<(Address, Address, i64, RTLReg)>("stack_var")
+            .any(|(func, node, _, _)| *func == span.0 && selected_nodes.contains(node)),
+        "{name} retained a competing raw stack identity"
+    );
+    assert!(
+        !db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+            .any(|(func, node, _)| *func == span.0 && selected_nodes.contains(node)),
+        "{name} retained a rejection at a selected backing access"
+    );
+    (span, slot)
+}
+
+fn assert_canonical_home_backing(db: &DecompileDB) {
+    for (name, rows, profile) in [
+        (
+            "home_partial_movzx_high_backing",
+            3,
+            &[
+                (0, 4, MemoryChunk::MInt32, false, true, false),
+                (2, 2, MemoryChunk::MInt16Unsigned, true, false, false),
+            ][..],
+        ),
+        (
+            "home_backing_movsx_high",
+            3,
+            &[
+                (0, 8, MemoryChunk::MInt64, false, true, false),
+                (2, 2, MemoryChunk::MInt16Signed, true, false, false),
+            ][..],
+        ),
+        (
+            "home_backing_signed_cmp_jcc",
+            3,
+            &[
+                (0, 8, MemoryChunk::MInt64, false, true, false),
+                (2, 2, MemoryChunk::MInt16Signed, true, false, false),
+            ][..],
+        ),
+        (
+            "home_backing_unsigned_cmp_setcc",
+            3,
+            &[
+                (0, 8, MemoryChunk::MInt64, false, true, false),
+                (2, 2, MemoryChunk::MInt16Unsigned, true, false, false),
+            ][..],
+        ),
+        (
+            "home_backing_partial_load",
+            3,
+            &[
+                (0, 8, MemoryChunk::MInt64, false, true, false),
+                (2, 2, MemoryChunk::MInt16Unsigned, true, false, false),
+            ][..],
+        ),
+        (
+            "home_backing_partial_store",
+            3,
+            &[
+                (0, 8, MemoryChunk::MInt64, false, true, false),
+                (2, 2, MemoryChunk::MInt16Unsigned, false, true, false),
+                (0, 8, MemoryChunk::MInt64, true, false, false),
+            ][..],
+        ),
+        (
+            "home_backing_add_high",
+            3,
+            &[
+                (0, 8, MemoryChunk::MInt64, false, true, false),
+                (2, 2, MemoryChunk::MInt16Unsigned, true, true, false),
+                (0, 8, MemoryChunk::MInt64, true, false, false),
+            ][..],
+        ),
+        (
+            "home_backing_test_jcc",
+            3,
+            &[
+                (0, 8, MemoryChunk::MInt64, false, true, false),
+                (1, 1, MemoryChunk::MInt8Unsigned, true, false, false),
+            ][..],
+        ),
+        (
+            "home_backing_test_setcc",
+            3,
+            &[
+                (0, 8, MemoryChunk::MInt64, false, true, false),
+                (2, 2, MemoryChunk::MInt16Unsigned, true, false, false),
+            ][..],
+        ),
+        (
+            "home_backing_cmov_cmp",
+            3,
+            &[
+                (0, 8, MemoryChunk::MInt64, false, true, false),
+                (0, 8, MemoryChunk::MInt64, true, false, false),
+            ][..],
+        ),
+        (
+            "home_backing_cmov_test",
+            3,
+            &[
+                (0, 8, MemoryChunk::MInt64, false, true, false),
+                (0, 8, MemoryChunk::MInt64, true, false, false),
+            ][..],
+        ),
+        (
+            "home_backing_div",
+            3,
+            &[
+                (0, 8, MemoryChunk::MInt64, false, true, false),
+                (0, 4, MemoryChunk::MInt32, true, false, false),
+            ][..],
+        ),
+        (
+            "home_backing_descriptor",
+            3,
+            &[
+                (0, 8, MemoryChunk::MInt64, false, true, false),
+                (0, 8, MemoryChunk::MInt64, false, false, true),
+            ][..],
+        ),
+        (
+            "home_backing_cmp_setcc",
+            4,
+            &[
+                (0, 8, MemoryChunk::MInt64, false, true, false),
+                (2, 2, MemoryChunk::MInt16Unsigned, true, false, false),
+                (0, 8, MemoryChunk::MInt64, true, false, false),
+            ][..],
+        ),
+    ] {
+        let (span, slot) = assert_home_backing_profile(db, name, rows, profile);
+        let semantic_nodes: HashSet<_> = db
+            .rel_iter::<(Address,)>("win64_home_backing_semantic_access")
+            .filter_map(|(node,)| in_span(*node, span).then_some(*node))
+            .collect();
+        if name.contains("_test_") || name.contains("_cmov_") {
+            assert_eq!(
+                semantic_nodes.len(),
+                1,
+                "{name} lost its unique normalized TEST/CMOV witness"
+            );
+            let node = *semantic_nodes.iter().next().unwrap();
+            let candidates = rtl_candidates(db, node);
+            assert_eq!(
+                candidates.len(),
+                1,
+                "{name} retained a competing semantic RTL candidate: {candidates:#x?}"
+            );
+            assert!(
+                candidates.iter().all(|inst| match inst {
+                    RTLInst::Icond(_, args, _, _)
+                    | RTLInst::Iop(Operation::Ocmp(_) | Operation::Osel(_, _), args, _) => {
+                        args.iter().filter(|arg| **arg == slot).count() == 1
+                    }
+                    _ => false,
+                }),
+                "{name} lacks one semantic RTL candidate over its backing slot: {candidates:#x?}"
+            );
+            let consumed: Vec<_> = db
+                .rel_iter::<(Address, Address)>("win64_home_backing_semantic_consumed")
+                .filter_map(|(access, consumer)| (*access == node).then_some(*consumer))
+                .collect();
+            assert_eq!(
+                consumed.len(),
+                1,
+                "{name} must consume one exact flag producer/consumer"
+            );
+            assert!(
+                rtl_candidates(db, consumed[0]).is_empty(),
+                "{name} retained its separately executable consumed flag node"
+            );
+            let successors: HashSet<_> = db
+                .rel_iter::<(Address, Address)>("rtl_succ_candidate")
+                .filter_map(|(source, destination)| {
+                    (*source == node).then_some(*destination)
+                })
+                .collect();
+            assert!(
+                !successors.is_empty(),
+                "{name} semantic node was not spliced into the RTL CFG"
+            );
+            assert!(
+                db.rel_iter::<(Address, Address)>("rtl_succ_candidate")
+                    .any(|(_, destination)| *destination == node),
+                "{name} has no incoming RTL edge after skip-over repair"
+            );
+        }
+        if name == "home_backing_div" {
+            assert!(
+                db.rel_iter::<(Address, RTLInst)>("rtl_inst_candidate")
+                    .any(|(node, inst)| {
+                        in_span(*node & !SYNTHETIC_NODE_MASK, span)
+                            && matches!(inst, RTLInst::Iop(Operation::Odivu, args, _)
+                                if args.contains(&slot))
+                    }),
+                "home_backing_div did not reuse the ordinary DIV lowering"
+            );
+        }
+        if name == "home_backing_descriptor" {
+            assert!(
+                db.rel_iter::<(Address, RTLReg)>("win64_home_address")
+                    .any(|(node, candidate_slot)| {
+                        in_span(*node, span) && *candidate_slot == slot
+                    }),
+                "descriptor LEA was not authenticated as &backing"
+            );
+        }
+    }
+
+    // Partial backing comparisons use their decoded subrange width and retain
+    // the signed/unsigned flag consumer exactly.  They are deliberately not
+    // reclassified as full-width scalar accesses.
+    for (name, expected_condition, expect_setcc) in [
+        (
+            "home_backing_signed_cmp_jcc",
+            Condition::Ccompimm(Comparison::Clt, -1),
+            false,
+        ),
+        (
+            "home_backing_unsigned_cmp_setcc",
+            Condition::Ccompuimm(Comparison::Clt, 7),
+            true,
+        ),
+    ] {
+        let span = function_span(db, name);
+        let slot = db
+            .rel_iter::<(Address, usize, RTLReg)>("win64_home_storage")
+            .find_map(|(func, pos, slot)| {
+                (*func == span.0 && *pos == 0).then_some(*slot)
+            })
+            .unwrap_or_else(|| panic!("{name} lost its backing slot"));
+        let compares: Vec<_> = db
+            .rel_iter::<(Address, Address, Symbol, Mreg, i64, usize, i64, usize)>(
+                "win64_home_backing_cmp_read",
+            )
+            .filter(|(_, func, _, _, _, _, _, _)| *func == span.0)
+            .copied()
+            .collect();
+        assert_eq!(
+            compares.len(),
+            1,
+            "{name} must retain one exact bounded CMP projection: {compares:#x?}"
+        );
+        let (compare, _, _, _, raw_disp, position, _, width) = compares[0];
+        assert_eq!(
+            (raw_disp, position, width),
+            (10, 0, 2),
+            "{name} changed its partial CMP coordinates"
+        );
+        assert!(
+            !db.rel_iter::<(Address, Address, Symbol, Mreg, i64, usize, i64, usize)>(
+                "win64_home_scalar_cmp_read",
+            )
+            .any(|(node, _, _, _, _, _, _, _)| *node == compare),
+            "{name} incorrectly widened its backing CMP into the scalar closed set"
+        );
+        let candidates = rtl_candidates(db, compare);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "{name} retained a competing CMP candidate: {candidates:#x?}"
+        );
+        let condition_matches = match &candidates[0] {
+            RTLInst::Icond(condition, args, _, _) if !expect_setcc => {
+                *condition == expected_condition && args.as_ref() == &[slot]
+            }
+            RTLInst::Iop(Operation::Ocmp(condition), args, _) if expect_setcc => {
+                *condition == expected_condition && args.as_ref() == &[slot]
+            }
+            _ => false,
+        };
+        assert!(
+            condition_matches,
+            "{name} lost CMP signedness, width, operand order, or canonical slot: {candidates:#x?}"
+        );
+        if expect_setcc {
+            let setcc = db
+                .rel_iter::<(Address, Address)>("next")
+                .find_map(|(source, destination)| {
+                    (*source == compare
+                        && db
+                            .rel_iter::<(Address, TestCond)>("setcc_testcond")
+                            .any(|(node, _)| node == destination))
+                    .then_some(*destination)
+                })
+                .expect("partial backing CMP lost its adjacent SETcc");
+            assert!(
+                rtl_candidates(db, setcc).is_empty(),
+                "{name} retained a separately executable SETcc"
+            );
+        }
+    }
+
+    let partial_store_span = function_span(db, "home_backing_partial_store");
+    let partial_store_slot = db
+        .rel_iter::<(Address, usize, RTLReg)>("win64_home_storage")
+        .find_map(|(func, pos, slot)| {
+            (*func == partial_store_span.0 && *pos == 0).then_some(*slot)
+        })
+        .expect("partial backing store lost its canonical slot");
+    let partial_stores: Vec<_> = db
+        .rel_iter::<(Address, Address, i64, usize, RTLReg, RTLReg)>(
+            "win64_home_backing_move_store",
+        )
+        .filter(|(_, func, raw_disp, width, _, _)| {
+            *func == partial_store_span.0 && *raw_disp == 10 && *width == 2
+        })
+        .copied()
+        .collect();
+    assert_eq!(
+        partial_stores.len(),
+        1,
+        "partial MOV store lacks one exact reaching-source projection: {partial_stores:#x?}"
+    );
+    let partial_store_candidates = rtl_candidates(db, partial_stores[0].0);
+    assert!(
+        matches!(partial_store_candidates.as_slice(),
+            [RTLInst::Iop(Operation::Omove, args, destination)]
+                if *destination == partial_store_slot
+                    && args.len() == 1
+                    && args[0] != partial_store_slot),
+        "partial MOV store did not select one canonical-slot write: {partial_store_candidates:#x?}"
+    );
+
+    let partial_load_span = function_span(db, "home_backing_partial_load");
+    let partial_load_slot = db
+        .rel_iter::<(Address, usize, RTLReg)>("win64_home_storage")
+        .find_map(|(func, pos, slot)| {
+            (*func == partial_load_span.0 && *pos == 0).then_some(*slot)
+        })
+        .expect("partial backing load lost its canonical slot");
+    let partial_loads: Vec<_> = db
+        .rel_iter::<(Address, Address, i64, usize, RTLReg, RTLReg)>(
+            "win64_home_backing_move_load",
+        )
+        .filter(|(_, func, raw_disp, width, _, _)| {
+            *func == partial_load_span.0 && *raw_disp == 10 && *width == 2
+        })
+        .copied()
+        .collect();
+    assert_eq!(
+        partial_loads.len(),
+        1,
+        "partial MOV load lacks one exact destination-def projection: {partial_loads:#x?}"
+    );
+    let partial_load_candidates = rtl_candidates(db, partial_loads[0].0);
+    assert!(
+        matches!(partial_load_candidates.as_slice(),
+            [RTLInst::Iop(Operation::Omove, args, destination)]
+                if args.as_ref() == &[partial_load_slot]
+                    && *destination != partial_load_slot),
+        "partial MOV load did not select one canonical-slot read: {partial_load_candidates:#x?}"
+    );
+
+    for (name, expected_chunk) in [
+        (
+            "home_partial_movzx_high_backing",
+            MemoryChunk::MInt16Unsigned,
+        ),
+        ("home_backing_movsx_high", MemoryChunk::MInt16Signed),
+    ] {
+        let span = function_span(db, name);
+        let read_nodes: HashSet<_> = db
+            .rel_iter::<(
+                Address,
+                RTLReg,
+                i64,
+                usize,
+                MemoryChunk,
+                bool,
+                bool,
+                bool,
+            )>("win64_home_backing_access")
+            .filter_map(|(node, _, _, width, chunk, read, write, address)| {
+                (in_span(*node, span)
+                    && *width == 2
+                    && *chunk == expected_chunk
+                    && *read
+                    && !*write
+                    && !*address)
+                    .then_some(*node)
+            })
+            .collect();
+        assert_eq!(
+            read_nodes.len(),
+            1,
+            "{name} lost its unique authenticated extending-load access"
+        );
+        let slot = db
+            .rel_iter::<(Address, usize, RTLReg)>("win64_home_storage")
+            .find_map(|(func, pos, slot)| {
+                (*func == span.0 && *pos == 0).then_some(*slot)
+            })
+            .expect("extending-load fixture lost canonical backing storage");
+        let selected: Vec<_> = db
+            .rel_iter::<(Address, Address, RTLInst)>(
+                "win64_home_backing_selected_candidate",
+            )
+            .filter_map(|(real, _, inst)| read_nodes.contains(real).then_some(inst.clone()))
+            .collect();
+        assert_eq!(
+            selected.len(),
+            1,
+            "{name} did not select one exact extending-load candidate: {selected:#x?}"
+        );
+        assert!(
+            selected.iter().all(|inst| !matches!(
+                inst,
+                RTLInst::Iop(
+                    Operation::Olea(Addressing::Ainstack(_))
+                        | Operation::Oleal(Addressing::Ainstack(_)),
+                    _,
+                    _
+                )
+            )),
+            "{name} retained its zero-argument stack-address shadow"
+        );
+        assert!(
+            selected.iter().all(|inst| match inst {
+                RTLInst::Iload(chunk, _, _, _) => *chunk == expected_chunk,
+                other => test_rtl_inst_uses(other, slot),
+            }),
+            "{name} selected a candidate without its authenticated backing read: {selected:#x?}"
+        );
+    }
+}
+
 fn assert_home_accesses_use_slot_at_position(
     db: &DecompileDB,
     name: &str,
@@ -3218,6 +4494,113 @@ fn assert_optimized_canonical_homes(db: &DecompileDB) {
     );
 }
 
+fn assert_optimized_home_backing(db: &DecompileDB) {
+    for name in [
+        "home_partial_movzx_high_backing",
+        "home_backing_movsx_high",
+        "home_backing_signed_cmp_jcc",
+        "home_backing_unsigned_cmp_setcc",
+        "home_backing_partial_load",
+        "home_backing_partial_store",
+        "home_backing_add_high",
+        "home_backing_test_jcc",
+        "home_backing_test_setcc",
+        "home_backing_cmov_cmp",
+        "home_backing_cmov_test",
+        "home_backing_div",
+        "home_backing_descriptor",
+        "home_backing_cmp_setcc",
+    ] {
+        let span = function_span(db, name);
+        let slot = db
+            .rel_iter::<(Address, usize, RTLReg)>("win64_home_storage")
+            .find_map(|(func, pos, slot)| {
+                (*func == span.0 && *pos == 0).then_some(*slot)
+            })
+            .unwrap_or_else(|| panic!("{name} lost backing storage after RTLOptimize"));
+        assert!(
+            db.rel_iter::<(Address, RTLReg)>("win64_home_escaped")
+                .any(|row| *row == (span.0, slot)),
+            "{name} lost its optimization barrier"
+        );
+        let types: HashSet<_> = db
+            .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .filter_map(|(reg, xtype)| (*reg == slot).then_some(*xtype))
+            .collect();
+        assert_eq!(
+            types,
+            HashSet::from([XType::Xany64]),
+            "{name} optimizer changed its byte-object type"
+        );
+        let accesses: Vec<_> = db
+            .rel_iter::<(
+                Address,
+                RTLReg,
+                i64,
+                usize,
+                MemoryChunk,
+                bool,
+                bool,
+                bool,
+            )>("win64_home_backing_access")
+            .filter_map(|(node, candidate_slot, _, _, _, read, write, address)| {
+                (in_span(*node, span) && *candidate_slot == slot)
+                    .then_some((*node, *read, *write, *address))
+            })
+            .collect();
+        let access_nodes: HashSet<_> = accesses.iter().map(|(node, ..)| *node).collect();
+        assert!(
+            !access_nodes.is_empty(),
+            "{name} lost all backing metadata during optimization"
+        );
+        assert!(
+            !db.rel_iter::<(Address, Address, i64, RTLReg)>("stack_var")
+                .any(|(func, node, _, _)| {
+                    *func == span.0 && access_nodes.contains(node)
+                }),
+            "{name} optimizer reintroduced a raw stack identity"
+        );
+        for (access, read, write, address) in accesses {
+            let optimized: Vec<_> = db
+                .rel_iter::<(Address, RTLInst)>("rtl_inst")
+                .filter_map(|(node, inst)| {
+                    ((*node & !SYNTHETIC_NODE_MASK) == access)
+                        .then_some((*node, inst.clone()))
+                })
+                .collect();
+            assert!(
+                !optimized.is_empty(),
+                "{name} lost its selected optimized RTL class at {access:#x}"
+            );
+            let unique_nodes: HashSet<_> = optimized.iter().map(|(node, _)| *node).collect();
+            assert_eq!(
+                unique_nodes.len(),
+                optimized.len(),
+                "{name} optimizer retained competing candidates at {access:#x}: {optimized:#x?}"
+            );
+            let uses_slot = optimized.iter().any(|(_, inst)| {
+                test_rtl_inst_uses(inst, slot) || matches!(inst, RTLInst::Iload(..))
+            });
+            let writes_slot = optimized.iter().any(|(_, inst)| {
+                matches!(inst, RTLInst::Istore(..))
+                    || matches!(inst, RTLInst::Iop(_, _, destination) if *destination == slot)
+            });
+            let takes_address = optimized.iter().any(|(_, inst)| {
+                matches!(inst,
+                    RTLInst::Iop(
+                        Operation::Olea(Addressing::Ainstack(_))
+                            | Operation::Oleal(Addressing::Ainstack(_)),
+                        _,
+                        _
+                    ))
+            });
+            assert_eq!(uses_slot, read, "{name} changed the selected read mode");
+            assert_eq!(writes_slot, write, "{name} changed the selected write mode");
+            assert_eq!(takes_address, address, "{name} changed the selected address mode");
+        }
+    }
+}
+
 fn assert_post_type_canonical_homes(db: &DecompileDB) {
     let selected: Vec<_> = db
         .rel_iter::<(Address, usize, u64)>("win64_home_storage")
@@ -3278,6 +4661,16 @@ fn assert_indexed_stack_cells_use_normalized_coordinates(db: &DecompileDB) {
         .find_map(|(addr, func, _, pos)| (*func == home.0 && *pos == 0).then_some(*addr))
         .expect("missing pre-prologue home spill");
     let indexed = indexed_store_at(db, home);
+    assert!(
+        !db.rel_iter::<(Address, Address, usize)>("win64_home_hard_veto_site")
+            .any(|(node, func, _)| (*node, *func) == (indexed, home.0)),
+        "disjoint post-prologue indexed local was classified as a hard home access"
+    );
+    assert!(
+        !db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+            .any(|(func, node, _)| (*func, *node) == (home.0, indexed)),
+        "disjoint post-prologue indexed local was marked unsupported"
+    );
     let home_vars = stack_vars_at(db, home.0, home_spill, 8);
     let indexed_vars = stack_vars_at(db, home.0, indexed, 8);
     assert!(!home_vars.is_empty() && !indexed_vars.is_empty());
@@ -3877,9 +5270,33 @@ fn assert_home_safety_vetoes(db: &DecompileDB) {
         ("home_conditional_spill_reload", Mreg::CX),
         ("home_wide_overlap", Mreg::CX),
         ("home_escape_numeric_use", Mreg::CX),
-        ("home_partial_movzx_high_rejected", Mreg::CX),
         ("home_cmp_flag_clobber_rejected", Mreg::CX),
         ("home_cmp_scheduled_rejected", Mreg::CX),
+        ("home_backing_cmp_flag_clobber_rejected", Mreg::CX),
+        ("home_backing_test_scheduled_rejected", Mreg::CX),
+        ("home_backing_cmov_scheduled_rejected", Mreg::CX),
+        ("home_backing_add_jcc_rejected", Mreg::CX),
+        ("home_backing_add_scheduled_jcc_rejected", Mreg::CX),
+        ("home_backing_add_scheduled_setcc_rejected", Mreg::CX),
+        ("home_backing_add_scheduled_cmov_rejected", Mreg::CX),
+        ("home_backing_add_scheduled_adc_rejected", Mreg::CX),
+        ("home_backing_add_scheduled_rcr_rejected", Mreg::CX),
+        ("home_backing_add_scheduled_setp_rejected", Mreg::CX),
+        ("home_backing_add_scheduled_setnp_rejected", Mreg::CX),
+        ("home_backing_add_scheduled_jo_rejected", Mreg::CX),
+        ("home_backing_add_scheduled_jno_rejected", Mreg::CX),
+        ("home_backing_add_scheduled_seto_rejected", Mreg::CX),
+        ("home_backing_add_scheduled_setno_rejected", Mreg::CX),
+        ("home_backing_add_scheduled_cmovo_rejected", Mreg::CX),
+        ("home_backing_add_scheduled_cmovno_rejected", Mreg::CX),
+        ("home_backing_lock_add_rejected", Mreg::CX),
+        ("home_backing_cmovs_rejected", Mreg::CX),
+        ("home_backing_cross_cell_rejected", Mreg::CX),
+        ("home_backing_indexed_rejected", Mreg::CX),
+        ("home_backing_rbp_xchg_rejected", Mreg::CX),
+        ("home_backing_partial_pointer_store_rejected", Mreg::CX),
+        ("home_backing_segmented_store_rejected", Mreg::CX),
+        ("home_backing_segmented_load_rejected", Mreg::CX),
     ] {
         let span = function_span(db, name);
         assert!(
@@ -3909,12 +5326,36 @@ fn assert_home_safety_vetoes(db: &DecompileDB) {
         "home_xmm_mutation",
         "home_xchg_mutation",
         "home_wide_overlap",
-        "home_partial_movzx_high_rejected",
         "home_cmp_flag_clobber_rejected",
         "home_cmp_scheduled_rejected",
+        "home_backing_cmp_flag_clobber_rejected",
+        "home_backing_test_scheduled_rejected",
+        "home_backing_cmov_scheduled_rejected",
+        "home_backing_add_jcc_rejected",
+        "home_backing_add_scheduled_jcc_rejected",
+        "home_backing_add_scheduled_setcc_rejected",
+        "home_backing_add_scheduled_cmov_rejected",
+        "home_backing_add_scheduled_adc_rejected",
+        "home_backing_add_scheduled_rcr_rejected",
+        "home_backing_add_scheduled_setp_rejected",
+        "home_backing_add_scheduled_setnp_rejected",
+        "home_backing_add_scheduled_jo_rejected",
+        "home_backing_add_scheduled_jno_rejected",
+        "home_backing_add_scheduled_seto_rejected",
+        "home_backing_add_scheduled_setno_rejected",
+        "home_backing_add_scheduled_cmovo_rejected",
+        "home_backing_add_scheduled_cmovno_rejected",
+        "home_backing_lock_add_rejected",
+        "home_backing_cmovs_rejected",
+        "home_backing_cross_cell_rejected",
+        "home_backing_indexed_rejected",
+        "home_backing_rbp_xchg_rejected",
+        "home_backing_partial_pointer_store_rejected",
+        "home_backing_segmented_store_rejected",
+        "home_backing_segmented_load_rejected",
     ] {
         let span = function_span(db, name);
-        let unsafe_overlaps: Vec<_> = db
+        let mut rejected_sites: Vec<_> = db
             .rel_iter::<(Address, Address, usize)>("win64_home_overlap")
             .filter_map(|(access, func, _)| {
                 ((*func == span.0)
@@ -3927,11 +5368,27 @@ fn assert_home_safety_vetoes(db: &DecompileDB) {
                 .then_some(*access)
             })
             .collect();
-        assert!(
-            !unsafe_overlaps.is_empty(),
-            "{name} lost structured rejection for its non-scalar home overlap"
+        rejected_sites.extend(
+            db.rel_iter::<(Address, Address, usize)>("win64_home_hard_veto_site")
+                .filter_map(|(access, func, _)| {
+                    ((*func == span.0)
+                        && db.rel_iter::<(Address, Address, Symbol)>(
+                            "unsupported_stack_address",
+                        )
+                        .any(|(unsupported_func, unsupported_access, reason)| {
+                            (*unsupported_func, *unsupported_access, *reason)
+                                == (span.0, *access, "unsupported-stack-address")
+                        }))
+                    .then_some(*access)
+                }),
         );
-        for access in unsafe_overlaps {
+        rejected_sites.sort_unstable();
+        rejected_sites.dedup();
+        assert!(
+            !rejected_sites.is_empty(),
+            "{name} lost structured rejection for its non-scalar home access"
+        );
+        for access in rejected_sites {
             let candidates = address_bearing_candidates(db, access);
             assert!(
                 candidates.is_empty(),
@@ -3939,6 +5396,137 @@ fn assert_home_safety_vetoes(db: &DecompileDB) {
             );
         }
     }
+
+    let indexed_home = function_span(db, "home_backing_indexed_rejected");
+    let hard_sites: Vec<_> = db
+        .rel_iter::<(Address, Address, usize)>("win64_home_hard_veto_site")
+        .filter_map(|(node, func, pos)| {
+            (*func == indexed_home.0).then_some((*node, *pos))
+        })
+        .collect();
+    assert_eq!(
+        hard_sites.len(),
+        1,
+        "indexed home fixture must expose one exact hard-veto site: {hard_sites:#x?}"
+    );
+    assert_eq!(hard_sites[0].1, 0);
+    assert!(
+        db.rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail")
+            .any(|(func, node, detail)| {
+                (*func, *node, *detail)
+                    == (
+                        indexed_home.0,
+                        hard_sites[0].0,
+                        "home-cell-shape-unrepresentable",
+                    )
+            }),
+        "indexed home hard-veto site lost its exact structured detail"
+    );
+
+    for name in [
+        "home_backing_segmented_store_rejected",
+        "home_backing_segmented_load_rejected",
+    ] {
+        let span = function_span(db, name);
+        let segmented: Vec<_> = db
+            .rel_iter::<(Address,)>("win64_home_segmented_memory_access")
+            .filter_map(|(access,)| in_span(*access, span).then_some(*access))
+            .collect();
+        assert_eq!(
+            segmented.len(),
+            1,
+            "{name} lost its exact segmented-memory witness: {segmented:#x?}"
+        );
+        let access = segmented[0];
+        assert!(
+            !db.rel_iter::<(Address, Address, Mreg, i64, usize, i64, i64, usize)>(
+                "win64_home_bounded_access",
+            )
+            .any(|(node, _, _, _, _, _, _, _)| *node == access),
+            "{name} admitted segmented memory into bounded home backing"
+        );
+        assert!(
+            !db.rel_iter::<(Address, Address, Mreg, i64, usize, i64, i64, usize)>(
+                "win64_home_backing_candidate",
+            )
+            .any(|(node, _, _, _, _, _, _, _)| *node == access),
+            "{name} promoted segmented memory into a backing candidate"
+        );
+        assert!(
+            !db.rel_iter::<(Address, Address, i64, usize, RTLReg, RTLReg)>(
+                "win64_home_backing_move_store",
+            )
+            .any(|(node, _, _, _, _, _)| *node == access)
+                && !db.rel_iter::<(Address, Address, i64, usize, RTLReg, RTLReg)>(
+                    "win64_home_backing_move_load",
+                )
+                .any(|(node, _, _, _, _, _)| *node == access),
+            "{name} resurrected a segmented access through backing MOV"
+        );
+    }
+
+    for (name, consumer_mnemonic) in [
+        ("home_backing_add_jcc_rejected", "JNE"),
+        ("home_backing_add_scheduled_jcc_rejected", "JNE"),
+        ("home_backing_add_scheduled_setcc_rejected", "SETNE"),
+        ("home_backing_add_scheduled_cmov_rejected", "CMOVNE"),
+        ("home_backing_add_scheduled_adc_rejected", "ADC"),
+        ("home_backing_add_scheduled_rcr_rejected", "RCR"),
+        ("home_backing_add_scheduled_setp_rejected", "SETP"),
+        ("home_backing_add_scheduled_setnp_rejected", "SETNP"),
+        ("home_backing_add_scheduled_jo_rejected", "JO"),
+        ("home_backing_add_scheduled_jno_rejected", "JNO"),
+        ("home_backing_add_scheduled_seto_rejected", "SETO"),
+        ("home_backing_add_scheduled_setno_rejected", "SETNO"),
+        ("home_backing_add_scheduled_cmovo_rejected", "CMOVO"),
+        ("home_backing_add_scheduled_cmovno_rejected", "CMOVNO"),
+    ] {
+        let span = function_span(db, name);
+        let flagged_writes: Vec<_> = db
+            .rel_iter::<(Address,)>("win64_home_backing_flagged_write")
+            .filter_map(|(node,)| in_span(*node, span).then_some(*node))
+            .collect();
+        assert_eq!(
+            flagged_writes.len(),
+            1,
+            "{name} did not retain one exact live-flags veto: {flagged_writes:#x?}"
+        );
+        assert!(
+            db.rel_iter::<InstructionRow>("instruction").any(
+                |(node, _, _, mnemonic, _, _, _, _, _, _)| {
+                    *node == flagged_writes[0] && *mnemonic == "ADD"
+                }
+            ),
+            "{name} attached its live-flags veto to a node other than the home ADD"
+        );
+        let consumers: Vec<_> = db
+            .rel_iter::<InstructionRow>("instruction")
+            .filter_map(|(node, _, _, mnemonic, _, _, _, _, _, _)| {
+                (in_span(*node, span) && *mnemonic == consumer_mnemonic).then_some(*node)
+            })
+            .collect();
+        assert_eq!(
+            consumers.len(),
+            1,
+            "{name} lost its exact raw {consumer_mnemonic} consumer: {consumers:#x?}"
+        );
+        assert!(
+            consumers[0] > flagged_writes[0],
+            "{name} raw {consumer_mnemonic} does not follow the flagged home ADD"
+        );
+    }
+    let lock = function_span(db, "home_backing_lock_add_rejected");
+    assert!(
+        db.rel_iter::<(Address,)>("win64_home_backing_lock_access")
+            .any(|(node,)| in_span(*node, lock)),
+        "LOCK-prefixed backing access lost its decoder-owned veto"
+    );
+    let cmovs = function_span(db, "home_backing_cmovs_rejected");
+    assert!(
+        db.rel_iter::<(Address,)>("win64_home_backing_cmov_sf")
+            .any(|(node,)| in_span(*node, cmovs)),
+        "CMOVS backing access lost its SF-semantics veto"
+    );
 
     for name in [
         "home_ambiguous_alias_call_escape",
@@ -4080,6 +5668,210 @@ fn assert_unknown_sp_indexed_accesses_are_rejected(db: &DecompileDB) {
         .any(|(_, func, _, _)| *func == span.0));
 }
 
+fn csharp_home_address(expr: &CsharpminorExpr, slot: Ident, byte_ofs: i64) -> bool {
+    let base = |expr: &CsharpminorExpr| {
+        matches!(
+            expr,
+            CsharpminorExpr::Eunop(CminorUnop::Olongofintu, inner)
+                if matches!(inner.as_ref(), CsharpminorExpr::Eaddrof(ident) if *ident == slot)
+        )
+    };
+    if byte_ofs == 0 {
+        return base(expr);
+    }
+    matches!(
+        expr,
+        CsharpminorExpr::Ebinop(CminorBinop::Oaddl, left, right)
+            if base(left)
+                && matches!(right.as_ref(), CsharpminorExpr::Econst(Constant::Olongconst(ofs)) if *ofs == byte_ofs)
+    )
+}
+
+fn csharp_expr_has_home_load(
+    expr: &CsharpminorExpr,
+    chunk: MemoryChunk,
+    slot: Ident,
+    byte_ofs: i64,
+) -> bool {
+    match expr {
+        CsharpminorExpr::Eload(candidate, address)
+            if *candidate == chunk && csharp_home_address(address, slot, byte_ofs) =>
+        {
+            true
+        }
+        CsharpminorExpr::Eunop(_, inner) => {
+            csharp_expr_has_home_load(inner, chunk, slot, byte_ofs)
+        }
+        CsharpminorExpr::Ebinop(_, left, right) => {
+            csharp_expr_has_home_load(left, chunk, slot, byte_ofs)
+                || csharp_expr_has_home_load(right, chunk, slot, byte_ofs)
+        }
+        CsharpminorExpr::Econdition(condition, if_true, if_false) => {
+            csharp_expr_has_home_load(condition, chunk, slot, byte_ofs)
+                || csharp_expr_has_home_load(if_true, chunk, slot, byte_ofs)
+                || csharp_expr_has_home_load(if_false, chunk, slot, byte_ofs)
+        }
+        _ => false,
+    }
+}
+
+fn csharp_stmt_has_home_load(
+    stmt: &CsharpminorStmt,
+    chunk: MemoryChunk,
+    slot: Ident,
+    byte_ofs: i64,
+) -> bool {
+    let has_load = |expr: &CsharpminorExpr| {
+        csharp_expr_has_home_load(expr, chunk, slot, byte_ofs)
+    };
+    match stmt {
+        CsharpminorStmt::Sset(_, value)
+        | CsharpminorStmt::Sjumptable(value, _)
+        | CsharpminorStmt::Sreturn(value) => has_load(value),
+        CsharpminorStmt::Sstore(_, address, value) => {
+            has_load(address) || has_load(value)
+        }
+        CsharpminorStmt::Scall(_, _, callee, args)
+        | CsharpminorStmt::Stailcall(_, callee, args) => {
+            let callee_has_load = match callee {
+                either::Either::Left(value) => has_load(value),
+                _ => false,
+            };
+            callee_has_load || args.iter().any(has_load)
+        }
+        CsharpminorStmt::Scond(_, args, _, _)
+        | CsharpminorStmt::Sifthenelse(_, args, _, _) => args.iter().any(has_load),
+        CsharpminorStmt::Sseq(statements) => statements
+            .iter()
+            .any(|statement| csharp_stmt_has_home_load(statement, chunk, slot, byte_ofs)),
+        CsharpminorStmt::Sloop(body) => {
+            csharp_stmt_has_home_load(body, chunk, slot, byte_ofs)
+        }
+        _ => false,
+    }
+}
+
+fn assert_csharp_home_backing(db: &DecompileDB) {
+    for name in [
+        "home_partial_movzx_high_backing",
+        "home_backing_movsx_high",
+        "home_backing_signed_cmp_jcc",
+        "home_backing_unsigned_cmp_setcc",
+        "home_backing_partial_load",
+        "home_backing_partial_store",
+        "home_backing_add_high",
+        "home_backing_test_jcc",
+        "home_backing_test_setcc",
+        "home_backing_cmov_cmp",
+        "home_backing_cmov_test",
+        "home_backing_div",
+        "home_backing_descriptor",
+        "home_backing_cmp_setcc",
+    ] {
+        let span = function_span(db, name);
+        let slot = db
+            .rel_iter::<(Address, usize, RTLReg)>("win64_home_storage")
+            .find_map(|(func, pos, slot)| {
+                (*func == span.0 && *pos == 0).then_some(*slot)
+            })
+            .unwrap_or_else(|| panic!("{name} lost its backing local before Cshminor"));
+        let slot_ident = manifold::decompile::passes::csh_pass::ident_from_reg(slot);
+        let accesses: Vec<_> = db
+            .rel_iter::<(
+                Address,
+                RTLReg,
+                i64,
+                usize,
+                MemoryChunk,
+                bool,
+                bool,
+                bool,
+            )>("win64_home_backing_access")
+            .filter_map(|(
+                node,
+                candidate_slot,
+                byte_ofs,
+                width,
+                chunk,
+                read,
+                write,
+                address,
+            )| {
+                (in_span(*node, span) && *candidate_slot == slot).then_some((
+                    *node,
+                    *byte_ofs,
+                    *width,
+                    *chunk,
+                    *read,
+                    *write,
+                    *address,
+                ))
+            })
+            .collect();
+        assert!(!accesses.is_empty(), "{name} lost backing metadata");
+        for (node, byte_ofs, width, chunk, read, write, address) in accesses {
+            let candidates: Vec<_> = db
+                .rel_iter::<(Address, CsharpminorStmt)>("csharp_stmt_candidate")
+                .filter_map(|(candidate_node, stmt)| {
+                    ((*candidate_node & !SYNTHETIC_NODE_MASK) == node)
+                        .then_some(stmt.clone())
+                })
+                .collect();
+            assert!(
+                !candidates.is_empty(),
+                "{name} has no Cshminor candidate at backing access {node:#x}"
+            );
+            if address {
+                assert_eq!(byte_ofs, 0, "descriptor fixture should take &cell");
+                assert!(
+                    candidates.iter().any(|stmt| matches!(
+                        stmt,
+                        CsharpminorStmt::Sset(_, CsharpminorExpr::Eaddrof(ident))
+                            if *ident == slot_ident
+                    )),
+                    "{name} did not lower its authenticated LEA to &backing: {candidates:#x?}"
+                );
+            } else if write {
+                assert!(
+                    candidates.iter().any(|stmt| {
+                        matches!(stmt, CsharpminorStmt::Sstore(candidate, address, _)
+                            if *candidate == chunk
+                                && csharp_home_address(address, slot_ident, byte_ofs))
+                    }),
+                    "{name} did not materialize its {width}-byte write at +{byte_ofs}: {candidates:#x?}"
+                );
+                if name == "home_backing_add_high" && byte_ofs == 2 {
+                    assert!(
+                        candidates.iter().any(|stmt| {
+                            matches!(stmt, CsharpminorStmt::Sstore(_, _, value)
+                                if csharp_expr_has_home_load(
+                                    value,
+                                    chunk,
+                                    slot_ident,
+                                    byte_ofs,
+                                ))
+                        }),
+                        "{name} lost the read half of its partial RMW: {candidates:#x?}"
+                    );
+                }
+            } else {
+                assert!(read, "{name} has a non-address access with no mode");
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|stmt| csharp_stmt_has_home_load(
+                            stmt,
+                            chunk,
+                            slot_ident,
+                            byte_ofs,
+                        )),
+                    "{name} did not materialize its {width}-byte read at +{byte_ofs}: {candidates:#x?}"
+                );
+            }
+        }
+    }
+}
+
 fn assert_final_output_compiles(object: &Path) {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(4)
@@ -4090,6 +5882,8 @@ fn assert_final_output_compiles(object: &Path) {
     manifold::decompile::disassembly::load_from_binary(&mut db, object);
     manifold::decompile::disassembly::load_preset(&mut db);
     pool.install(|| db.run_pipeline(object, false, false));
+
+    assert_csharp_home_backing(&db);
 
     let tu = db
         .cast_optimized_translation_unit
@@ -4211,6 +6005,25 @@ fn assert_final_output_compiles(object: &Path) {
         tu,
         BinaryFormat::Coff,
     );
+    for name in ["home_backing_movsx_high", "home_backing_signed_cmp_jcc"] {
+        let body = printed_function_definition(&text, name)
+            .unwrap_or_else(|| panic!("final optimized TU lost definition of {name}"));
+        assert!(
+            body.contains("short *") && !body.contains("unsigned short *"),
+            "{name} final AST lost its signed 16-bit backing load:\n{body}"
+        );
+    }
+    for name in [
+        "home_backing_unsigned_cmp_setcc",
+        "home_backing_partial_load",
+    ] {
+        let body = printed_function_definition(&text, name)
+            .unwrap_or_else(|| panic!("final optimized TU lost definition of {name}"));
+        assert!(
+            body.contains("unsigned short *"),
+            "{name} final AST lost its unsigned 16-bit backing load:\n{body}"
+        );
+    }
     for function in [
         "home_escape_mutated",
         "home_reassigned_cmp",
@@ -4223,6 +6036,20 @@ fn assert_final_output_compiles(object: &Path) {
         "home_reassigned_movsx",
         "home_reassigned_movzx",
         "home_partial_movzx_low",
+        "home_partial_movzx_high_backing",
+        "home_backing_movsx_high",
+        "home_backing_signed_cmp_jcc",
+        "home_backing_unsigned_cmp_setcc",
+        "home_backing_partial_load",
+        "home_backing_partial_store",
+        "home_backing_add_high",
+        "home_backing_test_jcc",
+        "home_backing_test_setcc",
+        "home_backing_cmov_cmp",
+        "home_backing_cmov_test",
+        "home_backing_div",
+        "home_backing_descriptor",
+        "home_backing_cmp_setcc",
         "home_partial_reload",
         "home_reassigned_add",
         "home_import_tailcall",
@@ -4304,6 +6131,7 @@ fn coff_stack_and_home_relations_preserve_values_and_abi_ordinals() {
             assert_home_store_is_not_outgoing(&db);
             assert_unsafe_home_cells_remain_storage(&db);
             assert_canonical_unsafe_home_storage(&db);
+            assert_canonical_home_backing(&db);
             assert_postsub_raw_offset_does_not_alias_home(&db);
             assert_postsub_escaped_offset_keeps_ordinary_origin(&db);
             assert_indexed_stack_cells_use_normalized_coordinates(&db);
@@ -4321,6 +6149,7 @@ fn coff_stack_and_home_relations_preserve_values_and_abi_ordinals() {
             assert_unknown_sp_indexed_accesses_are_rejected(&db);
             RTLOptimizePass.run(&mut db);
             assert_optimized_canonical_homes(&db);
+            assert_optimized_home_backing(&db);
             TypePass.run(&mut db);
             assert_post_type_canonical_homes(&db);
             drop(db);

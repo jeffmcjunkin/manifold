@@ -1054,7 +1054,14 @@ impl IRPass for TypePass {
         prog.run();
 
         prog.swap_db_fields(db);
-        crate::decompile::passes::rtl_pass::enforce_win64_home_slot_types(db);
+        crate::decompile::passes::rtl_pass::enforce_win64_home_types(db);
+    }
+
+    fn extra_reads(&self) -> &'static [&'static str] {
+        &[
+            "win64_home_backing_access",
+            "win64_home_backing_selected_candidate",
+        ]
     }
 
     declare_io_from!(TypePassProgram);

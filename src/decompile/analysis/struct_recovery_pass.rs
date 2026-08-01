@@ -619,7 +619,7 @@ impl IRPass for StructRecoveryPass {
                 db.rel_push("emit_var_type_candidate", (reg, XType::Xfuncptr));
             }
         }
-        crate::decompile::passes::rtl_pass::enforce_win64_home_slot_types(db);
+        crate::decompile::passes::rtl_pass::enforce_win64_home_types(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -649,6 +649,8 @@ impl IRPass for StructRecoveryPass {
             "func_has_param_at_position",
             "emit_function_return",
             "win64_home_slot_type",
+            "win64_home_backing_access",
+            "win64_home_backing_selected_candidate",
         ]
     }
 
@@ -677,6 +679,7 @@ impl IRPass for StructRecoveryPass {
             "global_deref_load",
             "global_is_struct_candidate",
             "emit_global_struct_fields",
+            "is_ptr",
         ]
     }
 }
