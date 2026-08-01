@@ -1,3 +1,4 @@
+use crate::decompile::disassembly::coff::CoffAddressMap;
 use crate::decompile::disassembly::operand::*;
 use crate::decompile::elevator::DecompileDB;
 use crate::mreg::Mreg;
@@ -41,17 +42,74 @@ pub struct DecodedInsn {
     pub interrupt_vector: Option<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodeRegion {
+    start: u64,
+    end: u64,
+}
+
+/// Partition a complete executable section at every authenticated COFF
+/// function boundary.  Prefix, inter-function, and suffix gaps remain regions
+/// of their own: they may contain alignment instructions, shared epilogues, or
+/// code reached only through indirect control flow.  Restarting Capstone at
+/// each boundary prevents undecodable inline data in one region from hiding
+/// every later function in the section.
+fn section_decode_regions(
+    section_start: u64,
+    section_len: usize,
+    function_ranges: &[(u64, u64)],
+) -> Vec<DecodeRegion> {
+    let Ok(section_len) = u64::try_from(section_len) else {
+        return Vec::new();
+    };
+    let Some(section_end) = section_start.checked_add(section_len) else {
+        return Vec::new();
+    };
+    if section_start == section_end {
+        return Vec::new();
+    }
+
+    let mut boundaries = vec![section_start, section_end];
+    for &(entry, end) in function_ranges {
+        if entry > section_start && entry < section_end {
+            boundaries.push(entry);
+        }
+        if end > section_start && end < section_end {
+            boundaries.push(end);
+        }
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    boundaries
+        .windows(2)
+        .filter_map(|pair| {
+            (pair[0] < pair[1]).then_some(DecodeRegion {
+                start: pair[0],
+                end: pair[1],
+            })
+        })
+        .collect()
+}
+
 // Disassemble executable sections into the instruction/operand/register relations, dispatching on target arch.
-pub fn disassemble_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<DecodedInsn> {
+pub fn disassemble_sections(
+    db: &mut DecompileDB,
+    obj: &object::File,
+    coff_address_map: Option<&CoffAddressMap>,
+) -> Vec<DecodedInsn> {
     match db.abi().arch {
         crate::abi::Arch::Aarch64 => {
             crate::decompile::disassembly::aarch64::disassemble_sections(db, obj)
         }
-        _ => disassemble_x86_sections(db, obj),
+        _ => disassemble_x86_sections(db, obj, coff_address_map),
     }
 }
 
-fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<DecodedInsn> {
+fn disassemble_x86_sections(
+    db: &mut DecompileDB,
+    obj: &object::File,
+    coff_address_map: Option<&CoffAddressMap>,
+) -> Vec<DecodedInsn> {
     let cs = {
         let mode = if db.abi().is_64bit() {
             arch::x86::ArchMode::Mode64
@@ -68,6 +126,7 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
     };
 
     let mut decoded: Vec<DecodedInsn> = Vec::new();
+    let mut nexts: Vec<(u64, u64)> = Vec::new();
 
     let mut op_registers: Vec<(&'static str, &'static str)> = Vec::new();
     let mut op_immediates: Vec<(&'static str, i64, usize)> = Vec::new();
@@ -115,13 +174,46 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
         };
         let base_addr = section.address();
 
-        let insns = cs.disasm_all(data, base_addr).unwrap_or_else(|e| {
-            panic!("Disassembly failed at section {:?}: {}", section.name(), e)
-        });
+        let function_ranges: Vec<(u64, u64)> = coff_address_map
+            .map(|address_map| {
+                address_map
+                    .functions
+                    .iter()
+                    .filter(|function| function.section_index == section.index().0)
+                    .map(|function| (function.mapped_entry, function.mapped_end))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let regions = section_decode_regions(base_addr, data.len(), &function_ranges);
 
-        for insn in insns.as_ref() {
+        for region in regions {
+            let start_offset = usize::try_from(region.start - base_addr)
+                .expect("COFF decode-region start offset does not fit usize");
+            let end_offset = usize::try_from(region.end - base_addr)
+                .expect("COFF decode-region end offset does not fit usize");
+            let region_data = data
+                .get(start_offset..end_offset)
+                .expect("COFF decode region lies outside its executable section");
+            let insns = cs.disasm_all(region_data, region.start).unwrap_or_else(|e| {
+                panic!(
+                    "Disassembly failed at section {:?} region [0x{:x}, 0x{:x}): {}",
+                    section.name(),
+                    region.start,
+                    region.end,
+                    e
+                )
+            });
+            let mut previous: Option<(u64, usize)> = None;
+
+            for insn in insns.as_ref() {
             let addr = insn.address();
             let size = insn.len();
+            if let Some((previous_address, previous_size)) = previous {
+                if previous_address + previous_size as u64 == addr {
+                    nexts.push((previous_address, addr));
+                }
+            }
+            previous = Some((addr, size));
 
             // Strip BND/NOTRACK prefixes (treated as the underlying instruction)
             let mnem_str = insn.mnemonic().unwrap_or("").to_ascii_uppercase();
@@ -441,6 +533,7 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
                 op_str,
                 interrupt_vector,
             });
+            }
         }
     }
 
@@ -453,12 +546,8 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
         instructions.into_iter().collect::<ascent::boxcar::Vec<_>>(),
     );
 
-    let mut nexts: Vec<(u64, u64)> = Vec::with_capacity(decoded.len());
-    for w in decoded.windows(2) {
-        if w[0].address + w[0].size as u64 == w[1].address {
-            nexts.push((w[0].address, w[1].address));
-        }
-    }
+    nexts.sort_unstable();
+    nexts.dedup();
     db.rel_set(
         "next",
         nexts.into_iter().collect::<ascent::boxcar::Vec<_>>(),
@@ -540,4 +629,147 @@ fn disassemble_x86_sections(db: &mut DecompileDB, obj: &object::File) -> Vec<Dec
     );
 
     decoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::x86::types::Address;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn push_section_header(
+        bytes: &mut Vec<u8>,
+        name: &[u8],
+        size: u32,
+        raw_offset: u32,
+        characteristics: u32,
+    ) {
+        let mut padded_name = [0u8; 8];
+        padded_name[..name.len()].copy_from_slice(name);
+        bytes.extend_from_slice(&padded_name);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&size.to_le_bytes());
+        bytes.extend_from_slice(&raw_offset.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&characteristics.to_le_bytes());
+    }
+
+    fn push_symbol(bytes: &mut Vec<u8>, name: &[u8], value: u32, typ: u16) {
+        let mut padded_name = [0u8; 8];
+        padded_name[..name.len()].copy_from_slice(name);
+        bytes.extend_from_slice(&padded_name);
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes.extend_from_slice(&1i16.to_le_bytes());
+        bytes.extend_from_slice(&typ.to_le_bytes());
+        bytes.push(object::pe::IMAGE_SYM_CLASS_EXTERNAL);
+        bytes.push(0);
+    }
+
+    fn inline_data_before_functions_fixture() -> Vec<u8> {
+        // A whole-section sweep stops at the trailing 0F in the named gap and
+        // misses both later mapped functions.
+        let text = [
+            0xc3, // first: ret
+            0x90, 0x90, 0x0f, // alignment/inline-data gap
+            0xb8, 1, 0, 0, 0, 0xc3, // second: mov eax, 1; ret
+            0x31, 0xc0, 0xc3, // third: xor eax, eax; ret
+        ];
+        const SYMBOL_COUNT: u32 = 4;
+        let raw_offset = 20 + 40;
+        let symbol_offset = raw_offset + text.len() as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&object::pe::IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&symbol_offset.to_le_bytes());
+        bytes.extend_from_slice(&SYMBOL_COUNT.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        push_section_header(
+            &mut bytes,
+            b".text",
+            text.len() as u32,
+            raw_offset,
+            0x6000_0020,
+        );
+        bytes.extend_from_slice(&text);
+
+        let function_type =
+            object::pe::IMAGE_SYM_DTYPE_FUNCTION << object::pe::IMAGE_SYM_DTYPE_SHIFT;
+        push_symbol(&mut bytes, b"first", 0, 0);
+        push_symbol(&mut bytes, b"gap", 1, 0);
+        push_symbol(&mut bytes, b"second", 4, function_type);
+        push_symbol(&mut bytes, b"third", 10, function_type);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn decode_regions_retain_inter_function_gaps_and_section_edges() {
+        let regions = section_decode_regions(
+            0x1000,
+            0x20,
+            &[(0x1004, 0x1008), (0x1010, 0x1018)],
+        );
+        assert_eq!(
+            regions,
+            vec![
+                DecodeRegion { start: 0x1000, end: 0x1004 },
+                DecodeRegion { start: 0x1004, end: 0x1008 },
+                DecodeRegion { start: 0x1008, end: 0x1010 },
+                DecodeRegion { start: 0x1010, end: 0x1018 },
+                DecodeRegion { start: 0x1018, end: 0x1020 },
+            ],
+        );
+    }
+
+    #[test]
+    fn coff_disassembly_restarts_after_inline_data_without_cross_entry_next() {
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "manifold-coff-segmented-disasm-{}-{}.obj",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::write(&path, inline_data_before_functions_fixture()).unwrap();
+
+        let mut db = DecompileDB::default();
+        let address_map = super::super::load_from_binary(&mut db, &path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let functions: BTreeMap<_, _> = address_map
+            .functions
+            .iter()
+            .map(|function| (function.original_name.as_str(), function))
+            .collect();
+        assert_eq!(functions.len(), 3);
+        let base = functions["first"].mapped_entry;
+        assert_eq!(functions["first"].mapped_end, base + 1);
+        assert_eq!(functions["second"].mapped_entry, base + 4);
+        assert_eq!(functions["third"].mapped_entry, base + 10);
+
+        let decoded: BTreeSet<u64> = db
+            .rel_iter::<(Address, u8)>("instruction_address_size")
+            .map(|(address, _)| *address)
+            .collect();
+        for offset in [0, 1, 2, 4, 9, 10, 12] {
+            assert!(decoded.contains(&(base + offset)), "missing offset {offset}");
+        }
+
+        let next: BTreeSet<(u64, u64)> = db
+            .rel_iter::<(Address, Address)>("next")
+            .copied()
+            .collect();
+        assert!(next.contains(&(base + 1, base + 2)));
+        assert!(next.contains(&(base + 4, base + 9)));
+        assert!(next.contains(&(base + 10, base + 12)));
+        assert!(!next.contains(&(base, base + 1)));
+        assert!(!next.contains(&(base + 9, base + 10)));
+    }
 }

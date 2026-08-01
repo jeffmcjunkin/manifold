@@ -58,7 +58,11 @@ pub fn load_from_binary(
     let pe_function_leaders = pe::load_metadata(db, &obj)
         .unwrap_or_else(|e| panic!("Failed to load PE metadata from {:?}: {}", binary_path, e));
 
-    let insns = instruction::disassemble_sections(db, &obj);
+    let insns = instruction::disassemble_sections(
+        db,
+        &obj,
+        coff_image.as_ref().map(|image| &image.address_map),
+    );
 
     // Jump table analysis must run before block building to provide extra leaders
     let jump_table_targets = cfg::analyze_jump_tables(db, &insns, &obj);
