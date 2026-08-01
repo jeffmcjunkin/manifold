@@ -640,6 +640,134 @@ ascent_par! {
         rsp_state(func, access, state),
         if let ConstPropagation::Constant(ofs) = state;
 
+    // Some MSVC functions contain a physically interposed block region which
+    // all normal control flow jumps over (for example, disabled checked-build
+    // code retained between two labels).  Such a region has no CFG predecessor,
+    // so the ordinary entry-anchored RSP lattice cannot reach it.  Recover its
+    // coordinate only from a strict layout sandwich: the preceding block must
+    // use an immediate unconditional jump directly to a later landing block,
+    // every intervening block must have no CFG predecessor from outside the
+    // skipped region, both reachable boundaries must carry the same affine
+    // entry-RSP coordinate, every involved block must have one function
+    // owner, and neither the jump nor any instruction in the skipped region may
+    // modify RSP.  The proof consumes rsp_state directly, rather than
+    // recursively inferred frame rows, so it cannot bootstrap across an
+    // unanchored component.
+    #[local] relation rsp_layout_shared_block(Address);
+    rsp_layout_shared_block(*block) <--
+        block_in_function(block, first),
+        block_in_function(block, second),
+        if first != second;
+
+    #[local] relation rsp_layout_block_mutates(Address);
+    rsp_layout_block_mutates(*block) <--
+        code_in_block(addr, block),
+        asm_reg_def(addr, ?&Mreg::SP);
+    rsp_layout_block_mutates(*block) <--
+        code_in_block(addr, block),
+        adjusts_stack(addr, "RSP", _);
+
+    #[local] relation rsp_layout_ambiguous_jump(Address);
+    rsp_layout_ambiguous_jump(*src) <--
+        direct_jump(src, first),
+        direct_jump(src, second),
+        if first != second;
+
+    // Keep the region search demand-driven.  A forward JMP can span many
+    // blocks, but only a skipped region containing a decoded RSP memory
+    // operand can improve the frame proof.
+    #[local] relation rsp_layout_rsp_access(Address);
+    rsp_layout_rsp_access(*addr) <--
+        instruction(addr, _, _, _, operand, _, _, _, _, _),
+        op_indirect(operand, _, "RSP", _, _, _, _);
+    rsp_layout_rsp_access(*addr) <--
+        instruction(addr, _, _, _, _, operand, _, _, _, _),
+        op_indirect(operand, _, "RSP", _, _, _, _);
+    rsp_layout_rsp_access(*addr) <--
+        instruction(addr, _, _, _, _, _, operand, _, _, _),
+        op_indirect(operand, _, "RSP", _, _, _, _);
+    rsp_layout_rsp_access(*addr) <--
+        instruction(addr, _, _, _, _, _, _, operand, _, _),
+        op_indirect(operand, _, "RSP", _, _, _, _);
+
+    // Candidate physical region [skipped, after): the immediately preceding
+    // block jumps over one or more layout blocks to a real later block.
+    #[local] relation rsp_layout_jump_region(Address, Address, Address, Address);
+    rsp_layout_jump_region(*before, *before_last, *skipped, *after) <--
+        block_boundaries(before, before_last, skipped),
+        block_boundaries(after, _, _),
+        instruction(before_last, _, _, jump_mnemonic, jump_target, _, _, _, _, _),
+        if matches!(*jump_mnemonic, "JMP" | "JMPQ"),
+        op_immediate(jump_target, target_value, _),
+        if *target_value >= 0 && (*target_value as Address) == *after,
+        direct_jump(before_last, after),
+        !rsp_layout_ambiguous_jump(before_last),
+        rsp_layout_rsp_access(access),
+        if *access >= *skipped && *access < *after,
+        if *skipped < *after;
+
+    #[local] relation rsp_layout_region_block(Address, Address, Address, Address);
+    rsp_layout_region_block(*before_last, *skipped, *after, *block) <--
+        rsp_layout_jump_region(_, before_last, skipped, after),
+        block_boundaries(block, _, _),
+        if *block >= *skipped && *block < *after;
+
+    #[local] relation rsp_layout_region_external_cfg_pred(Address, Address, Address);
+    rsp_layout_region_external_cfg_pred(*before_last, *skipped, *after) <--
+        rsp_layout_region_block(before_last, skipped, after, dst_block),
+        ddisasm_cfg_edge(src, dst, _),
+        code_in_block(src, src_block),
+        code_in_block(dst, dst_block),
+        !rsp_layout_region_block(before_last, skipped, after, src_block);
+    rsp_layout_region_external_cfg_pred(*before_last, *skipped, *after) <--
+        rsp_layout_region_block(before_last, skipped, after, dst_block),
+        trap_fallthrough(src, dst),
+        code_in_block(src, src_block),
+        code_in_block(dst, dst_block),
+        !rsp_layout_region_block(before_last, skipped, after, src_block);
+
+    #[local] relation rsp_layout_region_mutates(Address, Address, Address);
+    rsp_layout_region_mutates(*before_last, *skipped, *after) <--
+        rsp_layout_region_block(before_last, skipped, after, block),
+        rsp_layout_block_mutates(block);
+
+    #[local] relation rsp_layout_region_shared(Address, Address, Address);
+    rsp_layout_region_shared(*before_last, *skipped, *after) <--
+        rsp_layout_region_block(before_last, skipped, after, block),
+        rsp_layout_shared_block(block);
+
+    #[local] relation rsp_layout_region_owner_gap(Address, Address, Address, Address);
+    rsp_layout_region_owner_gap(*before_last, *skipped, *after, *func) <--
+        rsp_layout_jump_region(before, before_last, skipped, after),
+        block_in_function(before, func),
+        rsp_layout_region_block(before_last, skipped, after, block),
+        !block_in_function(block, func);
+
+    #[local] relation rsp_layout_sandwich(Address, Address, Address, Address, i64);
+    rsp_layout_sandwich(*func, *before_last, *skipped, *after, *before_ofs) <--
+        rsp_layout_jump_region(before, before_last, skipped, after),
+        block_in_function(before, func),
+        block_in_function(after, func),
+        !rsp_layout_shared_block(before),
+        !rsp_layout_shared_block(after),
+        !rsp_layout_region_shared(before_last, skipped, after),
+        !rsp_layout_region_owner_gap(before_last, skipped, after, func),
+        !rsp_layout_region_external_cfg_pred(before_last, skipped, after),
+        !rsp_transfer_kill(before_last),
+        !adjusts_stack(before_last, "RSP", _),
+        !rsp_layout_region_mutates(before_last, skipped, after),
+        rsp_state(func, before_last, before_state),
+        if let ConstPropagation::Constant(before_ofs) = before_state,
+        rsp_state(func, after, after_state),
+        if let ConstPropagation::Constant(after_ofs) = after_state,
+        if before_ofs == after_ofs;
+
+    rsp_frame_offset_at(*func, *access, *ofs) <--
+        rsp_layout_sandwich(func, before_last, skipped, after, ofs),
+        rsp_layout_region_block(before_last, skipped, after, block),
+        code_in_block(access, block),
+        instr_in_function(access, func);
+
     relation rsp_frame_at(Address, Address);
     rsp_frame_at(*access, *func) <--
         rsp_frame_offset_at(func, access, _);
@@ -10282,6 +10410,286 @@ mod privileged_instruction_tests {
                 vec![(function, copy, access)]
             );
             assert!(prog.bp_competing_reaching_def.is_empty());
+        });
+    }
+}
+
+#[cfg(test)]
+mod rsp_layout_sandwich_tests {
+    use super::*;
+
+    const FUNCTION: Address = 0x3000;
+    const BEFORE_LAST: Address = 0x3004;
+    const SKIPPED: Address = 0x3010;
+    const SKIPPED_SECOND: Address = 0x3018;
+    const AFTER: Address = 0x3020;
+    const OUTSIDE: Address = 0x3030;
+    const END: Address = 0x3050;
+    const OTHER_FUNCTION: Address = 0x4000;
+    const NONE: Symbol = "rsp_layout_none";
+    const RSP_MEMORY: Symbol = "rsp_layout_rsp_memory";
+    const RAX: Symbol = "rsp_layout_rax";
+    const JMP_TARGET: Symbol = "rsp_layout_jmp_target";
+
+    #[derive(Clone, Copy, Default)]
+    struct FixtureOptions {
+        jump_mnemonic: Option<&'static str>,
+        jump_immediate: Option<Address>,
+        direct_jump: bool,
+        external_predecessor: bool,
+        skipped_mutates_rsp: bool,
+        shared_skipped_block: bool,
+        unowned_skipped_block: bool,
+        ambiguous_jump: bool,
+    }
+
+    fn on_pipeline_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("rsp-layout-sandwich-test".to_string())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn RSP layout sandwich test")
+            .join()
+            .expect("RSP layout sandwich test panicked");
+    }
+
+    fn instruction(
+        addr: Address,
+        mnemonic: &'static str,
+        op1: Symbol,
+        op2: Symbol,
+    ) -> (
+        Address,
+        usize,
+        &'static str,
+        &'static str,
+        Symbol,
+        Symbol,
+        Symbol,
+        Symbol,
+        usize,
+        usize,
+    ) {
+        (addr, 1, "", mnemonic, op1, op2, NONE, NONE, 0, 0)
+    }
+
+    fn run_fixture(options: FixtureOptions) -> AsmPassProgram {
+        let mut prog = AsmPassProgram::default();
+
+        prog.func_span.push(("rsp_layout_function", FUNCTION, END));
+        prog.block_boundaries
+            .push((FUNCTION, BEFORE_LAST, SKIPPED));
+        prog.block_boundaries
+            .push((SKIPPED, SKIPPED, SKIPPED_SECOND));
+        prog.block_boundaries
+            .push((SKIPPED_SECOND, SKIPPED_SECOND, AFTER));
+        prog.block_boundaries.push((AFTER, AFTER, OUTSIDE));
+        prog.block_boundaries.push((OUTSIDE, OUTSIDE, END));
+
+        for (address, block) in [
+            (FUNCTION, FUNCTION),
+            (BEFORE_LAST, FUNCTION),
+            (SKIPPED, SKIPPED),
+            (SKIPPED_SECOND, SKIPPED_SECOND),
+            (AFTER, AFTER),
+            (OUTSIDE, OUTSIDE),
+        ] {
+            prog.code_in_block.push((address, block));
+            prog.instr_in_function.push((address, FUNCTION));
+        }
+        for block in [FUNCTION, SKIPPED, SKIPPED_SECOND, AFTER, OUTSIDE] {
+            if block != SKIPPED_SECOND || !options.unowned_skipped_block {
+                prog.block_in_function.push((block, FUNCTION));
+            }
+        }
+
+        prog.instruction
+            .push(instruction(FUNCTION, "SUB", NONE, NONE));
+        prog.instruction.push(instruction(
+            BEFORE_LAST,
+            options.jump_mnemonic.unwrap_or("JMP"),
+            JMP_TARGET,
+            NONE,
+        ));
+        prog.instruction
+            .push(instruction(SKIPPED, "MOV", RSP_MEMORY, RAX));
+        prog.instruction
+            .push(instruction(
+                SKIPPED_SECOND,
+                if options.skipped_mutates_rsp { "PUSH" } else { "NOP" },
+                NONE,
+                NONE,
+            ));
+        prog.instruction
+            .push(instruction(AFTER, "RET", NONE, NONE));
+        prog.instruction
+            .push(instruction(OUTSIDE, "RET", NONE, NONE));
+
+        prog.next.push((FUNCTION, BEFORE_LAST));
+        prog.next.push((BEFORE_LAST, SKIPPED));
+        prog.next.push((SKIPPED, SKIPPED_SECOND));
+        prog.next.push((SKIPPED_SECOND, AFTER));
+        prog.next.push((AFTER, OUTSIDE));
+        prog.adjusts_stack.push((FUNCTION, "RSP", -40_i64));
+        prog.asm_reg_def_seed.push((FUNCTION, Mreg::SP));
+
+        let memory: (
+            Symbol,
+            &'static str,
+            &'static str,
+            &'static str,
+            i64,
+            i64,
+            usize,
+        ) = (RSP_MEMORY, "NONE", "RSP", "NONE", 1, 0x30, 8);
+        prog.op_indirect.push(memory);
+        prog.op_register.push((RAX, "RAX"));
+        prog.op_immediate.push((
+            JMP_TARGET,
+            options.jump_immediate.unwrap_or(AFTER) as i64,
+            8,
+        ));
+
+        // The normal path skips the physically interposed region. Both sides
+        // therefore carry the same entry-relative RSP coordinate (-40).
+        prog.ddisasm_cfg_edge
+            .push((BEFORE_LAST, AFTER, "branch"));
+        // Internal edges in a multi-block skipped region are allowed; only an
+        // edge from outside the bounded region invalidates the layout proof.
+        prog.ddisasm_cfg_edge
+            .push((SKIPPED, SKIPPED_SECOND, "fallthrough"));
+        if options.direct_jump {
+            prog.direct_jump.push((BEFORE_LAST, AFTER));
+        }
+        if options.external_predecessor {
+            prog.ddisasm_cfg_edge
+                .push((OUTSIDE, SKIPPED_SECOND, "branch"));
+        }
+        if options.skipped_mutates_rsp {
+            prog.asm_reg_def_seed.push((SKIPPED_SECOND, Mreg::SP));
+            prog.adjusts_stack
+                .push((SKIPPED_SECOND, "RSP", -8_i64));
+        }
+        if options.shared_skipped_block {
+            prog.block_in_function
+                .push((SKIPPED_SECOND, OTHER_FUNCTION));
+        }
+        if options.ambiguous_jump {
+            prog.direct_jump.push((BEFORE_LAST, OUTSIDE));
+        }
+
+        prog.run();
+        prog
+    }
+
+    fn has_skipped_frame(prog: &AsmPassProgram) -> bool {
+        prog.rsp_frame_offset_at
+            .iter()
+            .any(|row| *row == (FUNCTION, SKIPPED, -40))
+    }
+
+    fn has_unknown_rsp_diagnostic(prog: &AsmPassProgram) -> bool {
+        prog.unsupported_address_detail_seed.iter().any(
+            |(function, address, reason)| {
+                *function == FUNCTION
+                    && *address == SKIPPED
+                    && *reason == "rsp-coordinate-unknown"
+            },
+        )
+    }
+
+    #[test]
+    fn recovers_rsp_only_for_an_unconditional_unentered_layout_sandwich() {
+        on_pipeline_stack(|| {
+            let prog = run_fixture(FixtureOptions {
+                direct_jump: true,
+                ..FixtureOptions::default()
+            });
+
+            assert!(prog
+                .rsp_layout_sandwich
+                .iter()
+                .any(|row| *row == (FUNCTION, BEFORE_LAST, SKIPPED, AFTER, -40)));
+            assert!(has_skipped_frame(&prog));
+            assert!(prog
+                .rsp_frame_offset_at
+                .iter()
+                .any(|row| *row == (FUNCTION, SKIPPED_SECOND, -40)));
+            assert!(!has_unknown_rsp_diagnostic(&prog));
+        });
+    }
+
+    #[test]
+    fn rejects_incomplete_or_ambiguous_layout_sandwich_proofs() {
+        on_pipeline_stack(|| {
+            let cases = [
+                (
+                    "missing direct target",
+                    FixtureOptions::default(),
+                ),
+                (
+                    "conditional transfer",
+                    FixtureOptions {
+                        jump_mnemonic: Some("JNE"),
+                        direct_jump: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "mismatched encoded target",
+                    FixtureOptions {
+                        jump_immediate: Some(OUTSIDE),
+                        direct_jump: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "external predecessor",
+                    FixtureOptions {
+                        direct_jump: true,
+                        external_predecessor: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "RSP mutation in skipped block",
+                    FixtureOptions {
+                        direct_jump: true,
+                        skipped_mutates_rsp: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "shared skipped block",
+                    FixtureOptions {
+                        direct_jump: true,
+                        shared_skipped_block: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "unowned skipped block",
+                    FixtureOptions {
+                        direct_jump: true,
+                        unowned_skipped_block: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+                (
+                    "ambiguous direct target",
+                    FixtureOptions {
+                        direct_jump: true,
+                        ambiguous_jump: true,
+                        ..FixtureOptions::default()
+                    },
+                ),
+            ];
+
+            for (name, options) in cases {
+                let prog = run_fixture(options);
+                assert!(!has_skipped_frame(&prog), "accepted {name}");
+                assert!(has_unknown_rsp_diagnostic(&prog), "lost diagnostic for {name}");
+            }
         });
     }
 }
