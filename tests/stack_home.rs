@@ -49,6 +49,8 @@ fn build_fixture() -> PathBuf {
         r#"
         .text
         .extern __imp_home_tailcall
+        .extern typed_slot_tailcall
+        .def typed_slot_tailcall; .scl 2; .type 32; .endef
         .globl sp_indexed_alias_collision
         .def sp_indexed_alias_collision; .scl 2; .type 32; .endef
 sp_indexed_alias_collision:
@@ -170,6 +172,53 @@ home_import_tailcall:
         movq 8(%rsp), %rcx
         movq 16(%rsp), %rdx
         jmpq *__imp_home_tailcall(%rip)
+
+        .globl home_typed_slot_tailcall
+        .def home_typed_slot_tailcall; .scl 2; .type 32; .endef
+home_typed_slot_tailcall:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 16(%rsp)
+        movq 8(%rsp), %rcx
+        movq 16(%rsp), %rdx
+        jmpq *typed_slot_tailcall(%rip)
+
+        .globl home_epilogue_register_tailcall
+        .def home_epilogue_register_tailcall; .scl 2; .type 32; .endef
+home_epilogue_register_tailcall:
+        pushq %rbx
+        subq $32, %rsp
+        movq %rcx, 8(%rsp)
+        movq %rdx, %rax
+        movq 8(%rsp), %rcx
+        addq $32, %rsp
+        popq %rbx
+        jmp .Lhome_epilogue_register_tailcall_shared
+.Lhome_epilogue_register_tailcall_shared:
+        jmpq *%rax
+
+        .globl home_adjacent_epilogue_register_tailcall
+        .def home_adjacent_epilogue_register_tailcall; .scl 2; .type 32; .endef
+home_adjacent_epilogue_register_tailcall:
+        subq $40, %rsp
+        movq %rcx, 8(%rsp)
+        movq %rdx, %rax
+        movq 8(%rsp), %rcx
+        addq $40, %rsp
+        jmpq *%rax
+
+        .globl home_live_frame_register_dispatch
+        .def home_live_frame_register_dispatch; .scl 2; .type 32; .endef
+home_live_frame_register_dispatch:
+        pushq %rbx
+        subq $32, %rsp
+        movq %rcx, 8(%rsp)
+        jmpq *%rdx
+
+        .globl home_frameless_register_dispatch
+        .def home_frameless_register_dispatch; .scl 2; .type 32; .endef
+home_frameless_register_dispatch:
+        movq %rcx, 8(%rsp)
+        jmpq *%rdx
 
         .globl home_reassigned_cmp_reg
         .def home_reassigned_cmp_reg; .scl 2; .type 32; .endef
@@ -3389,6 +3438,65 @@ fn assert_resolved_import_tailcall_keeps_frame_proofs(db: &DecompileDB) {
     );
 }
 
+fn assert_indirect_tailcall_proofs_are_structural(db: &DecompileDB) {
+    let typed_slot = function_span(db, "home_typed_slot_tailcall");
+    assert!(
+        db.rel_iter::<(Address,)>("is_extern_tailcall_jmp")
+            .any(|(address,)| in_span(*address, typed_slot)),
+        "function-typed RIP memory slot was not classified as an import tail call"
+    );
+    assert!(
+        !db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+            .any(|(func, _, _)| *func == typed_slot.0),
+        "typed import-pointer tail call poisoned frame provenance"
+    );
+
+    for name in [
+        "home_epilogue_register_tailcall",
+        "home_adjacent_epilogue_register_tailcall",
+    ] {
+        let epilogue = function_span(db, name);
+        let proven_jump = db
+            .rel_iter::<(Address,)>("is_epilogue_indirect_tailcall_jmp")
+            .find_map(|(address,)| in_span(*address, epilogue).then_some(*address))
+            .unwrap_or_else(|| {
+                panic!("{name}: restored register tail call lacked an epilogue proof")
+            });
+        let tailcalls: Vec<_> = db
+            .rel_iter::<(Address, MachInst)>("mach_inst")
+            .filter(|(address, inst)| {
+                in_span(*address, epilogue) && matches!(inst, MachInst::Mtailcall(_))
+            })
+            .collect();
+        assert_eq!(
+            tailcalls.len(),
+            1,
+            "{name}: structural and adjacent-pair rules emitted duplicate tail calls"
+        );
+        assert_eq!(tailcalls[0].0, proven_jump);
+        assert!(!db
+            .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+            .any(|(func, _, _)| *func == epilogue.0));
+    }
+
+    for name in [
+        "home_live_frame_register_dispatch",
+        "home_frameless_register_dispatch",
+    ] {
+        let span = function_span(db, name);
+        assert!(
+            !db.rel_iter::<(Address,)>("is_epilogue_indirect_tailcall_jmp")
+                .any(|(address,)| in_span(*address, span)),
+            "{name} received a tail-call proof without a dominated, restored frame"
+        );
+        assert!(
+            db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+                .any(|(func, _, _)| *func == span.0),
+            "{name} no longer guards unresolved internal control flow"
+        );
+    }
+}
+
 fn assert_bp_postprologue_and_xmm_forms(db: &DecompileDB) {
     for name in [
         "bp_fifth",
@@ -4087,6 +4195,9 @@ fn assert_final_output_compiles(object: &Path) {
         "home_reassigned_movzx",
         "home_reassigned_add",
         "home_import_tailcall",
+        "home_typed_slot_tailcall",
+        "home_epilogue_register_tailcall",
+        "home_adjacent_epilogue_register_tailcall",
         "fifth_inc",
         "outgoing_reuses_home_coordinate",
         "sp_indexed_fused_arith",
@@ -4109,10 +4220,15 @@ fn assert_final_output_compiles(object: &Path) {
     // Clight deliberately emits C's unspecified-parameter declaration for an
     // untyped COFF import.  The downstream C++ adapter supplies the recovered
     // prototype; relax this fixture-only declaration for the C++ syntax smoke.
-    let syntax_text = text.replace(
-        "int coff_ext_home_tailcall();",
-        "int coff_ext_home_tailcall(...);",
-    );
+    let syntax_text = text
+        .replace(
+            "int coff_ext_home_tailcall();",
+            "int coff_ext_home_tailcall(...);",
+        )
+        .replace(
+            "int coff_ext_typed_slot_tailcall();",
+            "int coff_ext_typed_slot_tailcall(...);",
+        );
     let output = object.with_extension("generated.cpp");
     std::fs::write(&output, &syntax_text).expect("failed to write stack/home generated C++");
     let compiled = Command::new("clang++")
@@ -4165,6 +4281,7 @@ fn coff_stack_and_home_relations_preserve_values_and_abi_ordinals() {
             assert_incoming_stack_rmw_is_initialized_and_survives(&db);
             assert_outgoing_home_coordinate_is_not_suppressed(&db);
             assert_resolved_import_tailcall_keeps_frame_proofs(&db);
+            assert_indirect_tailcall_proofs_are_structural(&db);
             assert_bp_postprologue_and_xmm_forms(&db);
             assert_bp_provenance_preserves_pointer_memory(&db);
             assert_bp_shortcuts_and_narrow_bases_stay_pointer_memory(&db);

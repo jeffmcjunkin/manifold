@@ -367,6 +367,12 @@ fn plan_image(obj: &object::File<'_>, data: &[u8]) -> Result<(Vec<BytePatch>, Co
 
     // Classify undefined symbols from both their COFF type and their use.  Some
     // producers omit the function type, but an E8/E9 REL32 field is definitive.
+    // Conversely, Microsoft COFF sometimes gives a function-pointer variable
+    // the function derived type.  An FF /2 or FF /4 RIP-memory operand is
+    // definitive evidence that the relocation names the pointer SLOT rather
+    // than the eventual callee.  Keep this use-site evidence ahead of the raw
+    // symbol type so CFG construction can resolve guarded dispatch and other
+    // compiler-generated indirect tail calls without guessing from names.
     let mut undefined_kinds: BTreeMap<String, CoffExternalKind> = BTreeMap::new();
     for sym in symbols.values() {
         if !matches!(sym.section, SymbolSection::Undefined | SymbolSection::Common) {
@@ -393,7 +399,13 @@ fn plan_image(obj: &object::File<'_>, data: &[u8]) -> Result<(Vec<BytePatch>, Co
             let direct_transfer = sec_data
                 .get(offset as usize - 1)
                 .map_or(false, |b| *b == 0xe8 || *b == 0xe9);
-            if !direct_transfer {
+            let indirect_pointer_transfer = offset >= 2
+                && sec_data
+                    .get(offset as usize - 2..offset as usize)
+                    .map_or(false, |prefix| {
+                        prefix[0] == 0xff && matches!(prefix[1], 0x15 | 0x25)
+                    });
+            if !direct_transfer && !indirect_pointer_transfer {
                 continue;
             }
             let RelocationTarget::Symbol(index) = reloc.target() else { continue };
@@ -404,7 +416,11 @@ fn plan_image(obj: &object::File<'_>, data: &[u8]) -> Result<(Vec<BytePatch>, Co
                     merge_external_kind(
                         &mut undefined_kinds,
                         &sym.original_name,
-                        CoffExternalKind::Function,
+                        if indirect_pointer_transfer {
+                            CoffExternalKind::ImportPointer
+                        } else {
+                            CoffExternalKind::Function
+                        },
                     );
                 }
             }
@@ -1276,6 +1292,84 @@ mod tests {
         bytes
     }
 
+    fn external_control_transfer_fixture() -> Vec<u8> {
+        // Four typed undefined symbols exercise all relocation-use classes:
+        // indirect JMP/CALL through slots, a direct CALL, and an ordinary
+        // RIP-relative data load.  Only the FF /4 and FF /2 operands denote
+        // import pointers even though every symbol carries the function type.
+        let text = [
+            0xff, 0x25, 0, 0, 0, 0,       // jmp qword ptr [rip + slotjmp]
+            0xe8, 0, 0, 0, 0,             // call directfn
+            0x48, 0x8b, 0x05, 0, 0, 0, 0, // mov rax, [rip + dataload]
+            0xff, 0x15, 0, 0, 0, 0,       // call qword ptr [rip + slotcall]
+            0xc3,                          // ret
+        ];
+        const SYMBOL_COUNT: u32 = 5;
+        const RELOCATION_COUNT: u16 = 4;
+        const HEADER_SIZE: u32 = 20 + 40;
+        const RELOCATION_SIZE: u32 = 10;
+        let text_offset = HEADER_SIZE;
+        let relocation_offset = text_offset + text.len() as u32;
+        let symbol_offset = relocation_offset + RELOCATION_COUNT as u32 * RELOCATION_SIZE;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&object::pe::IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&symbol_offset.to_le_bytes());
+        bytes.extend_from_slice(&SYMBOL_COUNT.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut name = [0u8; 8];
+        name[..5].copy_from_slice(b".text");
+        bytes.extend_from_slice(&name);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&text_offset.to_le_bytes());
+        bytes.extend_from_slice(&relocation_offset.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&RELOCATION_COUNT.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0x6000_0020u32.to_le_bytes());
+        bytes.extend_from_slice(&text);
+
+        for (field_offset, symbol_index) in [(2u32, 1u32), (7, 2), (14, 3), (20, 4)] {
+            bytes.extend_from_slice(&field_offset.to_le_bytes());
+            bytes.extend_from_slice(&symbol_index.to_le_bytes());
+            bytes.extend_from_slice(&object::pe::IMAGE_REL_AMD64_REL32.to_le_bytes());
+        }
+
+        let function_type =
+            object::pe::IMAGE_SYM_DTYPE_FUNCTION << object::pe::IMAGE_SYM_DTYPE_SHIFT;
+        push_symbol(
+            &mut bytes,
+            b"fixture",
+            0,
+            1,
+            function_type,
+            object::pe::IMAGE_SYM_CLASS_EXTERNAL,
+        );
+        for name in [
+            b"slotjmp".as_slice(),
+            b"directfn".as_slice(),
+            b"dataload".as_slice(),
+            b"slotcall".as_slice(),
+        ] {
+            push_symbol(
+                &mut bytes,
+                name,
+                0,
+                0,
+                function_type,
+                object::pe::IMAGE_SYM_CLASS_EXTERNAL,
+            );
+        }
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn complete_code_classifier_accepts_real_function_terminators() {
         let classifier = x64_classifier();
@@ -1353,6 +1447,33 @@ mod tests {
                 .mapped_address;
             assert!(constrained.contains(&address), "{name} must remain data-only");
         }
+    }
+
+    #[test]
+    fn rip_memory_control_relocation_overrides_function_typed_slot() {
+        let mut fixture = external_control_transfer_fixture();
+        let image = prepare_image(&mut fixture).unwrap().unwrap();
+        let kinds: BTreeMap<_, _> = image
+            .address_map
+            .externs
+            .iter()
+            .map(|external| (external.original_name.as_str(), external.kind))
+            .collect();
+        assert_eq!(kinds["slotjmp"], CoffExternalKind::ImportPointer);
+        assert_eq!(kinds["slotcall"], CoffExternalKind::ImportPointer);
+        assert_eq!(kinds["directfn"], CoffExternalKind::Function);
+        assert_eq!(kinds["dataload"], CoffExternalKind::Function);
+
+        let mut db = DecompileDB::default();
+        image.load_synthetic_symbols(&mut db);
+        let pointer_names: BTreeSet<&str> = db
+            .rel_iter::<(Address, Symbol)>("pointer_to_external_symbol")
+            .map(|(_, name)| *name)
+            .collect();
+        assert!(pointer_names.contains("coff_ext_slotjmp"));
+        assert!(pointer_names.contains("coff_ext_slotcall"));
+        assert!(!pointer_names.contains("coff_ext_directfn"));
+        assert!(!pointer_names.contains("coff_ext_dataload"));
     }
 
     #[test]

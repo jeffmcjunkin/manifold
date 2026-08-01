@@ -869,11 +869,56 @@ ascent_par! {
         shared_stack_access(addr),
         instr_in_function(addr, func);
 
-    // An unresolved computed jump has no complete predecessor set. It can
-    // enter a later stack access after an unobserved SP/BP mutation, so no
-    // stack classification in that function is trustworthy.
-    #[local] relation function_has_unresolved_indirect(Address);
-    function_has_unresolved_indirect(*func) <--
+    // A register-indirect jump after a dominating frame allocation and a
+    // proved restoration to the entry RSP coordinate is an ABI tail call, not
+    // a hidden predecessor of another framed block.  This structural proof is
+    // intentionally unavailable to frameless computed dispatch and to jumps
+    // made while the frame is live; those remain unresolved below.  The
+    // block-dominator lattice already maintained for BP provenance gives us
+    // the required all-path allocation witness without materializing another
+    // quadratic dominance relation.
+    #[local] relation stack_allocation_dominates_indirect_jmp(Address, Address, Address);
+    stack_allocation_dominates_indirect_jmp(*func, *alloc, *jmp) <--
+        instr_in_function(alloc, func),
+        adjusts_stack(alloc, "RSP", delta),
+        if *delta < 0,
+        code_in_block(alloc, block),
+        code_in_block(jmp, block),
+        if alloc < jmp;
+    stack_allocation_dominates_indirect_jmp(*func, *alloc, *jmp) <--
+        instr_in_function(alloc, func),
+        adjusts_stack(alloc, "RSP", delta),
+        if *delta < 0,
+        code_in_block(alloc, alloc_block),
+        code_in_block(jmp, jmp_block),
+        if alloc_block != jmp_block,
+        bp_block_dom_set(func, jmp_block, doms),
+        if doms.0.contains(alloc_block);
+
+    relation is_epilogue_indirect_tailcall_jmp(Address);
+    is_epilogue_indirect_tailcall_jmp(*addr) <--
+        instruction(addr, _, _, "JMP", dst, _, _, _, _, _),
+        op_register(dst, _),
+        instr_in_function(addr, func),
+        rsp_frame_offset_at(func, addr, offset),
+        if *offset == 0,
+        stack_allocation_dominates_indirect_jmp(func, _, addr);
+
+    // A genuinely unresolved computed jump has no complete predecessor set.
+    // It can enter a later stack access after an unobserved SP/BP mutation, so
+    // no stack classification in that function is trustworthy.  A proved
+    // epilogue jump does expose the exact entry RSP coordinate to any hidden
+    // successor, but it does not by itself prove the restored value of RBP;
+    // retain the conservative BP/EBP veto while allowing RSP cells.
+    #[local] relation function_has_unresolved_rsp_indirect(Address);
+    function_has_unresolved_rsp_indirect(*func) <--
+        ddisasm_cfg_edge(src, _, edge_type),
+        if *edge_type == "indirect",
+        !is_extern_tailcall_jmp(src),
+        !is_epilogue_indirect_tailcall_jmp(src),
+        instr_in_function(src, func);
+    #[local] relation function_has_unresolved_bp_indirect(Address);
+    function_has_unresolved_bp_indirect(*func) <--
         ddisasm_cfg_edge(src, _, edge_type),
         if *edge_type == "indirect",
         !is_extern_tailcall_jmp(src),
@@ -881,16 +926,20 @@ ascent_par! {
     // An unresolved predecessor may mutate BP before reaching the access.
     // Even an apparently scratch EBP therefore lacks sufficient provenance.
     unsupported_addr32_access(*func, *addr, "addr32-unresolved-indirect") <--
-        function_has_unresolved_indirect(func),
+        function_has_unresolved_bp_indirect(func),
         instr_in_function(addr, func),
         addr32_memory_operand(addr, _, _, base, index, _, _),
         if *base == "EBP" || *index == "EBP";
     unsafe_stack_access(*func, *addr, "unresolved-indirect-control-flow") <--
-        function_has_unresolved_indirect(func),
+        function_has_unresolved_rsp_indirect(func),
         instr_in_function(addr, func),
         raw_operand_at(addr, operand),
-        op_indirect(operand, _, base, _, _, _, _),
-        if *base == "RSP" || *base == "RBP";
+        op_indirect(operand, _, "RSP", _, _, _, _);
+    unsafe_stack_access(*func, *addr, "unresolved-indirect-control-flow") <--
+        function_has_unresolved_bp_indirect(func),
+        instr_in_function(addr, func),
+        raw_operand_at(addr, operand),
+        op_indirect(operand, _, "RBP", _, _, _, _);
 
     // Machine-readable trigger provenance.  The stable public suppression
     // reason remains one of the two adapter-facing codes below, while this
@@ -2080,6 +2129,20 @@ ascent_par! {
         op_register(rsp, "RSP"),
         next(addr, addr1),
         pjmp(addr1, dst),
+        op_register(dst, reg_str),
+        // The structural epilogue proof emits the transfer at the JMP itself.
+        // Keep this legacy adjacent-pair fallback only for cases that cannot
+        // establish that stronger proof, or the same transfer is emitted at
+        // both the ADD and JMP addresses.
+        !is_epilogue_indirect_tailcall_jmp(addr1);
+
+    // The CFG/frame proof also covers normal epilogues with one or more POPs
+    // between the ADD RSP and the final register JMP, plus shared epilogue
+    // labels reached by a direct branch.  Lower the proven transfer itself as
+    // an indirect tail call instead of leaving an operand-shaped goto.
+    mach_inst(addr, MachInst::Mtailcall(Either::Left(Mreg::x86(Ireg::from(reg_str))))) <--
+        is_epilogue_indirect_tailcall_jmp(addr),
+        instruction(addr, _, _, "JMP", dst, _, _, _, _, _),
         op_register(dst, reg_str);
 
     mach_inst(addr, MachInst::Mtailcall(Either::Right(Either::Right(*imm_str)))) <--
@@ -2200,7 +2263,8 @@ ascent_par! {
     mach_inst(addr, MachInst::Mgoto(dst)) <--
         instruction(addr, _, _, "JMP", dst, _, _, _, _, _),
         !is_tail_call_jmp(addr),
-        !is_extern_tailcall_jmp(addr);
+        !is_extern_tailcall_jmp(addr),
+        !is_epilogue_indirect_tailcall_jmp(addr);
 
     mach_inst(addr, MachInst::Mreturn) <--
         instruction(addr, _, _, "RET", _, _, _, _, _, _);
