@@ -7874,10 +7874,13 @@ ascent_par! {
 
     // MOVSX/MOVSXD/MOVZX are scalar reads too, but they are intentionally not
     // members of win64_home_move_class: treating them as plain MOV reloads
-    // would erase their signedness.  Accept only an access whose source width
-    // exactly matches the authoritative initial-spill signature, and publish
-    // an explicit cast over the canonical cell.  Mixed-width cell access
-    // remains rejected until its truncation/type interactions are audited.
+    // would erase their signedness.  `win64_unsafe_home_access` is derived from
+    // `win64_home_cell`, so this operand is already proved to begin at byte zero
+    // of the canonical cell.  A narrower integer read therefore observes
+    // exactly the low bits of the locked full-cell value on little-endian x86;
+    // publish the decoded sign/zero cast explicitly.  Nonzero-offset overlaps,
+    // wider reads, floating cells, and every non-extending opcode remain on the
+    // structured unsupported path.
     relation win64_home_scalar_extend_load(
         Node, Address, Mreg, i64, usize, i64, Mreg, usize, Operation
     );
@@ -7899,7 +7902,7 @@ ascent_par! {
         if is_x86_64_gp_register_name(base_str),
         if *idx_str == "NONE" || idx_str.is_empty(),
         if Mreg::x86(*base_str) == *base_reg && *asm_disp == *raw_disp,
-        if *mem_size == *width,
+        if *mem_size <= *width,
         if let Some(op) = extending_load_operation(mnem, *mem_size);
 
     rtl_inst_candidate(addr, inst) <--

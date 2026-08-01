@@ -307,12 +307,20 @@ home_reassigned_movzx:
         movzwl 8(%rsp), %eax
         retq
 
-        .globl home_partial_movzx_rejected
-        .def home_partial_movzx_rejected; .scl 2; .type 32; .endef
-home_partial_movzx_rejected:
+        .globl home_partial_movzx_low
+        .def home_partial_movzx_low; .scl 2; .type 32; .endef
+home_partial_movzx_low:
         movl %ecx, 8(%rsp)
         movl %edx, 8(%rsp)
         movzwl 8(%rsp), %eax
+        retq
+
+        .globl home_partial_movzx_high_rejected
+        .def home_partial_movzx_high_rejected; .scl 2; .type 32; .endef
+home_partial_movzx_high_rejected:
+        movl %ecx, 8(%rsp)
+        movl %edx, 8(%rsp)
+        movzwl 10(%rsp), %eax
         retq
 
         .globl home_cmp_flag_clobber_rejected
@@ -2730,6 +2738,16 @@ fn assert_canonical_unsafe_home_storage(db: &DecompileDB) {
             XType::Xint16unsigned,
             Operation::Ocast16unsigned,
         ),
+        (
+            "home_partial_movzx_low",
+            XType::Xint,
+            Operation::Ocast16unsigned,
+        ),
+        (
+            "home_partial_reload",
+            XType::Xany64,
+            Operation::Ocast8unsigned,
+        ),
     ] {
         let (span, slot) = canonical_home_storage_with_type(db, name, expected_type);
         assert_home_accesses_use_slot(db, name, span, slot);
@@ -3083,18 +3101,20 @@ fn assert_postsub_escaped_offset_keeps_ordinary_origin(db: &DecompileDB) {
 }
 
 fn assert_optimized_canonical_homes(db: &DecompileDB) {
-    for (name, position) in [
-        ("home_reassigned", 0),
-        ("home_reassigned_cmp", 0),
-        ("home_reassigned_cmp_reg", 0),
-        ("home_reassigned_cmp_setcc", 0),
-        ("home_reassigned_cmp_reg_setcc", 0),
-        ("home_reassigned_cmp_loop", 0),
-        ("home_cmp_after_alias_clobber", 3),
-        ("home_reassigned_add", 0),
-        ("home_mixed_base_clobber", 0),
-        ("home_alias_call_escape", 0),
-        ("home_alias_arith_clobber", 0),
+    for (name, position, expected_type) in [
+        ("home_reassigned", 0, XType::Xany64),
+        ("home_reassigned_cmp", 0, XType::Xany64),
+        ("home_reassigned_cmp_reg", 0, XType::Xany64),
+        ("home_reassigned_cmp_setcc", 0, XType::Xany64),
+        ("home_reassigned_cmp_reg_setcc", 0, XType::Xany64),
+        ("home_reassigned_cmp_loop", 0, XType::Xany64),
+        ("home_cmp_after_alias_clobber", 3, XType::Xany64),
+        ("home_reassigned_add", 0, XType::Xany64),
+        ("home_mixed_base_clobber", 0, XType::Xany64),
+        ("home_alias_call_escape", 0, XType::Xany64),
+        ("home_alias_arith_clobber", 0, XType::Xany64),
+        ("home_partial_movzx_low", 0, XType::Xint),
+        ("home_partial_reload", 0, XType::Xany64),
     ] {
         let span = function_span(db, name);
         let slot = db
@@ -3109,7 +3129,7 @@ fn assert_optimized_canonical_homes(db: &DecompileDB) {
             .collect();
         assert_eq!(
             types,
-            HashSet::from([XType::Xany64]),
+            HashSet::from([expected_type]),
             "{name} optimizer observed a non-signature canonical-slot type"
         );
         let access_nodes: HashSet<_> = db
@@ -3142,7 +3162,18 @@ fn assert_optimized_canonical_homes(db: &DecompileDB) {
                     || matches!(inst,
                         RTLInst::Iop(Operation::Ocmp(_), args, _)
                             if args.contains(&slot)
-                                || args.iter().all(|arg| !raw_stack_regs.contains(arg))),
+                                || args.iter().all(|arg| !raw_stack_regs.contains(arg)))
+                    || matches!(inst,
+                        RTLInst::Iop(
+                            Operation::Ocast8signed
+                                | Operation::Ocast8unsigned
+                                | Operation::Ocast16signed
+                                | Operation::Ocast16unsigned
+                                | Operation::Ocast32signed,
+                            args,
+                            _,
+                        ) if args.as_ref() == &[slot]
+                            || args.iter().all(|arg| !raw_stack_regs.contains(arg))),
                 "{name} reintroduced split/raw storage at {node:#x}: {inst:#x?}"
             );
         }
@@ -3842,12 +3873,11 @@ fn assert_home_safety_vetoes(db: &DecompileDB) {
         ("home_direct_alias_return", Mreg::CX),
         ("home_cross_class_reload", Mreg::CX),
         ("home_xmm_mutation", Mreg::X0),
-        ("home_partial_reload", Mreg::CX),
         ("home_xchg_mutation", Mreg::CX),
         ("home_conditional_spill_reload", Mreg::CX),
         ("home_wide_overlap", Mreg::CX),
         ("home_escape_numeric_use", Mreg::CX),
-        ("home_partial_movzx_rejected", Mreg::CX),
+        ("home_partial_movzx_high_rejected", Mreg::CX),
         ("home_cmp_flag_clobber_rejected", Mreg::CX),
         ("home_cmp_scheduled_rejected", Mreg::CX),
     ] {
@@ -3877,10 +3907,9 @@ fn assert_home_safety_vetoes(db: &DecompileDB) {
     for name in [
         "home_cross_class_reload",
         "home_xmm_mutation",
-        "home_partial_reload",
         "home_xchg_mutation",
         "home_wide_overlap",
-        "home_partial_movzx_rejected",
+        "home_partial_movzx_high_rejected",
         "home_cmp_flag_clobber_rejected",
         "home_cmp_scheduled_rejected",
     ] {
@@ -4193,6 +4222,8 @@ fn assert_final_output_compiles(object: &Path) {
         "home_reassigned_movsxd",
         "home_reassigned_movsx",
         "home_reassigned_movzx",
+        "home_partial_movzx_low",
+        "home_partial_reload",
         "home_reassigned_add",
         "home_import_tailcall",
         "home_typed_slot_tailcall",
