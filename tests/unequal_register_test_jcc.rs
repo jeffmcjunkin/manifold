@@ -1229,13 +1229,22 @@ fn assert_call_result_pipeline(object: &Path) {
         "qword TEST invented an ECX write for an unchanged incoming RCX"
     );
     assert!(
-        db.rel_iter::<(Address, Address, Symbol)>("unsupported_clight_condition")
+        !db.rel_iter::<(Address, Address, Symbol)>("unsupported_clight_condition")
             .any(|(function, node, reason)| {
                 *function == incoming_span.0
                     && *node == incoming_test[0]
                     && *reason == "condition-bits-unrepresentable"
             }),
-        "incoming RCX with insufficient high-bit type evidence did not fail closed"
+        "incoming RCX retained a fail-closed diagnostic despite full-width type evidence"
+    );
+    let incoming_body = printed_function(&text, "incoming_qword_test");
+    assert!(
+        text.contains("int coff_fn_incoming_qword_test(__int64 p0)")
+            && incoming_body.contains("if ((-9223372036854775808LL & p0) != 0)")
+            && !incoming_body.contains("(unsigned int)p0")
+            && incoming_body.contains("return 0;")
+            && incoming_body.contains("return 1;"),
+        "incoming RCX lost its full-width raw high-bit TEST or CFG arms:\n{incoming_body}"
     );
 
     let partial_span = function_span(&db, "partial_word_qword_test");
