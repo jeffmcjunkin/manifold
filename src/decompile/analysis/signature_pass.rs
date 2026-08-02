@@ -329,6 +329,8 @@ impl IRPass for SignatureReconciliationPass {
             "emit_function_signature", "call_args_collected",
             "emit_var_is_struct", "emit_function_param_is_pointer",
             "func_param_struct_type",
+            "emit_var_type_candidate",
+            "reg_rtl",
             "rtl_inst",
         ]
     }
@@ -350,6 +352,97 @@ pub(crate) fn param_mreg_sort_key(
         };
     }
     usize::MAX
+}
+
+/// The physical register class which supplied a source-language argument in
+/// an ABI where GP and vector registers share argument ordinals (Win64).
+///
+/// This is definition-side evidence: unlike a propagated value-web type or a
+/// caller vote, it comes from the decoded register which is live at function
+/// entry.  A scalar float parameter cannot enter through a GP register under
+/// this ABI, and an integer/pointer parameter cannot enter through XMM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedSlotRegisterClass {
+    GeneralPurpose,
+    Float,
+}
+
+/// Return the unique definition-side register class for one shared argument
+/// slot.  If both GP and XMM are live (for example an ambiguous/variadic
+/// pattern), return no class rather than guessing.  Multiple RTL aliases of
+/// the same physical class are harmless; the smallest one is selected to keep
+/// the result deterministic.
+fn shared_slot_definition_reg(
+    function: Address,
+    position: usize,
+    params: &[RTLReg],
+    rtl_to_mreg: &HashMap<(Address, RTLReg), Mreg>,
+    abi: &crate::abi::AbiConfig,
+) -> Option<(RTLReg, SharedSlotRegisterClass)> {
+    if !abi.uses_shared_arg_slots() || position >= abi.first_stack_arg_position() {
+        return None;
+    }
+    let gp = abi.int_arg_regs.get(position)?;
+    let fp = abi.float_arg_regs.get(position)?;
+    let mut gp_regs: Vec<_> = params
+        .iter()
+        .copied()
+        .filter(|reg| rtl_to_mreg.get(&(function, *reg)) == Some(gp))
+        .collect();
+    let mut fp_regs: Vec<_> = params
+        .iter()
+        .copied()
+        .filter(|reg| rtl_to_mreg.get(&(function, *reg)) == Some(fp))
+        .collect();
+    gp_regs.sort_unstable();
+    fp_regs.sort_unstable();
+    match (gp_regs.first().copied(), fp_regs.first().copied()) {
+        (Some(reg), None) => Some((reg, SharedSlotRegisterClass::GeneralPurpose)),
+        (None, Some(reg)) => Some((reg, SharedSlotRegisterClass::Float)),
+        // Both classes live at entry is not enough evidence to choose one
+        // source parameter class.  In particular, Win64 varargs can duplicate
+        // floating arguments into the corresponding GP slot.
+        _ => None,
+    }
+}
+
+fn xtype_matches_shared_slot_class(xtype: &XType, class: SharedSlotRegisterClass) -> bool {
+    match class {
+        SharedSlotRegisterClass::GeneralPurpose => {
+            !matches!(xtype, XType::Xfloat | XType::Xsingle | XType::Xvoid)
+        }
+        SharedSlotRegisterClass::Float => matches!(xtype, XType::Xfloat | XType::Xsingle),
+    }
+}
+
+/// Constrain recovered type evidence to the physical Win64 entry-register
+/// class.  The existing choice wins when it is ABI-compatible.  Otherwise use
+/// the strongest compatible value-web candidate, falling back to a
+/// register-width scalar for GP and double for XMM.
+fn reconcile_type_with_shared_slot_class<'a>(
+    resolved: Option<XType>,
+    candidates: impl Iterator<Item = &'a XType>,
+    class: SharedSlotRegisterClass,
+) -> XType {
+    if resolved
+        .as_ref()
+        .is_some_and(|xtype| xtype_matches_shared_slot_class(xtype, class))
+    {
+        return resolved.expect("checked Some above");
+    }
+    candidates
+        .filter(|xtype| xtype_matches_shared_slot_class(xtype, class))
+        .max_by_key(|xtype| {
+            (
+                crate::decompile::passes::clight_pass::xtype_refine_priority(xtype),
+                **xtype,
+            )
+        })
+        .copied()
+        .unwrap_or(match class {
+            SharedSlotRegisterClass::GeneralPurpose => XType::Xany64,
+            SharedSlotRegisterClass::Float => XType::Xfloat,
+        })
 }
 
 // Per-position int arg confirmation is in Ascent (int_pos_confirmed / reconciled_int_count).
@@ -838,12 +931,42 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         } else {
             reconciled_int + float_count
         };
+        let shared_slot_reg = |i: usize| -> Option<(RTLReg, SharedSlotRegisterClass)> {
+            existing_params.and_then(|params| {
+                shared_slot_definition_reg(func_addr, i, params, &rtl_to_mreg, &target_abi)
+            })
+        };
         let pos_reg = |i: usize| -> Option<RTLReg> {
             if i >= stack_base && i < stack_base + stack_count {
                 return Some(crate::decompile::passes::rtl_pass::fresh_stack_param_reg(
                     func_addr,
                     i - stack_base,
                 ));
+            }
+            if target_abi.uses_shared_arg_slots() && i < target_abi.first_stack_arg_position() {
+                if let Some((reg, _)) = shared_slot_reg(i) {
+                    return Some(reg);
+                }
+                // If both physical classes are live, retain deterministic GP
+                // preference without compacting a sparse slot into an earlier
+                // source position.  The class is deliberately left
+                // unconstrained in this ambiguous case.
+                let params = existing_params?;
+                let gp = target_abi.int_arg_regs.get(i);
+                let fp = target_abi.float_arg_regs.get(i);
+                return params
+                    .iter()
+                    .copied()
+                    .filter(|reg| {
+                        let mreg = rtl_to_mreg.get(&(func_addr, *reg));
+                        mreg == gp || mreg == fp
+                    })
+                    .min_by_key(|reg| {
+                        rtl_to_mreg
+                            .get(&(func_addr, *reg))
+                            .map(|mreg| param_mreg_sort_key(*mreg, &target_abi))
+                            .unwrap_or(usize::MAX)
+                    });
             }
             existing_params.and_then(|params| params.get(i).copied())
         };
@@ -1037,6 +1160,27 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                 }
             }
 
+            // Win64 GP/XMM registers share a source-language ordinal, but
+            // value-web and call-site propagation can still attach an
+            // incompatible scalar class to the entry web.  When exactly one
+            // decoded physical class is live at the definition, it is the ABI
+            // authority for a non-variadic function.  This prevents a used
+            // EDX parameter from becoming a synthetic XMM1 float (and vice
+            // versa) during patch_db; variadic calls may deliberately mirror
+            // floating values into GP slots, so they remain unconstrained.
+            if !is_va {
+                if let Some((definition_reg, class)) = shared_slot_reg(i) {
+                    let definition_type =
+                        existing_types.and_then(|types| types.get(&definition_reg));
+                    let value_types = emit_var_types.get(&definition_reg).into_iter().flatten();
+                    resolved_type = Some(reconcile_type_with_shared_slot_class(
+                        resolved_type,
+                        definition_type.into_iter().chain(value_types),
+                        class,
+                    ));
+                }
+            }
+
             // Default to Xany64 (register-width floor), not Xint (which would lie about ptrs/longs).
             param_types.push(resolved_type.unwrap_or(XType::Xany64));
         }
@@ -1054,8 +1198,8 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         let count_changed = reconciled_count != def_count;
         let current_param_types: Vec<XType> = (0..reconciled_count)
             .map(|i| {
-                existing_params
-                    .and_then(|params| params.get(i))
+                pos_reg(i)
+                    .as_ref()
                     .and_then(|reg| existing_types.and_then(|types| types.get(reg)))
                     .cloned()
                     .unwrap_or(XType::Xany64)
@@ -1312,6 +1456,56 @@ fn inherit_win64_tail_forwarder_prototypes(
     inherited_tailcalls
 }
 
+/// Identify final parameter types which differ from the definition-side type
+/// that TypePass saw. Registers are normally globally unique; if malformed
+/// input assigns one register conflicting final types, decline to rewrite that
+/// value candidate instead of choosing by iteration order.
+fn changed_parameter_value_types(
+    original: &HashMap<(Address, RTLReg), XType>,
+    final_types: &[(Address, RTLReg, XType)],
+    changed_functions: &HashSet<Address>,
+) -> HashMap<RTLReg, XType> {
+    let mut replacements = HashMap::new();
+    let mut ambiguous = HashSet::new();
+    for &(address, reg, xtype) in final_types {
+        if !changed_functions.contains(&address)
+            || original.get(&(address, reg)) == Some(&xtype)
+            || ambiguous.contains(&reg)
+        {
+            continue;
+        }
+        match replacements.get(&reg) {
+            Some(previous) if *previous != xtype => {
+                replacements.remove(&reg);
+                ambiguous.insert(reg);
+            }
+            Some(_) => {}
+            None => {
+                replacements.insert(reg, xtype);
+            }
+        }
+    }
+    replacements
+}
+
+/// Make a retyped parameter's value-web root agree exactly with its final
+/// declaration. Untouched registers retain every existing candidate, while
+/// changed roots receive one authoritative candidate; downstream Omove/AST
+/// constraints may still type distinct destination webs independently.
+fn rewrite_retyped_parameter_value_candidates(
+    candidates: impl IntoIterator<Item = (RTLReg, XType)>,
+    replacements: &HashMap<RTLReg, XType>,
+) -> Vec<(RTLReg, XType)> {
+    let mut rewritten: Vec<_> = candidates
+        .into_iter()
+        .filter(|(reg, _)| !replacements.contains_key(reg))
+        .collect();
+    rewritten.extend(replacements.iter().map(|(&reg, &xtype)| (reg, xtype)));
+    rewritten.sort_unstable();
+    rewritten.dedup();
+    rewritten
+}
+
 fn patch_db(
     db: &mut DecompileDB,
     prototypes: &[FunctionPrototype],
@@ -1335,6 +1529,32 @@ fn patch_db(
         .map(|p| (p.address, p))
         .collect();
 
+    // Snapshot the definition-side parameter type before publishing the
+    // reconciled signature.  Downstream Clight expressions are typed from
+    // emit_var_type_candidate, not emit_function_param_type, so an actually
+    // retyped parameter must update both relations or its declaration and
+    // same-ID body references disagree.
+    let original_param_types: HashMap<(Address, RTLReg), XType> = {
+        let mut grouped: HashMap<(Address, RTLReg), Vec<XType>> = HashMap::new();
+        for &(address, reg, xtype) in db
+            .rel_iter::<(Address, RTLReg, XType)>("emit_function_param_type_candidate")
+        {
+            grouped.entry((address, reg)).or_default().push(xtype);
+        }
+        grouped
+            .into_iter()
+            .map(|(key, mut types)| {
+                types.sort_by_key(|xtype| {
+                    (
+                        crate::decompile::passes::clight_pass::xtype_refine_priority(xtype),
+                        *xtype,
+                    )
+                });
+                (key, *types.last().expect("non-empty parameter type group"))
+            })
+            .collect()
+    };
+
     let call_targets: HashMap<Node, Address> = db.rel_iter::<(Node, Address)>("call_target_func")
         .map(|&(call_node, target)| (call_node, target))
         .collect();
@@ -1342,6 +1562,13 @@ fn patch_db(
     let rtl_to_mreg: HashMap<(Address, RTLReg), Mreg> = db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl")
         .map(|&(node, ref mreg, rtl_reg)| ((node, rtl_reg), *mreg))
         .collect();
+
+    // Preserve the exact source ordinal chosen for each final parameter.
+    // Synthetic register parameters have no reg_rtl row, so reconstructing
+    // their order later from rtl_to_mreg would sort them after all real
+    // registers and could bind a later sparse parameter to the wrong type.
+    let mut final_params_by_position: HashMap<Address, Vec<RTLReg>> = HashMap::new();
+    let mut synthesized_param_mregs: Vec<(Node, Mreg, RTLReg)> = Vec::new();
 
     {
         let mut existing_params: HashMap<Address, Vec<RTLReg>> = HashMap::new();
@@ -1375,17 +1602,21 @@ fn patch_db(
 
         for proto in prototypes {
             let existing = existing_params.get(&proto.address).cloned().unwrap_or_default();
+            let mut final_params = Vec::with_capacity(proto.param_count);
             if !target_abi.uses_shared_arg_slots() {
                 let current_count = existing.len();
                 for (i, &reg) in existing.iter().enumerate() {
                     if i < proto.param_count {
                         new_params.push((proto.address, reg));
+                        final_params.push(reg);
                     }
                 }
                 for i in current_count..proto.param_count {
                     let xtype = proto.param_types.get(i).cloned().unwrap_or(XType::Xany64);
                     let synthetic_reg = if let Some(mreg) = register_for_position(i, &xtype) {
-                        fresh_xtl_reg(proto.address, mreg)
+                        let reg = fresh_xtl_reg(proto.address, mreg);
+                        synthesized_param_mregs.push((proto.address, mreg, reg));
+                        reg
                     } else {
                         crate::decompile::passes::rtl_pass::fresh_stack_param_reg(
                             proto.address,
@@ -1393,11 +1624,13 @@ fn patch_db(
                         )
                     };
                     new_params.push((proto.address, synthetic_reg));
+                    final_params.push(synthetic_reg);
                     db.rel_push(
                         "emit_function_param_type_candidate",
                         (proto.address, synthetic_reg, xtype),
                     );
                 }
+                final_params_by_position.insert(proto.address, final_params);
                 continue;
             }
 
@@ -1411,7 +1644,11 @@ fn patch_db(
                         .iter()
                         .copied()
                         .find(|reg| rtl_to_mreg.get(&(proto.address, *reg)) == Some(&mreg))
-                        .unwrap_or_else(|| fresh_xtl_reg(proto.address, mreg))
+                        .unwrap_or_else(|| {
+                            let reg = fresh_xtl_reg(proto.address, mreg);
+                            synthesized_param_mregs.push((proto.address, mreg, reg));
+                            reg
+                        })
                 } else {
                     let stack_reg = crate::decompile::passes::rtl_pass::fresh_stack_param_reg(
                         proto.address,
@@ -1424,39 +1661,22 @@ fn patch_db(
                         .unwrap_or(stack_reg)
                 };
                 new_params.push((proto.address, selected_reg));
+                final_params.push(selected_reg);
                 db.rel_push(
                     "emit_function_param_type_candidate",
                     (proto.address, selected_reg, xtype),
                 );
             }
+            final_params_by_position.insert(proto.address, final_params);
         }
 
         db.rel_set("emit_function_param", new_params.into_iter().collect::<ascent::boxcar::Vec<_>>());
+        for provenance in synthesized_param_mregs.drain(..) {
+            db.rel_push("reg_rtl", provenance);
+        }
     }
 
     {
-        // Read from emit_function_param, just written by block 1, so synthetic regs added when growing param_count get types too; the candidate relation only had the pre-widening reg set.
-        let mut effective_params: HashMap<Address, Vec<RTLReg>> = HashMap::new();
-        for &(addr, reg) in db.rel_iter::<(Address, RTLReg)>("emit_function_param") {
-            let params = effective_params.entry(addr).or_default();
-            if !params.contains(&reg) {
-                params.push(reg);
-            }
-        }
-        for (addr, params) in effective_params.iter_mut() {
-            params.sort_by(|a, b| {
-                let ka = rtl_to_mreg
-                    .get(&(*addr, *a))
-                    .map(|m| param_mreg_sort_key(*m, &target_abi))
-                    .unwrap_or(usize::MAX);
-                let kb = rtl_to_mreg
-                    .get(&(*addr, *b))
-                    .map(|m| param_mreg_sort_key(*m, &target_abi))
-                    .unwrap_or(usize::MAX);
-                ka.cmp(&kb).then_with(|| a.cmp(b))
-            });
-        }
-
         let mut new_param_types: Vec<(Address, RTLReg, XType)> = db
             .rel_iter::<(Address, RTLReg, XType)>("emit_function_param_type_candidate")
             .filter(|&&(addr, _, _)| !proto_map.contains_key(&addr))
@@ -1464,44 +1684,50 @@ fn patch_db(
             .collect();
 
         for proto in prototypes {
-            if let Some(params) = effective_params.get(&proto.address) {
-                for (i, &reg) in params.iter().enumerate().take(proto.param_count) {
+            if let Some(params) = final_params_by_position.get(&proto.address) {
+                for (i, &reg) in params.iter().enumerate() {
                     let xtype = proto.param_types.get(i).cloned().unwrap_or(XType::Xany64);
                     new_param_types.push((proto.address, reg, xtype));
                 }
             }
         }
 
-        db.rel_set("emit_function_param_type", new_param_types.into_iter().collect::<ascent::boxcar::Vec<_>>());
+        let changed_functions: HashSet<Address> = proto_map.keys().copied().collect();
+        let retyped_value_regs = changed_parameter_value_types(
+            &original_param_types,
+            &new_param_types,
+            &changed_functions,
+        );
+
+        db.rel_set(
+            "emit_function_param_type",
+            new_param_types.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+
+        if !retyped_value_regs.is_empty() {
+            let rewritten = rewrite_retyped_parameter_value_candidates(
+                db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+                    .copied(),
+                &retyped_value_regs,
+            );
+            db.rel_set(
+                "emit_var_type_candidate",
+                rewritten.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+            );
+        }
     }
 
     {
         let known_param_regs: HashSet<(Address, RTLReg)> = {
             let mut set = HashSet::new();
-            let existing_params: HashMap<Address, Vec<RTLReg>> = {
-                let mut m: HashMap<Address, Vec<RTLReg>> = HashMap::new();
-                // Read from emit_function_param (just written) to include synthetic regs added when widening param_count beyond original evidence.
-                for &(addr, reg) in db.rel_iter::<(Address, RTLReg)>("emit_function_param") {
-                    m.entry(addr).or_default().push(reg);
-                }
-                for (addr, params) in m.iter_mut() {
-                    params.sort_by_key(|reg| {
-                        rtl_to_mreg.get(&(*addr, *reg))
-                            .map(|mreg| param_mreg_sort_key(*mreg, &target_abi))
-                            .unwrap_or(usize::MAX)
-                    });
-                    params.dedup();
-                }
-                m
-            };
             for proto in prototypes {
                 // Suppress struct/pointer overrides for prototypes whose param types come from a known signature (KnownExtern, e.g. printf; HighConfidence, e.g. main(int, char**)); otherwise downstream type-priority logic in clight_select treats var_is_struct as winning.
                 if matches!(
                     proto.confidence,
                     SignatureConfidence::KnownExtern | SignatureConfidence::HighConfidence
                 ) {
-                    if let Some(params) = existing_params.get(&proto.address) {
-                        for &reg in params.iter().take(proto.param_count) {
+                    if let Some(params) = final_params_by_position.get(&proto.address) {
+                        for &reg in params {
                             set.insert((proto.address, reg));
                         }
                     }
@@ -1956,5 +2182,196 @@ fn patch_db(
             log::info!("SignatureReconciliation: patched {} call signatures in rtl_inst", patched_insts);
             db.rel_set("rtl_inst", new_insts.into_iter().collect::<ascent::boxcar::Vec<_>>());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_slot_definition_class_uses_exact_ordinal_without_compaction() {
+        let abi = crate::abi::AbiConfig::win64();
+        let function = 0x1000;
+        let dx_web = 17;
+        let params = vec![dx_web];
+        let rtl_to_mreg = HashMap::from([((function, dx_web), Mreg::DX)]);
+
+        assert_eq!(
+            shared_slot_definition_reg(function, 0, &params, &rtl_to_mreg, &abi),
+            None
+        );
+        assert_eq!(
+            shared_slot_definition_reg(function, 1, &params, &rtl_to_mreg, &abi),
+            Some((dx_web, SharedSlotRegisterClass::GeneralPurpose))
+        );
+    }
+
+    #[test]
+    fn shared_slot_definition_class_refuses_gp_xmm_ambiguity() {
+        let abi = crate::abi::AbiConfig::win64();
+        let function = 0x1000;
+        let params = vec![17, 23];
+        let rtl_to_mreg = HashMap::from([((function, 17), Mreg::DX), ((function, 23), Mreg::X1)]);
+
+        assert_eq!(
+            shared_slot_definition_reg(function, 1, &params, &rtl_to_mreg, &abi),
+            None
+        );
+    }
+
+    #[test]
+    fn gp_slot_rejects_propagated_float_and_keeps_integer_evidence() {
+        let candidates = [XType::Xsingle, XType::Xint, XType::Xlongunsigned];
+        assert_eq!(
+            reconcile_type_with_shared_slot_class(
+                Some(XType::Xsingle),
+                candidates.iter(),
+                SharedSlotRegisterClass::GeneralPurpose,
+            ),
+            XType::Xlongunsigned
+        );
+    }
+
+    #[test]
+    fn xmm_slot_rejects_propagated_integer_and_keeps_float_evidence() {
+        let candidates = [XType::Xint, XType::Xsingle];
+        assert_eq!(
+            reconcile_type_with_shared_slot_class(
+                Some(XType::Xint),
+                candidates.iter(),
+                SharedSlotRegisterClass::Float,
+            ),
+            XType::Xsingle
+        );
+    }
+
+    #[test]
+    fn only_retyped_param_roots_follow_final_decl_and_pointer_winner_survives() {
+        const FUNCTION: Address = 0x1000;
+        const UNCHANGED: RTLReg = 10;
+        const INT_RETYPE: RTLReg = 11;
+        const POINTER_RETYPE: RTLReg = 12;
+
+        let original = HashMap::from([
+            ((FUNCTION, UNCHANGED), XType::Xint),
+            ((FUNCTION, INT_RETYPE), XType::Xsingle),
+            ((FUNCTION, POINTER_RETYPE), XType::Xlong),
+        ]);
+        let final_types = vec![
+            (FUNCTION, UNCHANGED, XType::Xint),
+            (FUNCTION, INT_RETYPE, XType::Xint),
+            (FUNCTION, POINTER_RETYPE, XType::Xptr),
+        ];
+        let replacements = changed_parameter_value_types(
+            &original,
+            &final_types,
+            &HashSet::from([FUNCTION]),
+        );
+        assert_eq!(
+            replacements,
+            HashMap::from([
+                (INT_RETYPE, XType::Xint),
+                (POINTER_RETYPE, XType::Xptr),
+            ])
+        );
+
+        let rewritten = rewrite_retyped_parameter_value_candidates(
+            [
+                (UNCHANGED, XType::Xint),
+                (UNCHANGED, XType::Xptr),
+                (INT_RETYPE, XType::Xsingle),
+                (POINTER_RETYPE, XType::Xlong),
+                (POINTER_RETYPE, XType::Xptr),
+            ],
+            &replacements,
+        );
+        assert_eq!(
+            rewritten,
+            vec![
+                (UNCHANGED, XType::Xint),
+                (UNCHANGED, XType::Xptr),
+                (INT_RETYPE, XType::Xint),
+                (POINTER_RETYPE, XType::Xptr),
+            ]
+        );
+    }
+
+    #[test]
+    fn sparse_win64_synthetic_slot_keeps_later_real_pointer_at_its_ordinal() {
+        const FUNCTION: Address = 0x4000;
+        const DX_PARAM: RTLReg = 0x4010;
+
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        db.rel_push(
+            "emit_function",
+            (FUNCTION, "sparse_parameter_fixture", FUNCTION),
+        );
+        db.rel_push("emit_function_param_candidate", (FUNCTION, DX_PARAM));
+        db.rel_push(
+            "emit_function_param_type_candidate",
+            (FUNCTION, DX_PARAM, XType::Xptr),
+        );
+        db.rel_push("emit_var_type_candidate", (DX_PARAM, XType::Xptr));
+        db.rel_push("reg_rtl", (FUNCTION, Mreg::DX, DX_PARAM));
+
+        let prototype = FunctionPrototype {
+            address: FUNCTION,
+            name: "sparse_parameter_fixture",
+            param_count: 2,
+            param_types: vec![XType::Xint, XType::Xptr],
+            return_type: XType::Xvoid,
+            confidence: SignatureConfidence::HighConfidence,
+            is_varargs: false,
+        };
+        patch_db(&mut db, &[prototype], &HashSet::new());
+
+        let cx_param = fresh_xtl_reg(FUNCTION, Mreg::CX);
+        let final_types: HashMap<RTLReg, XType> = db
+            .rel_iter::<(Address, RTLReg, XType)>("emit_function_param_type")
+            .filter_map(|(address, reg, xtype)| {
+                (*address == FUNCTION).then_some((*reg, *xtype))
+            })
+            .collect();
+        assert_eq!(final_types.get(&cx_param), Some(&XType::Xint));
+        assert_eq!(final_types.get(&DX_PARAM), Some(&XType::Xptr));
+
+        let value_types: HashSet<(RTLReg, XType)> = db
+            .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .copied()
+            .collect();
+        assert!(value_types.contains(&(cx_param, XType::Xint)));
+        assert!(value_types.contains(&(DX_PARAM, XType::Xptr)));
+        assert!(!value_types.contains(&(DX_PARAM, XType::Xint)));
+
+        let (functions, _) =
+            crate::decompile::passes::clight_select::query::extract_functions(&db)
+                .expect("sparse fixture must remain extractable");
+        let function = functions
+            .iter()
+            .find(|function| function.address == FUNCTION)
+            .expect("fixture function");
+        assert_eq!(function.param_regs, vec![cx_param, DX_PARAM]);
+        assert_eq!(
+            function.param_types,
+            vec![ParamType::Typed(XType::Xint), ParamType::Typed(XType::Xptr)]
+        );
+        assert_eq!(
+            function
+                .callee_signatures
+                .get(&(FUNCTION as Ident))
+                .map(|signature| signature.param_types.as_slice()),
+            Some([XType::Xint, XType::Xptr].as_slice())
+        );
+    }
+
+    #[test]
+    fn signature_pass_declares_retyped_value_candidates_as_output() {
+        let pass = SignatureReconciliationPass;
+        assert!(pass.inputs().contains(&"emit_var_type_candidate"));
+        assert!(pass.outputs().contains(&"emit_var_type_candidate"));
+        assert!(pass.inputs().contains(&"reg_rtl"));
+        assert!(pass.outputs().contains(&"reg_rtl"));
     }
 }
