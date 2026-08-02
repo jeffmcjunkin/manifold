@@ -85,10 +85,11 @@ fn main() {
 
     if show_version {
         println!(
-            "manifold {} (upstream {}; {})",
+            "manifold {} (upstream {}; {}; {})",
             env!("CARGO_PKG_VERSION"),
             crate::decompile::disassembly::coff::MANIFOLD_UPSTREAM_COMMIT,
             crate::decompile::disassembly::coff::COFF_LOADER_ID,
+            crate::debug::clight_export::CLIGHT_EXPORT_SCHEMA_ID,
         );
         if positional.is_empty() {
             return;

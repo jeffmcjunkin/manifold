@@ -1877,42 +1877,43 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
         .iter()
         .map(|func| func.name.as_str())
         .collect();
-    assert!(!selected
+    let selected_addresses: HashSet<Address> = db
+        .cast_selected_functions
         .iter()
-        .any(|name| is_fixture_name(name, "rsp_after_mov_load")));
-    assert!(!selected
+        .map(|function| function.address)
+        .collect();
+    let diagnostic_rows: HashSet<(Address, Address, Symbol)> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .copied()
+        .collect();
+    let diagnostic_addresses: HashSet<Address> = diagnostic_rows
         .iter()
-        .any(|name| is_fixture_name(name, "rsp_after_pop_imul")));
-    assert!(!selected
-        .iter()
-        .any(|name| is_fixture_name(name, "rsp_after_mov_two_accesses")));
-    for unsupported in [
-        "rbp_from_invalid_rsp",
-        "rsp_loop_drift",
-        "rsp_popw_sp",
-        "rsp_indexed_imul",
-        "rsp_indexed_cvtsi",
-        "rsp_indexed_sse",
-        "rsp_indexed_lea",
-        "shared_stack_a",
-        "shared_stack_b",
-        "unresolved_indirect_stack",
-        "unsupported_internal_callee",
-        "rsp_diamond_stress",
-        "addr32_esp_unsupported",
-        "addr32_frame_ebp_unsupported",
-        "addr32_shared_ebp_frame",
-        "addr32_shared_ebp_scratch",
-        "addr32_unresolved_ebp",
-        "addr32_unhandled_memory",
-    ] {
-        assert!(
-            !selected
-                .iter()
-                .any(|name| is_fixture_name(name, unsupported)),
-            "unsupported function {unsupported} reached selection"
+        .map(|(function, _, _)| *function)
+        .collect();
+    let certified_rows: HashSet<(Address, Address, Symbol)> = db
+        .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+        .copied()
+        .collect();
+    let partial_addresses: HashSet<Address> = db
+        .rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+        .map(|(function, _, _)| *function)
+        .collect();
+
+    assert!(!partial_addresses.is_empty(), "fixture recovered no partial functions");
+    assert!(partial_addresses.is_subset(&diagnostic_addresses));
+    for row @ (function, _, _) in &diagnostic_rows {
+        assert_eq!(
+            selected_addresses.contains(function),
+            partial_addresses.contains(function),
+            "diagnosed function 0x{function:x} was not selected exactly according to its bounded partial certificate"
         );
+        if partial_addresses.contains(function) {
+            assert!(certified_rows.contains(row));
+        }
     }
+    let diamond = function_span(&db, "rsp_diamond_stress").0;
+    assert!(partial_addresses.contains(&diamond));
+    assert!(selected_addresses.contains(&diamond));
     assert!(selected
         .iter()
         .any(|name| is_fixture_name(name, "rsp_safe_cvtsi")));
@@ -1939,6 +1940,9 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
         .any(|name| is_fixture_name(name, "addr32_safe_sibling")));
 
     let omitted = function_span(&db, "unsupported_internal_callee").0;
+    assert!(diagnostic_addresses.contains(&omitted));
+    assert!(!partial_addresses.contains(&omitted));
+    assert!(!selected_addresses.contains(&omitted));
     // Equal-length aliases are deliberately inserted in reverse lexical
     // order. The provider name must remain authoritative at every call and
     // declaration site.
@@ -1958,6 +1962,7 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
         serde_json::from_slice(&std::fs::read(&output).expect("read stack-safety JSON"))
             .expect("parse stack-safety JSON");
     let _ = std::fs::remove_file(&output);
+    assert_eq!(json["manifold_clight_schema"], "manifold-clight-v2");
 
     let json_function_names: Vec<&str> = json["functions"]
         .as_array()
@@ -2041,8 +2046,80 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
         .iter()
         .all(|name| !json_function_names.contains(name)));
 
+    let partial_json = json["partial_functions"]
+        .as_array()
+        .expect("partial_functions array");
+    assert!(!partial_json.is_empty());
+    let partial_names: HashSet<&str> = partial_json
+        .iter()
+        .filter_map(|record| record["name"].as_str())
+        .collect();
+    assert!(partial_names
+        .iter()
+        .all(|name| json_function_names.contains(name)));
+    assert!(partial_names.is_disjoint(&unsupported_names));
+    assert!(partial_names
+        .iter()
+        .any(|name| is_fixture_name(name, "rsp_diamond_stress")));
+
+    for record in partial_json {
+        let certification = &record["certification"];
+        assert_eq!(
+            certification["kind"],
+            "atomic-unsupported-address-suppression-v1"
+        );
+        assert_eq!(certification["atomic_chain_suppressed"], true);
+        assert_eq!(
+            certification["all_function_diagnostics_certified"],
+            true
+        );
+        let suppressed_count = certification["suppressed_instruction_count"]
+            .as_u64()
+            .expect("suppressed instruction count");
+        let owned_count = certification["owned_instruction_count"]
+            .as_u64()
+            .expect("owned instruction count");
+        assert!(suppressed_count > 0 && suppressed_count <= 8);
+        assert!(owned_count >= suppressed_count * 8);
+        assert_eq!(certification["max_suppressed_instruction_count"], 8);
+        assert_eq!(
+            certification["min_owned_instructions_per_suppressed"],
+            8
+        );
+
+        let suppressed_instructions: Vec<u64> = record["suppressed_instructions"]
+            .as_array()
+            .expect("suppressed instruction list")
+            .iter()
+            .map(parse_hex_address)
+            .collect();
+        assert!(!suppressed_instructions.is_empty());
+        assert!(suppressed_instructions.contains(&parse_hex_address(
+            &record["access_address"]
+        )));
+        let mut sorted_suppressed = suppressed_instructions.clone();
+        sorted_suppressed.sort_unstable();
+        sorted_suppressed.dedup();
+        assert_eq!(suppressed_instructions, sorted_suppressed);
+
+        let function = parse_hex_address(&record["address"]);
+        let exact_function_nodes: HashSet<u64> = partial_json
+            .iter()
+            .filter(|candidate| parse_hex_address(&candidate["address"]) == function)
+            .flat_map(|candidate| {
+                candidate["suppressed_instructions"]
+                    .as_array()
+                    .expect("suppressed instruction list")
+                    .iter()
+                    .map(parse_hex_address)
+            })
+            .collect();
+        assert_eq!(exact_function_nodes.len() as u64, suppressed_count);
+    }
+
     let reasons: HashSet<&str> = unsupported_json
         .iter()
+        .chain(partial_json.iter())
         .map(|record| {
             record["reason"]
                 .as_str()
@@ -2071,6 +2148,24 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
     sorted_unsupported_rows.sort();
     sorted_unsupported_rows.dedup();
     assert_eq!(unsupported_rows, sorted_unsupported_rows);
+
+    let partial_rows: Vec<(u64, u64, String)> = partial_json
+        .iter()
+        .map(|record| {
+            (
+                parse_hex_address(&record["address"]),
+                parse_hex_address(&record["access_address"]),
+                record["reason"]
+                    .as_str()
+                    .expect("partial reason string")
+                    .to_owned(),
+            )
+        })
+        .collect();
+    let mut sorted_partial_rows = partial_rows.clone();
+    sorted_partial_rows.sort();
+    sorted_partial_rows.dedup();
+    assert_eq!(partial_rows, sorted_partial_rows);
 
     let externals = json["externals"].as_array().expect("externals array");
     let external_keys: Vec<(String, u64, String, String)> = externals

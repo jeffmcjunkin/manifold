@@ -1498,6 +1498,9 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "struct_id_to_canonical",
     "unknown_extern",
     "unsupported_stack_address",
+    "suppressed_unsupported_address",
+    "suppressed_unsupported_address_node",
+    "partial_unsupported_function",
 ];
 
 /// Build the identifier names used by normal C emission.

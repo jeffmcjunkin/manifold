@@ -316,6 +316,14 @@ ascent_par! {
     relation unsupported_stack_address(Address, Address, Symbol);
     unsupported_stack_address(*func, *access, *reason) <--
         unsupported_stack_address_seed(func, access, reason);
+    // Imperative postconditions produced only after the unsupported-address
+    // selector has removed an entire real/synthetic lowering chain.  The
+    // per-node relation is the auditable loss provenance for the certified
+    // diagnostic; the function row exists only when every diagnostic is
+    // certified and the bounded partial-output policy is satisfied.
+    relation suppressed_unsupported_address(Address, Address, Symbol);
+    relation suppressed_unsupported_address_node(Address, Address, Node);
+    relation partial_unsupported_function(Address, usize, usize);
     relation string_data(String, String, usize);
     relation struct_id_to_canonical(usize, usize);
     relation symbol_resolved_addr(Symbol, Address);
@@ -12472,6 +12480,22 @@ fn win64_home_backing_semantic_chunk(
 
 const SYNTHETIC_NODE_MASK: u64 = (1u64 << 62) | (1u64 << 63);
 
+// Partial source is useful only while the omitted semantics remain tightly
+// bounded.  The absolute cap prevents a large function from degrading into a
+// compilable skeleton; the density cap prevents the same outcome in a small
+// function.  These are safety policy, not score tuning: downstream consumers
+// still receive every exact suppressed instruction and diagnostic.
+pub(crate) const MAX_PARTIAL_SUPPRESSED_INSTRUCTIONS: usize = 8;
+pub(crate) const MIN_OWNED_INSTRUCTIONS_PER_SUPPRESSED: usize = 8;
+
+pub(crate) fn partial_unsupported_loss_is_bounded(suppressed: usize, owned: usize) -> bool {
+    suppressed > 0
+        && suppressed <= MAX_PARTIAL_SUPPRESSED_INSTRUCTIONS
+        && suppressed
+            .checked_mul(MIN_OWNED_INSTRUCTIONS_PER_SUPPRESSED)
+            .is_some_and(|required| required <= owned)
+}
+
 fn real_instruction_for_node(node: Node, address_sizes: &BTreeMap<Address, u8>) -> Option<Address> {
     if address_sizes.contains_key(&node) {
         return Some(node);
@@ -13277,8 +13301,28 @@ fn is_unsupported_synthetic_node(
 // the chain's external successors so rejected candidates, stack provenance,
 // memberships, or CFG rewrites cannot escape into later passes.
 fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
-    let unsupported_site_owners: BTreeSet<(Address, Address)> = db
+    // Rebuild all certifications on each invocation.  Home-cell selection
+    // runs between two calls and may either resolve an old diagnostic or add a
+    // new one, so retaining a prior certificate would make it stale.
+    db.rel_set(
+        "suppressed_unsupported_address",
+        ascent::boxcar::Vec::<(Address, Address, Symbol)>::new(),
+    );
+    db.rel_set(
+        "suppressed_unsupported_address_node",
+        ascent::boxcar::Vec::<(Address, Address, Node)>::new(),
+    );
+    db.rel_set(
+        "partial_unsupported_function",
+        ascent::boxcar::Vec::<(Address, usize, usize)>::new(),
+    );
+
+    let unsupported_rows: BTreeSet<(Address, Address, Symbol)> = db
         .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .copied()
+        .collect();
+    let unsupported_site_owners: BTreeSet<(Address, Address)> = unsupported_rows
+        .iter()
         .map(|(function, access, _)| (*function, *access))
         .collect();
     let unsupported_sites: BTreeSet<Address> = unsupported_site_owners
@@ -13797,7 +13841,8 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
     );
 
     let members: ascent::boxcar::Vec<(Node, Address)> = old_members
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|(node, _)| {
             unsupported_memory_site_for_node(*node, &unsupported_sites)
                 .map_or(true, |real| *node == real)
@@ -13870,6 +13915,215 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
         .copied()
         .collect();
     db.rel_set("normalized_stack_lea_base", normalized_bases);
+
+    // Publish a certificate only after checking the final public relations,
+    // never merely because a diagnostic existed.  A certified site has one
+    // real Inop anchor, no candidate/member/edge or stack provenance left on
+    // any synthetic chain node, and no authenticated CMP consumer still using
+    // the rejected temporary.  Consumers are recorded as lost decoded
+    // instructions as well as the root, so the loss budget cannot undercount a
+    // rejected memory-CMP -> JCC/SETcc pair.
+    let final_candidates: Vec<(Node, RTLInst)> = db
+        .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+        .map(|(node, inst)| (*node, inst.clone()))
+        .collect();
+    let final_members: BTreeSet<(Node, Address)> = db
+        .rel_iter::<(Node, Address)>("instr_in_function")
+        .copied()
+        .collect();
+    let final_edges: BTreeSet<(Node, Node)> = db
+        .rel_iter::<(Node, Node)>("rtl_succ_candidate")
+        .copied()
+        .collect();
+    let decoded_instructions: BTreeSet<Node> = db
+        .rel_iter::<(
+            Address, usize, &'static str, &'static str, Symbol, Symbol,
+            Symbol, Symbol, usize, usize,
+        )>("instruction")
+        .map(|(node, ..)| *node)
+        .collect();
+
+    let mut certified = BTreeSet::new();
+    let mut certified_nodes: BTreeMap<(Address, Address), BTreeSet<Node>> = BTreeMap::new();
+    for &(function, access, reason) in &unsupported_rows {
+        if !old_members.contains(&(access, function))
+            || !final_members.contains(&(access, function))
+            || !decoded_instructions.contains(&access)
+        {
+            continue;
+        }
+
+        let mut chain_candidates: Vec<(Node, RTLInst)> = final_candidates
+            .iter()
+            .filter(|(node, _)| (*node & !SYNTHETIC_NODE_MASK) == access)
+            .cloned()
+            .collect();
+        chain_candidates.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
+        chain_candidates.dedup();
+        if chain_candidates != vec![(access, RTLInst::Inop)] {
+            continue;
+        }
+
+        let has_synthetic_member = final_members.iter().any(|(node, _)| {
+            *node != access && (*node & !SYNTHETIC_NODE_MASK) == access
+        });
+        let has_synthetic_edge = final_edges.iter().any(|(source, destination)| {
+            (*source != access && (*source & !SYNTHETIC_NODE_MASK) == access)
+                || (*destination != access
+                    && (*destination & !SYNTHETIC_NODE_MASK) == access)
+        });
+        let has_synthetic_negation = db
+            .rel_iter::<(Node, Node)>("rtl_edge_negated")
+            .any(|(source, destination)| {
+                (*source != access && (*source & !SYNTHETIC_NODE_MASK) == access)
+                    || (*destination != access
+                        && (*destination & !SYNTHETIC_NODE_MASK) == access)
+            });
+        if has_synthetic_member || has_synthetic_edge || has_synthetic_negation {
+            continue;
+        }
+
+        // These relations are candidate-derived address/provenance views.  A
+        // real or synthetic row rooted at the rejected instruction would let
+        // later adapters rediscover semantics which the candidate filter has
+        // explicitly discarded.
+        let has_address_remnant = db
+            .rel_iter::<(Node, Address)>("sp_indexed_fused_member")
+            .any(|(node, _)| (*node & !SYNTHETIC_NODE_MASK) == access)
+            || db
+                .rel_iter::<(Node,)>("synth_only_addr")
+                .any(|(node,)| (*node & !SYNTHETIC_NODE_MASK) == access)
+            || db
+                .rel_iter::<(Node, RTLReg, MemoryChunk, Addressing, Args)>(
+                    "call_through_memory_load",
+                )
+                .any(|(node, ..)| (*node & !SYNTHETIC_NODE_MASK) == access)
+            || db
+                .rel_iter::<(Node, RTLReg)>("op_produces_ptr")
+                .any(|(node, _)| (*node & !SYNTHETIC_NODE_MASK) == access)
+            || db
+                .rel_iter::<(Address, Node, i64, RTLReg)>("slot_escaped_origin")
+                .any(|(_, node, _, _)| (*node & !SYNTHETIC_NODE_MASK) == access)
+            || ["stack_xtl", "stack_var"].into_iter().any(|relation| {
+                db.rel_iter::<(Address, Node, i64, RTLReg)>(relation)
+                    .any(|(_, node, _, _)| (*node & !SYNTHETIC_NODE_MASK) == access)
+            })
+            || db
+                .rel_iter::<(Address, Node, RTLReg, i64)>("normalized_stack_lea_base")
+                .any(|(_, node, _, _)| (*node & !SYNTHETIC_NODE_MASK) == access);
+        if has_address_remnant {
+            continue;
+        }
+
+        let mut lost_nodes = BTreeSet::from([access]);
+        let mut cmp_dependency_safe = true;
+        for (_, consumer, temp, _) in db
+            .rel_iter::<(Address, Address, RTLReg, Address)>("cmp_memory_temp_consumer")
+            .filter(|(root, _, _, owner)| *root == access && *owner == function)
+        {
+            if !final_members.contains(&(*consumer, function))
+                || (*consumer & !SYNTHETIC_NODE_MASK) != *consumer
+                || !decoded_instructions.contains(consumer)
+            {
+                cmp_dependency_safe = false;
+                break;
+            }
+            if final_candidates.iter().any(|(node, inst)| {
+                if node != consumer {
+                    return false;
+                }
+                let mut uses = BTreeSet::new();
+                collect_rtl_uses(inst, &mut uses);
+                uses.contains(temp)
+            }) {
+                cmp_dependency_safe = false;
+                break;
+            }
+            lost_nodes.insert(*consumer);
+        }
+        if !cmp_dependency_safe
+            || lost_nodes
+                .iter()
+                .any(|node| !final_members.contains(&(*node, function)))
+        {
+            continue;
+        }
+
+        // Every rebuilt root successor must name a surviving candidate.  This
+        // admits authenticated semantic interprocedural edges while rejecting
+        // a dangling bridge that would make a partial body structurally lie.
+        if final_edges
+            .iter()
+            .filter(|(source, _)| *source == access)
+            .any(|(_, destination)| {
+                !final_candidates
+                    .iter()
+                    .any(|(node, _)| node == destination)
+            })
+        {
+            continue;
+        }
+
+        certified.insert((function, access, reason));
+        certified_nodes.insert((function, access), lost_nodes);
+    }
+
+    let mut diagnostics_by_function: BTreeMap<
+        Address,
+        BTreeSet<(Address, Address, Symbol)>,
+    > = BTreeMap::new();
+    for row @ (function, _, _) in &unsupported_rows {
+        diagnostics_by_function
+            .entry(*function)
+            .or_default()
+            .insert(*row);
+    }
+    let mut owned_instructions: BTreeMap<Address, BTreeSet<Node>> = BTreeMap::new();
+    for &(node, function) in &old_members {
+        if decoded_instructions.contains(&node) {
+            owned_instructions.entry(function).or_default().insert(node);
+        }
+    }
+
+    let mut partial_functions = BTreeSet::new();
+    for (function, diagnostics) in diagnostics_by_function {
+        if !diagnostics.is_subset(&certified) {
+            continue;
+        }
+        let mut lost_nodes = BTreeSet::new();
+        for (_, access, _) in diagnostics {
+            if let Some(nodes) = certified_nodes.get(&(function, access)) {
+                lost_nodes.extend(nodes.iter().copied());
+            }
+        }
+        let owned = owned_instructions.get(&function).cloned().unwrap_or_default();
+        if !lost_nodes.is_subset(&owned)
+            || !partial_unsupported_loss_is_bounded(lost_nodes.len(), owned.len())
+        {
+            continue;
+        }
+        partial_functions.insert((function, lost_nodes.len(), owned.len()));
+    }
+
+    db.rel_set(
+        "suppressed_unsupported_address",
+        certified.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "suppressed_unsupported_address_node",
+        certified_nodes
+            .into_iter()
+            .flat_map(|((function, access), nodes)| {
+                nodes.into_iter().map(move |node| (function, access, node))
+            })
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "partial_unsupported_function",
+        partial_functions
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
 }
 
 // Materialize mutable Win64 home cells after RTLPassProgram reaches its fixed
@@ -16000,7 +16254,7 @@ impl IRPass for RTLPass {
     }
 
     fn inputs(&self) -> &'static [&'static str] {
-        // These two relations are rebuilt imperatively after the Ascent rules
+        // These relations are rebuilt imperatively after the Ascent rules
         // run.  The generated metadata cannot see that producer, so do not
         // misclassify them as inputs to this pass.
         static INPUTS: std::sync::OnceLock<Box<[&'static str]>> =
@@ -16014,6 +16268,9 @@ impl IRPass for RTLPass {
                         *relation,
                         "win64_home_backing_access"
                             | "win64_home_backing_selected_candidate"
+                            | "suppressed_unsupported_address"
+                            | "suppressed_unsupported_address_node"
+                            | "partial_unsupported_function"
                     )
                 })
                 .collect()
@@ -16021,10 +16278,10 @@ impl IRPass for RTLPass {
     }
 
     fn outputs(&self) -> &'static [&'static str] {
-        // select_canonical_unsafe_home_rewrites populates these relations via
-        // rel_set, outside the Ascent rule graph.  Declare them explicitly so
-        // the staged scheduler copies them out of RTL's isolated sub-DB and
-        // establishes the producer/consumer edge to later passes.
+        // The canonical-home selector and unsupported-address certification
+        // populate these relations via rel_set, outside the Ascent rule graph.
+        // Declare them explicitly so the staged scheduler copies them out of
+        // RTL's isolated sub-DB and establishes producer/consumer edges.
         static OUTPUTS: std::sync::OnceLock<Box<[&'static str]>> =
             std::sync::OnceLock::new();
         OUTPUTS.get_or_init(|| {
@@ -16034,6 +16291,9 @@ impl IRPass for RTLPass {
                 .chain([
                     "win64_home_backing_access",
                     "win64_home_backing_selected_candidate",
+                    "suppressed_unsupported_address",
+                    "suppressed_unsupported_address_node",
+                    "partial_unsupported_function",
                 ])
                 .collect()
         })
@@ -16051,6 +16311,9 @@ mod encoding_tests {
         for relation in [
             "win64_home_backing_access",
             "win64_home_backing_selected_candidate",
+            "suppressed_unsupported_address",
+            "suppressed_unsupported_address_node",
+            "partial_unsupported_function",
         ] {
             assert!(pass.outputs().contains(&relation));
             assert!(!pass.inputs().contains(&relation));
@@ -16418,6 +16681,96 @@ mod encoding_tests {
         );
         db.rel_push("instr_in_function", (real, function));
         db.rel_push("rtl_inst_candidate", (real, RTLInst::Inop));
+    }
+
+    fn seed_decoded_instruction(db: &mut DecompileDB, function: Address, node: Node) {
+        db.rel_push("instr_in_function", (node, function));
+        db.rel_push(
+            "instruction",
+            (node, 1usize, "", "nop", "", "", "", "", 0usize, 0usize),
+        );
+    }
+
+    #[test]
+    fn partial_unsupported_loss_budget_has_exact_absolute_and_density_boundaries() {
+        assert!(!partial_unsupported_loss_is_bounded(0, 100));
+        assert!(!partial_unsupported_loss_is_bounded(1, 7));
+        assert!(partial_unsupported_loss_is_bounded(1, 8));
+        assert!(partial_unsupported_loss_is_bounded(8, 64));
+        assert!(!partial_unsupported_loss_is_bounded(8, 63));
+        assert!(!partial_unsupported_loss_is_bounded(9, 10_000));
+        assert!(!partial_unsupported_loss_is_bounded(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn owned_atomic_rejection_is_certified_and_budgeted_idempotently() {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x1100;
+        let root: Node = 0x1110;
+        seed_rejected_site(&mut db, function, root);
+        for node in root..root + 8 {
+            seed_decoded_instruction(&mut db, function, node);
+        }
+
+        for _ in 0..2 {
+            suppress_unsupported_address_candidates(&mut db);
+            assert_eq!(
+                db.rel_iter::<(Address, Address, Symbol)>(
+                    "suppressed_unsupported_address"
+                )
+                .copied()
+                .collect::<BTreeSet<_>>(),
+                BTreeSet::from([(function, root, "test-unsupported-address")])
+            );
+            assert_eq!(
+                db.rel_iter::<(Address, Address, Node)>(
+                    "suppressed_unsupported_address_node"
+                )
+                .copied()
+                .collect::<BTreeSet<_>>(),
+                BTreeSet::from([(function, root, root)])
+            );
+            assert_eq!(
+                db.rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+                    .copied()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([(function, 1, 8)])
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_cmp_rejection_counts_the_dependent_decoded_consumer() {
+        let (mut db, root, consumer, fallthrough, taken, _, _) =
+            cmp_consumer_rejection_db(
+                Some("unsupported-stack-address"),
+                CmpConsumerKind::Jcc,
+                false,
+            );
+        let function: Address = 0x7000;
+        for node in [root, consumer, fallthrough, taken] {
+            seed_decoded_instruction(&mut db, function, node);
+        }
+        for node in 0x7100..0x710c {
+            seed_decoded_instruction(&mut db, function, node);
+        }
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert_eq!(
+            db.rel_iter::<(Address, Address, Node)>(
+                "suppressed_unsupported_address_node"
+            )
+            .copied()
+            .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(function, root, root), (function, root, consumer)])
+        );
+        assert_eq!(
+            db.rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(function, 2, 16)])
+        );
     }
 
     fn outgoing(db: &DecompileDB, source: Node) -> BTreeSet<Node> {

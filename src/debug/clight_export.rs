@@ -11,6 +11,10 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+pub const CLIGHT_EXPORT_SCHEMA_ID: &str = "manifold-clight-v2";
+pub const PARTIAL_SUPPRESSION_CERTIFICATE_ID: &str =
+    "atomic-unsupported-address-suppression-v1";
+
 /// Export the selected Clight IR from the decompile DB to a JSON file.
 pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), String> {
     // Diagnostics
@@ -112,7 +116,64 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         details.sort();
         details.dedup();
     }
+    let certified: std::collections::HashSet<(Address, Address, Symbol)> = db
+        .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+        .copied()
+        .collect();
+    let mut suppressed_nodes: BTreeMap<(Address, Address), Vec<Address>> = BTreeMap::new();
+    for (func, access, node) in
+        db.rel_iter::<(Address, Address, Node)>("suppressed_unsupported_address_node")
+    {
+        suppressed_nodes
+            .entry((*func, *access))
+            .or_default()
+            .push(*node);
+    }
+    for nodes in suppressed_nodes.values_mut() {
+        nodes.sort_unstable();
+        nodes.dedup();
+    }
+    let mut suppressed_nodes_by_function: BTreeMap<Address, std::collections::BTreeSet<Node>> =
+        BTreeMap::new();
+    for ((func, _), nodes) in &suppressed_nodes {
+        suppressed_nodes_by_function
+            .entry(*func)
+            .or_default()
+            .extend(nodes.iter().copied());
+    }
+    let decoded_nodes: std::collections::HashSet<Node> = db
+        .rel_iter::<(
+            Address, usize, &'static str, &'static str, Symbol, Symbol,
+            Symbol, Symbol, usize, usize,
+        )>("instruction")
+        .map(|(node, ..)| *node)
+        .collect();
+    let mut owned_nodes_by_function: BTreeMap<Address, std::collections::BTreeSet<Node>> =
+        BTreeMap::new();
+    for (node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        if decoded_nodes.contains(node) {
+            owned_nodes_by_function
+                .entry(*func)
+                .or_default()
+                .insert(*node);
+        }
+    }
+    let mut partial_budgets: BTreeMap<Address, (usize, usize)> = BTreeMap::new();
+    for (func, suppressed, owned) in
+        db.rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+    {
+        let row = (*suppressed, *owned);
+        if let Some(previous) = partial_budgets.insert(*func, row) {
+            if previous != row {
+                return Err(format!(
+                    "partial function 0x{func:x} has conflicting loss budgets: {previous:?} versus {row:?}"
+                ));
+            }
+        }
+    }
+
     let mut unsupported_functions = Vec::with_capacity(unsupported_stack_rows.len());
+    let mut partial_functions = Vec::new();
     for (func, access, reason) in unsupported_stack_rows {
         if !matches!(
             reason.as_str(),
@@ -122,15 +183,11 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
                 "unsupported function 0x{func:x} has unknown reason code {reason:?}"
             ));
         }
-        if selected_addresses.contains(&func) {
-            return Err(format!(
-                "function 0x{func:x} is both selected and unsupported"
-            ));
-        }
         let name = provider_names.get(&func).ok_or_else(|| {
             format!("unsupported function 0x{func:x} has no emit_function provider name")
         })?;
-        unsupported_functions.push(json!({
+        let diagnostic = (func, access, reason.as_str());
+        let base = json!({
             "name": name,
             "address": format!("0x{func:x}"),
             "access_address": format!("0x{access:x}"),
@@ -139,7 +196,64 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
                 .get(&(func, access))
                 .cloned()
                 .unwrap_or_default(),
-        }));
+        });
+        if !selected_addresses.contains(&func) {
+            unsupported_functions.push(base);
+            continue;
+        }
+
+        if !certified.contains(&diagnostic) {
+            return Err(format!(
+                "selected partial function 0x{func:x} lacks an atomic suppression certificate at 0x{access:x}"
+            ));
+        }
+        let (suppressed_count, owned_count) = partial_budgets.get(&func).copied().ok_or_else(|| {
+            format!("selected partial function 0x{func:x} lacks a bounded loss certificate")
+        })?;
+        if !crate::decompile::passes::rtl_pass::partial_unsupported_loss_is_bounded(
+            suppressed_count,
+            owned_count,
+        ) {
+            return Err(format!(
+                "selected partial function 0x{func:x} has an invalid loss budget ({suppressed_count}/{owned_count})"
+            ));
+        }
+        let exact_suppressed_count = suppressed_nodes_by_function
+            .get(&func)
+            .map_or(0, std::collections::BTreeSet::len);
+        let exact_owned_count = owned_nodes_by_function
+            .get(&func)
+            .map_or(0, std::collections::BTreeSet::len);
+        if (exact_suppressed_count, exact_owned_count) != (suppressed_count, owned_count) {
+            return Err(format!(
+                "selected partial function 0x{func:x} loss certificate does not match exact provenance: certified ({suppressed_count}/{owned_count}), exact ({exact_suppressed_count}/{exact_owned_count})"
+            ));
+        }
+        let nodes = suppressed_nodes.get(&(func, access)).ok_or_else(|| {
+            format!(
+                "selected partial function 0x{func:x} has no suppressed instruction provenance at 0x{access:x}"
+            )
+        })?;
+        if nodes.is_empty() {
+            return Err(format!(
+                "selected partial function 0x{func:x} has empty suppressed instruction provenance at 0x{access:x}"
+            ));
+        }
+        let mut partial = base;
+        partial["suppressed_instructions"] = json!(nodes
+            .iter()
+            .map(|node| format!("0x{node:x}"))
+            .collect::<Vec<_>>());
+        partial["certification"] = json!({
+            "kind": PARTIAL_SUPPRESSION_CERTIFICATE_ID,
+            "atomic_chain_suppressed": true,
+            "all_function_diagnostics_certified": true,
+            "suppressed_instruction_count": suppressed_count,
+            "owned_instruction_count": owned_count,
+            "max_suppressed_instruction_count": crate::decompile::passes::rtl_pass::MAX_PARTIAL_SUPPRESSED_INSTRUCTIONS,
+            "min_owned_instructions_per_suppressed": crate::decompile::passes::rtl_pass::MIN_OWNED_INSTRUCTIONS_PER_SUPPRESSED,
+        });
+        partial_functions.push(partial);
     }
 
     let external_funcs: std::collections::HashSet<u64> = db
@@ -332,12 +446,14 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
 
     let program = json!({
         "compcert_clight": true,
+        "manifold_clight_schema": CLIGHT_EXPORT_SCHEMA_ID,
         "arch": "x86_64",
         "composites": composites,
         "globals": globals_json,
         "externals": extern_sigs,
         "functions": functions_json,
         "unsupported_functions": unsupported_functions,
+        "partial_functions": partial_functions,
     });
 
     let json_str = serde_json::to_string_pretty(&program)

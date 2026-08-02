@@ -58,18 +58,49 @@ pub struct SelectedFunction {
     pub loop_info: HashMap<Node, LoopInfo>,
 }
 
+fn unsupported_functions_requiring_omission(db: &DecompileDB) -> HashSet<Address> {
+    let diagnostics: Vec<(Address, Address, Symbol)> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .copied()
+        .collect();
+    let certified: HashSet<(Address, Address, Symbol)> = db
+        .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+        .copied()
+        .collect();
+    let budgeted: HashSet<Address> = db
+        .rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+        .filter_map(|(function, suppressed, owned)| {
+            crate::decompile::passes::rtl_pass::partial_unsupported_loss_is_bounded(
+                *suppressed,
+                *owned,
+            )
+            .then_some(*function)
+        })
+        .collect();
+
+    let mut by_function: HashMap<Address, Vec<(Address, Address, Symbol)>> = HashMap::new();
+    for row @ (function, _, _) in diagnostics {
+        by_function.entry(function).or_default().push(row);
+    }
+    by_function
+        .into_iter()
+        .filter_map(|(function, rows)| {
+            (!budgeted.contains(&function)
+                || rows.iter().any(|row| !certified.contains(row)))
+            .then_some(function)
+        })
+        .collect()
+}
+
 pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, String> {
     let (mut functions, id_to_name) = extract_functions(db)?;
 
-    // An arbitrary current RSP value cannot be represented faithfully in the
-    // source IR.  AsmPass records the affected function explicitly rather
-    // than fabricating an Ainstack slot or an unbound pointer.  Remove only
-    // those functions before the program-wide solver; supported siblings in
-    // the same object continue through the normal selection path.
-    let unsupported_stack_functions: HashSet<Address> = db
-        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
-        .map(|(func, _, _)| *func)
-        .collect();
+    // Arbitrary stack addresses cannot be represented faithfully in source.
+    // Keep the historic whole-function omission unless RTL published both an
+    // exact post-suppression certificate for every diagnostic and a bounded
+    // function-level loss row.  The diagnostic itself remains public: a
+    // selected function on this path is explicitly partial, never lossless.
+    let unsupported_stack_functions = unsupported_functions_requiring_omission(db);
     functions.retain(|func| !unsupported_stack_functions.contains(&func.address));
 
     let mut name_to_ident: HashMap<String, Ident> = HashMap::new();
@@ -2554,5 +2585,91 @@ fn ensure_goto_labels(statements: &mut HashMap<Node, ClightStmt>) {
                 ClightStmt::Slabel(label_ident, Box::new(ClightStmt::Sskip)),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unsupported_partial_tests {
+    use super::*;
+
+    const FUNCTION: Address = 0x1000;
+    const FIRST_ACCESS: Address = 0x1010;
+    const SECOND_ACCESS: Address = 0x1020;
+
+    fn diagnostic_db() -> DecompileDB {
+        let mut db = DecompileDB::default();
+        db.rel_push(
+            "unsupported_stack_address",
+            (FUNCTION, FIRST_ACCESS, "unsupported-stack-address"),
+        );
+        db
+    }
+
+    #[test]
+    fn partial_selection_requires_matching_site_and_bounded_function_certificates() {
+        let mut db = diagnostic_db();
+        db.rel_push(
+            "suppressed_unsupported_address",
+            (FUNCTION, FIRST_ACCESS, "unsupported-stack-address"),
+        );
+        db.rel_push(
+            "partial_unsupported_function",
+            (FUNCTION, 1usize, 8usize),
+        );
+        assert!(unsupported_functions_requiring_omission(&db).is_empty());
+
+        let mut db = diagnostic_db();
+        db.rel_push(
+            "suppressed_unsupported_address",
+            (FUNCTION, FIRST_ACCESS, "unsupported-stack-address"),
+        );
+        db.rel_push(
+            "partial_unsupported_function",
+            (FUNCTION, 1usize, 8usize),
+        );
+        db.rel_push(
+            "unsupported_stack_address",
+            (FUNCTION, SECOND_ACCESS, "unsupported-stack-address"),
+        );
+        assert_eq!(
+            db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                (FUNCTION, FIRST_ACCESS, "unsupported-stack-address"),
+                (FUNCTION, SECOND_ACCESS, "unsupported-stack-address"),
+            ])
+        );
+        assert_eq!(
+            unsupported_functions_requiring_omission(&db),
+            HashSet::from([FUNCTION])
+        );
+    }
+
+    #[test]
+    fn stale_or_over_budget_partial_rows_cannot_enable_selection() {
+        let mut missing_site = diagnostic_db();
+        missing_site.rel_push(
+            "partial_unsupported_function",
+            (FUNCTION, 1usize, 8usize),
+        );
+        assert_eq!(
+            unsupported_functions_requiring_omission(&missing_site),
+            HashSet::from([FUNCTION])
+        );
+
+        let mut over_budget = diagnostic_db();
+        over_budget.rel_push(
+            "suppressed_unsupported_address",
+            (FUNCTION, FIRST_ACCESS, "unsupported-stack-address"),
+        );
+        over_budget.rel_push(
+            "partial_unsupported_function",
+            (FUNCTION, 9usize, 1000usize),
+        );
+        assert_eq!(
+            unsupported_functions_requiring_omission(&over_budget),
+            HashSet::from([FUNCTION])
+        );
     }
 }
