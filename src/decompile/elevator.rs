@@ -182,6 +182,11 @@ pub struct DecompileDB {
 
     // Typed per-function trees produced by ClightSelectPass and consumed by ClightEmitPass.
     pub clight_selected_functions: Vec<SelectedFunction>,
+    // Exact, unfiltered selection consumed by ClightEmitPass. JSON export reuses
+    // this snapshot instead of repeating the program-level Z3 selection. None
+    // means no ClightEmitPass result is available, so standalone export selects
+    // directly from the relations as before.
+    pub clight_selected_functions_snapshot: Option<Vec<SelectedFunction>>,
 
     pub cast_selected_functions: Vec<SelectedFunction>,
     pub cast_globals: Vec<GlobalData>,
@@ -225,6 +230,7 @@ impl Default for DecompileDB {
             target_abi: None,
 
             clight_selected_functions: Default::default(),
+            clight_selected_functions_snapshot: None,
             cast_selected_functions: Default::default(),
             cast_globals: Default::default(),
             cast_id_to_name: Default::default(),

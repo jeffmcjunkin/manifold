@@ -1582,6 +1582,9 @@ impl IRPass for ClightSelectPass {
     }
 
     fn run(&self, db: &mut DecompileDB) {
+        // A new selection invalidates any snapshot retained by an earlier
+        // ClightEmitPass on this database.
+        db.clight_selected_functions_snapshot = None;
         let t = std::time::Instant::now();
         match crate::decompile::passes::clight_select::select::select_clight_stmts(db) {
             Ok(funcs) => {
@@ -1620,6 +1623,9 @@ impl IRPass for ClightEmitPass {
     }
 
     fn run(&self, db: &mut DecompileDB) {
+        // Direct/repeated pass use must never expose a stale snapshot if this
+        // emission consumes a different selection.
+        db.clight_selected_functions_snapshot = None;
         let binary_path = db
             .binary_path
             .clone()
@@ -1636,6 +1642,7 @@ impl IRPass for ClightEmitPass {
             Ok(names) => names,
             Err(error) => {
                 log::warn!("ClightEmitPass: failed to resolve function providers: {error}");
+                db.clight_selected_functions_snapshot = Some(selected_functions);
                 return;
             }
         };
@@ -1654,6 +1661,7 @@ impl IRPass for ClightEmitPass {
                 Ok(g) => g,
                 Err(e) => {
                     log::warn!("ClightEmitPass: failed to extract globals: {}", e);
+                    db.clight_selected_functions_snapshot = Some(selected_functions);
                     return;
                 }
             };
@@ -2455,6 +2463,7 @@ impl IRPass for ClightEmitPass {
         }
 
         db.cast_optimized_translation_unit = Some(tu);
+        db.clight_selected_functions_snapshot = Some(selected_functions);
     }
 
     fn inputs(&self) -> &'static [&'static str] {

@@ -11,6 +11,7 @@ use crate::decompile::passes::clight_select::select::{
 };
 use crate::x86::types::*;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
@@ -18,6 +19,15 @@ use std::sync::Arc;
 pub const CLIGHT_EXPORT_SCHEMA_ID: &str = "manifold-clight-v2";
 pub const PARTIAL_SUPPRESSION_CERTIFICATE_ID: &str =
     "atomic-unsupported-address-suppression-v1";
+
+fn selected_functions_for_export(
+    db: &DecompileDB,
+) -> Result<Cow<'_, [SelectedFunction]>, String> {
+    match db.clight_selected_functions_snapshot.as_deref() {
+        Some(selected_functions) => Ok(Cow::Borrowed(selected_functions)),
+        None => select_clight_stmts(db).map(Cow::Owned),
+    }
+}
 
 /// Export the selected Clight IR from the decompile DB to a JSON file.
 pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), String> {
@@ -39,7 +49,7 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
     eprintln!("  emit_var_type:                  {}", var_type_count);
     eprintln!("=== End Diagnostics ===\n");
 
-    let selected_functions = select_clight_stmts(db)?;
+    let selected_functions = selected_functions_for_export(db)?;
 
     let binary_path = db.binary_path.as_ref().ok_or("binary_path not set")?;
 
@@ -55,7 +65,7 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
     for (id, name) in symbol_names {
         id_to_name.insert(id, name);
     }
-    for func in &selected_functions {
+    for func in selected_functions.iter() {
         id_to_name
             .entry(func.address as usize)
             .or_insert_with(|| func.name.clone());
@@ -1242,6 +1252,54 @@ fn resolve_name(id: usize, id_to_name: &HashMap<usize, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_selection_reuses_the_exact_pipeline_snapshot() {
+        let mut db = DecompileDB::default();
+        db.clight_selected_functions_snapshot = Some(vec![SelectedFunction {
+            address: 0x401000,
+            name: "snapshot_function".to_string(),
+            entry_node: 0x401000,
+            return_type: ClightType::Tvoid,
+            param_regs: Vec::new(),
+            param_types: Vec::new(),
+            stack_size: 0,
+            statements: HashMap::new(),
+            successors: HashMap::new(),
+            used_regs: Default::default(),
+            struct_fields: HashMap::new(),
+            sseq_groups: HashMap::new(),
+            var_types: HashMap::new(),
+            var_type_candidates: HashMap::new(),
+            var_decl_idx: HashMap::new(),
+            loop_headers: Default::default(),
+            switch_heads: Default::default(),
+            reg_struct_ids: HashMap::new(),
+            loop_info: HashMap::new(),
+        }]);
+        let snapshot_ptr = db
+            .clight_selected_functions_snapshot
+            .as_deref()
+            .expect("pipeline snapshot")
+            .as_ptr();
+
+        let selected = selected_functions_for_export(&db).expect("reuse pipeline snapshot");
+        match selected {
+            Cow::Borrowed(functions) => {
+                assert_eq!(functions.as_ptr(), snapshot_ptr);
+                assert_eq!(functions[0].name, "snapshot_function");
+            }
+            Cow::Owned(_) => panic!("export repeated selection instead of borrowing the snapshot"),
+        }
+    }
+
+    #[test]
+    fn export_selection_falls_back_without_a_pipeline_snapshot() {
+        let db = DecompileDB::default();
+
+        let selected = selected_functions_for_export(&db).expect("standalone selection");
+        assert!(matches!(selected, Cow::Owned(functions) if functions.is_empty()));
+    }
 
     fn compact_bytes(value: &Value) -> Vec<u8> {
         let mut writer = BufWriter::new(Vec::new());
