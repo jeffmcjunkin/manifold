@@ -142,6 +142,45 @@ fn win64_home_flags_definitely_overwritten(mnem: &str) -> bool {
     )
 }
 
+// Instructions admitted between a home-cell CMP and SETcc must have ordinary
+// fallthrough semantics, preserve flags, and already have complete RTL
+// lowering.  Keep this deliberately narrower than `!is_flag_setting`: calls,
+// opaque transfers, string operations, and flag consumers all require their
+// own provenance model.  The selector additionally proves a unique decoded
+// path and a retained candidate for every admitted bridge.
+fn win64_home_compare_bridge_mnemonic(mnem: &str) -> bool {
+    let mnem = mnem.strip_prefix("LOCK ").unwrap_or(mnem);
+    matches!(
+        mnem,
+        "MOV"
+            | "MOVZX"
+            | "MOVSX"
+            | "MOVSXD"
+            | "MOVUPS"
+            | "MOVAPS"
+            | "MOVUPD"
+            | "MOVAPD"
+            | "MOVDQU"
+            | "MOVDQA"
+            | "VMOVUPS"
+            | "VMOVAPS"
+            | "VMOVUPD"
+            | "VMOVAPD"
+            | "VMOVDQU"
+            | "VMOVDQA"
+            | "LEA"
+            | "NOP"
+    )
+}
+
+// Keep the Datalog provenance seed finite.  The imperative selector below
+// still authenticates the complete decoded path, but an unbounded recursive
+// relation here makes a large straight-line COFF function materialize every
+// prefix from every home comparison.  Eight intervening flag-preserving
+// instructions covers compiler scheduling without turning this local pattern
+// into whole-function reachability.
+const WIN64_HOME_COMPARE_BRIDGE_LIMIT: i64 = 8;
+
 fn is_x86_64_gp_register_name(name: &str) -> bool {
     matches!(
         name,
@@ -9315,10 +9354,10 @@ ascent_par! {
     win64_home_cmp_read(addr, func, mem, base, raw, pos, entry, width) <--
         win64_home_backing_cmp_read(addr, func, mem, base, raw, pos, entry, width);
 
-    // Keep the branch fusion explicitly adjacent.  A scheduled CMP -> Jcc
-    // pair needs a snapshot at CMP and the Icond at Jcc so intervening
-    // flag-preserving operations still execute on both paths; moving the
-    // branch to CMP would silently skip those operations.
+    // Keep the comparison candidate keyed at CMP as private selector evidence.
+    // Adjacent CMP -> Jcc pairs can be fused at that node.  For a structured
+    // flags pair with intervening instructions, the selector below moves the
+    // Icond to the original Jcc and restores the exact decoded path atomically.
     #[local] relation win64_home_cmp_jcc_consumer(
         Node, Address, Node, TestCond, Address, Address
     );
@@ -9337,13 +9376,24 @@ ascent_par! {
         real_addr_in_func(jcc_addr, func_start),
         real_addr_in_func(target_addr, func_start),
         real_addr_in_func(fallthrough, func_start);
+    win64_home_cmp_jcc_consumer(
+        addr, func_start, jcc_addr, *testcond, *target_addr, *fallthrough
+    ) <--
+        flags_and_jump_pair(addr, jcc_addr, _),
+        pjcc(jcc_addr, testcond, target_sym),
+        symbol_resolved_addr(*target_sym, target_addr),
+        next(jcc_addr, fallthrough),
+        real_addr_in_func(addr, func_start),
+        real_addr_in_func(jcc_addr, func_start),
+        real_addr_in_func(target_addr, func_start),
+        real_addr_in_func(fallthrough, func_start);
 
     // SETcc is a value-producing consumer of the same comparison flags.  Its
     // destination is defined at the SETcc address, while the fused RTL
-    // operation remains keyed at CMP (the same convention used by Asm's
-    // register-only cmp_setcc_link).  Start with the exact adjacent shape;
-    // scheduled SETcc chains need an explicit flag-provenance relation rather
-    // than an unconstrained instruction walk.
+    // operation remains keyed at CMP as private selector evidence (the same
+    // convention used by Asm's register-only cmp_setcc_link).  The selector
+    // leaves adjacent fusion in place, but relocates scheduled fusion to SETcc
+    // only after authenticating the intervening decoded path.
     #[local] relation win64_home_cmp_setcc_consumer(Node, Node, TestCond, RTLReg);
     win64_home_cmp_setcc_consumer(addr, setcc_addr, *test_cond, destination) <--
         next(addr, setcc_addr),
@@ -9355,6 +9405,39 @@ ascent_par! {
         reg_xtl(setcc_addr, dst_reg, def_id),
         xtl_canonical(def_id, destination),
         instr_in_function(addr, func_start),
+        instr_in_function(setcc_addr, func_start);
+
+    // SETcc has no loader-level flags pair, so derive only a conservative
+    // straight-line path through explicitly admitted flag-preserving
+    // instructions.  The final selector revalidates ownership, candidate
+    // presence, cell stability, and unique incoming control before moving the
+    // Ocmp to the SETcc node.
+    #[local] relation win64_home_cmp_setcc_path(Node, Address, Node, i64);
+    win64_home_cmp_setcc_path(addr, func_start, *successor, 0) <--
+        win64_home_cmp_read(addr, func_start, _, _, _, _, _, _),
+        next(addr, successor),
+        instr_in_function(addr, func_start),
+        instr_in_function(successor, func_start);
+    win64_home_cmp_setcc_path(root, func_start, *successor, next_depth) <--
+        win64_home_cmp_setcc_path(root, func_start, current, depth),
+        instruction(current, _, _, mnemonic, _, _, _, _, _, _),
+        if win64_home_compare_bridge_mnemonic(mnemonic),
+        if *depth < WIN64_HOME_COMPARE_BRIDGE_LIMIT,
+        next(current, successor),
+        instr_in_function(successor, func_start),
+        let next_depth = depth + 1;
+    win64_home_cmp_setcc_consumer(
+        root, setcc_addr, *test_cond, destination
+    ) <--
+        win64_home_cmp_setcc_path(root, func_start, setcc_addr, _),
+        setcc_testcond(setcc_addr, test_cond),
+        instruction(setcc_addr, _, _, _, dst, _, _, _, _, _),
+        op_register(dst, dst_str),
+        let dst_reg = Mreg::x86(*dst_str),
+        is_def(setcc_addr, def_id),
+        reg_xtl(setcc_addr, dst_reg, def_id),
+        xtl_canonical(def_id, destination),
+        instr_in_function(root, func_start),
         instr_in_function(setcc_addr, func_start);
 
     // The fused value is now defined at CMP, so its semantic successor is the
@@ -9503,6 +9586,15 @@ ascent_par! {
         win64_home_cmp_read(addr, func_start, _, _, _, pos, _, _),
         win64_home_storage(func_start, pos, _),
         rtl_inst_candidate(addr, inst);
+
+    // Local relations are deliberately absent from DecompileDB after the
+    // parallel pass swaps its shared outputs back.  Retain only the
+    // authenticated root/consumer identity needed by the imperative
+    // all-access selector; the private path and destination evidence remain
+    // pass-local.
+    relation win64_home_cmp_setcc_plan(Node, Node);
+    win64_home_cmp_setcc_plan(*root, *consumer) <--
+        win64_home_cmp_setcc_consumer(root, consumer, _, _);
 
     // Likewise retain the exact consumed Jcc and its two destinations.  CFG
     // mutation remains imperative and atomic with successful cell selection;
@@ -11928,7 +12020,7 @@ enum UnsafeHomeRewrite {
         destination: RTLReg,
         op: Operation,
     },
-    Compare { inst: RTLInst },
+    Compare { emit_node: Node, inst: RTLInst },
 }
 
 fn home_move_xtype(move_class: usize, width: usize) -> Option<XType> {
@@ -14333,6 +14425,106 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                 .insert(*source);
         }
     }
+    let mut raw_next_by_source: BTreeMap<Node, BTreeSet<Node>> = BTreeMap::new();
+    for (source, destination) in db.rel_iter::<(Node, Node)>("next") {
+        raw_next_by_source
+            .entry(*source)
+            .or_default()
+            .insert(*destination);
+    }
+    let mut home_setcc_consumers: BTreeMap<Node, BTreeSet<Node>> = BTreeMap::new();
+    for (root, consumer) in
+        db.rel_iter::<(Node, Node)>("win64_home_cmp_setcc_plan")
+    {
+        home_setcc_consumers
+            .entry(*root)
+            .or_default()
+            .insert(*consumer);
+    }
+
+    // Recover the exact decoded straight-line path without relying on address
+    // arithmetic.  Every bridge instruction must be a conservative
+    // flag-preserving spelling, have one function owner, retain at least one
+    // non-control RTL candidate, and avoid every other access to this home
+    // cell.  The consumer must have no alternate decoded predecessor.
+    let scheduled_compare_path =
+        |root: Node,
+         consumer: Node,
+         func: Address,
+         cell_nodes: &BTreeSet<Node>|
+         -> Option<Vec<Node>> {
+            if raw_next_by_source
+                .get(&root)
+                .is_some_and(|successors| successors.contains(&consumer))
+            {
+                return None;
+            }
+            let owns = |node: Node| {
+                node_functions.get(&node).is_some_and(|owners| {
+                    owners.len() == 1 && owners.contains(&func)
+                })
+            };
+            if !owns(root) || !owns(consumer) {
+                return None;
+            }
+            let mut path = vec![root];
+            let mut seen = BTreeSet::from([root]);
+            let mut current = root;
+            loop {
+                let successors = raw_next_by_source.get(&current)?;
+                if successors.len() != 1 {
+                    return None;
+                }
+                let next_node = *successors.iter().next()?;
+                if !seen.insert(next_node) || !owns(next_node) {
+                    return None;
+                }
+                if next_node == consumer {
+                    if !raw_predecessors.get(&consumer).is_some_and(|predecessors| {
+                        !predecessors.is_empty()
+                            && predecessors.iter().all(|source| *source == current)
+                    }) {
+                        return None;
+                    }
+                    path.push(consumer);
+                    return Some(path);
+                }
+                if cell_nodes.contains(&next_node) {
+                    return None;
+                }
+                let mnemonics = instruction_mnemonics.get(&next_node)?;
+                if mnemonics.len() != 1
+                    || !win64_home_compare_bridge_mnemonic(
+                        mnemonics.iter().next().copied()?,
+                    )
+                {
+                    return None;
+                }
+                let candidates = candidates_at.get(&next_node)?;
+                let candidate = match candidates.as_slice() {
+                    [candidate] => *candidate,
+                    _ => return None,
+                };
+                let valid_candidate = if mnemonics.contains("NOP") {
+                    matches!(candidate, RTLInst::Inop)
+                } else {
+                    !matches!(
+                        candidate,
+                        RTLInst::Inop
+                            | RTLInst::Icond(..)
+                            | RTLInst::Ibranch(..)
+                            | RTLInst::Ijumptable(..)
+                            | RTLInst::Ireturn(..)
+                            | RTLInst::Itailcall(..)
+                    )
+                };
+                if !valid_candidate {
+                    return None;
+                }
+                path.push(next_node);
+                current = next_node;
+            }
+        };
 
     let mut storage = BTreeMap::new();
     let mut rewrites = BTreeMap::new();
@@ -14345,6 +14537,11 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
     let mut resolved_backing_sites = BTreeSet::new();
     let mut selected_home_jcc_plans: BTreeSet<(Node, Node, Address, Address)> =
         BTreeSet::new();
+    let mut selected_scheduled_compare_plans: BTreeMap<
+        Node,
+        (Vec<Node>, BTreeSet<Node>),
+    > = BTreeMap::new();
+    let mut selected_scheduled_path_nodes = BTreeSet::new();
 
     for (key @ (func, pos), slot) in seeded_storage {
         if vetoed.contains(&key) {
@@ -14414,6 +14611,10 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         let mut cell_bridge_nodes = BTreeSet::new();
         let mut cell_candidate_class: BTreeMap<Node, RTLInst> = BTreeMap::new();
         let mut cell_jcc_plans: BTreeSet<(Node, Node, Address, Address)> = BTreeSet::new();
+        let mut cell_scheduled_compare_plans: BTreeMap<
+            Node,
+            (Vec<Node>, BTreeSet<Node>),
+        > = BTreeMap::new();
         let mut signature: Option<(usize, usize)> = None;
         let mut complete = true;
 
@@ -14996,14 +15197,73 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                         complete = false;
                         break;
                     }
+                    let mut emit_node = node;
                     match candidates.first() {
                         Some(RTLInst::Iop(Operation::Ocmp(_), _, _)) => {
-                            let consumers = adjacent_setcc.get(&node);
+                            let consumers = home_setcc_consumers.get(&node);
                             if !consumers.is_some_and(|nodes| nodes.len() == 1) {
                                 complete = false;
                                 break;
                             }
-                            cell_setcc_nodes.extend(consumers.unwrap().iter().copied());
+                            let consumer = *consumers
+                                .unwrap()
+                                .iter()
+                                .next()
+                                .expect("one checked home SETcc consumer");
+                            let adjacent = raw_next_by_source
+                                .get(&node)
+                                .is_some_and(|successors| successors.contains(&consumer));
+                            if adjacent {
+                                let isolated = raw_predecessors
+                                    .get(&consumer)
+                                    .is_some_and(|predecessors| {
+                                        !predecessors.is_empty()
+                                            && predecessors
+                                                .iter()
+                                                .all(|source| *source == node)
+                                    });
+                                if !isolated {
+                                    complete = false;
+                                    break;
+                                }
+                                cell_setcc_nodes.insert(consumer);
+                            } else {
+                                let Some(path) = scheduled_compare_path(
+                                    node,
+                                    consumer,
+                                    func,
+                                    &shape_nodes,
+                                ) else {
+                                    complete = false;
+                                    break;
+                                };
+                                let Some(fallthroughs) = raw_next_by_source.get(&consumer)
+                                else {
+                                    complete = false;
+                                    break;
+                                };
+                                if fallthroughs.len() != 1 {
+                                    complete = false;
+                                    break;
+                                }
+                                let fallthrough = *fallthroughs
+                                    .iter()
+                                    .next()
+                                    .expect("one checked SETcc fallthrough");
+                                if !node_functions.get(&fallthrough).is_some_and(|owners| {
+                                    owners.len() == 1 && owners.contains(&func)
+                                }) || cell_scheduled_compare_plans
+                                    .insert(
+                                        node,
+                                        (path, BTreeSet::from([fallthrough])),
+                                    )
+                                    .is_some()
+                                {
+                                    complete = false;
+                                    break;
+                                }
+                                emit_node = consumer;
+                            }
                         }
                         Some(RTLInst::Icond(
                             _,
@@ -15021,21 +15281,52 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                             }
                             let &(plan_func, jcc, target, fallthrough) =
                                 plans.iter().next().expect("one checked home Jcc plan");
-                            let branch_is_isolated = raw_predecessors
-                                .get(&jcc)
-                                .is_some_and(|predecessors| {
-                                    !predecessors.is_empty()
-                                        && predecessors.iter().all(|source| *source == node)
-                                });
                             if plan_func != func
                                 || *if_true != target
                                 || *if_false != fallthrough
-                                || !branch_is_isolated
                             {
                                 complete = false;
                                 break;
                             }
-                            cell_jcc_plans.insert((node, jcc, target, fallthrough));
+                            let adjacent = raw_next_by_source
+                                .get(&node)
+                                .is_some_and(|successors| successors.contains(&jcc));
+                            if adjacent {
+                                let branch_is_isolated = raw_predecessors
+                                    .get(&jcc)
+                                    .is_some_and(|predecessors| {
+                                        !predecessors.is_empty()
+                                            && predecessors
+                                                .iter()
+                                                .all(|source| *source == node)
+                                    });
+                                if !branch_is_isolated {
+                                    complete = false;
+                                    break;
+                                }
+                                cell_jcc_plans.insert((node, jcc, target, fallthrough));
+                            } else {
+                                let Some(path) = scheduled_compare_path(
+                                    node,
+                                    jcc,
+                                    func,
+                                    &shape_nodes,
+                                ) else {
+                                    complete = false;
+                                    break;
+                                };
+                                if cell_scheduled_compare_plans
+                                    .insert(
+                                        node,
+                                        (path, BTreeSet::from([target, fallthrough])),
+                                    )
+                                    .is_some()
+                                {
+                                    complete = false;
+                                    break;
+                                }
+                                emit_node = jcc;
+                            }
                         }
                         _ => {
                             complete = false;
@@ -15045,11 +15336,31 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                     cell_rewrites.insert(
                         node,
                         UnsafeHomeRewrite::Compare {
+                            emit_node,
                             inst: candidates.pop().unwrap(),
                         },
                     );
                 }
             }
+        }
+
+        // If this scalar cell's address escapes, an otherwise unrelated
+        // indirect MOV store on the scheduled path may alias it.  Direct home
+        // accesses were rejected by `scheduled_compare_path`; reject the
+        // remaining write-through-alias possibility rather than rereading a
+        // value at the consumer that may differ from the value CMP observed.
+        if !cell_addresses.is_empty()
+            && cell_scheduled_compare_plans.values().any(|(path, _)| {
+                path[1..path.len() - 1].iter().any(|node| {
+                    candidates_at.get(node).is_some_and(|candidates| {
+                        candidates
+                            .iter()
+                            .any(|candidate| matches!(candidate, RTLInst::Istore(..)))
+                    })
+                })
+            })
+        {
+            complete = false;
         }
 
         let primary_type = if backing_required.contains(&key) {
@@ -15075,6 +15386,16 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                     Some(owners) => owners.len() != 1 || !owners.contains(&func),
                     None => true,
                 }
+        }) {
+            continue;
+        }
+        if cell_rewrites.values().any(|rewrite| match rewrite {
+            UnsafeHomeRewrite::Compare { emit_node, .. } => node_functions
+                .get(emit_node)
+                .map_or(true, |owners| {
+                    owners.len() != 1 || !owners.contains(&func)
+                }),
+            _ => false,
         }) {
             continue;
         }
@@ -15107,6 +15428,19 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         }) {
             continue;
         }
+        let mut cell_scheduled_path_nodes = BTreeSet::new();
+        let scheduled_paths_are_disjoint = cell_scheduled_compare_plans
+            .iter()
+            .all(|(root, (path, _))| {
+                !selected_scheduled_compare_plans.contains_key(root)
+                    && path.iter().all(|node| {
+                        !selected_scheduled_path_nodes.contains(node)
+                            && cell_scheduled_path_nodes.insert(*node)
+                    })
+            });
+        if !scheduled_paths_are_disjoint {
+            continue;
+        }
         storage.insert(key, slot);
         cell_types.insert(slot, primary_type);
         if backing_required.contains(&key) {
@@ -15130,6 +15464,8 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         backing_validated_candidates.extend(cell_candidate_class);
         rewritten_setcc_nodes.extend(cell_setcc_nodes);
         selected_home_jcc_plans.extend(cell_jcc_plans);
+        selected_scheduled_path_nodes.extend(cell_scheduled_path_nodes);
+        selected_scheduled_compare_plans.extend(cell_scheduled_compare_plans);
     }
 
     // A comparison candidate retained across the first safety scrub must
@@ -15168,6 +15504,59 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         db.rel_set(
             "rtl_succ_candidate",
             successors.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+    }
+
+    // Scheduled comparisons keep the CMP root as an Inop anchor and emit the
+    // condition at the original Jcc/SETcc node.  Rebuild the whole authenticated
+    // straight-line segment atomically so every intervening MOV/LEA executes
+    // before the consumer.  Existing bypass edges from the unsupported-root
+    // scrub are negated; exact path and terminal edges are un-negated.
+    if !selected_scheduled_compare_plans.is_empty() {
+        let mut planned_sources = BTreeSet::new();
+        let mut planned_edges = BTreeSet::new();
+        for (path, terminal_successors) in selected_scheduled_compare_plans.values() {
+            for edge in path.windows(2) {
+                planned_sources.insert(edge[0]);
+                planned_edges.insert((edge[0], edge[1]));
+            }
+            let consumer = *path.last().expect("scheduled compare path has a consumer");
+            planned_sources.insert(consumer);
+            planned_edges.extend(
+                terminal_successors
+                    .iter()
+                    .map(|successor| (consumer, *successor)),
+            );
+        }
+
+        let old_successors: BTreeSet<(Node, Node)> = db
+            .rel_iter::<(Node, Node)>("rtl_succ_candidate")
+            .copied()
+            .collect();
+        let mut successors: BTreeSet<(Node, Node)> = old_successors
+            .iter()
+            .filter(|(source, _)| !planned_sources.contains(source))
+            .copied()
+            .collect();
+        successors.extend(planned_edges.iter().copied());
+        db.rel_set(
+            "rtl_succ_candidate",
+            successors.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+
+        let mut negated: BTreeSet<(Node, Node)> = db
+            .rel_iter::<(Node, Node)>("rtl_edge_negated")
+            .copied()
+            .collect();
+        negated.extend(old_successors.into_iter().filter(|edge| {
+            planned_sources.contains(&edge.0) && !planned_edges.contains(edge)
+        }));
+        for edge in &planned_edges {
+            negated.remove(edge);
+        }
+        db.rel_set(
+            "rtl_edge_negated",
+            negated.into_iter().collect::<ascent::boxcar::Vec<_>>(),
         );
     }
 
@@ -15379,8 +15768,14 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
         .collect();
     rewritten_candidate_nodes.extend(rewritten_setcc_nodes);
     for (node, rewrite) in &rewrites {
-        if matches!(rewrite, UnsafeHomeRewrite::ArithRead { .. }) {
-            rewritten_candidate_nodes.insert(*node | (1u64 << 62));
+        match rewrite {
+            UnsafeHomeRewrite::ArithRead { .. } => {
+                rewritten_candidate_nodes.insert(*node | (1u64 << 62));
+            }
+            UnsafeHomeRewrite::Compare { emit_node, .. } => {
+                rewritten_candidate_nodes.insert(*emit_node);
+            }
+            _ => {}
         }
     }
 
@@ -15517,7 +15912,15 @@ fn select_canonical_unsafe_home_rewrites(db: &mut DecompileDB) {
                 ));
                 None
             }
-            UnsafeHomeRewrite::Compare { inst } => Some(inst),
+            UnsafeHomeRewrite::Compare { emit_node, inst } => {
+                if emit_node == node {
+                    Some(inst)
+                } else {
+                    selected.push((node, RTLInst::Inop));
+                    selected.push((emit_node, inst));
+                    None
+                }
+            }
         };
         if let Some(inst) = inst {
             selected.push((node, inst));

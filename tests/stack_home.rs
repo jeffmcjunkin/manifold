@@ -632,18 +632,47 @@ home_cmp_flag_clobber_rejected_nonzero:
         movl $1, %eax
         retq
 
-        .globl home_cmp_scheduled_rejected
-        .def home_cmp_scheduled_rejected; .scl 2; .type 32; .endef
-home_cmp_scheduled_rejected:
+        .globl home_cmp_scheduled_jcc
+        .def home_cmp_scheduled_jcc; .scl 2; .type 32; .endef
+home_cmp_scheduled_jcc:
         movq %rcx, 8(%rsp)
         movq %rdx, 8(%rsp)
         cmpq $0, 8(%rsp)
         movq %r8, %r9
+        movups %xmm0, %xmm1
         movq %rdx, %r8
-        jne home_cmp_scheduled_rejected_nonzero
+        jne home_cmp_scheduled_jcc_nonzero
         xorl %eax, %eax
         retq
-home_cmp_scheduled_rejected_nonzero:
+home_cmp_scheduled_jcc_nonzero:
+        movl $1, %eax
+        retq
+
+        .globl home_cmp_scheduled_setcc
+        .def home_cmp_scheduled_setcc; .scl 2; .type 32; .endef
+home_cmp_scheduled_setcc:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        movl %r8d, %eax
+        subq $40, %rsp
+        cmpq $0, 48(%rsp)
+        movl %eax, 32(%rsp)
+        setne %al
+        movzbl %al, %eax
+        addq $40, %rsp
+        retq
+
+        .globl home_cmp_scheduled_home_write_rejected
+        .def home_cmp_scheduled_home_write_rejected; .scl 2; .type 32; .endef
+home_cmp_scheduled_home_write_rejected:
+        movq %rcx, 8(%rsp)
+        movq %rdx, 8(%rsp)
+        cmpq $0, 8(%rsp)
+        movq %r8, 8(%rsp)
+        jne home_cmp_scheduled_home_write_rejected_nonzero
+        xorl %eax, %eax
+        retq
+home_cmp_scheduled_home_write_rejected_nonzero:
         movl $1, %eax
         retq
 
@@ -4041,6 +4070,187 @@ fn assert_home_accesses_use_slot(
     assert_home_accesses_use_slot_at_position(db, name, span, slot, 0);
 }
 
+fn decoded_path(db: &DecompileDB, start: Address, end: Address) -> Vec<Address> {
+    let mut path = vec![start];
+    let mut seen = HashSet::from([start]);
+    let mut current = start;
+    while current != end {
+        let successors: Vec<_> = db
+            .rel_iter::<(Address, Address)>("next")
+            .filter_map(|(source, destination)| (*source == current).then_some(*destination))
+            .collect();
+        assert_eq!(
+            successors.len(),
+            1,
+            "scheduled fixture lost its unique decoded path at {current:#x}: {successors:#x?}"
+        );
+        current = successors[0];
+        assert!(
+            seen.insert(current),
+            "scheduled fixture's decoded path cycles before {end:#x}: {path:#x?}"
+        );
+        path.push(current);
+    }
+    path
+}
+
+fn rtl_successors(db: &DecompileDB, source: Address) -> HashSet<Address> {
+    db.rel_iter::<(Address, Address)>("rtl_succ_candidate")
+        .filter_map(|(candidate_source, destination)| {
+            (*candidate_source == source).then_some(*destination)
+        })
+        .collect()
+}
+
+fn assert_scheduled_home_comparisons(db: &DecompileDB) {
+    let (jcc_span, jcc_slot) = canonical_home_storage(db, "home_cmp_scheduled_jcc");
+    let jcc_compare = db
+        .rel_iter::<(Address, Address, Symbol, Mreg, i64, usize, i64, usize)>(
+            "win64_home_scalar_cmp_read",
+        )
+        .find_map(|(node, func, _, _, _, _, _, _)| (*func == jcc_span.0).then_some(*node))
+        .expect("scheduled Jcc fixture lost its comparison shape");
+    let jcc_plan = db
+        .rel_iter::<(Address, Address, Address, Address, Address)>(
+            "win64_home_cmp_jcc_plan",
+        )
+        .find_map(|(root, func, consumer, target, fallthrough)| {
+            ((*root, *func) == (jcc_compare, jcc_span.0))
+                .then_some((*consumer, *target, *fallthrough))
+        })
+        .expect("scheduled Jcc fixture lost its flag-provenance plan");
+    let jcc_path = decoded_path(db, jcc_compare, jcc_plan.0);
+    assert_eq!(
+        jcc_path.len(),
+        5,
+        "scheduled Jcc fixture no longer contains its three bridge instructions"
+    );
+    assert_eq!(
+        rtl_candidates(db, jcc_compare),
+        vec![RTLInst::Inop],
+        "scheduled Jcc comparison was not retained as a CFG anchor"
+    );
+    let jcc_candidates = rtl_candidates(db, jcc_plan.0);
+    assert!(
+        jcc_candidates.iter().any(|inst| matches!(
+            inst,
+            RTLInst::Icond(
+                _,
+                args,
+                either::Either::Right(target),
+                either::Either::Right(fallthrough),
+            ) if args.contains(&jcc_slot)
+                && (*target, *fallthrough) == (jcc_plan.1, jcc_plan.2)
+        )),
+        "scheduled Jcc did not receive the canonical-cell condition: {jcc_candidates:#x?}"
+    );
+    for bridge in &jcc_path[1..jcc_path.len() - 1] {
+        let candidates = rtl_candidates(db, *bridge);
+        assert!(
+            candidates.iter().any(|inst| !matches!(
+                inst,
+                RTLInst::Icond(..)
+                    | RTLInst::Ibranch(..)
+                    | RTLInst::Ijumptable(..)
+                    | RTLInst::Ireturn(..)
+                    | RTLInst::Itailcall(..)
+            )),
+            "scheduled Jcc lost bridge instruction {bridge:#x}: {candidates:#x?}"
+        );
+    }
+    for edge in jcc_path.windows(2) {
+        assert_eq!(
+            rtl_successors(db, edge[0]),
+            HashSet::from([edge[1]]),
+            "scheduled Jcc path was bypassed at {:#x}",
+            edge[0]
+        );
+    }
+    assert_eq!(
+        rtl_successors(db, jcc_plan.0),
+        HashSet::from([jcc_plan.1, jcc_plan.2]),
+        "scheduled Jcc consumer lost its exact branch destinations"
+    );
+    assert!(
+        !db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+            .any(|(func, _, _)| *func == jcc_span.0),
+        "scheduled Jcc retained an unsupported stack-address reason"
+    );
+
+    let (setcc_span, setcc_slot) = canonical_home_storage(db, "home_cmp_scheduled_setcc");
+    let setcc_compare = db
+        .rel_iter::<(Address, Address, Symbol, Mreg, i64, usize, i64, usize)>(
+            "win64_home_scalar_cmp_read",
+        )
+        .find_map(|(node, func, _, _, _, _, _, _)| {
+            (*func == setcc_span.0).then_some(*node)
+        })
+        .expect("scheduled SETcc fixture lost its comparison shape");
+    let setcc = db
+        .rel_iter::<(Address, TestCond)>("setcc_testcond")
+        .find_map(|(node, _)| in_span(*node, setcc_span).then_some(*node))
+        .expect("scheduled SETcc fixture lost its consumer");
+    let setcc_plan: Vec<_> = db
+        .rel_iter::<(Address, Address)>("win64_home_cmp_setcc_plan")
+        .filter_map(|(root, consumer)| (*root == setcc_compare).then_some(*consumer))
+        .collect();
+    assert_eq!(
+        setcc_plan,
+        vec![setcc],
+        "scheduled SETcc plan did not retain its authenticated consumer"
+    );
+    let setcc_path = decoded_path(db, setcc_compare, setcc);
+    assert_eq!(
+        setcc_path.len(),
+        3,
+        "scheduled SETcc fixture no longer contains its intervening store"
+    );
+    assert_eq!(
+        rtl_candidates(db, setcc_compare),
+        vec![RTLInst::Inop],
+        "scheduled SETcc comparison was not retained as a CFG anchor"
+    );
+    let setcc_candidates = rtl_candidates(db, setcc);
+    assert!(
+        setcc_candidates.iter().any(|inst| matches!(
+            inst,
+            RTLInst::Iop(Operation::Ocmp(_), args, _) if args.contains(&setcc_slot)
+        )),
+        "scheduled SETcc did not receive the canonical-cell comparison: {setcc_candidates:#x?}"
+    );
+    let store = setcc_path[1];
+    let store_candidates = rtl_candidates(db, store);
+    assert!(
+        store_candidates.iter().any(|inst| matches!(
+            inst,
+            RTLInst::Istore(..) | RTLInst::Iop(Operation::Omove, _, _)
+        )),
+        "scheduled SETcc lost its pre-consumer store: {store_candidates:#x?}"
+    );
+    for edge in setcc_path.windows(2) {
+        assert_eq!(
+            rtl_successors(db, edge[0]),
+            HashSet::from([edge[1]]),
+            "scheduled SETcc path was bypassed at {:#x}",
+            edge[0]
+        );
+    }
+    let setcc_fallthrough = db
+        .rel_iter::<(Address, Address)>("next")
+        .find_map(|(source, destination)| (*source == setcc).then_some(*destination))
+        .expect("scheduled SETcc lost its decoded fallthrough");
+    assert_eq!(
+        rtl_successors(db, setcc),
+        HashSet::from([setcc_fallthrough]),
+        "scheduled SETcc consumer lost its exact fallthrough"
+    );
+    assert!(
+        !db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+            .any(|(func, _, _)| *func == setcc_span.0),
+        "scheduled SETcc retained an unsupported stack-address reason"
+    );
+}
+
 fn assert_canonical_unsafe_home_storage(db: &DecompileDB) {
     let (reassigned, reassigned_slot) = canonical_home_storage(db, "home_reassigned");
     assert_home_accesses_use_slot(db, "home_reassigned", reassigned, reassigned_slot);
@@ -4074,6 +4284,8 @@ fn assert_canonical_unsafe_home_storage(db: &DecompileDB) {
         reassigned_cmp_reg,
         reassigned_cmp_reg_slot,
     );
+
+    assert_scheduled_home_comparisons(db);
 
     for name in [
         "home_reassigned_cmp_setcc",
@@ -4619,6 +4831,8 @@ fn assert_optimized_canonical_homes(db: &DecompileDB) {
         ("home_reassigned_cmp_reg", 0, XType::Xany64),
         ("home_reassigned_cmp_setcc", 0, XType::Xany64),
         ("home_reassigned_cmp_reg_setcc", 0, XType::Xany64),
+        ("home_cmp_scheduled_jcc", 0, XType::Xany64),
+        ("home_cmp_scheduled_setcc", 0, XType::Xany64),
         ("home_reassigned_cmp_loop", 0, XType::Xany64),
         ("home_cmp_after_alias_clobber", 3, XType::Xany64),
         ("home_local_call_adjacent_cmp", 3, XType::Xany64),
@@ -5516,7 +5730,7 @@ fn assert_home_safety_vetoes(db: &DecompileDB) {
         ("home_wide_overlap", Mreg::CX),
         ("home_escape_numeric_use", Mreg::CX),
         ("home_cmp_flag_clobber_rejected", Mreg::CX),
-        ("home_cmp_scheduled_rejected", Mreg::CX),
+        ("home_cmp_scheduled_home_write_rejected", Mreg::CX),
         ("home_backing_cmp_flag_clobber_rejected", Mreg::CX),
         ("home_backing_test_scheduled_rejected", Mreg::CX),
         ("home_backing_cmov_scheduled_rejected", Mreg::CX),
@@ -5573,7 +5787,7 @@ fn assert_home_safety_vetoes(db: &DecompileDB) {
         "home_xchg_mutation",
         "home_wide_overlap",
         "home_cmp_flag_clobber_rejected",
-        "home_cmp_scheduled_rejected",
+        "home_cmp_scheduled_home_write_rejected",
         "home_backing_cmp_flag_clobber_rejected",
         "home_backing_test_scheduled_rejected",
         "home_backing_cmov_scheduled_rejected",
@@ -6307,6 +6521,8 @@ fn assert_final_output_compiles(object: &Path) {
         "home_reassigned_cmp_reg",
         "home_reassigned_cmp_setcc",
         "home_reassigned_cmp_reg_setcc",
+        "home_cmp_scheduled_jcc",
+        "home_cmp_scheduled_setcc",
         "home_reassigned_cmp_loop",
         "home_cmp_after_alias_clobber",
         "home_local_call_adjacent_cmp",
