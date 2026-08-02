@@ -1155,6 +1155,18 @@ ascent_par! {
         block_in_function(blockaddr, func),
         code_in_block(addr, blockaddr);
 
+    // Physical adjacency may bridge decoder layout gaps which have no CFG
+    // owner, but it must not claim a block already assigned to another
+    // function.  A nested/internal callable is not always surfaced as a
+    // ddisasm_function_entry, so the explicit block owner is the authoritative
+    // boundary in that case.
+    #[local] relation instruction_has_foreign_block_owner(Address, Address);
+    instruction_has_foreign_block_owner(*addr, *func) <--
+        code_in_block(addr, block),
+        block_in_function(block, owner),
+        func_span(_, func, _),
+        if owner != func;
+
     instr_in_function(next_addr, func) <--
         instr_in_function(addr, func),
         next(addr, next_addr),
@@ -1162,7 +1174,8 @@ ascent_par! {
         if *next_addr > *addr,
         if *next_addr < *end_addr,
         !ddisasm_function_entry(*next_addr),
-        if *next_addr != *func;
+        if *next_addr != *func,
+        !instruction_has_foreign_block_owner(next_addr, func);
 
 
     relation pcast(Address, Symbol, Symbol);
@@ -11003,6 +11016,125 @@ mod rsp_layout_sandwich_tests {
                     "lost diagnostic for {name}"
                 );
             }
+        });
+    }
+}
+
+#[cfg(test)]
+mod physical_function_ownership_tests {
+    use super::*;
+
+    const OUTER_FUNCTION: Address = 0x1000;
+    const LAYOUT_GAP: Address = 0x1010;
+    const INNER_FUNCTION: Address = 0x1020;
+    const INNER_BODY: Address = 0x1028;
+    const OUTER_CONTINUATION: Address = 0x1030;
+    const OUTER_END: Address = 0x1100;
+    const INNER_END: Address = 0x1080;
+    const NONE: Symbol = "physical_owner_none";
+    const INNER_RSP_MEMORY: Symbol = "physical_owner_inner_rsp_memory";
+    const CONTINUATION_RSP_MEMORY: Symbol = "physical_owner_continuation_rsp_memory";
+
+    fn on_pipeline_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("physical-function-ownership-test".to_string())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn physical ownership test")
+            .join()
+            .expect("physical ownership test panicked");
+    }
+
+    #[test]
+    fn physical_next_crosses_unassigned_gap_but_stops_at_foreign_block_owner() {
+        on_pipeline_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            prog.func_span
+                .push(("outer_function", OUTER_FUNCTION, OUTER_END));
+            prog.func_span
+                .push(("inner_function", INNER_FUNCTION, INNER_END));
+
+            // The layout gap deliberately has no block_in_function row.  The
+            // inner callable has an explicit CFG owner, but no independently
+            // discovered ddisasm_function_entry row.
+            prog.block_in_function
+                .push((OUTER_FUNCTION, OUTER_FUNCTION));
+            prog.block_in_function
+                .push((INNER_FUNCTION, INNER_FUNCTION));
+            prog.block_in_function
+                .push((OUTER_CONTINUATION, OUTER_FUNCTION));
+            prog.code_in_block
+                .push((OUTER_FUNCTION, OUTER_FUNCTION));
+            prog.code_in_block.push((LAYOUT_GAP, LAYOUT_GAP));
+            prog.code_in_block
+                .push((INNER_FUNCTION, INNER_FUNCTION));
+            prog.code_in_block.push((INNER_BODY, INNER_FUNCTION));
+            prog.code_in_block
+                .push((OUTER_CONTINUATION, OUTER_CONTINUATION));
+
+            prog.next.push((OUTER_FUNCTION, LAYOUT_GAP));
+            prog.next.push((LAYOUT_GAP, INNER_FUNCTION));
+            prog.next.push((INNER_FUNCTION, INNER_BODY));
+            prog.next.push((INNER_BODY, OUTER_CONTINUATION));
+            prog.instruction.push((
+                INNER_BODY,
+                1,
+                "",
+                "MOV",
+                INNER_RSP_MEMORY,
+                NONE,
+                NONE,
+                NONE,
+                0,
+                0,
+            ));
+            prog.instruction.push((
+                OUTER_CONTINUATION,
+                1,
+                "",
+                "MOV",
+                CONTINUATION_RSP_MEMORY,
+                NONE,
+                NONE,
+                NONE,
+                0,
+                0,
+            ));
+            prog.op_indirect
+                .push((INNER_RSP_MEMORY, "NONE", "RSP", "NONE", 1, 8, 8));
+            prog.op_indirect.push((
+                CONTINUATION_RSP_MEMORY,
+                "NONE",
+                "RSP",
+                "NONE",
+                1,
+                16,
+                8,
+            ));
+
+            prog.run();
+
+            let owners = |address| {
+                prog.instr_in_function
+                    .iter()
+                    .filter_map(|(node, function)| (*node == address).then_some(*function))
+                    .collect::<BTreeSet<_>>()
+            };
+            assert_eq!(owners(OUTER_FUNCTION), BTreeSet::from([OUTER_FUNCTION]));
+            assert_eq!(owners(LAYOUT_GAP), BTreeSet::from([OUTER_FUNCTION]));
+            assert_eq!(owners(INNER_FUNCTION), BTreeSet::from([INNER_FUNCTION]));
+            assert_eq!(owners(INNER_BODY), BTreeSet::from([INNER_FUNCTION]));
+            assert_eq!(
+                owners(OUTER_CONTINUATION),
+                BTreeSet::from([OUTER_FUNCTION])
+            );
+            assert!(!prog
+                .unsafe_stack_access
+                .iter()
+                .any(|(_, address, reason)| {
+                    matches!(*address, INNER_BODY | OUTER_CONTINUATION)
+                        && *reason == "shared-stack-node"
+                }));
         });
     }
 }
