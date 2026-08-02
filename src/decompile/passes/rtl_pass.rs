@@ -14,6 +14,9 @@ use crate::util::DEFAULT_VAR;
 use crate::x86::asm::{Ireg, TestCond};
 use crate::x86::mach::X86Mreg;
 use crate::x86::op::{Addressing, Comparison, Condition, Operation};
+use crate::x86::registers::{
+    is_x86_64_gp_register_name, x86_gp_operand_width, x86_gp_value_width,
+};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use ascent::lattice::set::Set;
@@ -184,80 +187,6 @@ fn win64_home_compare_bridge_mnemonic(mnem: &str) -> bool {
 // instructions covers compiler scheduling without turning this local pattern
 // into whole-function reachability.
 const WIN64_HOME_COMPARE_BRIDGE_LIMIT: i64 = 8;
-
-fn is_x86_64_gp_register_name(name: &str) -> bool {
-    matches!(
-        name,
-        "RAX"
-            | "RBX"
-            | "RCX"
-            | "RDX"
-            | "RSI"
-            | "RDI"
-            | "RBP"
-            | "RSP"
-            | "R8"
-            | "R9"
-            | "R10"
-            | "R11"
-            | "R12"
-            | "R13"
-            | "R14"
-            | "R15"
-    )
-}
-
-fn x86_gp_value_width(name: &str) -> Option<usize> {
-    if is_x86_64_gp_register_name(name) {
-        return Some(8);
-    }
-    matches!(
-        name,
-        "EAX"
-            | "EBX"
-            | "ECX"
-            | "EDX"
-            | "ESI"
-            | "EDI"
-            | "EBP"
-            | "ESP"
-            | "R8D"
-            | "R9D"
-            | "R10D"
-            | "R11D"
-            | "R12D"
-            | "R13D"
-            | "R14D"
-            | "R15D"
-    )
-    .then_some(4)
-}
-
-// Complete decoded GP operand width.  Unlike x86_gp_value_width, whose
-// existing users intentionally accept only the C value widths represented by
-// RTL registers, this helper preserves byte/word spellings for instruction
-// evidence.  Callers which cannot represent AH/BH/CH/DH must reject those
-// explicitly before collapsing the name to Mreg.
-fn x86_gp_operand_width(name: &str) -> Option<usize> {
-    if let Some(width) = x86_gp_value_width(name) {
-        return Some(width);
-    }
-    if matches!(
-        name,
-        "AX" | "BX" | "CX" | "DX" | "SI" | "DI" | "BP" | "SP"
-            | "R8W" | "R9W" | "R10W" | "R11W" | "R12W" | "R13W"
-            | "R14W" | "R15W"
-    ) {
-        return Some(2);
-    }
-    matches!(
-        name,
-        "AL" | "BL" | "CL" | "DL" | "AH" | "BH" | "CH" | "DH"
-            | "SIL" | "DIL" | "BPL" | "SPL" | "R8B" | "R9B" | "R10B"
-            | "R11B" | "R12B" | "R13B" | "R14B" | "R15B"
-    )
-    .then_some(1)
-}
 
 fn win64_home_rmw_source_width(name: &str) -> Option<usize> {
     (!matches!(name, "AH" | "BH" | "CH" | "DH"))

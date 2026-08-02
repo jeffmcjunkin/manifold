@@ -7,6 +7,7 @@ use crate::{declare_io_from, run_pass};
 use crate::mreg::Mreg;
 use crate::x86::asm::{Freg, Ireg, Preg, TestCond};
 use crate::x86::op::{Addressing, Comparison, Condition, Operation};
+use crate::x86::registers::x86_gp_operand_width;
 use crate::x86::types::*;
 use ascent::aggregators;
 use ascent::ascent_par;
@@ -3220,6 +3221,14 @@ ascent_par! {
         preg_of(mreg, preg_of_r),
         reg_def(d, mreg),
         if *addr0 < *d && *d < *addr1;
+    flags_args_redefined_between(addr0, addr1) <--
+        secondary_flags_consumer(addr0, addr1),
+        ptest(addr0, _, r2),
+        op_register(r2, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r),
+        reg_def(d, mreg),
+        if *addr0 < *d && *d < *addr1;
 
     #[local] relation secondary_safe(Address, Address);
     secondary_safe(addr0, addr1) <--
@@ -3256,6 +3265,12 @@ ascent_par! {
     reg_use(addr1, mreg) <--
         secondary_safe(addr0, addr1),
         ptest(addr0, r, _),
+        op_register(r, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r);
+    reg_use(addr1, mreg) <--
+        secondary_safe(addr0, addr1),
+        ptest(addr0, _, r),
         op_register(r, reg_str),
         ireg_of(preg_of_r, Ireg::from(reg_str)),
         preg_of(mreg, preg_of_r);
@@ -3434,6 +3449,33 @@ ascent_par! {
             Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, 0),
             Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, 0),
             other => other,
+        };
+
+    // TEST between two distinct GP registers is a bitwise intersection, not a
+    // comparison against either operand.  Preserve the decoded subregister
+    // width before Ireg/Mreg aliasing collapses AL/AX/EAX/RAX.  Legacy high-8
+    // operands are excluded because a low-byte cast cannot represent their
+    // bit offset within the parent register.
+    mach_inst(emit_addr, MachInst::Mcond(condition, Arc::new(vec![*arg1, *arg2]), lbl)) <--
+        ptest(addr0, r1, r2),
+        op_register(r1, reg_str1),
+        op_register(r2, reg_str2),
+        if reg_str1 != reg_str2,
+        if !is_reg_high8(reg_str1) && !is_reg_high8(reg_str2),
+        if let Some(width1) = x86_gp_operand_width(reg_str1),
+        if let Some(width2) = x86_gp_operand_width(reg_str2),
+        if width1 == width2,
+        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
+        ireg_of(preg_of_r2, Ireg::from(reg_str2)),
+        preg_of(arg1, preg_of_r1),
+        preg_of(arg2, preg_of_r2),
+        mcond_emit_addr(addr0, addr1, emit_addr),
+        pjcc(addr1, test_cond, lbl),
+        if matches!(test_cond, TestCond::CondE | TestCond::CondNe),
+        let condition = match test_cond {
+            TestCond::CondE => Condition::Ctestzero(width1),
+            TestCond::CondNe => Condition::Ctestnotzero(width1),
+            _ => unreachable!(),
         };
 
 

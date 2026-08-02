@@ -1898,6 +1898,8 @@ pub(crate) fn invert_condition(cond: &Condition) -> Condition {
         Condition::Ccompluimm(c, imm) => Condition::Ccompluimm(invert_comparison(c), *imm),
         Condition::Cmaskzero(m) => Condition::Cmasknotzero(*m),
         Condition::Cmasknotzero(m) => Condition::Cmaskzero(*m),
+        Condition::Ctestzero(width) => Condition::Ctestnotzero(*width),
+        Condition::Ctestnotzero(width) => Condition::Ctestzero(*width),
         Condition::Cnotcompf(c) => Condition::Ccompf(*c),
         Condition::Cnotcompfs(c) => Condition::Ccompfs(*c),
         // OF-set <-> OF-clear is an exact logical negation (the flag is a single bit).
@@ -3328,6 +3330,38 @@ fn is_int32_type(ty: &ClightType) -> bool {
     matches!(ty, ClightType::Tint(ClightIntSize::I32, _, _))
 }
 
+fn unsigned_test_operand(expr: ClightExpr, width: usize) -> Option<(ClightExpr, ClightType)> {
+    let result_type = match width {
+        1 | 2 | 4 => default_uint_type(),
+        8 => default_ulong_type(),
+        _ => return None,
+    };
+    let narrowed = match width {
+        1 => ClightExpr::Ecast(
+            Box::new(expr),
+            ClightType::Tint(
+                ClightIntSize::I8,
+                ClightSignedness::Unsigned,
+                default_attr(),
+            ),
+        ),
+        2 => ClightExpr::Ecast(
+            Box::new(expr),
+            ClightType::Tint(
+                ClightIntSize::I16,
+                ClightSignedness::Unsigned,
+                default_attr(),
+            ),
+        ),
+        4 | 8 => expr,
+        _ => unreachable!(),
+    };
+    Some((
+        ClightExpr::Ecast(Box::new(narrowed), result_type.clone()),
+        result_type,
+    ))
+}
+
 pub(crate) fn clight_condition_expr_with_types(
     cond: &Condition,
     args: &[CsharpminorExpr],
@@ -3551,6 +3585,38 @@ pub(crate) fn clight_condition_expr_with_types(
             } else {
                 Some(ClightExpr::EconstInt(1, default_bool_type()))
             }
+        }
+        Condition::Ctestzero(width) | Condition::Ctestnotzero(width) => {
+            if args.len() != 2 {
+                return None;
+            }
+            let lhs = clight_expr_from_csharp_with_multi_types(&args[0], var_types);
+            let rhs = clight_expr_from_csharp_with_multi_types(&args[1], var_types);
+            let (lhs, value_type) = unsigned_test_operand(lhs, *width)?;
+            let (rhs, rhs_type) = unsigned_test_operand(rhs, *width)?;
+            debug_assert_eq!(value_type, rhs_type);
+            let tested = ClightExpr::Ebinop(
+                ClightBinaryOp::Oand,
+                Box::new(lhs),
+                Box::new(rhs),
+                value_type.clone(),
+            );
+            let zero = if *width == 8 {
+                ClightExpr::EconstLong(0, value_type)
+            } else {
+                ClightExpr::EconstInt(0, value_type)
+            };
+            let comparison = if matches!(cond, Condition::Ctestzero(_)) {
+                ClightBinaryOp::Oeq
+            } else {
+                ClightBinaryOp::One
+            };
+            Some(ClightExpr::Ebinop(
+                comparison,
+                Box::new(tested),
+                Box::new(zero),
+                default_bool_type(),
+            ))
         }
         Condition::Cnotcompf(comp) => {
             let inner =
@@ -5295,5 +5361,140 @@ fn typ_to_clight_type(typ: &Typ) -> ClightType {
         Typ::Tfloat => default_float_type(),
         Typ::Tsingle => default_single_type(),
         _ => default_int_type(),
+    }
+}
+
+#[cfg(test)]
+mod unequal_register_test_condition_tests {
+    use super::*;
+
+    fn expected_operand(reg: RTLReg, width: usize) -> ClightExpr {
+        let source = ClightExpr::Etempvar(ident_from_reg(reg), default_ulong_type());
+        let result_type = if width == 8 {
+            default_ulong_type()
+        } else {
+            default_uint_type()
+        };
+        let narrowed = match width {
+            1 => ClightExpr::Ecast(
+                Box::new(source),
+                ClightType::Tint(
+                    ClightIntSize::I8,
+                    ClightSignedness::Unsigned,
+                    default_attr(),
+                ),
+            ),
+            2 => ClightExpr::Ecast(
+                Box::new(source),
+                ClightType::Tint(
+                    ClightIntSize::I16,
+                    ClightSignedness::Unsigned,
+                    default_attr(),
+                ),
+            ),
+            4 | 8 => source,
+            _ => unreachable!(),
+        };
+        ClightExpr::Ecast(Box::new(narrowed), result_type)
+    }
+
+    fn expected_test(reg1: RTLReg, reg2: RTLReg, width: usize, zero: bool) -> ClightExpr {
+        let value_type = if width == 8 {
+            default_ulong_type()
+        } else {
+            default_uint_type()
+        };
+        let intersection = ClightExpr::Ebinop(
+            ClightBinaryOp::Oand,
+            Box::new(expected_operand(reg1, width)),
+            Box::new(expected_operand(reg2, width)),
+            value_type.clone(),
+        );
+        let zero_value = if width == 8 {
+            ClightExpr::EconstLong(0, value_type)
+        } else {
+            ClightExpr::EconstInt(0, value_type)
+        };
+        ClightExpr::Ebinop(
+            if zero {
+                ClightBinaryOp::Oeq
+            } else {
+                ClightBinaryOp::One
+            },
+            Box::new(intersection),
+            Box::new(zero_value),
+            default_bool_type(),
+        )
+    }
+
+    #[test]
+    fn unequal_register_test_conditions_emit_width_exact_unsigned_and() {
+        let args = [CsharpminorExpr::Evar(11), CsharpminorExpr::Evar(22)];
+        let var_types = MultiVarTypeMap::from([
+            (11, vec![default_ulong_type()]),
+            (22, vec![default_ulong_type()]),
+        ]);
+
+        for width in [1, 2, 4, 8] {
+            let zero = clight_condition_expr_with_types(
+                &Condition::Ctestzero(width),
+                &args,
+                &var_types,
+            );
+            assert_eq!(zero, Some(expected_test(11, 22, width, true)));
+
+            let nonzero = clight_condition_expr_with_types(
+                &Condition::Ctestnotzero(width),
+                &args,
+                &var_types,
+            );
+            assert_eq!(nonzero, Some(expected_test(11, 22, width, false)));
+        }
+    }
+
+    #[test]
+    fn unequal_register_test_conditions_reject_malformed_inputs() {
+        let args = [CsharpminorExpr::Evar(11), CsharpminorExpr::Evar(22)];
+        let var_types = MultiVarTypeMap::new();
+
+        assert_eq!(
+            clight_condition_expr_with_types(&Condition::Ctestzero(3), &args, &var_types),
+            None
+        );
+        assert_eq!(
+            clight_condition_expr_with_types(
+                &Condition::Ctestzero(4),
+                &args[..1],
+                &var_types
+            ),
+            None
+        );
+        let three_args = [
+            CsharpminorExpr::Evar(11),
+            CsharpminorExpr::Evar(22),
+            CsharpminorExpr::Evar(33),
+        ];
+        assert_eq!(
+            clight_condition_expr_with_types(
+                &Condition::Ctestnotzero(4),
+                &three_args,
+                &var_types
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unequal_register_test_conditions_invert_without_losing_width() {
+        for width in [1, 2, 4, 8] {
+            assert_eq!(
+                invert_condition(&Condition::Ctestzero(width)),
+                Condition::Ctestnotzero(width)
+            );
+            assert_eq!(
+                invert_condition(&Condition::Ctestnotzero(width)),
+                Condition::Ctestzero(width)
+            );
+        }
     }
 }

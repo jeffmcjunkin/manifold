@@ -19,6 +19,10 @@ pub enum Condition {
     Cnotcompfs(Comparison),
     Cmaskzero(i64),
     Cmasknotzero(i64),
+    /// `(lhs & rhs) == 0`, with the decoded GP operand width in bytes.
+    Ctestzero(usize),
+    /// `(lhs & rhs) != 0`, with the decoded GP operand width in bytes.
+    Ctestnotzero(usize),
     // OF tests (JO/JNO) have no faithful CompCert encoding; these opaque variants exist to keep both Jcc edges.
     Coverflow,
     Cnotoverflow,
