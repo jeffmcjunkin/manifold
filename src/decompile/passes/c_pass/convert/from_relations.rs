@@ -5794,7 +5794,7 @@ fn order_nodes_dfs(
 
     let mut result: Vec<_> = post_order.into_iter().rev().collect();
 
-    // Disconnected members (edges lost to bundling or genuinely dead) are inserted BEFORE the trailing exit run, not after it -- placing them after would let the consumer's dead-statement trim silently drop them. exec_order_key is a last-resort presentation tiebreak, not a reachability decision.
+    // Disconnected members (edges lost to bundling or genuinely dead) are inserted BEFORE the trailing exit run, not after it -- placing them after would let the consumer's dead-statement trim silently drop them.  The authenticated function entry is a hard lower bound, though: when structuring has folded the whole reachable body into an exiting entry statement, moving a disconnected exit ahead of it would make dead-tail trimming discard the real function body. exec_order_key is a last-resort presentation tiebreak, not a reachability decision.
     let result_set: HashSet<_> = result.iter().copied().collect();
     let all_remaining: Vec<_> = nodes.difference(&result_set).copied().collect();
     // A disconnected node that is itself a LOOP HEADER is placed right after the reachable node edging into its body, or its Sloop floats to the wrong place and becomes unreachable.
@@ -5851,14 +5851,42 @@ fn order_nodes_dfs(
     }
     if !general_remaining.is_empty() {
         general_remaining.sort_by_key(|&n| crate::util::exec_order_key(n));
+        let entry_floor = result
+            .iter()
+            .position(|&node| node == entry)
+            .map_or(0, |position| position + 1);
         let mut insert_at = result.len();
-        while insert_at > 0 && is_exit(result[insert_at - 1]) {
+        while insert_at > entry_floor && is_exit(result[insert_at - 1]) {
             insert_at -= 1;
         }
         result.splice(insert_at..insert_at, general_remaining);
     }
 
     result
+}
+
+#[cfg(test)]
+mod node_order_tests {
+    use super::*;
+
+    #[test]
+    fn disconnected_exit_never_precedes_authenticated_entry() {
+        const ENTRY: Node = 0x1000;
+        const DISCONNECTED_EXIT: Node = 0x2000;
+        let nodes = HashSet::from([ENTRY, DISCONNECTED_EXIT]);
+
+        let ordered = order_nodes_dfs(
+            ENTRY,
+            &nodes,
+            &[],
+            |_| true,
+            &HashMap::new(),
+            &HashMap::new(),
+            |node| node,
+        );
+
+        assert_eq!(ordered, vec![ENTRY, DISCONNECTED_EXIT]);
+    }
 }
 
 fn simplify_fallthrough_gotos_in_block(items: Vec<CBlockItem>) -> Vec<CBlockItem> {
