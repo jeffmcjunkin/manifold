@@ -12,6 +12,7 @@ use crate::decompile::passes::clight_select::select::{
 use crate::x86::types::*;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
 pub const CLIGHT_EXPORT_SCHEMA_ID: &str = "manifold-clight-v2";
@@ -418,13 +419,25 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         "partial_functions": partial_functions,
     });
 
-    let json_str = serde_json::to_string_pretty(&program)
-        .map_err(|e| format!("JSON serialization error: {}", e))?;
-
-    std::fs::write(output_path, json_str)
+    let file = std::fs::File::create(output_path)
+        .map_err(|e| format!("Failed to write {}: {}", output_path, e))?;
+    let mut writer = BufWriter::new(file);
+    write_compact_json(&mut writer, &program).map_err(|e| {
+        if e.is_io() {
+            format!("Failed to write {}: {}", output_path, e)
+        } else {
+            format!("JSON serialization error: {}", e)
+        }
+    })?;
+    writer
+        .flush()
         .map_err(|e| format!("Failed to write {}: {}", output_path, e))?;
 
     Ok(())
+}
+
+fn write_compact_json<W: Write>(writer: W, program: &Value) -> serde_json::Result<()> {
+    serde_json::to_writer(writer, program)
 }
 
 fn external_decl_sort_key(value: &Value) -> (String, u64, String, String) {
@@ -1224,4 +1237,49 @@ fn resolve_name(id: usize, id_to_name: &HashMap<usize, String>) -> String {
         .get(&id)
         .cloned()
         .unwrap_or_else(|| format!("_{}", id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compact_bytes(value: &Value) -> Vec<u8> {
+        let mut writer = BufWriter::new(Vec::new());
+        write_compact_json(&mut writer, value).expect("serialize compact Clight JSON");
+        writer.flush().expect("flush in-memory Clight JSON");
+        writer.into_inner().expect("recover compact Clight JSON")
+    }
+
+    #[test]
+    fn compact_clight_json_is_deterministic_and_round_trips() {
+        let program = json!({
+            "compcert_clight": true,
+            "manifold_clight_schema": CLIGHT_EXPORT_SCHEMA_ID,
+            "arch": "x86_64",
+            "composites": [],
+            "globals": [{"name": "g", "id": 7}],
+            "externals": [],
+            "functions": [{
+                "name": "f",
+                "address": "0x1000",
+                "body": {"tag": "Sreturn", "expr": {"tag": "Econst_int", "value": 7}}
+            }],
+            "unsupported_functions": [],
+            "partial_functions": [],
+        });
+
+        let first = compact_bytes(&program);
+        let second = compact_bytes(&program);
+        assert_eq!(first, second);
+        assert_eq!(first, serde_json::to_vec(&program).unwrap());
+        assert!(!first.contains(&b'\n'));
+        assert!(first.len() < serde_json::to_vec_pretty(&program).unwrap().len());
+
+        let round_trip: Value = serde_json::from_slice(&first).expect("parse compact Clight JSON");
+        assert_eq!(round_trip, program);
+        assert_eq!(
+            round_trip["manifold_clight_schema"],
+            CLIGHT_EXPORT_SCHEMA_ID
+        );
+    }
 }
