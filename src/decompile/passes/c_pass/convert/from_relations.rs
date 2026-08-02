@@ -1288,6 +1288,12 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             }
         }
 
+        // A selected Clight call target has exact function-object evidence. The
+        // register declaration solver and usage heuristics above may only have
+        // scalar evidence for that same synthetic local; restore the stronger
+        // Clight type after those heuristic overrides have run.
+        retain_clight_function_object_types(&body, &func_var_types, &mut local_var_types);
+
         // A scalar-promoted store to an array local's base is illegal C, so reconcile it into the matching element store var[0] = val; keyed on the array-typed local with a bare-Var LHS.
         let array_locals: HashSet<String> = local_var_types
             .iter()
@@ -1730,7 +1736,17 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         let mut called_funcs: HashSet<String> = HashSet::new();
         for decl in tu.decls.iter() {
             if let crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDef(fdef) = decl {
-                collect_called_names_in_stmt(&fdef.body, &mut called_funcs);
+                let local_names: HashSet<String> = fdef
+                    .params
+                    .iter()
+                    .filter_map(|param| param.name.clone())
+                    .chain(fdef.local_vars.iter().map(|var| var.name.clone()))
+                    .collect();
+                collect_nonlocal_called_names_in_stmt(
+                    &fdef.body,
+                    &local_names,
+                    &mut called_funcs,
+                );
             }
         }
         let declared: HashSet<String> = tu.symbols.keys().cloned().collect();
@@ -3502,6 +3518,17 @@ impl ConversionContext {
         self.var_types.entry(var_name.to_string()).or_insert(ty);
     }
 
+    pub(crate) fn merge_function_object_types_into(
+        &self,
+        target: &mut HashMap<String, CType>,
+    ) {
+        for (name, ty) in &self.var_types {
+            if ctype_involves_function(ty) {
+                target.insert(name.clone(), ty.clone());
+            }
+        }
+    }
+
     pub fn temp_name(&mut self, id: usize) -> String {
         if let Some(name) = self.temp_names.get(&id) {
             return name.clone();
@@ -4551,7 +4578,7 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
             value: val.0 as f64,
             suffix: FloatLiteralSuffix::F,
         }),
-        clight::ClightExpr::Evar(id, _ty) => {
+        clight::ClightExpr::Evar(id, ty) => {
             let raw_name = ctx
                 .id_to_name
                 .get(id)
@@ -4565,7 +4592,28 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
                     });
                 }
             }
-            CExpr::Var(ctx.var_name(*id))
+            let name = ctx.var_name(*id);
+            if !ctx.id_to_name.contains_key(id) {
+                // An unmapped Clight Evar is not a named global. Retain its
+                // object type so an indirect callee remains `ret (*v)(...)`
+                // rather than degenerating to an int local which is then also
+                // mistaken for an undeclared direct function. Void and bare
+                // function types cannot declare C objects; those keep the
+                // existing conservative fallback.
+                let object_type = convert_clight_type(ty);
+                if !matches!(object_type, CType::Void | CType::Function(..)) {
+                    if matches!(
+                        ctx.var_types.get(&name),
+                        Some(existing) if ctype_involves_function(&object_type)
+                            && !ctype_involves_function(existing)
+                    ) {
+                        ctx.var_types.insert(name.clone(), object_type);
+                    } else {
+                        ctx.record_var_type(&name, object_type);
+                    }
+                }
+            }
+            CExpr::Var(name)
         }
         clight::ClightExpr::EvarSymbol(name, _ty) => {
             if !ctx.suppress_string_literals {
@@ -6406,6 +6454,20 @@ fn collect_called_names_in_stmt(stmt: &CStmt, names: &mut HashSet<String>) {
     }
 }
 
+fn collect_nonlocal_called_names_in_stmt(
+    stmt: &CStmt,
+    local_names: &HashSet<String>,
+    names: &mut HashSet<String>,
+) {
+    let mut candidates = HashSet::new();
+    collect_called_names_in_stmt(stmt, &mut candidates);
+    names.extend(
+        candidates
+            .into_iter()
+            .filter(|name| !local_names.contains(name)),
+    );
+}
+
 fn collect_called_names_in_expr(expr: &CExpr, names: &mut HashSet<String>) {
     match expr {
         CExpr::Call(callee, args) => {
@@ -6526,6 +6588,22 @@ fn ctype_involves_function(ty: &CType) -> bool {
             ctype_involves_function(inner)
         }
         _ => false,
+    }
+}
+
+fn retain_clight_function_object_types(
+    body: &CStmt,
+    clight_var_types: &HashMap<String, CType>,
+    local_var_types: &mut HashMap<String, CType>,
+) {
+    let mut body_names = HashSet::new();
+    collect_var_names_from_stmt(body, &mut body_names);
+    for name in body_names {
+        if let Some(ty) = clight_var_types.get(&name) {
+            if ctype_involves_function(ty) {
+                local_var_types.insert(name, ty.clone());
+            }
+        }
     }
 }
 
@@ -6757,6 +6835,12 @@ fn collect_call_arg_evidence_in_expr(
     match expr {
         CExpr::Call(callee, args) => {
             if let CExpr::Var(name) = callee.as_ref() {
+                if env.local_types.contains_key(name) {
+                    for arg in args {
+                        collect_call_arg_evidence_in_expr(arg, env, sites);
+                    }
+                    return;
+                }
                 let evidence: Vec<ArgEvidence> =
                     args.iter().map(|a| arg_evidence_of_expr(a, env)).collect();
                 sites.entry(name.clone()).or_default().push(evidence);
@@ -7203,6 +7287,125 @@ fn replace_last_assign_with_return(stmt: &CStmt, var: &str) -> CStmt {
             CStmt::Sequence(new_stmts)
         }
         other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod callee_identity_tests {
+    use super::*;
+
+    #[test]
+    fn unmapped_clight_function_designator_keeps_its_pointer_type() {
+        let clight_type = ClightType::Tpointer(
+            Arc::new(ClightType::Tfunction(
+                Arc::new(vec![ClightType::Tlong(
+                    ClightSignedness::Signed,
+                    ClightAttr::default(),
+                )]),
+                Arc::new(ClightType::Tvoid),
+                CallConv::default(),
+            )),
+            ClightAttr::default(),
+        );
+        let expected_type = convert_clight_type(&clight_type);
+        let mut context = ConversionContext::new(HashMap::new());
+        context.record_var_type("var_268866684", CType::int());
+        context.record_var_type("unrelated_scalar", CType::long());
+
+        let converted = convert_expr(
+            &ClightExpr::Evar(268_866_684, clight_type),
+            &mut context,
+        );
+
+        assert_eq!(converted, CExpr::Var("var_268866684".to_string()));
+        assert_eq!(
+            context.var_types.get("var_268866684"),
+            Some(&expected_type),
+            "the Clight function-pointer annotation must reach the local declaration"
+        );
+        let mut emission_types =
+            HashMap::from([("var_268866684".to_string(), CType::int())]);
+        context.merge_function_object_types_into(&mut emission_types);
+        assert_eq!(
+            emission_types.get("var_268866684"),
+            Some(&expected_type),
+            "the selected Clight type must cross the optimized-emission handoff"
+        );
+        assert!(
+            !emission_types.contains_key("unrelated_scalar"),
+            "the indirect-callee handoff must not inject unrelated scalar declarations"
+        );
+        assert!(ctype_involves_function(&expected_type));
+    }
+
+    #[test]
+    fn clight_function_object_type_survives_local_type_reconciliation() {
+        let function_pointer = CType::ptr(CType::Function(
+            Box::new(CType::Void),
+            vec![CType::long()],
+            false,
+            false,
+        ));
+        let body = CStmt::Expr(CExpr::Call(
+            Box::new(CExpr::Var("var_0".to_string())),
+            vec![CExpr::int(1)],
+        ));
+        let clight_types = HashMap::from([("var_0".to_string(), function_pointer.clone())]);
+        let mut reconciled_types = HashMap::from([("var_0".to_string(), CType::int())]);
+
+        retain_clight_function_object_types(&body, &clight_types, &mut reconciled_types);
+
+        assert_eq!(reconciled_types.get("var_0"), Some(&function_pointer));
+    }
+
+    #[test]
+    fn local_indirect_callee_is_not_an_external_forward_declaration() {
+        let body = CStmt::Sequence(vec![
+            CStmt::Expr(CExpr::Call(
+                Box::new(CExpr::Var("var_0".to_string())),
+                vec![CExpr::int(1)],
+            )),
+            CStmt::Expr(CExpr::Call(
+                Box::new(CExpr::Var("external_target".to_string())),
+                vec![],
+            )),
+        ]);
+        let locals = HashSet::from(["var_0".to_string()]);
+        let mut called = HashSet::new();
+
+        collect_nonlocal_called_names_in_stmt(&body, &locals, &mut called);
+
+        assert_eq!(called, HashSet::from(["external_target".to_string()]));
+    }
+
+    #[test]
+    fn local_indirect_callee_does_not_contribute_direct_call_signature_evidence() {
+        let local_function_pointer = CType::ptr(CType::Function(
+            Box::new(CType::Void),
+            vec![CType::long()],
+            false,
+            false,
+        ));
+        let local_types = HashMap::from([("var_0".to_string(), local_function_pointer)]);
+        let global_types = HashMap::new();
+        let callee_ret = HashMap::new();
+        let environment = ArgEvidenceEnv {
+            local_types,
+            global_types: &global_types,
+            callee_ret: &callee_ret,
+        };
+        let expression = CExpr::Call(
+            Box::new(CExpr::Var("var_0".to_string())),
+            vec![CExpr::int(1)],
+        );
+        let mut sites = HashMap::new();
+
+        collect_call_arg_evidence_in_expr(&expression, &environment, &mut sites);
+
+        assert!(
+            sites.is_empty(),
+            "an indirect local must not synthesize a file-scope function prototype"
+        );
     }
 }
 

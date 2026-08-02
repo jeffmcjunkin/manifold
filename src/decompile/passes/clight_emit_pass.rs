@@ -2187,6 +2187,12 @@ impl IRPass for ClightEmitPass {
             all_edges.extend(func_edges);
         }
 
+        // convert_stmt records exact Clight object types in its conversion
+        // context. Carry those into the optimized emission map; in particular,
+        // a selected indirect callee's function-pointer annotation must beat a
+        // scalar register seed before the declaration heuristics run.
+        ctx.merge_function_object_types_into(&mut var_types_for_emission);
+
         db.cast_selected_functions = internal_functions;
         db.cast_globals = globals;
         db.cast_id_to_name = id_to_name;
