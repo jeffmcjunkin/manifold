@@ -14,6 +14,39 @@ use log::debug;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+pub(crate) type FunctionObjectTypes = HashMap<Address, HashMap<String, CType>>;
+
+/// Addressable Clight locals are explicit pipeline objects.  Register values use
+/// `Etempvar`; the `Evar` form is local only when stack recovery declared that
+/// identifier in the current function.  Keep this provenance separate from the
+/// global symbol-name map so an unnamed direct callee is never mistaken for a
+/// local merely because it has no symbol.
+pub(crate) fn local_evar_ids_by_function(db: &DecompileDB) -> HashMap<Address, HashSet<Ident>> {
+    let mut out: HashMap<Address, HashSet<Ident>> = HashMap::new();
+    for (func, _node, _offset, reg) in db.rel_iter::<(Address, Address, i64, RTLReg)>("stack_var") {
+        out.entry(*func)
+            .or_default()
+            .insert(crate::decompile::passes::csh_pass::ident_from_reg(*reg));
+    }
+    for (func, buffers) in &db.stack_struct_buffers {
+        let ids = out.entry(*func).or_default();
+        ids.extend(
+            buffers
+                .keys()
+                .map(|reg| crate::decompile::passes::csh_pass::ident_from_reg(*reg)),
+        );
+    }
+    for (func, arrays) in &db.stack_array_buffers {
+        let ids = out.entry(*func).or_default();
+        ids.extend(
+            arrays
+                .keys()
+                .map(|reg| crate::decompile::passes::csh_pass::ident_from_reg(*reg)),
+        );
+    }
+    out
+}
+
 // GCC hot/cold splitting emits `<base>_cold` companions with trivial abort/unreachable bodies; drop only when name ends in `_cold` AND body matches that trivial pattern (empty body is kept, not silently deleted).
 fn has_cold_suffix(name: &str) -> bool {
     name.len() > 5 && name.ends_with("_cold")
@@ -362,6 +395,7 @@ pub fn build_cast_from_relations(
     struct_fields: &HashMap<String, HashMap<String, CType>>,
 ) -> TranslationUnit {
     let mut ctx = ConversionContext::new(id_to_name.clone());
+    let local_evar_ids = local_evar_ids_by_function(db);
     ctx.func_renames = header_collision_policy(selected_functions).renames;
     for global in globals {
         if global.is_string {
@@ -393,6 +427,7 @@ pub fn build_cast_from_relations(
 
     let mut stmt_map: HashMap<crate::x86::types::Node, CStmt> = HashMap::new();
     for func in selected_functions {
+        ctx.enter_function(func.address, local_evar_ids.get(&func.address));
         // func.statements is a HashMap; iterating it directly leaks non-deterministic order into convert_stmt -> record_var_type (which is first-wins), so a variable's recorded C type flips between runs. Walk nodes in sorted order.
         let mut nodes: Vec<crate::x86::types::Node> = func.statements.keys().copied().collect();
         nodes.sort();
@@ -411,6 +446,7 @@ pub fn build_cast_from_relations(
         &stmt_map,
         edges,
         &ctx.var_types,
+        ctx.function_object_types(),
         &HashMap::new(),
         struct_fields,
     )
@@ -424,11 +460,13 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     stmt_map: &HashMap<crate::x86::types::Node, CStmt>,
     edges: &[(crate::x86::types::Node, crate::x86::types::Node)],
     var_types: &HashMap<String, CType>,
+    function_object_types: &FunctionObjectTypes,
     optimized_node_to_func: &HashMap<crate::x86::types::Node, crate::x86::types::Address>,
     struct_fields: &HashMap<String, HashMap<String, CType>>,
 ) -> TranslationUnit {
     let mut tu = TranslationUnit::new();
     let mut func_var_types = var_types.clone();
+    let local_evar_ids = local_evar_ids_by_function(db);
 
     let dwarf_param_names: HashMap<(Address, usize), String> = db
         .rel_iter::<(Address, usize, Symbol)>("dwarf_func_param_name")
@@ -978,6 +1016,10 @@ pub fn build_translation_unit_from_stmt_map_with_types(
 
     let mut emitted_func_names: HashSet<String> = HashSet::new();
     for func in selected_functions {
+        let mut scoped_function_object_types = function_object_types
+            .get(&func.address)
+            .cloned()
+            .unwrap_or_default();
         let params: Vec<FuncParam> = func
             .param_regs
             .iter()
@@ -1126,6 +1168,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             let covered_nodes: HashSet<crate::x86::types::Node> = nodes.iter().copied().collect();
 
             let mut fb_ctx = ConversionContext::new(id_to_name.clone());
+            fb_ctx.enter_function(func.address, local_evar_ids.get(&func.address));
             fb_ctx.func_renames = local_def_policy.renames.clone();
             {
                 let mut addr_name_map: HashMap<u64, String> = HashMap::new();
@@ -1167,6 +1210,13 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                     if !matches!(cstmt, CStmt::Empty) {
                         body_items.push(CBlockItem::Stmt(cstmt));
                     }
+                }
+            }
+            if let Some(fallback_types) = fb_ctx.function_object_types.get(&func.address) {
+                for (name, ty) in fallback_types {
+                    scoped_function_object_types
+                        .entry(name.clone())
+                        .or_insert_with(|| ty.clone());
                 }
             }
             for (name, ty) in fb_ctx.var_types {
@@ -1288,11 +1338,14 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             }
         }
 
-        // A selected Clight call target has exact function-object evidence. The
-        // register declaration solver and usage heuristics above may only have
-        // scalar evidence for that same synthetic local; restore the stronger
-        // Clight type after those heuristic overrides have run.
-        retain_clight_function_object_types(&body, &func_var_types, &mut local_var_types);
+        // An actual local Scall target must have a callable declaration.  This
+        // evidence is scoped by function and call position, so it safely wins
+        // even when scalar/storage heuristics classified the same register.
+        retain_clight_function_object_types(
+            &body,
+            &scoped_function_object_types,
+            &mut local_var_types,
+        );
 
         // A scalar-promoted store to an array local's base is illegal C, so reconcile it into the matching element store var[0] = val; keyed on the array-typed local with a bare-Var LHS.
         let array_locals: HashSet<String> = local_var_types
@@ -3462,6 +3515,9 @@ pub struct ConversionContext {
     pub func_renames: HashMap<String, String>,
     /// CAST-2: label id -> final injective C identifier, computed once so Slabel(id) and Sgoto(id) always resolve to the SAME name while distinct ids never share one.
     label_disambig: HashMap<usize, String>,
+    current_function: Option<Address>,
+    current_local_evar_ids: HashSet<Ident>,
+    function_object_types: FunctionObjectTypes,
 }
 
 impl ConversionContext {
@@ -3480,6 +3536,9 @@ impl ConversionContext {
             func_addrs_sorted: Vec::new(),
             func_renames: HashMap::new(),
             label_disambig,
+            current_function: None,
+            current_local_evar_ids: HashSet::new(),
+            function_object_types: HashMap::new(),
         }
     }
 
@@ -3518,15 +3577,45 @@ impl ConversionContext {
         self.var_types.entry(var_name.to_string()).or_insert(ty);
     }
 
-    pub(crate) fn merge_function_object_types_into(
-        &self,
-        target: &mut HashMap<String, CType>,
+    pub(crate) fn enter_function(
+        &mut self,
+        address: Address,
+        local_evar_ids: Option<&HashSet<Ident>>,
     ) {
-        for (name, ty) in &self.var_types {
-            if ctype_involves_function(ty) {
-                target.insert(name.clone(), ty.clone());
-            }
+        self.current_function = Some(address);
+        self.current_local_evar_ids.clear();
+        if let Some(ids) = local_evar_ids {
+            self.current_local_evar_ids.extend(ids.iter().copied());
         }
+    }
+
+    fn is_current_local_evar(&self, id: Ident) -> bool {
+        self.current_local_evar_ids.contains(&id)
+    }
+
+    fn local_evar_name(&self, id: Ident) -> String {
+        format!("var_{}", id)
+    }
+
+    fn record_current_function_object_type(&mut self, name: String, mut ty: CType) {
+        let Some(address) = self.current_function else {
+            return;
+        };
+        if let CType::Function(..) = ty {
+            ty = CType::ptr(ty);
+        }
+        if !ctype_involves_function(&ty) {
+            return;
+        }
+        self.function_object_types
+            .entry(address)
+            .or_default()
+            .entry(name)
+            .or_insert(ty);
+    }
+
+    pub(crate) fn function_object_types(&self) -> &FunctionObjectTypes {
+        &self.function_object_types
     }
 
     pub fn temp_name(&mut self, id: usize) -> String {
@@ -4578,13 +4667,17 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
             value: val.0 as f64,
             suffix: FloatLiteralSuffix::F,
         }),
-        clight::ClightExpr::Evar(id, ty) => {
-            let raw_name = ctx
-                .id_to_name
-                .get(id)
-                .cloned()
-                .unwrap_or_else(|| format!("var_{}", id));
-            if !ctx.suppress_string_literals {
+        clight::ClightExpr::Evar(id, _ty) => {
+            let is_local = ctx.is_current_local_evar(*id);
+            let raw_name = if is_local {
+                ctx.local_evar_name(*id)
+            } else {
+                ctx.id_to_name
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("var_{}", id))
+            };
+            if !is_local && !ctx.suppress_string_literals {
                 if let Some(content) = ctx.string_label_to_content.get(&raw_name) {
                     return CExpr::StringLit(StringLiteral {
                         value: content.trim_end_matches('\0').to_string(),
@@ -4592,27 +4685,11 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
                     });
                 }
             }
-            let name = ctx.var_name(*id);
-            if !ctx.id_to_name.contains_key(id) {
-                // An unmapped Clight Evar is not a named global. Retain its
-                // object type so an indirect callee remains `ret (*v)(...)`
-                // rather than degenerating to an int local which is then also
-                // mistaken for an undeclared direct function. Void and bare
-                // function types cannot declare C objects; those keep the
-                // existing conservative fallback.
-                let object_type = convert_clight_type(ty);
-                if !matches!(object_type, CType::Void | CType::Function(..)) {
-                    if matches!(
-                        ctx.var_types.get(&name),
-                        Some(existing) if ctype_involves_function(&object_type)
-                            && !ctype_involves_function(existing)
-                    ) {
-                        ctx.var_types.insert(name.clone(), object_type);
-                    } else {
-                        ctx.record_var_type(&name, object_type);
-                    }
-                }
-            }
+            let name = if is_local {
+                ctx.local_evar_name(*id)
+            } else {
+                ctx.var_name(*id)
+            };
             CExpr::Var(name)
         }
         clight::ClightExpr::EvarSymbol(name, _ty) => {
@@ -5103,6 +5180,47 @@ fn contains_named_label(stmt: &CStmt) -> bool {
     }
 }
 
+fn clight_callee_leaf(expr: &clight::ClightExpr) -> &clight::ClightExpr {
+    match expr {
+        clight::ClightExpr::Ecast(inner, _) => clight_callee_leaf(inner),
+        _ => expr,
+    }
+}
+
+fn record_local_callee_function_type(callee: &clight::ClightExpr, ctx: &mut ConversionContext) {
+    let name = match clight_callee_leaf(callee) {
+        // Register-valued Clight expressions are locals by construction.
+        clight::ClightExpr::Etempvar(id, _) => Some(ctx.temp_name(*id)),
+        // Addressable Evar locals require explicit per-function stack provenance.
+        clight::ClightExpr::Evar(id, _) if ctx.is_current_local_evar(*id) => {
+            Some(ctx.local_evar_name(*id))
+        }
+        _ => None,
+    };
+    if let Some(name) = name {
+        ctx.record_current_function_object_type(name, clight_expr_to_ctype(callee));
+    }
+}
+
+fn convert_callee_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> CExpr {
+    // A provider cast does not turn a direct address callee into a local
+    // function-pointer object.  Emit the designator bare so direct-call
+    // evidence and forward-declaration recovery continue to recognize it.
+    if let clight::ClightExpr::Evar(id, _) = clight_callee_leaf(expr) {
+        if !ctx.is_current_local_evar(*id) && !ctx.id_to_name.contains_key(id) {
+            return CExpr::Var(format!("FUN_{:x}", id));
+        }
+    }
+    match expr {
+        // Preserve casts around genuine indirect callees.
+        clight::ClightExpr::Ecast(inner, ty) => CExpr::Cast(
+            convert_clight_type(ty),
+            Box::new(convert_callee_expr(inner, ctx)),
+        ),
+        _ => convert_expr(expr, ctx),
+    }
+}
+
 pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> CStmt {
     match stmt {
         clight::ClightStmt::Sskip => CStmt::Empty,
@@ -5130,7 +5248,8 @@ pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> C
         }
 
         clight::ClightStmt::Scall(dst, func, args) => {
-            let func_expr = convert_expr(func, ctx);
+            record_local_callee_function_type(func, ctx);
+            let func_expr = convert_callee_expr(func, ctx);
             let func_expr = if let CExpr::Var(ref name) = func_expr {
                 let resolved = ctx.resolve_l_label(name);
                 if resolved != *name {
@@ -7294,9 +7413,8 @@ fn replace_last_assign_with_return(stmt: &CStmt, var: &str) -> CStmt {
 mod callee_identity_tests {
     use super::*;
 
-    #[test]
-    fn unmapped_clight_function_designator_keeps_its_pointer_type() {
-        let clight_type = ClightType::Tpointer(
+    fn function_pointer_type() -> ClightType {
+        ClightType::Tpointer(
             Arc::new(ClightType::Tfunction(
                 Arc::new(vec![ClightType::Tlong(
                     ClightSignedness::Signed,
@@ -7306,56 +7424,170 @@ mod callee_identity_tests {
                 CallConv::default(),
             )),
             ClightAttr::default(),
-        );
-        let expected_type = convert_clight_type(&clight_type);
-        let mut context = ConversionContext::new(HashMap::new());
-        context.record_var_type("var_268866684", CType::int());
-        context.record_var_type("unrelated_scalar", CType::long());
-
-        let converted = convert_expr(
-            &ClightExpr::Evar(268_866_684, clight_type),
-            &mut context,
-        );
-
-        assert_eq!(converted, CExpr::Var("var_268866684".to_string()));
-        assert_eq!(
-            context.var_types.get("var_268866684"),
-            Some(&expected_type),
-            "the Clight function-pointer annotation must reach the local declaration"
-        );
-        let mut emission_types =
-            HashMap::from([("var_268866684".to_string(), CType::int())]);
-        context.merge_function_object_types_into(&mut emission_types);
-        assert_eq!(
-            emission_types.get("var_268866684"),
-            Some(&expected_type),
-            "the selected Clight type must cross the optimized-emission handoff"
-        );
-        assert!(
-            !emission_types.contains_key("unrelated_scalar"),
-            "the indirect-callee handoff must not inject unrelated scalar declarations"
-        );
-        assert!(ctype_involves_function(&expected_type));
+        )
     }
 
     #[test]
-    fn clight_function_object_type_survives_local_type_reconciliation() {
-        let function_pointer = CType::ptr(CType::Function(
-            Box::new(CType::Void),
-            vec![CType::long()],
-            false,
-            false,
-        ));
+    fn unmapped_nonlocal_evar_callee_stays_direct() {
+        let function_address: Address = 0x401000;
+        let callee_id: Ident = 0x402345;
+        let mut context = ConversionContext::new(HashMap::new());
+        context.enter_function(function_address, None);
+
+        let converted = convert_stmt(
+            &ClightStmt::Scall(
+                None,
+                ClightExpr::Evar(callee_id, function_pointer_type()),
+                vec![],
+            ),
+            &mut context,
+        );
+
+        assert_eq!(
+            converted,
+            CStmt::Expr(CExpr::Call(
+                Box::new(CExpr::Var("FUN_402345".to_string())),
+                vec![],
+            ))
+        );
+        assert!(
+            context
+                .function_object_types()
+                .get(&function_address)
+                .is_none(),
+            "a direct callee must not acquire a local object declaration"
+        );
+        let mut local_names = HashSet::new();
+        collect_var_names_from_stmt(&converted, &mut local_names);
+        assert!(local_names.is_empty());
+        let mut called = HashSet::new();
+        collect_nonlocal_called_names_in_stmt(&converted, &local_names, &mut called);
+        assert_eq!(called, HashSet::from(["FUN_402345".to_string()]));
+    }
+
+    #[test]
+    fn cast_wrapped_unmapped_nonlocal_evar_stays_direct() {
+        let function_address: Address = 0x401000;
+        let callee_id: Ident = 0x402346;
+        let function_pointer = function_pointer_type();
+        let callee = ClightExpr::Ecast(
+            Box::new(ClightExpr::Evar(callee_id, function_pointer.clone())),
+            function_pointer,
+        );
+        let mut context = ConversionContext::new(HashMap::new());
+        context.enter_function(function_address, None);
+
+        let converted = convert_stmt(&ClightStmt::Scall(None, callee, vec![]), &mut context);
+
+        assert_eq!(
+            converted,
+            CStmt::Expr(CExpr::Call(
+                Box::new(CExpr::Var("FUN_402346".to_string())),
+                vec![],
+            )),
+            "a provider cast must not hide a direct callee from declaration recovery"
+        );
+        let mut called = HashSet::new();
+        collect_nonlocal_called_names_in_stmt(&converted, &HashSet::new(), &mut called);
+        assert_eq!(called, HashSet::from(["FUN_402346".to_string()]));
+    }
+
+    #[test]
+    fn declared_local_evar_callee_keeps_pointer_type() {
+        let function_address: Address = 0x401000;
+        let local_id: Ident = 7;
+        let clight_type = function_pointer_type();
+        let expected_type = convert_clight_type(&clight_type);
+        let mut context = ConversionContext::new(HashMap::new());
+        context.enter_function(function_address, Some(&HashSet::from([local_id])));
+
+        let converted = convert_stmt(
+            &ClightStmt::Scall(None, ClightExpr::Evar(local_id, clight_type), vec![]),
+            &mut context,
+        );
+
+        assert_eq!(
+            converted,
+            CStmt::Expr(CExpr::Call(
+                Box::new(CExpr::Var("var_7".to_string())),
+                vec![],
+            ))
+        );
+        let scoped_types = context
+            .function_object_types()
+            .get(&function_address)
+            .expect("function-local callee type");
+        assert_eq!(scoped_types.get("var_7"), Some(&expected_type));
+        let mut reconciled_types = HashMap::from([("var_7".to_string(), CType::int())]);
+        retain_clight_function_object_types(&converted, scoped_types, &mut reconciled_types);
+        assert_eq!(reconciled_types.get("var_7"), Some(&expected_type));
+
+        let locals = HashSet::from(["var_7".to_string()]);
+        let mut called = HashSet::new();
+        collect_nonlocal_called_names_in_stmt(&converted, &locals, &mut called);
+        assert!(called.is_empty());
+    }
+
+    #[test]
+    fn etempvar_indirect_callee_keeps_pointer_type() {
+        let function_address: Address = 0x401000;
+        let temp_id: Ident = 13;
+        let clight_type = function_pointer_type();
+        let expected_type = convert_clight_type(&clight_type);
+        let callee = ClightExpr::Ecast(
+            Box::new(ClightExpr::Etempvar(
+                temp_id,
+                ClightType::Tlong(ClightSignedness::Signed, ClightAttr::default()),
+            )),
+            clight_type,
+        );
+        let mut context = ConversionContext::new(HashMap::new());
+        context.enter_function(function_address, None);
+
+        let converted = convert_stmt(&ClightStmt::Scall(None, callee, vec![]), &mut context);
+
+        assert_eq!(
+            converted,
+            CStmt::Expr(CExpr::Call(
+                Box::new(CExpr::Cast(
+                    expected_type.clone(),
+                    Box::new(CExpr::Var("var_13".to_string())),
+                )),
+                vec![],
+            ))
+        );
+        let scoped_types = context
+            .function_object_types()
+            .get(&function_address)
+            .expect("function-local callee type");
+        assert_eq!(scoped_types.get("var_13"), Some(&expected_type));
+        let mut reconciled_types = HashMap::from([("var_13".to_string(), CType::long())]);
+
+        retain_clight_function_object_types(&converted, scoped_types, &mut reconciled_types);
+
+        assert_eq!(reconciled_types.get("var_13"), Some(&expected_type));
+    }
+
+    #[test]
+    fn actual_local_callee_type_wins_conflicting_scalar_authority() {
+        let function_pointer = convert_clight_type(&function_pointer_type());
         let body = CStmt::Expr(CExpr::Call(
-            Box::new(CExpr::Var("var_0".to_string())),
-            vec![CExpr::int(1)],
+            Box::new(CExpr::Var("var_21".to_string())),
+            vec![],
         ));
-        let clight_types = HashMap::from([("var_0".to_string(), function_pointer.clone())]);
-        let mut reconciled_types = HashMap::from([("var_0".to_string(), CType::int())]);
+        let call_target_types =
+            HashMap::from([("var_21".to_string(), function_pointer.clone())]);
+        // Model a late integer-only declaration heuristic classifying the same
+        // register as a scalar before call-target reconciliation runs.
+        let mut reconciled_types = HashMap::from([("var_21".to_string(), CType::long())]);
 
-        retain_clight_function_object_types(&body, &clight_types, &mut reconciled_types);
+        retain_clight_function_object_types(
+            &body,
+            &call_target_types,
+            &mut reconciled_types,
+        );
 
-        assert_eq!(reconciled_types.get("var_0"), Some(&function_pointer));
+        assert_eq!(reconciled_types.get("var_21"), Some(&function_pointer));
     }
 
     #[test]

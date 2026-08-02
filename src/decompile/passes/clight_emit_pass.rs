@@ -2050,6 +2050,10 @@ impl IRPass for ClightEmitPass {
             crate::decompile::passes::c_pass::convert::from_relations::ConversionContext::new(
                 id_to_name.clone(),
             );
+        let local_evar_ids =
+            crate::decompile::passes::c_pass::convert::from_relations::local_evar_ids_by_function(
+                db,
+            );
 
         let mut var_types_for_emission: HashMap<String, CType> = HashMap::new();
         let mut all_statements: Vec<(Node, CStmt)> = Vec::new();
@@ -2057,6 +2061,7 @@ impl IRPass for ClightEmitPass {
         let mut node_to_func_addr: HashMap<Node, u64> = HashMap::new();
 
         for func in &internal_functions {
+            ctx.enter_function(func.address, local_evar_ids.get(&func.address));
             let mut statements = Vec::new();
             let mut func_edges = Vec::new();
 
@@ -2187,12 +2192,6 @@ impl IRPass for ClightEmitPass {
             all_edges.extend(func_edges);
         }
 
-        // convert_stmt records exact Clight object types in its conversion
-        // context. Carry those into the optimized emission map; in particular,
-        // a selected indirect callee's function-pointer annotation must beat a
-        // scalar register seed before the declaration heuristics run.
-        ctx.merge_function_object_types_into(&mut var_types_for_emission);
-
         db.cast_selected_functions = internal_functions;
         db.cast_globals = globals;
         db.cast_id_to_name = id_to_name;
@@ -2216,6 +2215,7 @@ impl IRPass for ClightEmitPass {
             &stmt_map,
             &all_edges,
             &db.cast_var_types_for_emission,
+            ctx.function_object_types(),
             &node_to_func_addr,
             &field_types,
         );
