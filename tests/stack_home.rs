@@ -21,7 +21,7 @@ use manifold::x86::asm::TestCond;
 use manifold::x86::op::{Addressing, Comparison, Condition, Operation};
 use manifold::x86::types::{
     Address, CminorBinop, CminorUnop, Constant, CsharpminorExpr, CsharpminorStmt, Ident, LTLInst,
-    MachInst, MemoryChunk, RTLInst, RTLReg, Symbol, Typ, XType,
+    MachInst, MemoryChunk, RTLInst, RTLReg, Signature, Symbol, Typ, XType,
 };
 
 const SYNTH1: Address = 1u64 << 62;
@@ -1618,6 +1618,28 @@ home_wide_overlap:
         movdqu 4(%rsp), %xmm1
         movq 8(%rsp), %rax
         retq
+
+        # Keep the forwarding thunk and its target in distinct COFF text
+        # sections so the assembler must preserve a symbol relocation on the
+        # JMP.  This is the same representation used by delinked same-object
+        # calls whose target bytes and definition are both present in the TU.
+        .section .text$local_symbol_tail_wrapper,"xr"
+        .globl local_symbol_tail_wrapper
+        .def local_symbol_tail_wrapper; .scl 2; .type 32; .endef
+local_symbol_tail_wrapper:
+        movl $3, %r10d
+        jmp local_symbol_tail_target
+
+        .section .text$local_symbol_tail_target,"xr"
+        .globl local_symbol_tail_target
+        .def local_symbol_tail_target; .scl 2; .type 32; .endef
+local_symbol_tail_target:
+        movq (%rcx), %rax
+        addsd %xmm2, %xmm1
+        addsd %xmm3, %xmm1
+        cvttsd2siq %xmm1, %rdx
+        addq %rdx, %rax
+        retq
 "#,
     )
     .expect("failed to write stack/home fixture assembly");
@@ -2895,6 +2917,42 @@ fn assert_home_store_is_not_outgoing(db: &DecompileDB) {
     assert!(
         !evidence.contains(&7),
         "entry home spill was misclassified as an outgoing eighth argument: {evidence:?}"
+    );
+}
+
+fn assert_local_symbol_tail_target_resolves(db: &DecompileDB) {
+    let wrapper = function_span(db, "local_symbol_tail_wrapper");
+    let target = function_span(db, "local_symbol_tail_target");
+    let direct_tailcalls: Vec<_> = db
+        .rel_iter::<(Address, LTLInst)>("ltl_inst")
+        .filter_map(|(node, inst)| {
+            if !in_span(*node, wrapper) {
+                return None;
+            }
+            match inst {
+                LTLInst::Ltailcall(either::Either::Right(either::Either::Left(address))) => {
+                    Some((*node, *address))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    assert_eq!(
+        direct_tailcalls.len(),
+        1,
+        "COFF loader must map the relocation-backed tailcall: {direct_tailcalls:?}"
+    );
+    assert_eq!(
+        direct_tailcalls[0].1,
+        target.0,
+        "tailcall relocation resolved to the wrong local function"
+    );
+    assert!(
+        db.rel_iter::<(Address, Address)>("call_target_func")
+            .any(|(node, callee)| {
+                (*node, *callee) == (direct_tailcalls[0].0, target.0)
+            }),
+        "same-object COFF symbol tailcall did not resolve to its emitted target"
     );
 }
 
@@ -6363,6 +6421,67 @@ fn assert_csharp_home_backing(db: &DecompileDB) {
     }
 }
 
+fn assert_final_local_symbol_tail_signature(db: &DecompileDB, tu: &manifold::decompile::passes::c_pass::types::TranslationUnit) {
+    let wrapper_span = function_span(db, "local_symbol_tail_wrapper");
+    let target_span = function_span(db, "local_symbol_tail_target");
+    let signatures: std::collections::HashMap<_, _> = db
+        .rel_iter::<(Address, Signature)>("emit_function_signature")
+        .map(|(address, signature)| (*address, signature.clone()))
+        .collect();
+    let wrapper_signature = signatures
+        .get(&wrapper_span.0)
+        .expect("forwarding thunk lost its final signature");
+    let target_signature = signatures
+        .get(&target_span.0)
+        .expect("local tail target lost its final signature");
+    assert_eq!(
+        wrapper_signature.sig_args, target_signature.sig_args,
+        "an unchanged same-object tail forwarder must inherit the target register classes"
+    );
+    assert_eq!(wrapper_signature.sig_args.len(), 4);
+    assert!(matches!(
+        wrapper_signature.sig_args[0],
+        XType::Xptr
+            | XType::Xcharptr
+            | XType::Xcharptrptr
+            | XType::Xintptr
+            | XType::Xfloatptr
+            | XType::Xsingleptr
+            | XType::Xfuncptr
+            | XType::XstructPtr(_)
+    ));
+    assert_eq!(
+        &wrapper_signature.sig_args[1..],
+        &[XType::Xfloat, XType::Xfloat, XType::Xfloat]
+    );
+
+    let definition = |name: &str| {
+        let coff_name = format!("coff_fn_{name}");
+        tu.decls.iter().find_map(|decl| match decl {
+            TopLevelDecl::FuncDef(function)
+                if function.name == name || function.name == coff_name =>
+            {
+                Some(function)
+            }
+            _ => None,
+        })
+    };
+    let wrapper = definition("local_symbol_tail_wrapper")
+        .expect("final TU lost the local-symbol forwarding thunk");
+    let target = definition("local_symbol_tail_target")
+        .expect("final TU lost the local-symbol tail target");
+    let wrapper_types: Vec<_> = wrapper.params.iter().map(|param| &param.ty).collect();
+    let target_types: Vec<_> = target.params.iter().map(|param| &param.ty).collect();
+    assert_eq!(wrapper_types.len(), 4);
+    assert_eq!(target_types.len(), 4);
+    assert!(matches!(wrapper_types[0], CType::Pointer(..)));
+    assert!(matches!(target_types[0], CType::Pointer(..)));
+    assert_eq!(wrapper_types[1], &CType::double());
+    assert_eq!(wrapper_types[2], &CType::double());
+    assert_eq!(wrapper_types[3], &CType::double());
+    assert_eq!(&wrapper_types[1..], &target_types[1..]);
+}
+
 fn assert_final_output_compiles(object: &Path) {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(4)
@@ -6380,6 +6499,8 @@ fn assert_final_output_compiles(object: &Path) {
         .cast_optimized_translation_unit
         .as_ref()
         .expect("stack/home pipeline must emit an optimized translation unit");
+
+    assert_final_local_symbol_tail_signature(&db, tu);
 
     // This path uses the dependency scheduler (Asm runs in a parallel stage on
     // x86).  The decoder snapshot must be an Asm output, not an input-only
@@ -6496,6 +6617,22 @@ fn assert_final_output_compiles(object: &Path) {
         tu,
         BinaryFormat::Coff,
     );
+    let wrapper_body = printed_function_definition(&text, "local_symbol_tail_wrapper")
+        .expect("final optimized TU lost the relocation-backed tail forwarder");
+    let wrapper_statements = wrapper_body
+        .split_once('{')
+        .map(|(_, statements)| statements)
+        .expect("tail-forwarder definition lost its body");
+    assert!(
+        wrapper_statements.contains("coff_fn_local_symbol_tail_target"),
+        "tail forwarder lost its local target:\n{wrapper_body}"
+    );
+    for parameter in ["p0", "p1", "p2", "p3"] {
+        assert!(
+            wrapper_statements.contains(parameter),
+            "tail forwarder replaced {parameter} with a fabricated value:\n{wrapper_body}"
+        );
+    }
     for name in ["home_backing_movsx_high", "home_backing_signed_cmp_jcc"] {
         let body = printed_function_definition(&text, name)
             .unwrap_or_else(|| panic!("final optimized TU lost definition of {name}"));
@@ -6562,6 +6699,8 @@ fn assert_final_output_compiles(object: &Path) {
         "sp_indexed_fused_misaligned_field",
         "sp_indexed_fused_param_rmw",
         "sp_indexed_fused_gap",
+        "local_symbol_tail_wrapper",
+        "local_symbol_tail_target",
     ] {
         let coff_name = format!("coff_fn_{function}");
         assert!(
@@ -6631,6 +6770,7 @@ fn coff_stack_and_home_relations_preserve_values_and_abi_ordinals() {
             assert_home_pointer_reload_beats_shadow_address(&db);
             assert_stack_param_and_rmw_relations(&db);
             assert_home_store_is_not_outgoing(&db);
+            assert_local_symbol_tail_target_resolves(&db);
             assert_unsafe_home_cells_remain_storage(&db);
             assert_canonical_unsafe_home_storage(&db);
             assert_canonical_home_backing(&db);

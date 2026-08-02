@@ -315,6 +315,8 @@ impl IRPass for SignatureReconciliationPass {
             "rtl_inst",
             "known_func_param_is_ptr",
             "abi_int_arg_position",
+            "arg_reg_param_live_at",
+            "instr_in_function",
         ]
     }
 
@@ -1091,12 +1093,229 @@ fn reconcile_signatures(db: &mut DecompileDB) {
     // prototype changed.  Running patch_db for the empty-delta case publishes
     // the already-correct definition signature instead of leaving the final
     // emitter with an empty relation and an accidental `void` fallback.
-    patch_db(db, &prototypes);
+    let inherited_tailcalls = inherit_win64_tail_forwarder_prototypes(
+        db,
+        &functions,
+        &target_abi,
+        &call_targets,
+        &is_varargs_fn_set,
+        &mut prototypes,
+    );
+    patch_db(db, &prototypes, &inherited_tailcalls);
+}
+
+// A same-object COFF thunk can consist only of a relocation-backed tail branch,
+// so its own body may contain no type-bearing operation at all. Inherit an
+// internal tail target's complete Win64 register signature only when every
+// target register is proven to still hold this function's incoming value at
+// the unique tailcall.  This admits ordinary instrumentation thunks (which may
+// write scratch registers) while rejecting adapters that transform, replace,
+// drop, or add source arguments.
+fn inherit_win64_tail_forwarder_prototypes(
+    db: &DecompileDB,
+    functions: &HashMap<Address, Symbol>,
+    abi: &crate::abi::AbiConfig,
+    call_targets: &HashMap<Node, Address>,
+    variadic_functions: &HashSet<Address>,
+    prototypes: &mut Vec<FunctionPrototype>,
+) -> HashSet<Node> {
+    if !abi.uses_shared_arg_slots() {
+        return HashSet::new();
+    }
+
+    let mut candidate_signatures: HashMap<Address, Signature> = HashMap::new();
+    let mut ambiguous_candidates = HashSet::new();
+    for (address, signature) in
+        db.rel_iter::<(Address, Signature)>("emit_function_signature_candidate")
+    {
+        match candidate_signatures.get(address) {
+            Some(existing) if existing != signature => {
+                ambiguous_candidates.insert(*address);
+            }
+            Some(_) => {}
+            None => {
+                candidate_signatures.insert(*address, signature.clone());
+            }
+        }
+    }
+    candidate_signatures.retain(|address, _| !ambiguous_candidates.contains(address));
+
+    let mut resolved: HashMap<Address, FunctionPrototype> = candidate_signatures
+        .into_iter()
+        .filter_map(|(address, signature)| {
+            let name = functions.get(&address).copied()?;
+            Some((
+                address,
+                FunctionPrototype {
+                    address,
+                    name,
+                    param_count: signature.sig_args.len(),
+                    param_types: signature.sig_args.as_ref().clone(),
+                    return_type: signature.sig_res,
+                    confidence: SignatureConfidence::DefinitionOnly,
+                    is_varargs: variadic_functions.contains(&address),
+                },
+            ))
+        })
+        .collect();
+    for prototype in prototypes.iter().cloned() {
+        resolved.insert(prototype.address, prototype);
+    }
+
+    let mut owners: HashMap<Node, HashSet<Address>> = HashMap::new();
+    for (node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        owners.entry(*node).or_default().insert(*function);
+    }
+    let mut returning_functions = HashSet::new();
+    let mut tailcalls: HashMap<Address, Vec<(Node, Address)>> = HashMap::new();
+    for (node, instruction) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        let Some(node_owners) = owners.get(node) else {
+            continue;
+        };
+        if node_owners.len() != 1 {
+            continue;
+        }
+        let function = *node_owners.iter().next().expect("one checked owner");
+        match instruction {
+            RTLInst::Ireturn(..) => {
+                returning_functions.insert(function);
+            }
+            RTLInst::Itailcall(..) => {
+                if let Some(target) = call_targets.get(node) {
+                    tailcalls.entry(function).or_default().push((*node, *target));
+                }
+            }
+            _ => {}
+        }
+    }
+    for edges in tailcalls.values_mut() {
+        edges.sort_unstable();
+        edges.dedup();
+    }
+
+    let incoming_live: HashSet<(Address, Node, Mreg)> = db
+        .rel_iter::<(Address, Node, Mreg)>("arg_reg_param_live_at")
+        .copied()
+        .collect();
+    let mut evidence_positions: HashMap<Address, HashSet<usize>> = HashMap::new();
+    for (function, position) in
+        db.rel_iter::<(Address, usize)>("func_has_param_evidence")
+    {
+        evidence_positions
+            .entry(*function)
+            .or_default()
+            .insert(*position);
+    }
+
+    let mut prototype_indices: HashMap<Address, usize> = prototypes
+        .iter()
+        .enumerate()
+        .map(|(index, prototype)| (prototype.address, index))
+        .collect();
+    let mut callers: Vec<Address> = tailcalls.keys().copied().collect();
+    callers.sort_unstable();
+    let mut inherited_tailcalls = HashSet::new();
+
+    // A finite call graph reaches its fixed point in at most one update per
+    // function along an acyclic chain.  The bound also makes recursive thunk
+    // cycles terminate without relying on update order.
+    for _ in 0..=functions.len() {
+        let mut changed = false;
+        for caller in &callers {
+            if returning_functions.contains(caller)
+                || variadic_functions.contains(caller)
+            {
+                continue;
+            }
+            let Some(edges) = tailcalls.get(caller) else {
+                continue;
+            };
+            let [(tail_node, target)] = edges.as_slice() else {
+                continue;
+            };
+            if caller == target || variadic_functions.contains(target) {
+                continue;
+            }
+            let Some(target_prototype) = resolved.get(target).cloned() else {
+                continue;
+            };
+            if target_prototype.param_count > abi.first_stack_arg_position()
+                || target_prototype.param_types.len() != target_prototype.param_count
+            {
+                continue;
+            }
+            let forwarded = target_prototype
+                .param_types
+                .iter()
+                .enumerate()
+                .all(|(position, xtype)| {
+                    let register = if matches!(xtype, XType::Xfloat | XType::Xsingle) {
+                        abi.float_arg_regs.get(position)
+                    } else {
+                        abi.int_arg_regs.get(position)
+                    };
+                    register.is_some_and(|register| {
+                        incoming_live.contains(&(*caller, *tail_node, *register))
+                    })
+                });
+            if !forwarded
+                || evidence_positions.get(caller).is_some_and(|positions| {
+                    positions
+                        .iter()
+                        .any(|position| *position >= target_prototype.param_count)
+                })
+            {
+                continue;
+            }
+            // The callee may already have the right prototype while this
+            // otherwise-empty forwarding thunk does not.  Remember the edge
+            // itself so patch_db also materializes the newly inherited
+            // incoming operands; keying only on a changed *callee* leaves the
+            // call signature correct but its argument vector short.
+            inherited_tailcalls.insert(*tail_node);
+
+            let Some(name) = functions.get(caller).copied() else {
+                continue;
+            };
+            let inherited = FunctionPrototype {
+                address: *caller,
+                name,
+                param_count: target_prototype.param_count,
+                param_types: target_prototype.param_types.clone(),
+                return_type: target_prototype.return_type,
+                confidence: SignatureConfidence::HighConfidence,
+                is_varargs: false,
+            };
+            let differs = resolved.get(caller).map_or(true, |current| {
+                current.param_count != inherited.param_count
+                    || current.param_types != inherited.param_types
+                    || current.return_type != inherited.return_type
+                    || current.is_varargs != inherited.is_varargs
+            });
+            if !differs {
+                continue;
+            }
+
+            resolved.insert(*caller, inherited.clone());
+            if let Some(index) = prototype_indices.get(caller).copied() {
+                prototypes[index] = inherited;
+            } else {
+                prototype_indices.insert(*caller, prototypes.len());
+                prototypes.push(inherited);
+            }
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    inherited_tailcalls
 }
 
 fn patch_db(
     db: &mut DecompileDB,
     prototypes: &[FunctionPrototype],
+    inherited_tailcalls: &HashSet<Node>,
 ) {
     let target_abi = db.abi().clone();
     let first_stack_position = target_abi.first_stack_arg_position();
@@ -1156,15 +1375,13 @@ fn patch_db(
 
         for proto in prototypes {
             let existing = existing_params.get(&proto.address).cloned().unwrap_or_default();
-            let current_count = existing.len();
-
-            for (i, &reg) in existing.iter().enumerate() {
-                if i < proto.param_count {
-                    new_params.push((proto.address, reg));
+            if !target_abi.uses_shared_arg_slots() {
+                let current_count = existing.len();
+                for (i, &reg) in existing.iter().enumerate() {
+                    if i < proto.param_count {
+                        new_params.push((proto.address, reg));
+                    }
                 }
-            }
-
-            if proto.param_count > current_count {
                 for i in current_count..proto.param_count {
                     let xtype = proto.param_types.get(i).cloned().unwrap_or(XType::Xany64);
                     let synthetic_reg = if let Some(mreg) = register_for_position(i, &xtype) {
@@ -1176,9 +1393,41 @@ fn patch_db(
                         )
                     };
                     new_params.push((proto.address, synthetic_reg));
-
-                    db.rel_push("emit_function_param_type_candidate", (proto.address, synthetic_reg, xtype));
+                    db.rel_push(
+                        "emit_function_param_type_candidate",
+                        (proto.address, synthetic_reg, xtype),
+                    );
                 }
+                continue;
+            }
+
+            // Win64 GP/XMM registers share source-language ordinals.  Select
+            // the physical register class dictated by the final type at each
+            // ordinal instead of taking the first N interleaved candidates.
+            for i in 0..proto.param_count {
+                let xtype = proto.param_types.get(i).cloned().unwrap_or(XType::Xany64);
+                let selected_reg = if let Some(mreg) = register_for_position(i, &xtype) {
+                    existing
+                        .iter()
+                        .copied()
+                        .find(|reg| rtl_to_mreg.get(&(proto.address, *reg)) == Some(&mreg))
+                        .unwrap_or_else(|| fresh_xtl_reg(proto.address, mreg))
+                } else {
+                    let stack_reg = crate::decompile::passes::rtl_pass::fresh_stack_param_reg(
+                        proto.address,
+                        i - first_stack_position,
+                    );
+                    existing
+                        .iter()
+                        .copied()
+                        .find(|reg| *reg == stack_reg)
+                        .unwrap_or(stack_reg)
+                };
+                new_params.push((proto.address, selected_reg));
+                db.rel_push(
+                    "emit_function_param_type_candidate",
+                    (proto.address, selected_reg, xtype),
+                );
             }
         }
 
@@ -1382,6 +1631,33 @@ fn patch_db(
     }
 
     // reg->rtl and def-at-use maps, shared by the (dead) call_args_collected reconciliation and the Icall/Itailcall argument-arity reconciliation in the rtl_inst patch below.
+    // Reduce only unambiguous final signatures.  The normal reconciliation
+    // path emits one row per function; if an older candidate relation still
+    // contains conflicting rows, declining to rewrite that call is safer than
+    // choosing whichever parallel tuple happens to arrive last.
+    let final_signatures: HashMap<Address, Signature> = {
+        let mut signatures = HashMap::new();
+        let mut ambiguous = HashSet::new();
+        for (address, signature) in
+            db.rel_iter::<(Address, Signature)>("emit_function_signature")
+        {
+            match signatures.get(address) {
+                Some(existing) if existing != signature => {
+                    ambiguous.insert(*address);
+                }
+                Some(_) => {}
+                None => {
+                    signatures.insert(*address, signature.clone());
+                }
+            }
+        }
+        signatures.retain(|address, _| !ambiguous.contains(address));
+        signatures
+    };
+    let variadic_targets: HashSet<Address> = db
+        .rel_iter::<(Address,)>("is_varargs_fn")
+        .map(|(address,)| *address)
+        .collect();
     let reg_rtl_map: HashMap<(Node, Mreg), RTLReg> = db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl")
         .map(|&(addr, ref mreg, rtl)| ((addr, *mreg), rtl))
         .collect();
@@ -1389,6 +1665,24 @@ fn patch_db(
     for &(def_addr, ref mreg, use_addr) in db.rel_iter::<(Address, Mreg, Address)>("reg_def_used") {
         reg_def_at_use.insert((*mreg, use_addr), def_addr);
     }
+    let mut call_owners: HashMap<Node, Address> = HashMap::new();
+    let mut ambiguous_call_owners = HashSet::new();
+    for (node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        match call_owners.get(node) {
+            Some(existing) if existing != function => {
+                ambiguous_call_owners.insert(*node);
+            }
+            Some(_) => {}
+            None => {
+                call_owners.insert(*node, *function);
+            }
+        }
+    }
+    call_owners.retain(|node, _| !ambiguous_call_owners.contains(node));
+    let incoming_live: HashSet<(Address, Node, Mreg)> = db
+        .rel_iter::<(Address, Node, Mreg)>("arg_reg_param_live_at")
+        .copied()
+        .collect();
 
     {
         let mut new_call_args: Vec<(Node, Arc<Vec<RTLReg>>)> = Vec::new();
@@ -1403,34 +1697,55 @@ fn patch_db(
                 }
             };
 
-            let proto = match proto_map.get(&target) {
-                Some(p) => p,
+            // Preserve the historical no-op for calls whose target prototype
+            // did not change during reconciliation.
+            if !proto_map.contains_key(&target)
+                && !inherited_tailcalls.contains(&call_node)
+            {
+                new_call_args.push((call_node, args.clone()));
+                continue;
+            }
+
+            let signature = match final_signatures.get(&target) {
+                Some(signature) => signature,
                 None => {
                     new_call_args.push((call_node, args.clone()));
                     continue;
                 }
             };
 
-            if args.len() == proto.param_count {
+            if variadic_targets.contains(&target) {
                 new_call_args.push((call_node, args.clone()));
                 continue;
             }
 
-            if args.len() > proto.param_count {
+            let param_count = signature.sig_args.len();
+            if args.len() == param_count {
+                new_call_args.push((call_node, args.clone()));
+                continue;
+            }
+
+            if args.len() > param_count {
                 // Truncate unconditionally: Signature/FuncDef/FuncDecl model only fixed-arity sigs.
-                let trimmed: Vec<RTLReg> = args.iter().take(proto.param_count).cloned().collect();
+                let trimmed: Vec<RTLReg> = args.iter().take(param_count).cloned().collect();
                 new_call_args.push((call_node, Arc::new(trimmed)));
                 patched_calls.insert(call_node);
                 continue;
             }
 
             let mut widened = args.as_ref().clone();
-            for i in args.len()..proto.param_count {
-                let xtype = proto.param_types.get(i).unwrap_or(&XType::Xany64);
+            for i in args.len()..param_count {
+                let xtype = signature.sig_args.get(i).unwrap_or(&XType::Xany64);
                 let Some(mreg) = register_for_position(i, xtype) else {
                     break;
                 };
 
+                if let Some(&function) = call_owners.get(&call_node) {
+                    if incoming_live.contains(&(function, call_node, mreg)) {
+                        widened.push(fresh_xtl_reg(function, mreg));
+                        continue;
+                    }
+                }
                 if let Some(&rtl) = reg_rtl_map.get(&(call_node, mreg)) {
                     widened.push(rtl);
                     continue;
@@ -1462,65 +1777,102 @@ fn patch_db(
         let mut patched_insts: usize = 0;
 
         // Reconcile a call's argument list to the callee's reconciled arity, since cminor builds Scall directly from Icall.args and clang checks it against the already-reconciled declaration.
-        let reconcile_args = |call_node: Node, args: &Args, param_types: &[XType]| -> Args {
+        let reconcile_args = |call_node: Node,
+                              args: &Args,
+                              previous_signature: Option<&Signature>,
+                              param_types: &[XType]|
+         -> Args {
             let param_count = param_types.len();
-            if args.len() == param_count {
-                return args.clone();
-            }
-            if args.len() > param_count {
-                // Only fixed-arity signatures are modeled; drop the extra collected args.
-                return Arc::new(args.iter().take(param_count).cloned().collect());
-            }
-            let mut widened = args.as_ref().clone();
-            for i in args.len()..param_count {
+            let mut reconciled = Vec::with_capacity(param_count);
+            for i in 0..param_count {
                 if let Some(mreg) = register_for_position(i, &param_types[i]) {
+                    if let Some(&function) = call_owners.get(&call_node) {
+                        if incoming_live.contains(&(function, call_node, mreg)) {
+                            reconciled.push(fresh_xtl_reg(function, mreg));
+                            continue;
+                        }
+                    }
+                    let previous_mreg = previous_signature
+                        .and_then(|signature| signature.sig_args.get(i))
+                        .and_then(|xtype| register_for_position(i, xtype));
+                    if let Some(&existing) = args.get(i) {
+                        let fabricated = existing == fresh_xtl_reg(call_node, mreg)
+                            || previous_mreg.is_some_and(|previous| {
+                                existing == fresh_xtl_reg(call_node, previous)
+                            });
+                        if !fabricated
+                            && (previous_mreg == Some(mreg)
+                                || rtl_to_mreg.get(&(call_node, existing)) == Some(&mreg))
+                        {
+                            reconciled.push(existing);
+                            continue;
+                        }
+                    }
                     if let Some(&rtl) = reg_rtl_map.get(&(call_node, mreg)) {
-                        widened.push(rtl);
+                        reconciled.push(rtl);
                         continue;
                     }
                     if let Some(&def_addr) = reg_def_at_use.get(&(mreg, call_node)) {
                         if let Some(&rtl) = reg_rtl_map.get(&(def_addr, mreg)) {
-                            widened.push(rtl);
+                            reconciled.push(rtl);
                             continue;
                         }
                     }
-                    widened.push(fresh_xtl_reg(call_node, mreg));
+                    let positional = args.get(i).copied().filter(|arg| {
+                        rtl_to_mreg.get(&(call_node, *arg)) == Some(&mreg)
+                    });
+                    reconciled.push(
+                        positional.unwrap_or_else(|| fresh_xtl_reg(call_node, mreg)),
+                    );
                 } else {
-                    // Stack-passed parameters (beyond the 6 GP arg registers).
-                    widened.push(crate::decompile::passes::rtl_pass::fresh_stack_param_reg(
-                        call_node,
-                        i - first_stack_position,
-                    ));
+                    // Existing stack arguments already carry their positional
+                    // load/store value.  Synthesize only when the collected
+                    // list is genuinely short.
+                    reconciled.push(args.get(i).copied().unwrap_or_else(|| {
+                        crate::decompile::passes::rtl_pass::fresh_stack_param_reg(
+                            call_node,
+                            i - first_stack_position,
+                        )
+                    }));
                 }
             }
-            Arc::new(widened)
+            Arc::new(reconciled)
         };
 
         for &(node, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
             match inst {
                 RTLInst::Icall(sig_opt, callee, args, dst, succ) => {
-                    let target = match callee {
-                        either::Either::Right(either::Either::Left(addr)) => Some(*addr),
-                        _ => None,
-                    };
-                    let proto = target.and_then(|t| proto_map.get(&t).copied());
-                    if let Some(proto) = proto {
+                    let target = call_targets.get(&node).copied();
+                    let final_signature = target
+                        .filter(|address| {
+                            proto_map.contains_key(address)
+                                || inherited_tailcalls.contains(&node)
+                        })
+                        .and_then(|address| final_signatures.get(&address));
+                    if let Some(final_signature) = final_signature {
+                        let is_varargs = target
+                            .is_some_and(|address| variadic_targets.contains(&address));
                         // Variadic callees keep their full (tail-bearing) arg list; only fixed-arity calls are reconciled to the prototype count.
-                        let new_args = if proto.is_varargs {
+                        let new_args = if is_varargs {
                             args.clone()
                         } else {
-                            reconcile_args(node, args, &proto.param_types)
+                            reconcile_args(
+                                node,
+                                args,
+                                sig_opt.as_ref(),
+                                final_signature.sig_args.as_slice(),
+                            )
                         };
                         // Type the variadic tail at its natural 64-bit width; an untyped tail slot defaults to int and truncates a pointer vararg.
-                        let mut sig_args = proto.param_types.clone();
-                        if proto.is_varargs {
+                        let mut sig_args = final_signature.sig_args.as_ref().clone();
+                        if is_varargs {
                             while sig_args.len() < new_args.len() {
                                 sig_args.push(XType::Xany64);
                             }
                         }
                         let new_sig = Signature {
                             sig_args: Arc::new(sig_args),
-                            sig_res: proto.return_type,
+                            sig_res: final_signature.sig_res,
                             sig_cc: sig_opt.as_ref().map(|s| s.sig_cc.clone()).unwrap_or_default(),
                         };
                         let sig_changed = sig_opt.as_ref()
@@ -1544,28 +1896,37 @@ fn patch_db(
                     new_insts.push((node, inst.clone()));
                 }
                 RTLInst::Itailcall(sig_opt, callee, args) => {
-                    let target = match callee {
-                        either::Either::Right(either::Either::Left(addr)) => Some(*addr),
-                        _ => None,
-                    };
-                    let proto = target.and_then(|t| proto_map.get(&t).copied());
-                    if let Some(proto) = proto {
+                    let target = call_targets.get(&node).copied();
+                    let final_signature = target
+                        .filter(|address| {
+                            proto_map.contains_key(address)
+                                || inherited_tailcalls.contains(&node)
+                        })
+                        .and_then(|address| final_signatures.get(&address));
+                    if let Some(final_signature) = final_signature {
+                        let is_varargs = target
+                            .is_some_and(|address| variadic_targets.contains(&address));
                         // Variadic callees keep their full (tail-bearing) arg list; only fixed-arity calls are reconciled to the prototype count.
-                        let new_args = if proto.is_varargs {
+                        let new_args = if is_varargs {
                             args.clone()
                         } else {
-                            reconcile_args(node, args, &proto.param_types)
+                            reconcile_args(
+                                node,
+                                args,
+                                sig_opt.as_ref(),
+                                final_signature.sig_args.as_slice(),
+                            )
                         };
                         // Type the variadic tail at its natural 64-bit width; an untyped tail slot defaults to int and truncates a pointer vararg.
-                        let mut sig_args = proto.param_types.clone();
-                        if proto.is_varargs {
+                        let mut sig_args = final_signature.sig_args.as_ref().clone();
+                        if is_varargs {
                             while sig_args.len() < new_args.len() {
                                 sig_args.push(XType::Xany64);
                             }
                         }
                         let new_sig = Signature {
                             sig_args: Arc::new(sig_args),
-                            sig_res: proto.return_type,
+                            sig_res: final_signature.sig_res,
                             sig_cc: sig_opt.as_ref().map(|s| s.sig_cc.clone()).unwrap_or_default(),
                         };
                         let sig_changed = sig_opt.as_ref()
