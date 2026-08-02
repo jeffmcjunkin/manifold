@@ -4,6 +4,9 @@ use crate::run_pass;
 use crate::decompile::passes::asm_pass::{is_flag_setting, transl_addressing_rev_sized};
 use crate::decompile::passes::cminor_pass::*;
 use crate::decompile::passes::clight_select::query::canonical_function_owners;
+use crate::decompile::passes::clight_select::select::{
+    UNSUPPORTED_ADDRESS_DETAIL_CODES, UNSUPPORTED_ADDRESS_REASON_CODES,
+};
 use crate::decompile::passes::csh_pass::*;
 use crate::decompile::passes::pass::IRPass;
 use crate::mreg::Mreg;
@@ -3247,7 +3250,8 @@ ascent_par! {
         instr_in_function(*addr, func);
 
     // Tail-bridge: when a synth-only addr's next() is neither ltl_inst nor synth-only, walk past it to the next live in-func ltl_inst and add a parallel edge to the post-skip target.
-    rtl_succ_candidate(synth_last, dst) <--
+    relation synthetic_tail_member(Node, Address);
+    rtl_succ_candidate(synth_last, dst), synthetic_tail_member(synth_last, *func) <--
         synth_only_addr(addr),
         instr_in_function(addr, func),
         next(addr, mid),
@@ -3258,7 +3262,7 @@ ascent_par! {
         let synth_last = (*addr | (1u64 << 62)) | (1u64 << 63);
 
     // Some synth-only producers emit only a single synth (bit 62), not the double (62+63); tail is `addr | (1<<62)`, emit bridging edge from that synth too.
-    rtl_succ_candidate(synth_last, dst) <--
+    rtl_succ_candidate(synth_last, dst), synthetic_tail_member(synth_last, *func) <--
         synth_only_addr(addr),
         instr_in_function(addr, func),
         next(addr, mid),
@@ -13109,15 +13113,21 @@ fn select_sp_indexed_fused_lowerings(db: &mut DecompileDB) {
 }
 
 // Synthetic membership feeds later passes, but keeping it out of the main
-// fixed point prevents the complete-lowering witness from becoming recursive
-// with function/call aggregates through instr_in_function.
-fn materialize_sp_indexed_fused_members(db: &mut DecompileDB) {
+// fixed point prevents complete-lowering and tail-bridge witnesses from
+// becoming recursive with function/call aggregates through
+// instr_in_function. Materialize every producer-authenticated owner before
+// the unsupported-address preflight snapshots public membership.
+fn materialize_synthetic_members(db: &mut DecompileDB) {
     let mut rows: Vec<(Node, Address)> = db
         .rel_iter::<(Node, Address)>("instr_in_function")
         .copied()
         .collect();
     rows.extend(
         db.rel_iter::<(Node, Address)>("sp_indexed_fused_member")
+            .copied(),
+    );
+    rows.extend(
+        db.rel_iter::<(Node, Address)>("synthetic_tail_member")
             .copied(),
     );
     rows.sort_unstable();
@@ -13322,25 +13332,98 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
         .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
         .copied()
         .collect();
-    let unsupported_site_owners: BTreeSet<(Address, Address)> = unsupported_rows
+    let detail_rows: BTreeSet<(Address, Address, Symbol)> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail")
+        .copied()
+        .collect();
+    let diagnostic_sites: BTreeSet<(Address, Address)> = unsupported_rows
         .iter()
         .map(|(function, access, _)| (*function, *access))
         .collect();
-    let unsupported_sites: BTreeSet<Address> = unsupported_site_owners
+    let invalid_reason_rows: BTreeSet<(Address, Address, Symbol)> = unsupported_rows
+        .iter()
+        .filter(|(_, _, reason)| !UNSUPPORTED_ADDRESS_REASON_CODES.contains(reason))
+        .copied()
+        .collect();
+    let invalid_detail_rows: BTreeSet<(Address, Address, Symbol)> = detail_rows
+        .iter()
+        .filter(|(function, access, detail)| {
+            !diagnostic_sites.contains(&(*function, *access))
+                || !UNSUPPORTED_ADDRESS_DETAIL_CODES.contains(detail)
+        })
+        .copied()
+        .collect();
+    // A diagnostic bundle is one function-level safety claim. Unknown reason
+    // or detail vocabulary, and details without a matching diagnostic site,
+    // must not authorize even a known sibling row to mutate node-global RTL.
+    // Block both the malformed owner and the affected access so a second raw
+    // claimant cannot suppress the shared node on its behalf.
+    let invalid_bundle_functions: BTreeSet<Address> = invalid_reason_rows
+        .iter()
+        .chain(invalid_detail_rows.iter())
+        .map(|(function, _, _)| *function)
+        .collect();
+    let invalid_bundle_sites: BTreeSet<Address> = invalid_reason_rows
+        .iter()
+        .chain(invalid_detail_rows.iter())
+        .map(|(_, access, _)| *access)
+        .collect();
+    let diagnosed_site_owners: BTreeSet<(Address, Address)> = unsupported_rows
+        .iter()
+        .filter(|(function, access, reason)| {
+            UNSUPPORTED_ADDRESS_REASON_CODES.contains(reason)
+                && !invalid_bundle_functions.contains(function)
+                && !invalid_bundle_sites.contains(access)
+        })
+        .map(|(function, access, _)| (*function, *access))
+        .collect();
+    let diagnosed_sites: BTreeSet<Address> = diagnosed_site_owners
         .iter()
         .map(|(_, access)| *access)
         .collect();
-    if unsupported_sites.is_empty() {
+    if diagnosed_sites.is_empty() {
         return;
     }
 
-    // Diagnostics may outlive a function-membership row while passes are
-    // being inspected independently.  Such rows still veto unsafe lowering,
-    // but must not mint a phantom replacement instruction or CFG node.
+    // Candidate, membership, CFG, negation, and provenance relations are all
+    // node-global, while diagnostics retain a function owner. Snapshot every
+    // relation used by the imperative rewrite and admit a root only after its
+    // complete conservative mutation footprint is authenticated against the
+    // pre-mutation ownership relation. A rejected preflight leaves that whole
+    // root untouched; its diagnostic still omits the function downstream.
     let old_members: Vec<(Node, Address)> = db
         .rel_iter::<(Node, Address)>("instr_in_function")
         .copied()
         .collect();
+    let old_candidates: Vec<(Node, RTLInst)> = db
+        .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+        .map(|(node, inst)| (*node, inst.clone()))
+        .collect();
+    let old_candidate_nodes: BTreeSet<Node> =
+        old_candidates.iter().map(|(node, _)| *node).collect();
+    let old_edges: Vec<(Node, Node)> = db
+        .rel_iter::<(Node, Node)>("rtl_succ_candidate")
+        .copied()
+        .collect();
+    let old_negated: BTreeSet<(Node, Node)> = db
+        .rel_iter::<(Node, Node)>("rtl_edge_negated")
+        .copied()
+        .collect();
+    let raw_next: BTreeSet<(Node, Node)> = db
+        .rel_iter::<(Node, Node)>("rtl_next")
+        .copied()
+        .collect();
+    let raw_control_next: BTreeSet<(Node, Node)> = db
+        .rel_iter::<(Node, Node)>("next")
+        .copied()
+        .collect();
+    let canonical_owners_before = canonical_function_owners(old_members.iter().copied());
+    let same_canonical_owner = |left: Node, right: Node| {
+        canonical_owners_before
+            .get(&left)
+            .zip(canonical_owners_before.get(&right))
+            .is_some_and(|(left_owner, right_owner)| left_owner == right_owner)
+    };
     let mut node_owners: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
     for &(node, function) in &old_members {
         node_owners.entry(node).or_default().insert(function);
@@ -13352,6 +13435,162 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
             .is_some_and(|(left_owners, right_owners)| !left_owners.is_disjoint(right_owners))
     };
 
+    let cmp_dependencies: Vec<(Address, Address, RTLReg, Address)> = db
+        .rel_iter::<(Address, Address, RTLReg, Address)>("cmp_memory_temp_consumer")
+        .copied()
+        .collect();
+    let fused_member_rows: Vec<(Node, Address)> = db
+        .rel_iter::<(Node, Address)>("sp_indexed_fused_member")
+        .copied()
+        .collect();
+    let synth_only_nodes: Vec<Node> = db
+        .rel_iter::<(Node,)>("synth_only_addr")
+        .map(|(node,)| *node)
+        .collect();
+    let indirect_load_nodes: Vec<Node> = db
+        .rel_iter::<(Node, RTLReg, MemoryChunk, Addressing, Args)>(
+            "call_through_memory_load",
+        )
+        .map(|(node, ..)| *node)
+        .collect();
+    let pointer_nodes: Vec<Node> = db
+        .rel_iter::<(Node, RTLReg)>("op_produces_ptr")
+        .map(|(node, _)| *node)
+        .collect();
+    let escaped_origin_rows: Vec<(Address, Node)> = db
+        .rel_iter::<(Address, Node, i64, RTLReg)>("slot_escaped_origin")
+        .map(|(function, node, _, _)| (*function, *node))
+        .collect();
+    let mut stack_provenance_rows = Vec::new();
+    for relation in ["stack_xtl", "stack_var"] {
+        stack_provenance_rows.extend(
+            db.rel_iter::<(Address, Node, i64, RTLReg)>(relation)
+                .map(|(function, node, _, _)| (*function, *node)),
+        );
+    }
+    let normalized_base_rows: Vec<(Address, Node)> = db
+        .rel_iter::<(Address, Node, RTLReg, i64)>("normalized_stack_lea_base")
+        .map(|(function, node, _, _)| (*function, *node))
+        .collect();
+
+    let suppressible_site_owners: BTreeSet<(Address, Address)> = diagnosed_site_owners
+        .iter()
+        .filter(|&&(function, access)| {
+            let is_rooted = |node: Node| {
+                node == access
+                    || (node & !SYNTHETIC_NODE_MASK) == access
+                        && (node & SYNTHETIC_NODE_MASK) != 0
+            };
+            let is_canonical = |node: Node| {
+                node_owners
+                    .get(&node)
+                    .is_some_and(|owners| owners.contains(&function))
+                    && canonical_owners_before.get(&node) == Some(&function)
+            };
+            if !is_canonical(access) {
+                return false;
+            }
+
+            let mut footprint = BTreeSet::from([access]);
+            footprint.extend(
+                old_candidates
+                    .iter()
+                    .filter_map(|(node, _)| is_rooted(*node).then_some(*node)),
+            );
+
+            // Synthetic memberships are deleted wholesale. They must be
+            // exclusive to the diagnosed owner; the real root's extra stale
+            // claimants are harmless because its membership is retained.
+            for &(node, owner) in &old_members {
+                if !is_rooted(node) {
+                    continue;
+                }
+                if node != access && owner != function {
+                    return false;
+                }
+                footprint.insert(node);
+            }
+
+            // First collect every chain node named by a node-global edge or
+            // negation. The opposite endpoints are added below because their
+            // outgoing/incoming relation row may be removed or redirected.
+            for &(source, destination) in old_edges.iter().chain(old_negated.iter()) {
+                if is_rooted(source) {
+                    footprint.insert(source);
+                }
+                if is_rooted(destination) {
+                    footprint.insert(destination);
+                }
+            }
+
+            for &(node, owner) in &fused_member_rows {
+                if is_rooted(node) {
+                    if owner != function {
+                        return false;
+                    }
+                    footprint.insert(node);
+                }
+            }
+            footprint.extend(
+                synth_only_nodes
+                    .iter()
+                    .chain(indirect_load_nodes.iter())
+                    .chain(pointer_nodes.iter())
+                    .filter_map(|&node| is_rooted(node).then_some(node)),
+            );
+            for &(owner, node) in escaped_origin_rows
+                .iter()
+                .chain(stack_provenance_rows.iter())
+                .chain(normalized_base_rows.iter())
+            {
+                if is_rooted(node) {
+                    if owner != function {
+                        return false;
+                    }
+                    footprint.insert(node);
+                }
+            }
+
+            for &(_, consumer, _, owner) in cmp_dependencies
+                .iter()
+                .filter(|(root, _, _, _)| *root == access)
+            {
+                if owner != function {
+                    return false;
+                }
+                footprint.insert(consumer);
+            }
+
+            // Edge semantics belong to their source. If an affected node is
+            // the destination, authenticate the external predecessor whose
+            // outgoing row will be removed or redirected. An exit *from* an
+            // affected root/consumer needs no ownership claim on its external
+            // destination; semantic RTL exits may deliberately cross a
+            // function boundary.
+            let directly_mutated = footprint.clone();
+            for &(source, destination) in old_edges
+                .iter()
+                .chain(old_negated.iter())
+                .chain(raw_next.iter())
+                .chain(raw_control_next.iter())
+            {
+                if directly_mutated.contains(&destination) {
+                    footprint.insert(source);
+                }
+            }
+
+            footprint.into_iter().all(is_canonical)
+        })
+        .copied()
+        .collect();
+    let unsupported_sites: BTreeSet<Address> = suppressible_site_owners
+        .iter()
+        .map(|(_, access)| *access)
+        .collect();
+    if unsupported_sites.is_empty() {
+        return;
+    }
+
     // Synthetic membership is not sufficient ownership for minting a real
     // replacement node.  In a partially inspected DB it may be the only stale
     // remnant of a rejected chain; require the real instruction's own row.
@@ -13359,13 +13598,6 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
         .iter()
         .filter_map(|(node, _)| unsupported_sites.contains(node).then_some(*node))
         .collect();
-
-    let old_candidates: Vec<(Node, RTLInst)> = db
-        .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
-        .map(|(node, inst)| (*node, inst.clone()))
-        .collect();
-    let old_candidate_nodes: BTreeSet<Node> =
-        old_candidates.iter().map(|(node, _)| *node).collect();
 
     // A rejected memory CMP owns a temporary consumed at the following JCC
     // or SETcc node.  Root-only filtering would leave that consumer reading a
@@ -13377,10 +13609,8 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
     let mut rejected_cmp_consumers: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
     let mut rejected_cmp_consumers_by_root: BTreeMap<Address, BTreeSet<(Node, Address)>> =
         BTreeMap::new();
-    for (root, consumer, temp, owner) in
-        db.rel_iter::<(Address, Address, RTLReg, Address)>("cmp_memory_temp_consumer")
-    {
-        if unsupported_site_owners.contains(&(*owner, *root))
+    for (root, consumer, temp, owner) in &cmp_dependencies {
+        if suppressible_site_owners.contains(&(*owner, *root))
             && node_owners
                 .get(root)
                 .is_some_and(|owners| owners.contains(owner))
@@ -13504,19 +13734,6 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
         candidates.into_iter().collect::<ascent::boxcar::Vec<_>>(),
     );
 
-    let old_edges: Vec<(Node, Node)> = db
-        .rel_iter::<(Node, Node)>("rtl_succ_candidate")
-        .copied()
-        .collect();
-    let raw_next: BTreeSet<(Node, Node)> = db
-        .rel_iter::<(Node, Node)>("rtl_next")
-        .copied()
-        .collect();
-    let raw_control_next: BTreeSet<(Node, Node)> = db
-        .rel_iter::<(Node, Node)>("next")
-        .copied()
-        .collect();
-
     // Icond edges were materialized before this imperative filter.  Remove a
     // rejected condition's taken edge unless a surviving control candidate at
     // the same node explicitly claims it.  Its false edge is decoded
@@ -13535,10 +13752,11 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
             if !surviving_control_edges.contains(&(consumer, false_target)) {
                 stale_cmp_control_edges.insert((consumer, false_target));
             }
-        } else if node_owners
-            .get(&false_target)
-            .is_some_and(|owners| !owners.is_disjoint(&rejecting_owners))
-            && surviving_candidate_nodes.contains(&false_target)
+        } else if surviving_candidate_nodes.contains(&false_target)
+            && (raw_next.contains(&(consumer, false_target))
+                || canonical_owners_before
+                    .get(&false_target)
+                    .is_some_and(|owner| rejecting_owners.contains(owner)))
         {
             safe_cmp_fallthrough_edges.insert((consumer, false_target));
         } else {
@@ -13554,9 +13772,10 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
             .filter(|(source, _)| source == consumer)
         {
             if surviving_candidate_nodes.contains(destination)
-                && node_owners
-                    .get(destination)
-                    .is_some_and(|owners| !owners.is_disjoint(rejecting_owners))
+                && (raw_next.contains(&(*consumer, *destination))
+                    || canonical_owners_before
+                        .get(destination)
+                        .is_some_and(|owner| rejecting_owners.contains(owner)))
                 && !is_unsupported_synthetic_node(*destination, &unsupported_sites)
                 && !(unsupported_sites.contains(destination)
                     && !owned_sites.contains(destination))
@@ -13633,7 +13852,7 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
             && !internal_synthetic_sources.contains(&source)
             && surviving_candidate_nodes.contains(&destination)
             && shares_owner(real, source)
-            && shares_owner(real, destination)
+            && same_canonical_owner(real, destination)
             && unsupported_memory_site_for_node(destination, &unsupported_sites) != Some(real)
             && !is_unsupported_synthetic_node(destination, &unsupported_sites)
         {
@@ -13718,7 +13937,7 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
             if !seen.insert(node) || is_unsupported_synthetic_node(node, &unsupported_sites) {
                 continue;
             }
-            if !shares_owner(real, node) {
+            if !same_canonical_owner(real, node) {
                 continue;
             }
             if surviving_candidate_nodes.contains(&node) {
@@ -13735,8 +13954,8 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
 
     // Finalize negations first.  The Ascent fixed point has already run, so
     // mutating this relation alone would not re-fire rtl_next -> successor.
-    let mut negated: BTreeSet<(Node, Node)> = db
-        .rel_iter::<(Node, Node)>("rtl_edge_negated")
+    let mut negated: BTreeSet<(Node, Node)> = old_negated
+        .iter()
         .filter(|(source, destination)| {
             !is_unsupported_synthetic_node(*source, &unsupported_sites)
                 && !is_unsupported_synthetic_node(*destination, &unsupported_sites)
@@ -13948,7 +14167,9 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
     let mut certified = BTreeSet::new();
     let mut certified_nodes: BTreeMap<(Address, Address), BTreeSet<Node>> = BTreeMap::new();
     for &(function, access, reason) in &unsupported_rows {
-        if !old_members.contains(&(access, function))
+        if !UNSUPPORTED_ADDRESS_REASON_CODES.contains(&reason)
+            || !suppressible_site_owners.contains(&(function, access))
+            || !old_members.contains(&(access, function))
             || !final_members.contains(&(access, function))
             || canonical_owners.get(&access) != Some(&function)
             || !decoded_instructions.contains(&access)
@@ -14020,8 +14241,8 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
 
         let mut lost_nodes = BTreeSet::from([access]);
         let mut cmp_dependency_safe = true;
-        for (_, consumer, temp, _) in db
-            .rel_iter::<(Address, Address, RTLReg, Address)>("cmp_memory_temp_consumer")
+        for (_, consumer, temp, _) in cmp_dependencies
+            .iter()
             .filter(|(root, _, _, owner)| *root == access && *owner == function)
         {
             if !final_members.contains(&(*consumer, function))
@@ -14053,16 +14274,17 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
             continue;
         }
 
-        // Every rebuilt root successor must name a surviving candidate.  This
-        // admits authenticated semantic interprocedural edges while rejecting
-        // a dangling bridge that would make a partial body structurally lie.
+        // Every rebuilt lost-node successor must name a surviving candidate.
+        // A nonsemantic CMP/tail/decoded bridge must stay in the diagnosed
+        // canonical owner; only an exact semantic rtl_next edge may cross a
+        // function boundary.
         if final_edges
             .iter()
-            .filter(|(source, _)| *source == access)
-            .any(|(_, destination)| {
-                !final_candidates
-                    .iter()
-                    .any(|(node, _)| node == destination)
+            .filter(|(source, _)| lost_nodes.contains(source))
+            .any(|(source, destination)| {
+                !final_candidates.iter().any(|(node, _)| node == destination)
+                    || (!raw_next.contains(&(*source, *destination))
+                        && canonical_owners.get(destination) != Some(&function))
             })
         {
             continue;
@@ -16246,7 +16468,7 @@ impl IRPass for RTLPass {
         run_pass!(db, RTLPassProgram);
         canonicalize_indexed_stack_rtl_values(db);
         select_sp_indexed_fused_lowerings(db);
-        materialize_sp_indexed_fused_members(db);
+        materialize_synthetic_members(db);
         normalize_addr32_rtl_outputs(db);
         classify_indexed_stack_lowerings(db);
         // Filter before home-cell selection so its peer/type/deadness repair is
@@ -16681,7 +16903,7 @@ mod encoding_tests {
     fn seed_rejected_site(db: &mut DecompileDB, function: Address, real: Node) {
         db.rel_push(
             "unsupported_stack_address",
-            (function, real, "test-unsupported-address"),
+            (function, real, "unsupported-stack-address"),
         );
         db.rel_push("instr_in_function", (real, function));
         db.rel_push("rtl_inst_candidate", (real, RTLInst::Inop));
@@ -16693,6 +16915,34 @@ mod encoding_tests {
             "instruction",
             (node, 1usize, "", "nop", "", "", "", "", 0usize, 0usize),
         );
+    }
+
+    fn seed_observable_rejection_chain(
+        db: &mut DecompileDB,
+        function: Address,
+        root: Node,
+    ) {
+        let successor = root + 0x10;
+        let temporary = root + 0x20;
+        seed_rejected_site(db, function, root);
+        db.rel_push("instr_in_function", (successor, function));
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                root,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed(8),
+                    Arc::new(vec![root + 0x30]),
+                    temporary,
+                ),
+            ),
+        );
+        db.rel_push("rtl_inst_candidate", (successor, RTLInst::Inop));
+        db.rel_push("rtl_succ_candidate", (root, successor));
+        db.rel_push("rtl_edge_negated", (root, successor));
+        db.rel_push("op_produces_ptr", (root, temporary));
+        db.rel_push("stack_var", (function, root, 8, temporary));
     }
 
     #[test]
@@ -16724,7 +16974,7 @@ mod encoding_tests {
                 )
                 .copied()
                 .collect::<BTreeSet<_>>(),
-                BTreeSet::from([(function, root, "test-unsupported-address")])
+                BTreeSet::from([(function, root, "unsupported-stack-address")])
             );
             assert_eq!(
                 db.rel_iter::<(Address, Address, Node)>(
@@ -16744,6 +16994,64 @@ mod encoding_tests {
     }
 
     #[test]
+    fn mixed_known_and_unknown_reason_preserves_site_before_certification() {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x1200;
+        let root: Node = 0x1210;
+        seed_observable_rejection_chain(&mut db, function, root);
+        db.rel_push(
+            "unsupported_stack_address",
+            (function, root, "unsupported-future-address"),
+        );
+        for node in root..root + 8 {
+            seed_decoded_instruction(&mut db, function, node);
+        }
+
+        let before = suppression_snapshot(&db);
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert_eq!(suppression_snapshot(&db), before);
+        assert!(db
+            .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+            .next()
+            .is_none());
+        assert!(db
+            .rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn unknown_or_orphan_detail_preserves_the_entire_function_bundle() {
+        for (detail_access_delta, detail) in [
+            (0, "unsupported-future-detail"),
+            (8, "rsp-coordinate-unknown"),
+        ] {
+            let mut db = DecompileDB::default();
+            let function: Address = 0x1300;
+            let root: Node = 0x1310;
+            seed_observable_rejection_chain(&mut db, function, root);
+            db.rel_push(
+                "unsupported_address_detail",
+                (function, root + detail_access_delta, detail),
+            );
+
+            let before = suppression_snapshot(&db);
+            suppress_unsupported_address_candidates(&mut db);
+
+            assert_eq!(suppression_snapshot(&db), before, "detail={detail}");
+            assert!(db
+                .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+                .next()
+                .is_none());
+            assert!(db
+                .rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+                .next()
+                .is_none());
+        }
+    }
+
+    #[test]
     fn shared_rejection_certifies_only_the_canonical_clight_owner() {
         let mut db = DecompileDB::default();
         let earlier_owner: Address = 0x1100;
@@ -16752,7 +17060,7 @@ mod encoding_tests {
         seed_rejected_site(&mut db, earlier_owner, root);
         db.rel_push(
             "unsupported_stack_address",
-            (canonical_owner, root, "test-unsupported-address"),
+            (canonical_owner, root, "unsupported-stack-address"),
         );
         for node in root..root + 8 {
             seed_decoded_instruction(&mut db, earlier_owner, node);
@@ -16768,7 +17076,7 @@ mod encoding_tests {
             BTreeSet::from([(
                 canonical_owner,
                 root,
-                "test-unsupported-address"
+                "unsupported-stack-address"
             )])
         );
         assert_eq!(
@@ -16785,6 +17093,199 @@ mod encoding_tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([(canonical_owner, 1, 8)])
         );
+    }
+
+    #[test]
+    fn noncanonical_root_diagnostic_preserves_canonical_owner_semantics() {
+        let mut db = DecompileDB::default();
+        let diagnosed_owner: Address = 0x1100;
+        let canonical_owner: Address = 0x1108;
+        let root: Node = 0x1110;
+        let successor: Node = 0x1120;
+        let original = RTLInst::Iop(Operation::Ointconst(7), Arc::new(vec![]), 0x1130);
+
+        db.rel_push(
+            "unsupported_stack_address",
+            (diagnosed_owner, root, "unsupported-addr32-address"),
+        );
+        for function in [diagnosed_owner, canonical_owner] {
+            db.rel_push("instr_in_function", (root, function));
+        }
+        db.rel_push("instr_in_function", (successor, canonical_owner));
+        db.rel_push(
+            "instruction",
+            (root, 1usize, "", "nop", "", "", "", "", 0usize, 0usize),
+        );
+        db.rel_push("rtl_inst_candidate", (root, original.clone()));
+        db.rel_push("rtl_inst_candidate", (successor, RTLInst::Inop));
+        db.rel_push("rtl_succ_candidate", (root, successor));
+        // Force the suppression machinery past its empty-mutation fast path;
+        // only this unrelated canonical site is eligible for rewriting.
+        seed_rejected_site(&mut db, 0x2000, 0x2010);
+
+        let candidates_before = candidate_snapshot(&db);
+        let edges_before = edge_snapshot(&db);
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert_eq!(candidate_snapshot(&db), candidates_before);
+        assert_eq!(edge_snapshot(&db), edges_before);
+        assert!(db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .any(|(node, inst)| *node == root && *inst == original));
+        assert!(db
+            .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+            .next()
+            .is_none());
+        assert!(db
+            .rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn unknown_reason_diagnostic_cannot_authorize_node_global_mutation() {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x2100;
+        let root: Node = 0x2110;
+        let successor: Node = 0x2120;
+        let original = RTLInst::Iop(Operation::Ointconst(9), Arc::new(vec![]), 0x2130);
+
+        db.rel_push(
+            "unsupported_stack_address",
+            (function, root, "unsupported-future-address"),
+        );
+        for node in [root, successor] {
+            db.rel_push("instr_in_function", (node, function));
+        }
+        db.rel_push("rtl_inst_candidate", (root, original));
+        db.rel_push("rtl_inst_candidate", (successor, RTLInst::Inop));
+        db.rel_push("rtl_succ_candidate", (root, successor));
+        db.rel_push("rtl_edge_negated", (root, successor));
+        db.rel_push("op_produces_ptr", (root, 0x2140));
+        db.rel_push("stack_var", (function, root, 8, 0x2140));
+        seed_rejected_site(&mut db, 0x2200, 0x2210);
+
+        let before = suppression_snapshot(&db);
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert_eq!(suppression_snapshot(&db), before);
+        assert!(db
+            .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn split_owner_synthetic_chain_preserves_every_node_global_relation() {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x3000;
+        let another_owner: Address = 0x3008;
+        let root: Node = 0x3010;
+        let synthetic = root | (1u64 << 62);
+        let successor: Node = 0x3020;
+        let temporary: RTLReg = 0x3030;
+
+        db.rel_push(
+            "unsupported_stack_address",
+            (function, root, "unsupported-stack-address"),
+        );
+        for node in [root, synthetic, successor] {
+            db.rel_push("instr_in_function", (node, function));
+        }
+        db.rel_push("instr_in_function", (synthetic, another_owner));
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                root,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed(8),
+                    Arc::new(vec![0x3040]),
+                    temporary,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                synthetic,
+                RTLInst::Iop(Operation::Ointconst(1), Arc::new(vec![]), temporary),
+            ),
+        );
+        db.rel_push("rtl_inst_candidate", (successor, RTLInst::Inop));
+        db.rel_push("rtl_succ_candidate", (root, synthetic));
+        db.rel_push("rtl_succ_candidate", (synthetic, successor));
+        db.rel_push("rtl_edge_negated", (root, successor));
+        db.rel_push("sp_indexed_fused_member", (synthetic, function));
+        db.rel_push("synth_only_addr", (root,));
+        db.rel_push("op_produces_ptr", (synthetic, temporary));
+        db.rel_push("stack_var", (function, synthetic, 8, temporary));
+        seed_rejected_site(&mut db, 0x9000, 0x9010);
+
+        let before = suppression_snapshot(&db);
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert_eq!(suppression_snapshot(&db), before);
+        assert!(db
+            .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn split_owner_incoming_edge_source_preserves_redirect_relations() {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x4000;
+        let another_owner: Address = 0x4004;
+        let predecessor: Node = 0x4008;
+        let root: Node = 0x4010;
+        let synthetic = root | (1u64 << 62);
+        let successor: Node = 0x4020;
+        let temporary: RTLReg = 0x4030;
+
+        db.rel_push(
+            "unsupported_stack_address",
+            (function, root, "unsupported-stack-address"),
+        );
+        for node in [predecessor, root, synthetic, successor] {
+            db.rel_push("instr_in_function", (node, function));
+        }
+        db.rel_push("instr_in_function", (predecessor, another_owner));
+        db.rel_push(
+            "rtl_inst_candidate",
+            (predecessor, RTLInst::Ibranch(Either::Right(root))),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                root,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed(8),
+                    Arc::new(vec![0x4040]),
+                    temporary,
+                ),
+            ),
+        );
+        db.rel_push("rtl_inst_candidate", (synthetic, RTLInst::Inop));
+        db.rel_push("rtl_inst_candidate", (successor, RTLInst::Inop));
+        db.rel_push("rtl_succ_candidate", (predecessor, synthetic));
+        db.rel_push("rtl_succ_candidate", (root, synthetic));
+        db.rel_push("rtl_succ_candidate", (synthetic, successor));
+        db.rel_push("rtl_edge_negated", (predecessor, root));
+        db.rel_push("next", (predecessor, root));
+        db.rel_push("op_produces_ptr", (synthetic, temporary));
+        db.rel_push("stack_xtl", (function, synthetic, 8, temporary));
+        seed_rejected_site(&mut db, 0x9000, 0x9010);
+
+        let before = suppression_snapshot(&db);
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert_eq!(suppression_snapshot(&db), before);
+        assert!(db
+            .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+            .next()
+            .is_none());
     }
 
     #[test]
@@ -16840,9 +17341,17 @@ mod encoding_tests {
         // only the dependent decoded instruction changes canonical owner.
         let another_owner: Address = 0x7018;
         db.rel_push("instr_in_function", (consumer, another_owner));
+        // Exercise the mixed mutation set instead of passing only because the
+        // split-owner root is the sole diagnostic.
+        seed_rejected_site(&mut db, 0x8000, 0x8010);
+
+        let candidates_before = candidate_snapshot(&db);
+        let edges_before = edge_snapshot(&db);
 
         suppress_unsupported_address_candidates(&mut db);
 
+        assert_eq!(candidate_snapshot(&db), candidates_before);
+        assert_eq!(edge_snapshot(&db), edges_before);
         assert!(db
             .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
             .next()
@@ -16859,11 +17368,132 @@ mod encoding_tests {
             .is_none());
     }
 
+    #[test]
+    fn cmp_dependency_missing_diagnosed_owner_membership_preserves_original_relations() {
+        let (mut db, root, consumer, fallthrough, taken, temp, _) =
+            cmp_consumer_rejection_db(
+                Some("unsupported-stack-address"),
+                CmpConsumerKind::Jcc,
+                false,
+            );
+        let function: Address = 0x7000;
+        for node in [root, consumer, fallthrough, taken] {
+            seed_decoded_instruction(&mut db, function, node);
+        }
+
+        // Model a malformed/stale dependency row: it still attributes the
+        // consumer to the diagnosed function, but that function no longer
+        // owns the consumer. Another canonical body does, so node-global
+        // mutation would erase live semantics if the row were trusted.
+        let another_owner: Address = 0x7018;
+        let members: ascent::boxcar::Vec<(Node, Address)> = db
+            .rel_iter::<(Node, Address)>("instr_in_function")
+            .filter(|(node, owner)| *node != consumer || *owner != function)
+            .copied()
+            .chain([(consumer, another_owner)])
+            .collect();
+        db.rel_set("instr_in_function", members);
+        seed_rejected_site(&mut db, 0x8000, 0x8010);
+
+        let candidates_before = candidate_snapshot(&db);
+        let edges_before = edge_snapshot(&db);
+        assert!(candidate_uses(&db, consumer, temp));
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert_eq!(candidate_snapshot(&db), candidates_before);
+        assert_eq!(edge_snapshot(&db), edges_before);
+        assert!(candidate_uses(&db, consumer, temp));
+        assert!(db
+            .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+            .next()
+            .is_none());
+        assert!(db
+            .rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+            .next()
+            .is_none());
+    }
+
     fn outgoing(db: &DecompileDB, source: Node) -> BTreeSet<Node> {
         db.rel_iter::<(Node, Node)>("rtl_succ_candidate")
             .filter_map(|(edge_source, destination)| {
                 (*edge_source == source).then_some(*destination)
             })
+            .collect()
+    }
+
+    fn candidate_snapshot(db: &DecompileDB) -> Vec<(Node, RTLInst)> {
+        let mut candidates: Vec<_> = db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .map(|(node, inst)| (*node, inst.clone()))
+            .collect();
+        candidates.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
+        candidates
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct SuppressionSnapshot {
+        candidates: Vec<(Node, RTLInst)>,
+        successors: BTreeSet<(Node, Node)>,
+        negations: BTreeSet<(Node, Node)>,
+        memberships: BTreeSet<(Node, Address)>,
+        provenance: Vec<(&'static str, String)>,
+    }
+
+    fn suppression_snapshot(db: &DecompileDB) -> SuppressionSnapshot {
+        let mut provenance = Vec::new();
+        provenance.extend(
+            db.rel_iter::<(Node, Address)>("sp_indexed_fused_member")
+                .map(|row| ("sp_indexed_fused_member", format!("{row:?}"))),
+        );
+        provenance.extend(
+            db.rel_iter::<(Node,)>("synth_only_addr")
+                .map(|row| ("synth_only_addr", format!("{row:?}"))),
+        );
+        provenance.extend(
+            db.rel_iter::<(Node, RTLReg, MemoryChunk, Addressing, Args)>(
+                "call_through_memory_load",
+            )
+            .map(|row| ("call_through_memory_load", format!("{row:?}"))),
+        );
+        provenance.extend(
+            db.rel_iter::<(Node, RTLReg)>("op_produces_ptr")
+                .map(|row| ("op_produces_ptr", format!("{row:?}"))),
+        );
+        provenance.extend(
+            db.rel_iter::<(Address, Node, i64, RTLReg)>("slot_escaped_origin")
+                .map(|row| ("slot_escaped_origin", format!("{row:?}"))),
+        );
+        for relation in ["stack_xtl", "stack_var"] {
+            provenance.extend(
+                db.rel_iter::<(Address, Node, i64, RTLReg)>(relation)
+                    .map(|row| (relation, format!("{row:?}"))),
+            );
+        }
+        provenance.extend(
+            db.rel_iter::<(Address, Node, RTLReg, i64)>("normalized_stack_lea_base")
+                .map(|row| ("normalized_stack_lea_base", format!("{row:?}"))),
+        );
+        provenance.sort();
+
+        SuppressionSnapshot {
+            candidates: candidate_snapshot(db),
+            successors: edge_snapshot(db),
+            negations: db
+                .rel_iter::<(Node, Node)>("rtl_edge_negated")
+                .copied()
+                .collect(),
+            memberships: db
+                .rel_iter::<(Node, Address)>("instr_in_function")
+                .copied()
+                .collect(),
+            provenance,
+        }
+    }
+
+    fn edge_snapshot(db: &DecompileDB) -> BTreeSet<(Node, Node)> {
+        db.rel_iter::<(Node, Node)>("rtl_succ_candidate")
+            .copied()
             .collect()
     }
 
@@ -17127,7 +17757,7 @@ mod encoding_tests {
     }
 
     #[test]
-    fn rejected_cmp_does_not_bridge_fallthrough_across_owners() {
+    fn semantic_cmp_fallthrough_may_cross_function_owners() {
         let (mut db, _, consumer, fallthrough, _, temp, _) = cmp_consumer_rejection_db(
             Some("unsupported-stack-address"),
             CmpConsumerKind::Jcc,
@@ -17143,6 +17773,36 @@ mod encoding_tests {
             "instr_in_function",
             members.into_iter().collect::<ascent::boxcar::Vec<_>>(),
         );
+
+        // cmp_consumer_rejection_db supplies the exact semantic
+        // rtl_next(consumer, fallthrough), so this cross-owner exit is the
+        // sole admitted exception to canonical destination ownership.
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert!(!candidate_uses(&db, consumer, temp));
+        assert_eq!(outgoing(&db, consumer), BTreeSet::from([fallthrough]));
+    }
+
+    #[test]
+    fn rejected_cmp_nonsemantic_fallthrough_rejects_raw_shared_foreign_owner() {
+        let (mut db, _, consumer, fallthrough, _, temp, _) = cmp_consumer_rejection_db(
+            Some("unsupported-stack-address"),
+            CmpConsumerKind::Jcc,
+            false,
+        );
+        // Keep the diagnosed owner's raw claim, but add a nearer function
+        // entry so canonical Clight ownership belongs elsewhere. This is the
+        // case an intersection-only shares_owner check admitted.
+        let another_owner: Address = 0x7018;
+        db.rel_push("instr_in_function", (fallthrough, another_owner));
+        // Remove the exact semantic witness. The remaining decoded
+        // fallthrough must satisfy canonical destination ownership instead.
+        let semantic: ascent::boxcar::Vec<(Node, Node)> = db
+            .rel_iter::<(Node, Node)>("rtl_next")
+            .filter(|edge| **edge != (consumer, fallthrough))
+            .copied()
+            .collect();
+        db.rel_set("rtl_next", semantic);
 
         suppress_unsupported_address_candidates(&mut db);
 
@@ -17170,7 +17830,7 @@ mod encoding_tests {
     }
 
     #[test]
-    fn synthetic_membership_does_not_own_rejected_real() {
+    fn synthetic_membership_does_not_authorize_rejected_root_mutation() {
         let mut db = DecompileDB::default();
         let function: Address = 0x1000;
         let predecessor: Node = 0x1010;
@@ -17179,7 +17839,7 @@ mod encoding_tests {
 
         db.rel_push(
             "unsupported_stack_address",
-            (function, real, "test-unsupported-address"),
+            (function, real, "unsupported-stack-address"),
         );
         db.rel_push("instr_in_function", (predecessor, function));
         db.rel_push("instr_in_function", (synthetic, function));
@@ -17188,14 +17848,16 @@ mod encoding_tests {
         db.rel_push("rtl_succ_candidate", (predecessor, synthetic));
         db.rel_push("next", (predecessor, real));
 
+        let candidates_before = candidate_snapshot(&db);
+        let edges_before = edge_snapshot(&db);
         suppress_unsupported_address_candidates(&mut db);
 
-        assert!(!db
-            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
-            .any(|(node, _)| (*node & !SYNTHETIC_NODE_MASK) == real));
-        assert!(!db
-            .rel_iter::<(Node, Node)>("rtl_succ_candidate")
-            .any(|(source, destination)| *source == real || *destination == real));
+        assert_eq!(candidate_snapshot(&db), candidates_before);
+        assert_eq!(edge_snapshot(&db), edges_before);
+        assert!(db
+            .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+            .next()
+            .is_none());
     }
 
     #[test]
@@ -17221,6 +17883,48 @@ mod encoding_tests {
         suppress_unsupported_address_candidates(&mut db);
 
         assert_eq!(outgoing(&db, real), BTreeSet::from([live]));
+    }
+
+    #[test]
+    fn synthetic_tail_exit_rejects_raw_shared_foreign_canonical_destination() {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x2400;
+        let real: Node = 0x2410;
+        let synthetic = real | (1u64 << 62);
+        let another_owner: Address = 0x2420;
+        let destination: Node = 0x2430;
+
+        seed_rejected_site(&mut db, function, real);
+        db.rel_push("instr_in_function", (synthetic, function));
+        db.rel_push("instr_in_function", (destination, function));
+        db.rel_push("instr_in_function", (destination, another_owner));
+        db.rel_push("rtl_inst_candidate", (synthetic, RTLInst::Inop));
+        db.rel_push("rtl_inst_candidate", (destination, RTLInst::Inop));
+        db.rel_push("rtl_succ_candidate", (real, synthetic));
+        db.rel_push("rtl_succ_candidate", (synthetic, destination));
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert!(outgoing(&db, real).is_empty());
+    }
+
+    #[test]
+    fn decoded_fallback_rejects_raw_shared_foreign_canonical_destination() {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x2500;
+        let real: Node = 0x2510;
+        let another_owner: Address = 0x2520;
+        let destination: Node = 0x2530;
+
+        seed_rejected_site(&mut db, function, real);
+        db.rel_push("instr_in_function", (destination, function));
+        db.rel_push("instr_in_function", (destination, another_owner));
+        db.rel_push("rtl_inst_candidate", (destination, RTLInst::Inop));
+        db.rel_push("next", (real, destination));
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert!(outgoing(&db, real).is_empty());
     }
 
     #[test]

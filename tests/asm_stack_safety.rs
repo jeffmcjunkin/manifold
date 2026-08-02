@@ -739,11 +739,11 @@ fn cmp_candidate_uses_temp(inst: &RTLInst, temp: u64) -> bool {
     }
 }
 
-fn assert_no_address_bearing_candidate(db: &DecompileDB, context: &str, access: Address) {
+fn address_bearing_candidates(db: &DecompileDB, access: Address) -> Vec<(Address, RTLInst)> {
     let is_lea = db
         .rel_iter::<InstructionRow>("instruction")
         .any(|(address, _, _, mnemonic, ..)| *address == access && *mnemonic == "LEA");
-    let leaked: Vec<(Address, RTLInst)> = db
+    db
         .rel_iter::<(Address, RTLInst)>("rtl_inst_candidate")
         .filter(|(node, inst)| {
             (*node == access || (*node & !SYNTHETIC_NODE_MASK) == access)
@@ -758,7 +758,11 @@ fn assert_no_address_bearing_candidate(db: &DecompileDB, context: &str, access: 
                     && matches!(inst, RTLInst::Iop(..)))
         })
         .map(|(node, inst)| (*node, inst.clone()))
-        .collect();
+        .collect()
+}
+
+fn assert_no_address_bearing_candidate(db: &DecompileDB, context: &str, access: Address) {
+    let leaked = address_bearing_candidates(db, access);
     assert!(
         leaked.is_empty(),
         "{context} retained address-bearing RTL at 0x{access:x}: {leaked:#x?}"
@@ -860,6 +864,83 @@ fn assert_no_address_bearing_candidate(db: &DecompileDB, context: &str, access: 
     }
 }
 
+fn assert_unsupported_site_follows_certification(
+    db: &DecompileDB,
+    context: &str,
+    access: Address,
+) {
+    let diagnostics: HashSet<(Address, Address, Symbol)> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .filter(|(_, row_access, _)| *row_access == access)
+        .copied()
+        .collect();
+    assert!(
+        !diagnostics.is_empty(),
+        "{context} has no structured diagnostic at 0x{access:x}"
+    );
+
+    let certificates: HashSet<(Address, Address, Symbol)> = db
+        .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+        .filter(|(_, row_access, _)| *row_access == access)
+        .copied()
+        .collect();
+    assert!(
+        certificates.is_subset(&diagnostics),
+        "{context} published an orphan suppression certificate at 0x{access:x}: \
+         diagnostics={diagnostics:#x?}, certificates={certificates:#x?}"
+    );
+
+    let certified_nodes: Vec<(Address, Address, Address)> = db
+        .rel_iter::<(Address, Address, Address)>("suppressed_unsupported_address_node")
+        .filter(|(_, row_access, _)| *row_access == access)
+        .copied()
+        .collect();
+    let certified_site_owners: HashSet<(Address, Address)> = certificates
+        .iter()
+        .map(|(owner, row_access, _)| (*owner, *row_access))
+        .collect();
+    assert!(
+        certified_nodes
+            .iter()
+            .all(|(owner, row_access, _)| certified_site_owners.contains(&(*owner, *row_access))),
+        "{context} published node provenance without an owner/site certificate at \
+         0x{access:x}: {certified_nodes:#x?}"
+    );
+    for owner in diagnostics.iter().map(|(owner, _, _)| *owner) {
+        let owner_diagnostics: HashSet<_> = diagnostics
+            .iter()
+            .filter(|(row_owner, _, _)| *row_owner == owner)
+            .copied()
+            .collect();
+        let owner_certificates: HashSet<_> = certificates
+            .iter()
+            .filter(|(row_owner, _, _)| *row_owner == owner)
+            .copied()
+            .collect();
+        if owner_certificates != owner_diagnostics {
+            assert!(
+                !db.rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+                    .any(|(function, _, _)| *function == owner),
+                "{context} admitted incompletely certified owner 0x{owner:x} as partial"
+            );
+        }
+    }
+    if certificates.is_empty() {
+        return;
+    }
+
+    for (owner, _, _) in &certificates {
+        assert!(
+            certified_nodes
+                .iter()
+                .any(|row| *row == (*owner, access, access)),
+            "{context} certificate for owner 0x{owner:x} omitted its decoded root \
+             0x{access:x}: {certified_nodes:#x?}"
+        );
+    }
+    assert_no_address_bearing_candidate(db, context, access);
+}
+
 fn assert_rejected_rmw_chain_is_atomic(db: &DecompileDB) {
     let name = "rsp_after_mov_rmw_chain";
     let access = instruction_address(db, name, "ADD");
@@ -941,7 +1022,7 @@ fn assert_rejected_rmw_chain_is_atomic(db: &DecompileDB) {
     }
 }
 
-fn assert_all_structured_unsupported_sites_are_filtered(db: &DecompileDB) {
+fn assert_all_structured_unsupported_sites_follow_certification(db: &DecompileDB) {
     let mut sites: Vec<Address> = db
         .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
         .map(|(_, access, _)| *access)
@@ -949,7 +1030,7 @@ fn assert_all_structured_unsupported_sites_are_filtered(db: &DecompileDB) {
     sites.sort_unstable();
     sites.dedup();
     for access in sites {
-        assert_no_address_bearing_candidate(db, "structured unsupported site", access);
+        assert_unsupported_site_follows_certification(db, "structured unsupported site", access);
     }
 }
 
@@ -1022,7 +1103,7 @@ fn assert_stack_unsupported(db: &DecompileDB, name: &str, access: Address) {
             }),
         "{name} did not retain its structured unsupported site at 0x{access:x}"
     );
-    assert_no_address_bearing_candidate(db, name, access);
+    assert_unsupported_site_follows_certification(db, name, access);
 }
 
 fn assert_addr32_unsupported(db: &DecompileDB, name: &str, access: Address) {
@@ -1034,7 +1115,7 @@ fn assert_addr32_unsupported(db: &DecompileDB, name: &str, access: Address) {
             }),
         "{name} did not retain its addr32 unsupported site at 0x{access:x}"
     );
-    assert_no_address_bearing_candidate(db, name, access);
+    assert_unsupported_site_follows_certification(db, name, access);
 }
 
 fn cmp_temp_provenance(
@@ -1791,6 +1872,15 @@ fn assert_shared_and_indirect_stack_sites_are_rejected(db: &DecompileDB) {
     assert_stack_unsupported(db, "shared_stack_a", shared_access);
     assert_stack_unsupported(db, "shared_stack_b", shared_access);
     assert_ne!(shared_a.0, shared_b.0);
+    assert!(
+        !address_bearing_candidates(db, shared_access).is_empty(),
+        "split-owner shared stack site was mutated without a certificate"
+    );
+    assert!(
+        !db.rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+            .any(|(_, access, _)| *access == shared_access),
+        "split-owner shared stack site unexpectedly received a certificate"
+    );
 
     let indirect = memory_access_address(db, "unresolved_indirect_stack", "RSP", 8);
     let indirect_span = function_span(db, "unresolved_indirect_stack");
@@ -1810,6 +1900,15 @@ fn assert_shared_and_indirect_stack_sites_are_rejected(db: &DecompileDB) {
         .any(|(node, func)| (*node, *func) == (shared_addr32, addr32_frame.0)));
     assert_addr32_unsupported(db, "addr32_shared_ebp_frame", shared_addr32);
     assert_addr32_unsupported(db, "addr32_shared_ebp_scratch", shared_addr32);
+    assert!(
+        !address_bearing_candidates(db, shared_addr32).is_empty(),
+        "split-owner addr32 site was mutated without a certificate"
+    );
+    assert!(
+        !db.rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+            .any(|(_, access, _)| *access == shared_addr32),
+        "split-owner addr32 site unexpectedly received a certificate"
+    );
 
     let unresolved_addr32 = memory_access_address(db, "addr32_unresolved_ebp", "EBP", 8);
     let unresolved_addr32_span = function_span(db, "addr32_unresolved_ebp");
@@ -1894,7 +1993,7 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
     manifold::decompile::disassembly::load_preset(&mut db);
     db.run_pipeline(object, false, false);
 
-    assert_all_structured_unsupported_sites_are_filtered(&db);
+    assert_all_structured_unsupported_sites_follow_certification(&db);
 
     // This path uses the scheduled/parallel pipeline rather than manually
     // ordered passes, guarding the Asm seed -> RTL public diagnostic edge.
@@ -1930,6 +2029,10 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
 
     assert!(!partial_addresses.is_empty(), "fixture recovered no partial functions");
     assert!(partial_addresses.is_subset(&diagnostic_addresses));
+    assert!(
+        certified_rows.is_subset(&diagnostic_rows),
+        "real-TU pipeline published orphan suppression certificates"
+    );
     for row @ (function, _, _) in &diagnostic_rows {
         assert_eq!(
             selected_addresses.contains(function),
@@ -1939,6 +2042,33 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
         if partial_addresses.contains(function) {
             assert!(certified_rows.contains(row));
         }
+    }
+    for (function, suppressed, _) in
+        db.rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+    {
+        let diagnostics: HashSet<_> = diagnostic_rows
+            .iter()
+            .filter(|(owner, _, _)| owner == function)
+            .copied()
+            .collect();
+        let certificates: HashSet<_> = certified_rows
+            .iter()
+            .filter(|(owner, _, _)| owner == function)
+            .copied()
+            .collect();
+        assert_eq!(
+            certificates, diagnostics,
+            "partial owner 0x{function:x} was not certified for every exact diagnostic"
+        );
+        let nodes: HashSet<_> = db
+            .rel_iter::<(Address, Address, Address)>("suppressed_unsupported_address_node")
+            .filter_map(|(owner, _, node)| (*owner == *function).then_some(*node))
+            .collect();
+        assert_eq!(
+            nodes.len(),
+            *suppressed,
+            "partial owner 0x{function:x} budget did not match exact node provenance"
+        );
     }
     let diamond = function_span(&db, "rsp_diamond_stress").0;
     assert!(partial_addresses.contains(&diamond));
@@ -2418,7 +2548,7 @@ fn unsafe_bp_rsp_shortcuts_fall_back_to_pointer_loads() {
             assert_shared_and_indirect_stack_sites_are_rejected(&db);
             assert_addr32_semantics(&db);
             assert_cmp_cross_node_safety(&db);
-            assert_all_structured_unsupported_sites_are_filtered(&db);
+            assert_all_structured_unsupported_sites_follow_certification(&db);
         })
         .expect("failed to spawn asm stack-safety test thread")
         .join()

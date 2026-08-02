@@ -7,6 +7,7 @@ use crate::decompile::passes::clight_select::query::{
 };
 use crate::decompile::passes::clight_select::select::{
     select_clight_stmts, validate_partial_unsupported_functions, SelectedFunction,
+    UNSUPPORTED_ADDRESS_REASON_CODES,
 };
 use crate::x86::types::*;
 use serde_json::{json, Value};
@@ -138,14 +139,16 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         || !partial_validation.orphan_provenance_sites.is_empty()
         || !partial_validation.orphan_budget_functions.is_empty()
         || !partial_validation.orphan_details.is_empty()
+        || !partial_validation.unknown_reasons.is_empty()
         || !partial_validation.unknown_details.is_empty()
     {
         return Err(format!(
-            "invalid partial-suppression relation bundle: orphan certificates={:?}, provenance={:?}, budgets={:?}, details={:?}; unknown details={:?}",
+            "invalid partial-suppression relation bundle: orphan certificates={:?}, provenance={:?}, budgets={:?}, details={:?}; unknown reason codes={:?}, unknown details={:?}",
             partial_validation.orphan_certificates,
             partial_validation.orphan_provenance_sites,
             partial_validation.orphan_budget_functions,
             partial_validation.orphan_details,
+            partial_validation.unknown_reasons,
             partial_validation.unknown_details,
         ));
     }
@@ -171,10 +174,7 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
 
     let mut unsupported_functions = Vec::with_capacity(unsupported_stack_rows.len());
     for (func, access, reason) in &unsupported_stack_rows {
-        if !matches!(
-            reason.as_str(),
-            "unsupported-stack-address" | "unsupported-addr32-address"
-        ) {
+        if !UNSUPPORTED_ADDRESS_REASON_CODES.contains(&reason.as_str()) {
             return Err(format!(
                 "unsupported function 0x{func:x} has unknown reason code {reason:?}"
             ));
