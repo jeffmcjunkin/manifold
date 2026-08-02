@@ -1506,6 +1506,9 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "suppressed_unsupported_address",
     "suppressed_unsupported_address_node",
     "partial_unsupported_function",
+    "unsupported_control_flow",
+    "unsupported_rtl_condition",
+    "unsupported_clight_condition",
 ];
 
 /// Build the identifier names used by normal C emission.

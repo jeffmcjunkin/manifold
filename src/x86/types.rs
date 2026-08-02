@@ -13,6 +13,16 @@ pub type Ident = usize;
 
 pub type MregArgs = Arc<Vec<Mreg>>;
 
+/// Architectural widening performed by the definition which reaches a TEST
+/// operand. Clight's inferred type cannot prove the high bits of an x86 parent
+/// register: an ECX write clears RCX's high half, while a byte/word write does
+/// not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TestOperandExtension {
+    ZeroExtended(usize),
+    SignExtended(usize),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParamType {
     Pointer,

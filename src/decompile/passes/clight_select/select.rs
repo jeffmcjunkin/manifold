@@ -405,6 +405,20 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
     let unsupported_stack_functions = unsupported_functions_requiring_omission(db);
     functions.retain(|func| !unsupported_stack_functions.contains(&func.address));
 
+    let unsupported_condition_functions: HashSet<Address> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_control_flow")
+        .map(|(function, _, _)| *function)
+        .chain(
+            db.rel_iter::<(Address, Address, Symbol)>("unsupported_rtl_condition")
+                .map(|(function, _, _)| *function),
+        )
+        .chain(
+            db.rel_iter::<(Address, Address, Symbol)>("unsupported_clight_condition")
+                .map(|(function, _, _)| *function),
+        )
+        .collect();
+    functions.retain(|func| !unsupported_condition_functions.contains(&func.address));
+
     let mut name_to_ident: HashMap<String, Ident> = HashMap::new();
     {
         // Iterate in sorted (id, name) order so that, on a sanitized-name collision, the surviving Ident is deterministic across runs.

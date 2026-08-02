@@ -36,6 +36,8 @@ ascent_par! {
     relation emit_sseq(Node, Node);
     relation emit_var_type_candidate(RTLReg, XType);
     relation all_var_types_global(Arc<Vec<(RTLReg, XType)>>);
+    relation test_operand_extension(RTLReg, TestOperandExtension);
+    relation all_test_operand_extensions_global(Arc<Vec<(RTLReg, TestOperandExtension)>>);
     relation func_param_struct_type(Address, usize, usize);
     relation func_span(Symbol, Address, Address);
     relation global_struct_catalog(u64, usize, usize, usize);
@@ -82,6 +84,8 @@ ascent_par! {
     relation clight_stmt_dead(Address, Node, ClightStmt);
     relation clight_stmt_for_func_raw(Address, Node, ClightStmt);
     relation clight_stmt_raw(Node, ClightStmt);
+    relation unsupported_clight_condition_seed(Address, Address, Symbol);
+    relation unsupported_clight_condition(Address, Address, Symbol);
     relation clight_succ(Node, Node);
     relation clight_var_read(Address, Ident);
     relation clight_var_write(Address, Ident);
@@ -146,6 +150,26 @@ ascent_par! {
     // collect_all_var_types aggregates the whole emit_var_type_candidate relation and does not depend on any node, so materialize it once here instead of recomputing it inside every per-statement rule below.
     all_var_types_global(Arc::new(pairs)) <--
         agg pairs = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty);
+    all_test_operand_extensions_global(Arc::new(pairs)) <--
+        agg pairs = collect_all_test_operand_extensions(reg, extension)
+            in test_operand_extension(reg, extension);
+
+    // Only the new raw-bit TEST class is subject to this gate; legacy
+    // condition conversion behavior remains unchanged.
+    unsupported_clight_condition(*func, *node, *reason) <--
+        unsupported_clight_condition_seed(func, node, reason);
+    unsupported_clight_condition(*func, *node, "condition-bits-unrepresentable") <--
+        csharp_stmt(node, stmt),
+        instr_in_function(node, func),
+        all_var_types_global(all_var_types),
+        all_test_operand_extensions_global(test_extensions),
+        if csharp_stmt_has_unrepresentable_test_condition(stmt, all_var_types, test_extensions);
+    unsupported_clight_condition(*func, *node, "condition-bits-unrepresentable") <--
+        csharp_stmt(node, stmt),
+        block_in_function(node, func),
+        all_var_types_global(all_var_types),
+        all_test_operand_extensions_global(test_extensions),
+        if csharp_stmt_has_unrepresentable_test_condition(stmt, all_var_types, test_extensions);
 
     clight_stmt_raw(node, stmt) <--
         clight_stmt(node, s),
@@ -643,9 +667,10 @@ ascent_par! {
         final_goto(ifso, ifso_final),
         final_goto(ifnot, ifnot_final),
         all_var_types_global(all_var_types),
+        all_test_operand_extensions_global(test_extensions),
         let vars_used = extract_vars_from_csharp_exprs(exprs.as_slice()),
         let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
-        let condition_opt = crate::decompile::passes::clight_pass::clight_condition_expr_with_types(&cond, exprs.as_slice(), &var_types),
+        let condition_opt = crate::decompile::passes::clight_pass::clight_condition_expr_with_types_and_extensions(&cond, exprs.as_slice(), &var_types, test_extensions),
         if let Some(condition) = condition_opt,
         let then_stmt = ClightStmt::Sgoto(ident_from_node(*ifso_final)),
         let else_stmt = ClightStmt::Sgoto(ident_from_node(*ifnot_final)),
@@ -655,22 +680,24 @@ ascent_par! {
     clight_stmt(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sifthenelse(cond, args, then_body, else_body)),
         all_var_types_global(all_var_types),
+        all_test_operand_extensions_global(test_extensions),
         agg func_syms = collect_func_symbols(ident, sym) in ident_to_symbol(ident, sym),
         let vars_used = extract_vars_from_csharp_exprs(args.as_slice()),
         let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
-        if let Some(condition) = crate::decompile::passes::clight_pass::clight_condition_expr_with_types(&cond, args.as_slice(), &var_types),
-        let then_clight = crate::decompile::passes::clight_pass::convert_csharp_stmt_to_clight(then_body, all_var_types, &func_syms),
-        let else_clight = crate::decompile::passes::clight_pass::convert_csharp_stmt_to_clight(else_body, all_var_types, &func_syms),
+        if let Some(condition) = crate::decompile::passes::clight_pass::clight_condition_expr_with_types_and_extensions(&cond, args.as_slice(), &var_types, test_extensions),
+        let then_clight = crate::decompile::passes::clight_pass::convert_csharp_stmt_to_clight_with_extensions(then_body, all_var_types, &func_syms, test_extensions),
+        let else_clight = crate::decompile::passes::clight_pass::convert_csharp_stmt_to_clight_with_extensions(else_body, all_var_types, &func_syms, test_extensions),
         let stmt = ClightStmt::Sifthenelse(condition, Box::new(then_clight), Box::new(else_clight));
 
     // Top-level Sseq node (tail_dup_pass's duplicated cross-jump tail): convert each member into a flat sequence, with no instr_in_function gate since synthetic nodes are absent from it.
     clight_stmt(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sseq(stmts)),
         all_var_types_global(all_var_types),
+        all_test_operand_extensions_global(test_extensions),
         agg func_syms = collect_func_symbols(ident, sym) in ident_to_symbol(ident, sym),
         let stmt = ClightStmt::Ssequence(
             stmts.iter()
-                .map(|s| crate::decompile::passes::clight_pass::convert_csharp_stmt_to_clight(s, all_var_types, &func_syms))
+                .map(|s| crate::decompile::passes::clight_pass::convert_csharp_stmt_to_clight_with_extensions(s, all_var_types, &func_syms, test_extensions))
                 .collect::<Vec<_>>()
         );
 
@@ -694,9 +721,10 @@ ascent_par! {
         valid_ternary(func, branch, var, true_expr, false_expr, _merge),
         csharp_stmt(branch, ?CsharpminorStmt::Scond(cond, args, _, _)),
         all_var_types_global(all_var_types),
+        all_test_operand_extensions_global(test_extensions),
         let vars_used = extract_vars_from_csharp_exprs(&[true_expr.clone(), false_expr.clone()]),
         let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
-        let condition_opt = crate::decompile::passes::clight_pass::clight_condition_expr_with_types(&cond, args.as_slice(), &var_types),
+        let condition_opt = crate::decompile::passes::clight_pass::clight_condition_expr_with_types_and_extensions(&cond, args.as_slice(), &var_types, test_extensions),
         if let Some(condition) = condition_opt,
         let true_clight = clight_expr_from_csharp_with_multi_types(&true_expr, &var_types),
         let false_clight = clight_expr_from_csharp_with_multi_types(&false_expr, &var_types),
@@ -1026,6 +1054,10 @@ impl IRPass for ClightPass {
     }
 
     fn run(&self, db: &mut DecompileDB) {
+        db.rel_set(
+            "unsupported_clight_condition",
+            ascent::boxcar::Vec::<(Address, Address, Symbol)>::new(),
+        );
         run_pass!(db, ClightPassProgram);
     }
 
@@ -1376,6 +1408,15 @@ pub(crate) fn collect_all_var_types<'a>(
     std::iter::once(pairs)
 }
 
+pub(crate) fn collect_all_test_operand_extensions<'a>(
+    input: impl Iterator<Item = (&'a RTLReg, &'a TestOperandExtension)>,
+) -> impl Iterator<Item = Vec<(RTLReg, TestOperandExtension)>> {
+    let mut pairs: Vec<_> = input.map(|(reg, extension)| (*reg, *extension)).collect();
+    pairs.sort();
+    pairs.dedup();
+    std::iter::once(pairs)
+}
+
 pub(crate) fn collect_func_symbols<'a>(
     input: impl Iterator<Item = (&'a Ident, &'a Symbol)>,
 ) -> impl Iterator<Item = Vec<(Ident, Symbol)>> {
@@ -1383,6 +1424,36 @@ pub(crate) fn collect_func_symbols<'a>(
     // ident_to_symbol is multi-valued; sort so downstream `.find()` picks a deterministic symbol.
     pairs.sort();
     std::iter::once(pairs)
+}
+
+fn csharp_stmt_has_unrepresentable_test_condition(
+    stmt: &CsharpminorStmt,
+    all_var_type_pairs: &[(RTLReg, XType)],
+    test_extensions: &[(RTLReg, TestOperandExtension)],
+) -> bool {
+    let condition_fails = |cond: &Condition, args: &[CsharpminorExpr]| {
+        if !matches!(cond, Condition::Ctestzero(_) | Condition::Ctestnotzero(_)) {
+            return false;
+        }
+        let vars_used = extract_vars_from_csharp_exprs(args);
+        let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
+        clight_condition_expr_with_types_and_extensions(cond, args, &var_types, test_extensions).is_none()
+    };
+    match stmt {
+        CsharpminorStmt::Scond(cond, args, _, _) => condition_fails(cond, args.as_slice()),
+        CsharpminorStmt::Sifthenelse(cond, args, then_body, else_body) => {
+            condition_fails(cond, args.as_slice())
+                || csharp_stmt_has_unrepresentable_test_condition(then_body, all_var_type_pairs, test_extensions)
+                || csharp_stmt_has_unrepresentable_test_condition(else_body, all_var_type_pairs, test_extensions)
+        }
+        CsharpminorStmt::Sloop(body) => {
+            csharp_stmt_has_unrepresentable_test_condition(body, all_var_type_pairs, test_extensions)
+        }
+        CsharpminorStmt::Sseq(statements) => statements.iter().any(|statement| {
+            csharp_stmt_has_unrepresentable_test_condition(statement, all_var_type_pairs, test_extensions)
+        }),
+        _ => false,
+    }
 }
 
 /// SR-2: restrict aggregated field evidence to a non-overlapping layout, since build_fields_with_padding silently rebases intersecting extents and corrupts ->ofs_N byte offsets.
@@ -1570,6 +1641,15 @@ pub(crate) fn convert_csharp_stmt_to_clight(
     all_var_type_pairs: &[(RTLReg, XType)],
     func_symbols: &[(Ident, Symbol)],
 ) -> ClightStmt {
+    convert_csharp_stmt_to_clight_with_extensions(stmt, all_var_type_pairs, func_symbols, &[])
+}
+
+pub(crate) fn convert_csharp_stmt_to_clight_with_extensions(
+    stmt: &CsharpminorStmt,
+    all_var_type_pairs: &[(RTLReg, XType)],
+    func_symbols: &[(Ident, Symbol)],
+    test_extensions: &[(RTLReg, TestOperandExtension)],
+) -> ClightStmt {
     match stmt {
         CsharpminorStmt::Sset(dst, expr) => {
             let vars_used = extract_vars_from_csharp_exprs(&[expr.clone()]);
@@ -1619,8 +1699,9 @@ pub(crate) fn convert_csharp_stmt_to_clight(
         CsharpminorStmt::Scond(cond, args, ifso, ifnot) => {
             let vars_used = extract_vars_from_csharp_exprs(args.as_slice());
             let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
-            if let Some(condition) =
-                clight_condition_expr_with_types(cond, args.as_slice(), &var_types)
+            if let Some(condition) = clight_condition_expr_with_types_and_extensions(
+                cond, args.as_slice(), &var_types, test_extensions
+            )
             {
                 let then_stmt = ClightStmt::Sgoto(ident_from_node(*ifso));
                 let else_stmt = ClightStmt::Sgoto(ident_from_node(*ifnot));
@@ -1645,20 +1726,25 @@ pub(crate) fn convert_csharp_stmt_to_clight(
         CsharpminorStmt::Sifthenelse(cond, args, then_body, else_body) => {
             let vars_used = extract_vars_from_csharp_exprs(args.as_slice());
             let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
-            if let Some(condition) =
-                clight_condition_expr_with_types(cond, args.as_slice(), &var_types)
+            if let Some(condition) = clight_condition_expr_with_types_and_extensions(
+                cond, args.as_slice(), &var_types, test_extensions
+            )
             {
-                let then_clight =
-                    convert_csharp_stmt_to_clight(then_body, all_var_type_pairs, func_symbols);
-                let else_clight =
-                    convert_csharp_stmt_to_clight(else_body, all_var_type_pairs, func_symbols);
+                let then_clight = convert_csharp_stmt_to_clight_with_extensions(
+                    then_body, all_var_type_pairs, func_symbols, test_extensions
+                );
+                let else_clight = convert_csharp_stmt_to_clight_with_extensions(
+                    else_body, all_var_type_pairs, func_symbols, test_extensions
+                );
                 ClightStmt::Sifthenelse(condition, Box::new(then_clight), Box::new(else_clight))
             } else {
                 ClightStmt::Sskip
             }
         }
         CsharpminorStmt::Sloop(body) => {
-            let body_clight = convert_csharp_stmt_to_clight(body, all_var_type_pairs, func_symbols);
+            let body_clight = convert_csharp_stmt_to_clight_with_extensions(
+                body, all_var_type_pairs, func_symbols, test_extensions
+            );
             ClightStmt::Sloop(Box::new(body_clight), Box::new(ClightStmt::Sskip))
         }
         CsharpminorStmt::Sbreak => ClightStmt::Sbreak,
@@ -1675,10 +1761,11 @@ pub(crate) fn convert_csharp_stmt_to_clight(
                         .iter()
                         .enumerate()
                         .map(|(idx, case_body)| {
-                            let body_clight = convert_csharp_stmt_to_clight(
+                            let body_clight = convert_csharp_stmt_to_clight_with_extensions(
                                 case_body,
                                 all_var_type_pairs,
                                 func_symbols,
+                                test_extensions,
                             );
                             (Some(idx as Z), body_clight)
                         })
@@ -1688,7 +1775,9 @@ pub(crate) fn convert_csharp_stmt_to_clight(
             }
             let clight_stmts: Vec<ClightStmt> = stmts
                 .iter()
-                .map(|s| convert_csharp_stmt_to_clight(s, all_var_type_pairs, func_symbols))
+                .map(|s| convert_csharp_stmt_to_clight_with_extensions(
+                    s, all_var_type_pairs, func_symbols, test_extensions
+                ))
                 .collect();
             ClightStmt::Ssequence(clight_stmts)
         }
@@ -1760,8 +1849,9 @@ pub(crate) fn convert_csharp_stmt_to_clight(
         CsharpminorStmt::Scond(cond, args, ifso, ifnot) => {
             let vars_used = extract_vars_from_csharp_exprs(args.as_slice());
             let var_types = filter_and_build_multi_var_type_map(all_var_type_pairs, &vars_used);
-            if let Some(condition) =
-                clight_condition_expr_with_types(cond, args.as_slice(), &var_types)
+            if let Some(condition) = clight_condition_expr_with_types_and_extensions(
+                cond, args.as_slice(), &var_types, test_extensions
+            )
             {
                 let then_stmt = ClightStmt::Sgoto(ident_from_node(*ifso));
                 let else_stmt = ClightStmt::Sgoto(ident_from_node(*ifnot));
@@ -3330,42 +3420,104 @@ fn is_int32_type(ty: &ClightType) -> bool {
     matches!(ty, ClightType::Tint(ClightIntSize::I32, _, _))
 }
 
-fn unsigned_test_operand(expr: ClightExpr, width: usize) -> Option<(ClightExpr, ClightType)> {
+fn clight_integral_width(ty: &ClightType) -> Option<usize> {
+    match ty {
+        ClightType::Tint(ClightIntSize::I8, _, _) => Some(1),
+        ClightType::Tint(ClightIntSize::I16, _, _) => Some(2),
+        ClightType::Tint(ClightIntSize::I32, _, _) => Some(4),
+        ClightType::Tlong(_, _) => Some(8),
+        _ => None,
+    }
+}
+
+fn unsigned_type_for_width(width: usize) -> Option<ClightType> {
+    match width {
+        1 => Some(ClightType::Tint(ClightIntSize::I8, ClightSignedness::Unsigned, default_attr())),
+        2 => Some(ClightType::Tint(ClightIntSize::I16, ClightSignedness::Unsigned, default_attr())),
+        4 => Some(default_uint_type()),
+        8 => Some(default_ulong_type()),
+        _ => None,
+    }
+}
+
+fn signed_type_for_width(width: usize) -> Option<ClightType> {
+    match width {
+        1 => Some(ClightType::Tint(ClightIntSize::I8, ClightSignedness::Signed, default_attr())),
+        2 => Some(ClightType::Tint(ClightIntSize::I16, ClightSignedness::Signed, default_attr())),
+        4 => Some(default_int_type()),
+        8 => Some(default_long_type()),
+        _ => None,
+    }
+}
+
+fn explicit_cast(expr: ClightExpr, target: ClightType) -> ClightExpr {
+    if clight_expr_type(&expr) == target { expr } else { ClightExpr::Ecast(Box::new(expr), target) }
+}
+
+fn test_operand_extension_for_reg(
+    reg: RTLReg,
+    extensions: &[(RTLReg, TestOperandExtension)],
+) -> Result<Option<TestOperandExtension>, ()> {
+    // collect_all_test_operand_extensions sorts and deduplicates this table.
+    // Two binary partitions make each condition lookup O(log N); the tiny
+    // same-key slice is bounded by the finite extension enum and is inspected
+    // only to reject conflicting evidence.
+    let start = extensions.partition_point(|(candidate, _)| *candidate < reg);
+    let end = extensions.partition_point(|(candidate, _)| *candidate <= reg);
+    if start == end { return Ok(None); }
+    let extension = extensions[start].1;
+    if extensions[start + 1..end].iter().any(|(_, candidate)| *candidate != extension) {
+        Err(())
+    } else {
+        Ok(Some(extension))
+    }
+}
+
+fn unsigned_test_operand(
+    expr: ClightExpr,
+    width: usize,
+    extension: Option<TestOperandExtension>,
+) -> Option<(ClightExpr, ClightType)> {
     let result_type = match width {
         1 | 2 | 4 => default_uint_type(),
         8 => default_ulong_type(),
         _ => return None,
     };
-    let narrowed = match width {
-        1 => ClightExpr::Ecast(
-            Box::new(expr),
-            ClightType::Tint(
-                ClightIntSize::I8,
-                ClightSignedness::Unsigned,
-                default_attr(),
-            ),
-        ),
-        2 => ClightExpr::Ecast(
-            Box::new(expr),
-            ClightType::Tint(
-                ClightIntSize::I16,
-                ClightSignedness::Unsigned,
-                default_attr(),
-            ),
-        ),
-        4 | 8 => expr,
-        _ => unreachable!(),
+    let source_type = clight_expr_type(&expr);
+    let source_width = if is_pointer_type(&source_type) { 8 } else { clight_integral_width(&source_type)? };
+
+    // Certified extension takes precedence even if qword use-side evidence
+    // made the selected declaration 64-bit: `(u64)(u32)value` still records an
+    // E* write, while MOVSX preserves sign extension through the parent.
+    let normalized = match extension {
+        Some(TestOperandExtension::ZeroExtended(extension_width)) if extension_width <= width => {
+            let low_bits = explicit_cast(expr, unsigned_type_for_width(extension_width)?);
+            explicit_cast(low_bits, unsigned_type_for_width(width)?)
+        }
+        Some(TestOperandExtension::SignExtended(extension_width)) if extension_width <= width => {
+            let low_signed = explicit_cast(expr, signed_type_for_width(extension_width)?);
+            let widened_signed = explicit_cast(low_signed, signed_type_for_width(width)?);
+            explicit_cast(widened_signed, unsigned_type_for_width(width)?)
+        }
+        _ if source_width >= width => explicit_cast(expr, unsigned_type_for_width(width)?),
+        _ => return None,
     };
-    Some((
-        ClightExpr::Ecast(Box::new(narrowed), result_type.clone()),
-        result_type,
-    ))
+    Some((explicit_cast(normalized, result_type.clone()), result_type))
 }
 
 pub(crate) fn clight_condition_expr_with_types(
     cond: &Condition,
     args: &[CsharpminorExpr],
     var_types: &MultiVarTypeMap,
+) -> Option<ClightExpr> {
+    clight_condition_expr_with_types_and_extensions(cond, args, var_types, &[])
+}
+
+pub(crate) fn clight_condition_expr_with_types_and_extensions(
+    cond: &Condition,
+    args: &[CsharpminorExpr],
+    var_types: &MultiVarTypeMap,
+    test_extensions: &[(RTLReg, TestOperandExtension)],
 ) -> Option<ClightExpr> {
     match cond {
         Condition::Ccomp(comp)
@@ -3592,8 +3744,12 @@ pub(crate) fn clight_condition_expr_with_types(
             }
             let lhs = clight_expr_from_csharp_with_multi_types(&args[0], var_types);
             let rhs = clight_expr_from_csharp_with_multi_types(&args[1], var_types);
-            let (lhs, value_type) = unsigned_test_operand(lhs, *width)?;
-            let (rhs, rhs_type) = unsigned_test_operand(rhs, *width)?;
+            let extension_for = |arg: &CsharpminorExpr| -> Result<Option<_>, ()> {
+                let CsharpminorExpr::Evar(reg) = arg else { return Ok(None); };
+                test_operand_extension_for_reg(*reg, test_extensions)
+            };
+            let (lhs, value_type) = unsigned_test_operand(lhs, *width, extension_for(&args[0]).ok()?)?;
+            let (rhs, rhs_type) = unsigned_test_operand(rhs, *width, extension_for(&args[1]).ok()?)?;
             debug_assert_eq!(value_type, rhs_type);
             let tested = ClightExpr::Ebinop(
                 ClightBinaryOp::Oand,
@@ -3619,8 +3775,9 @@ pub(crate) fn clight_condition_expr_with_types(
             ))
         }
         Condition::Cnotcompf(comp) => {
-            let inner =
-                clight_condition_expr_with_types(&Condition::Ccompf(*comp), args, var_types)?;
+            let inner = clight_condition_expr_with_types_and_extensions(
+                &Condition::Ccompf(*comp), args, var_types, test_extensions
+            )?;
             Some(ClightExpr::Eunop(
                 ClightUnaryOp::Onotbool,
                 Box::new(inner),
@@ -3628,8 +3785,9 @@ pub(crate) fn clight_condition_expr_with_types(
             ))
         }
         Condition::Cnotcompfs(comp) => {
-            let inner =
-                clight_condition_expr_with_types(&Condition::Ccompfs(*comp), args, var_types)?;
+            let inner = clight_condition_expr_with_types_and_extensions(
+                &Condition::Ccompfs(*comp), args, var_types, test_extensions
+            )?;
             Some(ClightExpr::Eunop(
                 ClightUnaryOp::Onotbool,
                 Box::new(inner),
@@ -5368,6 +5526,13 @@ fn typ_to_clight_type(typ: &Typ) -> ClightType {
 mod unequal_register_test_condition_tests {
     use super::*;
 
+    #[test]
+    fn clight_pass_imports_structured_condition_failures() {
+        assert!(ClightPass
+            .inputs()
+            .contains(&"unsupported_clight_condition_seed"));
+    }
+
     fn expected_operand(reg: RTLReg, width: usize) -> ClightExpr {
         let source = ClightExpr::Etempvar(ident_from_reg(reg), default_ulong_type());
         let result_type = if width == 8 {
@@ -5392,10 +5557,15 @@ mod unequal_register_test_condition_tests {
                     default_attr(),
                 ),
             ),
-            4 | 8 => source,
+            4 => ClightExpr::Ecast(Box::new(source), default_uint_type()),
+            8 => source,
             _ => unreachable!(),
         };
-        ClightExpr::Ecast(Box::new(narrowed), result_type)
+        if clight_expr_type(&narrowed) == result_type {
+            narrowed
+        } else {
+            ClightExpr::Ecast(Box::new(narrowed), result_type)
+        }
     }
 
     fn expected_test(reg1: RTLReg, reg2: RTLReg, width: usize, zero: bool) -> ClightExpr {
@@ -5481,6 +5651,76 @@ mod unequal_register_test_condition_tests {
                 &var_types
             ),
             None
+        );
+    }
+
+    #[test]
+    fn qword_test_requires_certified_narrow_extension() {
+        let narrow = ClightExpr::Etempvar(0x1234, default_int_type());
+        assert_eq!(unsigned_test_operand(narrow.clone(), 8, None), None);
+
+        let expected_zero = ClightExpr::Ecast(
+            Box::new(ClightExpr::Ecast(Box::new(narrow.clone()), default_uint_type())),
+            default_ulong_type(),
+        );
+        assert_eq!(
+            unsigned_test_operand(narrow, 8, Some(TestOperandExtension::ZeroExtended(4))),
+            Some((expected_zero, default_ulong_type())),
+        );
+
+        let signed_byte_type = ClightType::Tint(
+            ClightIntSize::I8,
+            ClightSignedness::Signed,
+            default_attr(),
+        );
+        let signed_byte = ClightExpr::Etempvar(0x1235, signed_byte_type);
+        let expected_signed = ClightExpr::Ecast(
+            Box::new(ClightExpr::Ecast(Box::new(signed_byte.clone()), default_long_type())),
+            default_ulong_type(),
+        );
+        assert_eq!(
+            unsigned_test_operand(signed_byte, 8, Some(TestOperandExtension::SignExtended(1))),
+            Some((expected_signed, default_ulong_type())),
+        );
+    }
+
+    #[test]
+    fn dword_test_accepts_equal_width_extension_and_conflicts_fail_closed() {
+        let signed_byte_type = ClightType::Tint(
+            ClightIntSize::I8,
+            ClightSignedness::Signed,
+            default_attr(),
+        );
+        let signed_byte = ClightExpr::Etempvar(0x1240, signed_byte_type);
+        let expected = ClightExpr::Ecast(Box::new(signed_byte), default_uint_type());
+        assert_eq!(
+            unsigned_test_operand(
+                ClightExpr::Etempvar(
+                    0x1240,
+                    ClightType::Tint(ClightIntSize::I8, ClightSignedness::Signed, default_attr()),
+                ),
+                4,
+                Some(TestOperandExtension::ZeroExtended(4)),
+            ),
+            Some((expected, default_uint_type())),
+        );
+
+        let args = [CsharpminorExpr::Evar(11), CsharpminorExpr::Evar(22)];
+        let var_types = MultiVarTypeMap::from([
+            (11, vec![default_ulong_type()]),
+            (22, vec![default_ulong_type()]),
+        ]);
+        assert_eq!(
+            clight_condition_expr_with_types_and_extensions(
+                &Condition::Ctestzero(8),
+                &args,
+                &var_types,
+                &[
+                    (11, TestOperandExtension::ZeroExtended(4)),
+                    (11, TestOperandExtension::SignExtended(1)),
+                ],
+            ),
+            None,
         );
     }
 

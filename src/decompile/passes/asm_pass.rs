@@ -3195,7 +3195,9 @@ ascent_par! {
         test_jcc_link(addr0, mid),
         if *mid < *addr1;
 
-    // When the compared register is redefined between the compare and a secondary jcc, re-reading it would test the WRONG value, so that secondary keeps the legacy cmp-keyed behavior.
+    // Track whether either operand changes before a secondary consumer. The
+    // condition snapshot below still uses producer-site SSA values; this fact
+    // only enables the exact-inverse Mgoto optimization.
     #[local] relation flags_args_redefined_between(Address, Address);
     flags_args_redefined_between(addr0, addr1) <--
         secondary_flags_consumer(addr0, addr1),
@@ -3230,50 +3232,104 @@ ascent_par! {
         reg_def(d, mreg),
         if *addr0 < *d && *d < *addr1;
 
-    #[local] relation secondary_safe(Address, Address);
-    secondary_safe(addr0, addr1) <--
-        secondary_flags_consumer(addr0, addr1),
-        !flags_args_redefined_between(addr0, addr1);
+    #[local] relation flags_jcc_link(Address, Address);
+    flags_jcc_link(addr0, addr1) <-- cmp_jcc_link(addr0, addr1);
+    flags_jcc_link(addr0, addr1) <-- test_jcc_link(addr0, addr1);
 
-    // Where each (compare, jcc) pair's Mcond is keyed: primary (and unsafe secondary) -> the compare's address; safe secondary -> the jcc's own address.
+    #[local] relation flags_primary_consumer(Address, Address);
+    flags_primary_consumer(addr0, addr1) <--
+        flags_jcc_link(addr0, addr1),
+        !secondary_flags_consumer(addr0, addr1);
+
+    // DDisasm CFG endpoints are normally basic-block addresses, not the
+    // terminal JCC instruction address. Bind the primary's block and its exact
+    // fallthrough edge before scanning incoming edges; this also avoids a
+    // primary-by-all-CFG-edges Cartesian relation on large objects.
+    #[local] relation flags_primary_fallthrough_edge(Address, Address, Address, Address, Address, Address, Symbol);
+    flags_primary_fallthrough_edge(addr0, primary, func, fallthrough_block, edge_src, edge_dst, edge_type) <--
+        flags_primary_consumer(addr0, primary),
+        code_in_block(primary, primary_block),
+        ddisasm_cfg_edge(edge_src, edge_dst, edge_type),
+        if *edge_type == "fallthrough",
+        code_in_block(edge_src, primary_block),
+        code_in_block(edge_dst, fallthrough_block),
+        instr_in_function(addr0, func),
+        instr_in_function(primary, func);
+
+    #[local] relation flags_primary_fallthrough_block(Address, Address, Address, Address);
+    flags_primary_fallthrough_block(addr0, primary, func, fallthrough_block) <--
+        flags_primary_fallthrough_edge(addr0, primary, func, fallthrough_block, _, _, _);
+
+    #[local] relation flags_fallthrough_block_other_pred(Address, Address, Address, Address);
+    flags_fallthrough_block_other_pred(addr0, primary, func, block) <--
+        flags_primary_fallthrough_block(addr0, primary, func, block),
+        ddisasm_cfg_edge(src, dst, edge_type),
+        code_in_block(dst, block),
+        !code_in_block(src, block),
+        !flags_primary_fallthrough_edge(addr0, primary, func, block, src, dst, edge_type);
+    // An authenticated entry inside the fallthrough block can arrive with
+    // unrelated EFLAGS even when no decoded CFG edge targets that entry.
+    flags_fallthrough_block_other_pred(addr0, primary, func, block) <--
+        flags_primary_fallthrough_block(addr0, primary, func, block),
+        ddisasm_function_entry(entry),
+        code_in_block(entry, block);
+
+    #[local] relation secondary_unique_primary_fallthrough(Address, Address, Address, Address);
+    secondary_unique_primary_fallthrough(addr0, primary, secondary, func) <--
+        flags_primary_fallthrough_block(addr0, primary, func, block),
+        secondary_flags_consumer(addr0, secondary),
+        code_in_block(secondary, block),
+        instr_in_function(secondary, func),
+        !flags_fallthrough_block_other_pred(addr0, primary, func, block);
+
+    // A multiply-entered secondary may receive unrelated EFLAGS even when its
+    // operands are unchanged. Surface a structured whole-function failure
+    // instead of silently discarding that CFG edge.
+    relation unsupported_control_flow(Address, Address, Symbol);
+    unsupported_control_flow(*func, *secondary, "ambiguous-secondary-flags") <--
+        flags_primary_consumer(addr0, primary),
+        secondary_flags_consumer(addr0, secondary),
+        instr_in_function(addr0, func),
+        instr_in_function(primary, func),
+        instr_in_function(secondary, func),
+        !secondary_unique_primary_fallthrough(addr0, primary, secondary, func);
+
+    #[local] relation unsafe_inverse_secondary(Address, Address, Address, Symbol);
+    unsafe_inverse_secondary(addr0, primary, secondary, target) <--
+        secondary_unique_primary_fallthrough(addr0, primary, secondary, _),
+        flags_args_redefined_between(addr0, secondary),
+        pjcc(primary, primary_cond, _),
+        if *primary_cond != TestCond::Unknown,
+        pjcc(secondary, secondary_cond, target),
+        if negate_testcond(*primary_cond) == *secondary_cond;
+
+    // The primary's not-taken edge proves an exact inverse secondary is taken.
+    mach_inst(secondary, MachInst::Mgoto(target)) <--
+        unsafe_inverse_secondary(_, _, secondary, target);
+
+    #[local] relation secondary_condition_snapshot(Address, Address);
+    secondary_condition_snapshot(addr0, secondary) <--
+        secondary_unique_primary_fallthrough(addr0, _, secondary, _),
+        !unsafe_inverse_secondary(addr0, _, secondary, _);
+
+    // The primary stays at the flag producer. A non-folded secondary lives at
+    // its JCC, with RTL resolving every argument from the producer snapshot.
     #[local] relation mcond_emit_addr(Address, Address, Address);
     mcond_emit_addr(addr0, addr1, addr0) <--
         cmp_jcc_link(addr0, addr1),
-        !secondary_safe(addr0, addr1);
+        !secondary_flags_consumer(addr0, addr1);
     mcond_emit_addr(addr0, addr1, addr0) <--
         test_jcc_link(addr0, addr1),
-        !secondary_safe(addr0, addr1);
+        !secondary_flags_consumer(addr0, addr1);
     mcond_emit_addr(addr0, addr1, addr1) <--
-        secondary_safe(addr0, addr1);
+        secondary_condition_snapshot(addr0, addr1);
 
     relation mcond_at_jcc(Address);
-    mcond_at_jcc(addr1) <-- secondary_safe(_, addr1);
+    mcond_at_jcc(addr1) <-- secondary_condition_snapshot(_, addr1);
 
-    // A secondary-consumer Mcond reads its compare's registers at the JCC's address, where the raw jcc has no operands, so bind the uses here or liveness never connects the compare's def.
-    reg_use(addr1, mreg) <--
-        secondary_safe(addr0, addr1),
-        pcmp(addr0, r, _),
-        op_register(r, reg_str),
-        ireg_of(preg_of_r, Ireg::from(reg_str)),
-        preg_of(mreg, preg_of_r);
-    reg_use(addr1, mreg) <--
-        secondary_safe(addr0, addr1),
-        pcmp(addr0, _, r),
-        op_register(r, reg_str),
-        ireg_of(preg_of_r, Ireg::from(reg_str)),
-        preg_of(mreg, preg_of_r);
-    reg_use(addr1, mreg) <--
-        secondary_safe(addr0, addr1),
-        ptest(addr0, r, _),
-        op_register(r, reg_str),
-        ireg_of(preg_of_r, Ireg::from(reg_str)),
-        preg_of(mreg, preg_of_r);
-    reg_use(addr1, mreg) <--
-        secondary_safe(addr0, addr1),
-        ptest(addr0, _, r),
-        op_register(r, reg_str),
-        ireg_of(preg_of_r, Ireg::from(reg_str)),
-        preg_of(mreg, preg_of_r);
+    relation mcond_compare_site(Address, Address);
+    mcond_compare_site(*addr1, *addr0) <--
+        secondary_condition_snapshot(addr0, addr1);
 
     #[local] relation cmp_cmov_link(Address, Address);
     cmp_cmov_link(addr0, addr1) <--
@@ -9641,6 +9697,10 @@ impl IRPass for AsmPass {
             "unsupported_stack_address_seed",
             ascent::boxcar::Vec::<(Address, Address, Symbol)>::new(),
         );
+        db.rel_set(
+            "unsupported_control_flow",
+            ascent::boxcar::Vec::<(Address, Address, Symbol)>::new(),
+        );
 
         let mut prog = AsmPassProgram::default();
         prog.swap_db_fields(db);
@@ -11178,5 +11238,116 @@ mod physical_function_ownership_tests {
                         && *reason == "shared-stack-node"
                 }));
         });
+    }
+}
+
+#[cfg(test)]
+mod secondary_flags_entry_tests {
+    use super::*;
+
+    const FUNCTION: Address = 0x2000;
+    const PRIMARY: Address = 0x2002;
+    const FALLTHROUGH: Address = 0x2010;
+    const SECONDARY: Address = 0x2012;
+    const LEFT: Symbol = "secondary_entry_left";
+    const RIGHT: Symbol = "secondary_entry_right";
+    const PRIMARY_TARGET: Symbol = "secondary_entry_primary_target";
+    const SECONDARY_TARGET: Symbol = "secondary_entry_secondary_target";
+
+    fn run_fixture(
+        secondary_cond: TestCond,
+        redefine: bool,
+        authenticated_entry: bool,
+    ) -> AsmPassProgram {
+        let mut prog = AsmPassProgram::default();
+        prog.ptest.push((FUNCTION, LEFT, RIGHT));
+        prog.op_register.push((LEFT, "ECX"));
+        prog.op_register.push((RIGHT, "EDX"));
+        prog.pjcc
+            .push((PRIMARY, TestCond::CondE, PRIMARY_TARGET));
+        prog.pjcc
+            .push((SECONDARY, secondary_cond, SECONDARY_TARGET));
+        prog.flags_and_jump_pair
+            .push((FUNCTION, PRIMARY, "primary"));
+        prog.flags_and_jump_pair
+            .push((FUNCTION, SECONDARY, "secondary"));
+
+        prog.code_in_block.push((FUNCTION, FUNCTION));
+        prog.code_in_block.push((PRIMARY, FUNCTION));
+        prog.code_in_block.push((FALLTHROUGH, FALLTHROUGH));
+        prog.code_in_block.push((SECONDARY, FALLTHROUGH));
+        prog.ddisasm_cfg_edge
+            .push((FUNCTION, FALLTHROUGH, "fallthrough"));
+        // Decoder CFGs may also carry instruction-sequential edges. This edge
+        // is wholly inside the fallthrough block and is not an alternate
+        // entry.
+        prog.ddisasm_cfg_edge
+            .push((FALLTHROUGH, SECONDARY, "fallthrough"));
+        if authenticated_entry {
+            prog.ddisasm_function_entry.push((SECONDARY,));
+        }
+        prog.instr_in_function.push((FUNCTION, FUNCTION));
+        prog.instr_in_function.push((PRIMARY, FUNCTION));
+        prog.instr_in_function.push((SECONDARY, FUNCTION));
+        if redefine {
+            prog.reg_def.push((FALLTHROUGH, Mreg::CX));
+        }
+
+        prog.run();
+        prog
+    }
+
+    #[test]
+    fn authenticated_secondary_entry_rejects_inherited_flags() {
+        std::thread::Builder::new()
+            .name("asm-secondary-flags-entry-test".to_string())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                for (secondary_cond, redefine) in
+                    [(TestCond::CondE, false), (TestCond::CondNe, true)]
+                {
+                    let control = run_fixture(secondary_cond, redefine, false);
+                    assert!(
+                        control.mach_inst.iter().any(|(node, inst)| {
+                            *node == SECONDARY
+                                && if redefine {
+                                    matches!(inst, MachInst::Mgoto(_))
+                                } else {
+                                    matches!(inst, MachInst::Mcond(..))
+                                }
+                        }),
+                        "control fixture did not inherit flags along its sole entry"
+                    );
+                    assert!(!control.unsupported_control_flow.iter().any(
+                        |(function, consumer, reason)| {
+                            *function == FUNCTION
+                                && *consumer == SECONDARY
+                                && *reason == "ambiguous-secondary-flags"
+                        }
+                    ));
+
+                    let prog = run_fixture(secondary_cond, redefine, true);
+                    assert!(
+                        !prog.mach_inst.iter().any(|(node, inst)| {
+                            *node == SECONDARY
+                                && matches!(inst, MachInst::Mcond(..) | MachInst::Mgoto(_))
+                        }),
+                        "authenticated entry inherited a predecessor's EFLAGS"
+                    );
+                    assert!(
+                        prog.unsupported_control_flow.iter().any(
+                            |(function, consumer, reason)| {
+                                *function == FUNCTION
+                                    && *consumer == SECONDARY
+                                    && *reason == "ambiguous-secondary-flags"
+                            }
+                        ),
+                        "authenticated secondary entry lost its fail-closed diagnostic"
+                    );
+                }
+            })
+            .expect("spawn Asm secondary-flags entry test")
+            .join()
+            .expect("Asm secondary-flags entry test panicked");
     }
 }

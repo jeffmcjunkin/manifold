@@ -436,6 +436,15 @@ ascent_par! {
     relation emit_function_param(Address, RTLReg);
     relation next(Address, Address);
     relation emit_var_type_candidate(RTLReg, XType);
+    #[local] relation all_cshminor_var_types(Arc<Vec<(RTLReg, XType)>>);
+    all_cshminor_var_types(Arc::new(pairs)) <--
+        agg pairs = crate::decompile::passes::clight_pass::collect_all_var_types(reg, xty)
+            in emit_var_type_candidate(reg, xty);
+    relation test_operand_extension(RTLReg, TestOperandExtension);
+    #[local] relation all_test_operand_extensions(Arc<Vec<(RTLReg, TestOperandExtension)>>);
+    all_test_operand_extensions(Arc::new(pairs)) <--
+        agg pairs = crate::decompile::passes::clight_pass::collect_all_test_operand_extensions(reg, extension)
+            in test_operand_extension(reg, extension);
     relation idom(Address, Node, Node);
     relation stack_var(Address, Address, i64, RTLReg);
     // rtl_pass export: node-keyed proof that this stack-address expression is
@@ -1151,6 +1160,7 @@ ascent_par! {
     relation emit_loop_exit(Address, Node, Node, Condition, Arc<Vec<CsharpminorExpr>>, Node, Node);
     relation trim_step(Address, Node, Node);
     relation emit_break_stmt(Address, Node, Node, ClightStmt);
+    relation unsupported_clight_condition_seed(Address, Address, Symbol);
     // A non-primary loop exit flowing to a function return rather than post-loop code: a valueless break would drop the returned value, so select tail-duplicates value_node and the return into it.
     relation loop_exit_to_return(Address, Node, Node, Node, Node);
     relation node_multi_pred(Address, Node);
@@ -1176,20 +1186,40 @@ ascent_par! {
         valid_loop(func, header),
         loop_exit_branch(func, header, exit_node, cond, args, _, _, inverted),
         !primary_exit_node(func, header, exit_node),
-        agg all_var_types = crate::decompile::passes::clight_pass::collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty),
+        all_cshminor_var_types(all_var_types),
+        all_test_operand_extensions(test_extensions),
         let vars_used = crate::decompile::passes::clight_pass::extract_vars_from_csharp_exprs(args.as_slice()),
-        let var_types = crate::decompile::passes::clight_pass::filter_and_build_multi_var_type_map(&all_var_types, &vars_used),
+        let var_types = crate::decompile::passes::clight_pass::filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let break_cond_raw = if *inverted {
             crate::decompile::passes::clight_pass::invert_condition(&cond)
         } else {
             cond.clone()
         },
-        if let Some(break_cond) = crate::decompile::passes::clight_pass::clight_condition_expr_with_types(&break_cond_raw, args.as_slice(), &var_types),
+        if let Some(break_cond) = crate::decompile::passes::clight_pass::clight_condition_expr_with_types_and_extensions(&break_cond_raw, args.as_slice(), &var_types, test_extensions),
         let break_stmt = ClightStmt::Sifthenelse(
             break_cond,
             Box::new(ClightStmt::Sbreak),
             Box::new(ClightStmt::Sskip),
         );
+
+    // A non-primary exit is converted directly to Clight and therefore does
+    // not pass through ClightPass's later Csharp condition audit. Preserve the
+    // same fail-closed contract when its raw TEST bits cannot be represented.
+    unsupported_clight_condition_seed(*func, *exit_node, "condition-bits-unrepresentable") <--
+        valid_loop(func, header),
+        loop_exit_branch(func, header, exit_node, cond, args, _, _, inverted),
+        !primary_exit_node(func, header, exit_node),
+        all_cshminor_var_types(all_var_types),
+        all_test_operand_extensions(test_extensions),
+        let vars_used = crate::decompile::passes::clight_pass::extract_vars_from_csharp_exprs(args.as_slice()),
+        let var_types = crate::decompile::passes::clight_pass::filter_and_build_multi_var_type_map(all_var_types, &vars_used),
+        let break_cond_raw = if *inverted {
+            crate::decompile::passes::clight_pass::invert_condition(&cond)
+        } else {
+            cond.clone()
+        },
+        if matches!(&break_cond_raw, Condition::Ctestzero(_) | Condition::Ctestnotzero(_)),
+        if crate::decompile::passes::clight_pass::clight_condition_expr_with_types_and_extensions(&break_cond_raw, args.as_slice(), &var_types, test_extensions).is_none();
 
     node_multi_pred(func, n) <--
         pred(func, n, p1),
@@ -1434,6 +1464,11 @@ impl IRPass for CshminorPass {
     fn run(&self, db: &mut DecompileDB) {
         Self::prepare_jump_tables(db);
 
+        db.rel_set(
+            "unsupported_clight_condition_seed",
+            ascent::boxcar::Vec::<(Address, Address, Symbol)>::new(),
+        );
+
         run_pass!(db, CshminorPassProgram);
         materialize_win64_home_backing(db);
     }
@@ -1451,4 +1486,124 @@ impl IRPass for CshminorPass {
     }
 
     declare_io_from!(CshminorPassProgram);
+}
+
+#[cfg(test)]
+mod test_condition_tests {
+    use super::*;
+    use crate::decompile::passes::csh_pass::{default_uint_type, default_ulong_type};
+
+    fn contains_u32_to_u64_cast(expr: &ClightExpr) -> bool {
+        if let ClightExpr::Ecast(inner, outer) = expr {
+            if outer == &default_ulong_type()
+                && matches!(
+                    inner.as_ref(),
+                    ClightExpr::Ecast(_, inner_type) if inner_type == &default_uint_type()
+                )
+            {
+                return true;
+            }
+        }
+        match expr {
+            ClightExpr::Eunop(_, inner, _)
+            | ClightExpr::Ecast(inner, _)
+            | ClightExpr::Ederef(inner, _)
+            | ClightExpr::Eaddrof(inner, _)
+            | ClightExpr::Efield(inner, _, _) => contains_u32_to_u64_cast(inner),
+            ClightExpr::Ebinop(_, left, right, _) => {
+                contains_u32_to_u64_cast(left) || contains_u32_to_u64_cast(right)
+            }
+            ClightExpr::Econdition(condition, yes, no, _) => {
+                contains_u32_to_u64_cast(condition)
+                    || contains_u32_to_u64_cast(yes)
+                    || contains_u32_to_u64_cast(no)
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn secondary_loop_break_uses_test_extension_evidence() {
+        assert!(CshminorPass.inputs().contains(&"test_operand_extension"));
+        assert!(CshminorPass
+            .outputs()
+            .contains(&"unsupported_clight_condition_seed"));
+        std::thread::Builder::new()
+            .name("cshminor-test-loop-break".to_string())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let mut program = CshminorPassProgram::default();
+                let function = 0x1000;
+                let header = 0x1010;
+                let exit_node = 0x1020;
+                let unsupported_exit_node = 0x1028;
+                let lhs = 0x2000;
+                let rhs = 0x2001;
+                let narrow_lhs = 0x2002;
+                let narrow_rhs = 0x2003;
+                program.valid_loop.push((function, header));
+                program.loop_exit_branch.push((
+                    function,
+                    header,
+                    exit_node,
+                    Condition::Ctestnotzero(8),
+                    Arc::new(vec![CsharpminorExpr::Evar(lhs), CsharpminorExpr::Evar(rhs)]),
+                    0x1030,
+                    0x1040,
+                    false,
+                ));
+                program.loop_exit_branch.push((
+                    function,
+                    header,
+                    unsupported_exit_node,
+                    Condition::Ctestzero(8),
+                    Arc::new(vec![
+                        CsharpminorExpr::Evar(narrow_lhs),
+                        CsharpminorExpr::Evar(narrow_rhs),
+                    ]),
+                    0x1050,
+                    0x1060,
+                    false,
+                ));
+                program.emit_var_type_candidate.push((lhs, XType::Xlong));
+                program.emit_var_type_candidate.push((rhs, XType::Xlong));
+                program
+                    .emit_var_type_candidate
+                    .push((narrow_lhs, XType::Xint));
+                program
+                    .emit_var_type_candidate
+                    .push((narrow_rhs, XType::Xint));
+                program.test_operand_extension.push((
+                    lhs,
+                    TestOperandExtension::ZeroExtended(4),
+                ));
+
+                program.run();
+
+                assert!(program.emit_break_stmt.iter().any(|(func, loop_header, node, stmt)| {
+                    *func == function
+                        && *loop_header == header
+                        && *node == exit_node
+                        && matches!(
+                            stmt,
+                            ClightStmt::Sifthenelse(condition, _, _)
+                                if contains_u32_to_u64_cast(condition)
+                        )
+                }));
+                assert!(!program
+                    .emit_break_stmt
+                    .iter()
+                    .any(|(_, _, node, _)| *node == unsupported_exit_node));
+                assert!(program.unsupported_clight_condition_seed.iter().any(
+                    |(func, node, reason)| {
+                        *func == function
+                            && *node == unsupported_exit_node
+                            && *reason == "condition-bits-unrepresentable"
+                    }
+                ));
+            })
+            .expect("spawn Cshminor loop-break test")
+            .join()
+            .expect("Cshminor loop-break test panicked");
+    }
 }

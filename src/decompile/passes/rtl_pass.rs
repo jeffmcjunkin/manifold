@@ -203,6 +203,411 @@ fn is_valid_stack_operand_base_name(name: &str) -> bool {
     is_x86_64_gp_register_name(name)
 }
 
+fn is_legacy_high8_register(name: &str) -> bool {
+    matches!(name, "AH" | "BH" | "CH" | "DH")
+}
+
+/// Combine CFG-aware reaching definitions with exact Capstone destination
+/// spelling. A row is published only when every TEST use of one canonical RTL
+/// value has complete, agreeing architectural extension evidence.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TestDefinitionProvenance {
+    FullWidth,
+    Extension(TestOperandExtension),
+    PartialParent,
+    UnknownWrite,
+}
+
+struct TestProvenanceEvidence<'a> {
+    register_operands: &'a HashMap<Symbol, &'static str>,
+    memory_operand_widths: &'a HashMap<Symbol, usize>,
+    instructions: &'a HashMap<Address, (&'static str, Symbol)>,
+    exact_writes: &'a HashMap<(Address, Mreg), BTreeSet<(&'static str, usize)>>,
+    reaching_definitions: &'a HashMap<(Address, Mreg), BTreeSet<Address>>,
+    function_entries: &'a BTreeSet<Address>,
+    decoded_register_definitions: &'a BTreeSet<(Address, Mreg)>,
+    abi_livein_edges: &'a BTreeSet<(Address, Mreg, Address)>,
+}
+
+impl TestProvenanceEvidence<'_> {
+    fn singleton(mode: TestDefinitionProvenance) -> BTreeSet<TestDefinitionProvenance> {
+        BTreeSet::from([mode])
+    }
+
+    fn classify_at_use(
+        &self,
+        use_address: Address,
+        mreg: Mreg,
+        test_width: usize,
+        memo: &mut HashMap<(Address, Mreg, usize), BTreeSet<TestDefinitionProvenance>>,
+        visiting: &mut BTreeSet<(Address, Mreg, usize)>,
+    ) -> BTreeSet<TestDefinitionProvenance> {
+        let key = (use_address, mreg, test_width);
+        if let Some(cached) = memo.get(&key) {
+            return cached.clone();
+        }
+        if !visiting.insert(key) {
+            return Self::singleton(TestDefinitionProvenance::UnknownWrite);
+        }
+
+        let modes = match self.reaching_definitions.get(&(use_address, mreg)) {
+            None => {
+                // No reaching decoded definition is the genuine function-entry
+                // live-in case. Its complete physical register width is valid.
+                Self::singleton(TestDefinitionProvenance::FullWidth)
+            }
+            Some(definitions) if definitions.is_empty() => {
+                Self::singleton(TestDefinitionProvenance::FullWidth)
+            }
+            Some(definitions) => definitions
+                .iter()
+                .flat_map(|definition| {
+                    if self
+                        .abi_livein_edges
+                        .contains(&(*definition, mreg, use_address))
+                    {
+                        return Self::singleton(TestDefinitionProvenance::FullWidth);
+                    }
+                    self.classify_definition(
+                        *definition,
+                        mreg,
+                        test_width,
+                        memo,
+                        visiting,
+                    )
+                })
+                .collect(),
+        };
+
+        visiting.remove(&key);
+        memo.insert(key, modes.clone());
+        modes
+    }
+
+    fn classify_definition(
+        &self,
+        definition: Address,
+        mreg: Mreg,
+        test_width: usize,
+        memo: &mut HashMap<(Address, Mreg, usize), BTreeSet<TestDefinitionProvenance>>,
+        visiting: &mut BTreeSet<(Address, Mreg, usize)>,
+    ) -> BTreeSet<TestDefinitionProvenance> {
+        let Some(writes) = self.exact_writes.get(&(definition, mreg)) else {
+            let is_call = self
+                .instructions
+                .get(&definition)
+                .is_some_and(|(mnemonic, _)| mnemonic.starts_with("CALL"));
+            if is_call && test_width <= 4 {
+                // Existing call lowering represents the low ABI result bits
+                // directly; sub-qword TEST does not observe the unspecified
+                // parent bits. Qword TEST remains an exact widening boundary.
+                return Self::singleton(TestDefinitionProvenance::FullWidth);
+            }
+            if self.function_entries.contains(&definition)
+                && !self
+                    .decoded_register_definitions
+                    .contains(&(definition, mreg))
+                && !is_call
+            {
+                // reg_def_used represents an ABI live-in as a pseudo
+                // definition at the function entry.  It is not an unknown
+                // decoded write, even when the entry shares the first real
+                // instruction's address.
+                return Self::singleton(TestDefinitionProvenance::FullWidth);
+            }
+            // reg_def_used proves that an actual decoded instruction defines
+            // this register. Without exact destination spelling, treating it
+            // like a live-in would lose partial/ABI extension semantics.
+            return Self::singleton(TestDefinitionProvenance::UnknownWrite);
+        };
+        if writes.len() != 1 {
+            return Self::singleton(TestDefinitionProvenance::UnknownWrite);
+        }
+        let &(destination_name, decoded_width) = writes.iter().next().unwrap();
+        let Some(destination_width) = x86_gp_operand_width(destination_name) else {
+            return Self::singleton(TestDefinitionProvenance::UnknownWrite);
+        };
+        if decoded_width != 0 && decoded_width != destination_width {
+            return Self::singleton(TestDefinitionProvenance::UnknownWrite);
+        }
+        // AH/BH/CH/DH alias the parent Mreg but write bits 8..15. The RTL
+        // parent-register value cannot represent that offset as a low-byte
+        // definition, so even a later byte TEST must fail closed.
+        if is_legacy_high8_register(destination_name) {
+            return Self::singleton(TestDefinitionProvenance::UnknownWrite);
+        }
+        if destination_width < 4 {
+            let mode = if destination_width < test_width {
+                TestDefinitionProvenance::PartialParent
+            } else {
+                TestDefinitionProvenance::FullWidth
+            };
+            return Self::singleton(mode);
+        }
+        if destination_width == 4 {
+            // Every E* destination clears its parent register's upper half.
+            return Self::singleton(TestDefinitionProvenance::Extension(
+                TestOperandExtension::ZeroExtended(4),
+            ));
+        }
+        if destination_width != 8 {
+            return Self::singleton(TestDefinitionProvenance::UnknownWrite);
+        }
+
+        let Some(&(mnemonic, source_operand)) = self.instructions.get(&definition) else {
+            return Self::singleton(TestDefinitionProvenance::UnknownWrite);
+        };
+        if mnemonic == "MOV" {
+            if let Some(source_name) = self.register_operands.get(&source_operand) {
+                if x86_gp_operand_width(source_name) == Some(8) {
+                    let source_mreg = Mreg::x86(*source_name);
+                    if source_mreg == Mreg::Unknown {
+                        return Self::singleton(TestDefinitionProvenance::UnknownWrite);
+                    }
+                    // A full-width register copy preserves every source bit.
+                    // Follow its reaching definition so E32/MOVSX provenance
+                    // survives RTL Omove canonicalization.
+                    return self.classify_at_use(
+                        definition,
+                        source_mreg,
+                        test_width,
+                        memo,
+                        visiting,
+                    );
+                }
+            }
+            return Self::singleton(TestDefinitionProvenance::FullWidth);
+        }
+        if !matches!(mnemonic, "MOVZX" | "MOVSX" | "MOVSXD") {
+            return Self::singleton(TestDefinitionProvenance::FullWidth);
+        }
+
+        let source_width = if let Some(source_name) = self.register_operands.get(&source_operand) {
+            if is_legacy_high8_register(source_name) {
+                return Self::singleton(TestDefinitionProvenance::UnknownWrite);
+            }
+            let Some(width) = x86_gp_operand_width(source_name) else {
+                return Self::singleton(TestDefinitionProvenance::UnknownWrite);
+            };
+            width
+        } else {
+            let Some(width) = self.memory_operand_widths.get(&source_operand) else {
+                return Self::singleton(TestDefinitionProvenance::UnknownWrite);
+            };
+            *width
+        };
+        if source_width >= destination_width {
+            return Self::singleton(TestDefinitionProvenance::UnknownWrite);
+        }
+        let extension = match mnemonic {
+            "MOVZX" => TestOperandExtension::ZeroExtended(source_width),
+            "MOVSX" | "MOVSXD" => TestOperandExtension::SignExtended(source_width),
+            _ => unreachable!("extension mnemonic checked above"),
+        };
+        Self::singleton(TestDefinitionProvenance::Extension(extension))
+    }
+}
+
+fn materialize_test_operand_extensions(db: &mut DecompileDB) {
+    let register_operands: HashMap<Symbol, &'static str> = db
+        .rel_iter::<(Symbol, &'static str)>("op_register")
+        .map(|(operand, name)| (*operand, *name))
+        .collect();
+    let memory_operand_widths: HashMap<Symbol, usize> = db
+        .rel_iter::<(Symbol, &'static str, &'static str, &'static str, i64, i64, usize)>("op_indirect")
+        .map(|(operand, _, _, _, _, _, width)| (*operand, *width))
+        .collect();
+    let instructions: HashMap<Address, (&'static str, Symbol)> = db
+        .rel_iter::<(Address, usize, &'static str, &'static str, Symbol, Symbol, Symbol, Symbol, usize, usize)>("unrefinedinstruction")
+        .map(|(address, _, _, mnemonic, source, _, _, _, _, _)| (*address, (*mnemonic, *source)))
+        .collect();
+
+    let mut exact_writes: HashMap<(Address, Mreg), BTreeSet<(&'static str, usize)>> = HashMap::new();
+    for (address, mreg, name, width) in db.rel_iter::<(Address, Mreg, &'static str, usize)>("decoded_reg_write") {
+        exact_writes.entry((*address, *mreg)).or_default().insert((*name, *width));
+    }
+
+    let mut reaching_definitions: HashMap<(Address, Mreg), BTreeSet<Address>> = HashMap::new();
+    for (definition, mreg, use_address) in db.rel_iter::<(Address, Mreg, Address)>("reg_def_used") {
+        reaching_definitions.entry((*use_address, *mreg)).or_default().insert(*definition);
+    }
+    let function_entries: BTreeSet<Address> = db
+        .rel_iter::<(Symbol, Address, Address)>("func_span")
+        .map(|(_, start, _)| *start)
+        .collect();
+    // asm_reg_def is AsmPass's immutable copy of decoder register effects.
+    let decoded_register_definitions: BTreeSet<(Address, Mreg)> = db
+        .rel_iter::<(Address, Mreg)>("asm_reg_def")
+        .copied()
+        .collect();
+    let mut rtl_at_register_use: HashMap<(Node, Mreg), BTreeSet<RTLReg>> = HashMap::new();
+    for (node, mreg, rtl) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl") {
+        rtl_at_register_use.entry((*node, *mreg)).or_default().insert(*rtl);
+    }
+    let abi_livein_edges: BTreeSet<(Address, Mreg, Address)> = db
+        .rel_iter::<(Address, Mreg, Address)>("abi_livein_reaches_use")
+        .copied()
+        .collect();
+    let evidence = TestProvenanceEvidence {
+        register_operands: &register_operands,
+        memory_operand_widths: &memory_operand_widths,
+        instructions: &instructions,
+        exact_writes: &exact_writes,
+        reaching_definitions: &reaching_definitions,
+        function_entries: &function_entries,
+        decoded_register_definitions: &decoded_register_definitions,
+        abi_livein_edges: &abi_livein_edges,
+    };
+    let mut provenance_memo = HashMap::new();
+
+    // Only conditions that actually survive RTL lowering consume the raw-bit
+    // TEST semantics.  Scanning every decoded ptest would let a dead flag
+    // producer (or a legacy same-register TEST) add an unrelated whole-
+    // function diagnostic.
+    let mut compare_sites_by_consumer: HashMap<Address, BTreeSet<Address>> = HashMap::new();
+    for (consumer, producer) in
+        db.rel_iter::<(Address, Address)>("mcond_compare_site")
+    {
+        compare_sites_by_consumer
+            .entry(*consumer)
+            .or_default()
+            .insert(*producer);
+    }
+    let mut active_test_addresses = BTreeSet::new();
+    for (node, instruction) in db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate") {
+        if !matches!(
+            instruction,
+            RTLInst::Icond(
+                Condition::Ctestzero(_) | Condition::Ctestnotzero(_),
+                _,
+                _,
+                _
+            )
+        ) {
+            continue;
+        }
+        if let Some(producers) = compare_sites_by_consumer.get(node) {
+            active_test_addresses.extend(producers.iter().copied());
+        } else {
+            active_test_addresses.insert(*node);
+        }
+    }
+
+    let mut test_registers: BTreeMap<(Address, Mreg), usize> = BTreeMap::new();
+    for (test_address, left, right) in db.rel_iter::<(Address, Symbol, Symbol)>("ptest") {
+        if !active_test_addresses.contains(test_address) {
+            continue;
+        }
+        for operand in [left, right] {
+            let Some(name) = register_operands.get(operand) else { continue; };
+            let mreg = Mreg::x86(*name);
+            if let Some(width) = x86_gp_operand_width(name) {
+                if mreg != Mreg::Unknown {
+                    test_registers.insert((*test_address, mreg), width);
+                }
+            }
+        }
+    }
+
+    let mut provenance_by_rtl: BTreeMap<RTLReg, BTreeSet<TestDefinitionProvenance>> =
+        BTreeMap::new();
+    let mut invalid_provenance_rtls = BTreeSet::new();
+    let mut test_uses_by_rtl: BTreeMap<RTLReg, BTreeSet<Address>> = BTreeMap::new();
+    let mut partial_parent_tests = BTreeSet::new();
+    let mut unknown_write_tests = BTreeSet::new();
+    for ((test_address, mreg), test_width) in test_registers {
+        let Some(rtl_regs) = rtl_at_register_use.get(&(test_address, mreg)) else { continue; };
+        for &rtl in rtl_regs { test_uses_by_rtl.entry(rtl).or_default().insert(test_address); }
+        let modes = evidence.classify_at_use(
+            test_address,
+            mreg,
+            test_width,
+            &mut provenance_memo,
+            &mut BTreeSet::new(),
+        );
+        if modes.contains(&TestDefinitionProvenance::PartialParent) {
+            invalid_provenance_rtls.extend(rtl_regs.iter().copied());
+            partial_parent_tests.insert(test_address);
+            continue;
+        }
+        if modes.contains(&TestDefinitionProvenance::UnknownWrite) {
+            invalid_provenance_rtls.extend(rtl_regs.iter().copied());
+            unknown_write_tests.insert(test_address);
+            continue;
+        }
+        for &rtl in rtl_regs {
+            provenance_by_rtl
+                .entry(rtl)
+                .or_default()
+                .extend(modes.iter().copied());
+        }
+    }
+
+    let conflicting_rtls: BTreeSet<_> = provenance_by_rtl
+        .iter()
+        .filter_map(|(rtl, modes)| {
+            (modes.len() > 1 || invalid_provenance_rtls.contains(rtl)).then_some(*rtl)
+        })
+        .collect();
+    let rows = provenance_by_rtl
+        .into_iter()
+        .filter_map(|(rtl, modes)| {
+            if modes.len() != 1 || invalid_provenance_rtls.contains(&rtl) {
+                return None;
+            }
+            match modes.iter().next().copied().unwrap() {
+                TestDefinitionProvenance::Extension(extension) => Some((rtl, extension)),
+                TestDefinitionProvenance::FullWidth
+                | TestDefinitionProvenance::PartialParent
+                | TestDefinitionProvenance::UnknownWrite => None,
+            }
+        })
+        .collect::<ascent::boxcar::Vec<_>>();
+    db.rel_set("test_operand_extension", rows);
+
+    if !conflicting_rtls.is_empty()
+        || !partial_parent_tests.is_empty()
+        || !unknown_write_tests.is_empty()
+    {
+        let mut owners: HashMap<Address, BTreeSet<Address>> = HashMap::new();
+        for (instruction, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+            owners.entry(*instruction).or_default().insert(*function);
+        }
+        let mut diagnostics: BTreeSet<(Address, Address, Symbol)> = db
+            .rel_iter::<(Address, Address, Symbol)>("unsupported_rtl_condition").copied().collect();
+        for rtl in conflicting_rtls {
+            if let Some(test_uses) = test_uses_by_rtl.get(&rtl) {
+                for &test_address in test_uses {
+                    if let Some(functions) = owners.get(&test_address) {
+                        for &function in functions {
+                            diagnostics.insert((function, test_address, "conflicting-test-extension-provenance"));
+                        }
+                    }
+                }
+            }
+        }
+        for test_address in partial_parent_tests {
+            if let Some(functions) = owners.get(&test_address) {
+                for &function in functions {
+                    diagnostics.insert((function, test_address, "partial-register-test-parent-bits"));
+                }
+            }
+        }
+        for test_address in unknown_write_tests {
+            if let Some(functions) = owners.get(&test_address) {
+                for &function in functions {
+                    diagnostics.insert((
+                        function,
+                        test_address,
+                        "unknown-test-register-definition",
+                    ));
+                }
+            }
+        }
+        db.rel_set("unsupported_rtl_condition", diagnostics.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    }
+}
+
 ascent_par! {
     #![measure_rule_times]
 
@@ -311,6 +716,8 @@ ascent_par! {
     relation pcmov(Address, TestCond, Symbol, Symbol);
     // osel_compare_site(cmov_addr, compare_addr): from asm_pass; the compare whose flags this cmov consumes, so condition operands resolve at the compare site rather than the (possibly register-reusing) cmov site.
     relation osel_compare_site(Address, Address);
+    relation mcond_compare_site(Address, Address);
+    relation unsupported_rtl_condition(Address, Address, Symbol);
     relation pdiv(Address, Symbol, Symbol);
     relation pidiv(Address, Symbol, Symbol);
     relation pudiv(Address, Symbol, Symbol);
@@ -328,6 +735,7 @@ ascent_par! {
     relation stack_def(Address, Symbol, i64);
     relation decoded_memory_read_operand(Address, Symbol);
     relation decoded_memory_write_operand(Address, Symbol);
+    relation decoded_reg_write(Address, Mreg, &'static str, usize);
     relation trim_instruction(Address);
     relation stack_def_used(Address, Symbol, i64, Address, Symbol, i64);
     relation symbols(Address, Symbol, Symbol);
@@ -694,19 +1102,71 @@ ascent_par! {
         !store_arg_mapping(addr, _, _);
 
 
+    #[local] relation cond_arg_at_compare(Node, usize, RTLReg);
+    cond_arg_at_compare(addr, pos, arg_rtl) <--
+        ltl_inst(addr, ?LTLInst::Lcond(_, mregs, _, _)),
+        mcond_compare_site(addr, compare_addr),
+        for (pos, arg) in mregs.iter().enumerate(),
+        reg_rtl(compare_addr, *arg, arg_rtl);
+
+    #[local] relation secondary_snapshot_missing(Node);
+    secondary_snapshot_missing(*addr) <--
+        ltl_inst(addr, ?LTLInst::Lcond(_, mregs, _, _)),
+        mcond_compare_site(addr, compare_addr),
+        for (_, arg) in mregs.iter().enumerate(),
+        !reg_rtl(compare_addr, *arg, _);
+
+    #[local] relation secondary_snapshot_ambiguous(Node);
+    secondary_snapshot_ambiguous(*addr) <--
+        ltl_inst(addr, ?LTLInst::Lcond(_, mregs, _, _)),
+        mcond_compare_site(addr, compare_addr),
+        for (_, arg) in mregs.iter().enumerate(),
+        reg_rtl(compare_addr, *arg, left),
+        reg_rtl(compare_addr, *arg, right),
+        if left != right;
+
+    #[local] relation secondary_snapshot_complete(Node);
+    secondary_snapshot_complete(*addr) <--
+        ltl_inst(addr, ?LTLInst::Lcond(_, _, _, _)),
+        mcond_compare_site(addr, _),
+        !secondary_snapshot_missing(addr),
+        !secondary_snapshot_ambiguous(addr);
+
+    #[local] relation cond_mapping_ready(Node);
+    cond_mapping_ready(*addr) <--
+        ltl_inst(addr, ?LTLInst::Lcond(_, _, _, _)),
+        !mcond_compare_site(addr, _);
+    cond_mapping_ready(*addr) <-- secondary_snapshot_complete(addr);
+
+    cond_arg_mapping(addr, pos, arg_rtl) <--
+        cond_arg_at_compare(addr, pos, arg_rtl),
+        secondary_snapshot_complete(addr);
+
     cond_arg_mapping(addr, pos, arg_rtl) <--
         ltl_inst(addr, ?LTLInst::Lcond(_, mregs, _, _)),
         for (pos, arg) in mregs.iter().enumerate(),
+        !mcond_compare_site(addr, _),
         reg_rtl(addr, *arg, arg_rtl);
+
+    // Producer snapshots are all-or-nothing: never mix one compare-site value
+    // with another value read at the later JCC.
+    unsupported_rtl_condition(*func, *addr, "secondary-snapshot-missing-operand") <--
+        secondary_snapshot_missing(addr),
+        instr_in_function(addr, func);
+    unsupported_rtl_condition(*func, *addr, "secondary-snapshot-ambiguous-operand") <--
+        secondary_snapshot_ambiguous(addr),
+        instr_in_function(addr, func);
 
     cond_args_collected(addr, args) <--
         ltl_inst(addr, ?LTLInst::Lcond(_, mregs, _, _)),
         if !mregs.is_empty(),
+        cond_mapping_ready(addr),
         agg args = build_call_args(pos, reg) in cond_arg_mapping(addr, pos, reg);
 
     cond_args_collected(addr, Arc::new(vec![])) <--
         ltl_inst(addr, ?LTLInst::Lcond(_, mregs, _, _)),
         if !mregs.is_empty(),
+        cond_mapping_ready(addr),
         !cond_arg_mapping(addr, _, _);
 
     call_args_collected_candidate(call_addr, args) <--
@@ -824,9 +1284,8 @@ ascent_par! {
 
 
     comparison_operand(addr, cond.clone(), rtl_arg) <--
-        ltl_inst(addr, ?LTLInst::Lcond(cond, mregs, _, _)),
-        for mreg in mregs.iter(),
-        reg_rtl(addr, *mreg, rtl_arg);
+        ltl_inst(addr, ?LTLInst::Lcond(cond, _, _, _)),
+        cond_arg_mapping(addr, _, rtl_arg);
 
 
     reg_xtl(head_addr, mreg, arg_id) <--
@@ -10791,6 +11250,12 @@ ascent_par! {
         if matches!(cond, Condition::Ccompl(_) | Condition::Ccomplu(_)
             | Condition::Ccomplimm(_, _) | Condition::Ccompluimm(_, _));
 
+    // Use-side width evidence: a qword TEST consumes the complete 64-bit SSA
+    // value. Producer extension is still certified independently below.
+    is_long(reg) <--
+        comparison_operand(_, cond, reg),
+        if matches!(cond, Condition::Ctestzero(8) | Condition::Ctestnotzero(8));
+
     must_be_ptr(reg) <-- arg_constrained_as_ptr(_, reg);
     must_be_ptr(ret_reg) <--
         call_site(node, func_name),
@@ -16394,7 +16859,16 @@ impl IRPass for RTLPass {
             "unsupported_address_detail",
             ascent::boxcar::Vec::<(Address, Address, Symbol)>::new(),
         );
+        db.rel_set(
+            "test_operand_extension",
+            ascent::boxcar::Vec::<(RTLReg, TestOperandExtension)>::new(),
+        );
+        db.rel_set(
+            "unsupported_rtl_condition",
+            ascent::boxcar::Vec::<(Address, Address, Symbol)>::new(),
+        );
         run_pass!(db, RTLPassProgram);
+        materialize_test_operand_extensions(db);
         canonicalize_indexed_stack_rtl_values(db);
         select_sp_indexed_fused_lowerings(db);
         materialize_synthetic_members(db);
@@ -16426,6 +16900,7 @@ impl IRPass for RTLPass {
                             | "suppressed_unsupported_address"
                             | "suppressed_unsupported_address_node"
                             | "partial_unsupported_function"
+                            | "test_operand_extension"
                     )
                 })
                 .collect()
@@ -16449,6 +16924,7 @@ impl IRPass for RTLPass {
                     "suppressed_unsupported_address",
                     "suppressed_unsupported_address_node",
                     "partial_unsupported_function",
+                    "test_operand_extension",
                 ])
                 .collect()
         })
@@ -16469,6 +16945,7 @@ mod encoding_tests {
             "suppressed_unsupported_address",
             "suppressed_unsupported_address_node",
             "partial_unsupported_function",
+            "test_operand_extension",
         ] {
             assert!(pass.outputs().contains(&relation));
             assert!(!pass.inputs().contains(&relation));
@@ -16776,6 +17253,332 @@ mod encoding_tests {
             .expect("spawn RTL program test")
             .join()
             .expect("RTL program test panicked");
+    }
+
+    fn seed_raw_test_condition(db: &mut DecompileDB, node: Node, width: usize) {
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                node,
+                RTLInst::Icond(
+                    Condition::Ctestzero(width),
+                    Arc::new(vec![]),
+                    Either::Right(node + 1),
+                    Either::Right(node + 2),
+                ),
+            ),
+        );
+    }
+
+    #[test]
+    fn secondary_snapshot_never_mixes_producer_and_consumer_values() {
+        on_rtl_program_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let function = 0x1000;
+            let producer = 0x1010;
+            let consumer = 0x1020;
+            prog.ltl_inst.push((
+                consumer,
+                LTLInst::Lcond(
+                    Condition::Ctestzero(4),
+                    Arc::new(vec![Mreg::CX, Mreg::DX]),
+                    Either::Right(0x1030),
+                    Either::Right(0x1040),
+                ),
+            ));
+            prog.mcond_compare_site.push((consumer, producer));
+            prog.instr_in_function.push((consumer, function));
+            prog.reg_rtl.push((producer, Mreg::CX, 0x2001));
+            // Only a current-JCC value exists for DX. It must not fill the
+            // missing producer-side slot.
+            prog.reg_rtl.push((consumer, Mreg::DX, 0x2002));
+
+            prog.run();
+
+            assert!(!prog
+                .cond_arg_mapping
+                .iter()
+                .any(|(node, _, _)| *node == consumer));
+            assert!(!prog
+                .cond_args_collected
+                .iter()
+                .any(|(node, _)| *node == consumer));
+            assert!(!prog.rtl_inst_candidate.iter().any(|(node, inst)| {
+                *node == consumer && matches!(inst, RTLInst::Icond(..))
+            }));
+            assert!(prog.unsupported_rtl_condition.iter().any(|row| {
+                *row == (function, consumer, "secondary-snapshot-missing-operand")
+            }));
+        });
+    }
+
+    #[test]
+    fn conflicting_extension_modes_on_one_rtl_web_fail_closed() {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x3000;
+        let eax_definition: Address = 0x3010;
+        let movsx_definition: Address = 0x3020;
+        let first_test: Address = 0x3030;
+        let second_test: Address = 0x3040;
+        let shared_rtl: RTLReg = 0x4000;
+
+        for row in [
+            ("test_rax_1", "RAX"),
+            ("test_rax_2", "RAX"),
+            ("test_rdx_1", "RDX"),
+            ("test_rdx_2", "RDX"),
+            ("movsx_source", "AL"),
+        ] {
+            db.rel_push("op_register", row);
+        }
+        db.rel_push("ptest", (first_test, "test_rax_1", "test_rdx_1"));
+        db.rel_push("ptest", (second_test, "test_rax_2", "test_rdx_2"));
+        seed_raw_test_condition(&mut db, first_test, 8);
+        seed_raw_test_condition(&mut db, second_test, 8);
+        db.rel_push("decoded_reg_write", (eax_definition, Mreg::AX, "EAX", 4usize));
+        db.rel_push("decoded_reg_write", (movsx_definition, Mreg::AX, "RAX", 8usize));
+        db.rel_push(
+            "unrefinedinstruction",
+            (
+                movsx_definition,
+                3usize,
+                "",
+                "MOVSX",
+                "movsx_source",
+                "movsx_destination",
+                "NO_OP",
+                "NO_OP",
+                0usize,
+                0usize,
+            ),
+        );
+        db.rel_push("reg_def_used", (eax_definition, Mreg::AX, first_test));
+        db.rel_push("reg_def_used", (movsx_definition, Mreg::AX, second_test));
+        db.rel_push("reg_rtl", (first_test, Mreg::AX, shared_rtl));
+        db.rel_push("reg_rtl", (second_test, Mreg::AX, shared_rtl));
+        db.rel_push("instr_in_function", (first_test, function));
+        db.rel_push("instr_in_function", (second_test, function));
+
+        materialize_test_operand_extensions(&mut db);
+
+        assert!(!db
+            .rel_iter::<(RTLReg, TestOperandExtension)>("test_operand_extension")
+            .any(|(rtl, _)| *rtl == shared_rtl));
+        let diagnostics: BTreeSet<_> = db
+            .rel_iter::<(Address, Address, Symbol)>("unsupported_rtl_condition")
+            .copied()
+            .collect();
+        assert_eq!(
+            diagnostics,
+            BTreeSet::from([
+                (function, first_test, "conflicting-test-extension-provenance"),
+                (function, second_test, "conflicting-test-extension-provenance"),
+            ])
+        );
+    }
+
+    #[test]
+    fn mixed_e32_and_full_width_reaching_defs_fail_closed() {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x5000;
+        let eax_definition: Address = 0x5010;
+        let rax_definition: Address = 0x5020;
+        let joined_test: Address = 0x5030;
+        let joined_rtl: RTLReg = 0x6000;
+
+        for row in [("joined_rax", "RAX"), ("joined_rdx", "RDX")] {
+            db.rel_push("op_register", row);
+        }
+        db.rel_push("ptest", (joined_test, "joined_rax", "joined_rdx"));
+        seed_raw_test_condition(&mut db, joined_test, 8);
+        db.rel_push(
+            "decoded_reg_write",
+            (eax_definition, Mreg::AX, "EAX", 4usize),
+        );
+        db.rel_push(
+            "decoded_reg_write",
+            (rax_definition, Mreg::AX, "RAX", 8usize),
+        );
+        db.rel_push(
+            "unrefinedinstruction",
+            (
+                rax_definition,
+                3usize,
+                "",
+                "MOV",
+                "full_source",
+                "full_destination",
+                "NO_OP",
+                "NO_OP",
+                0usize,
+                0usize,
+            ),
+        );
+        db.rel_push(
+            "reg_def_used",
+            (eax_definition, Mreg::AX, joined_test),
+        );
+        db.rel_push(
+            "reg_def_used",
+            (rax_definition, Mreg::AX, joined_test),
+        );
+        db.rel_push("reg_rtl", (joined_test, Mreg::AX, joined_rtl));
+        db.rel_push("instr_in_function", (joined_test, function));
+
+        materialize_test_operand_extensions(&mut db);
+
+        assert!(!db
+            .rel_iter::<(RTLReg, TestOperandExtension)>("test_operand_extension")
+            .any(|(rtl, _)| *rtl == joined_rtl));
+        assert!(db
+            .rel_iter::<(Address, Address, Symbol)>("unsupported_rtl_condition")
+            .any(|row| {
+                *row
+                    == (
+                        function,
+                        joined_test,
+                        "conflicting-test-extension-provenance",
+                    )
+            }));
+    }
+
+    #[test]
+    fn unknown_decoded_def_fails_closed_but_true_live_in_is_full_width() {
+        let mut db = DecompileDB::default();
+        let function: Address = 0x7000;
+        let call_definition: Address = 0x7010;
+        let call_result_test: Address = 0x7020;
+        let live_in_test: Address = 0x7030;
+        let dead_test: Address = 0x7040;
+        let call_result_rtl: RTLReg = 0x8000;
+        let live_in_rtl: RTLReg = 0x8001;
+        let dead_test_rtl: RTLReg = 0x8002;
+
+        for row in [
+            ("call_result_rax", "RAX"),
+            ("call_result_rdx", "RDX"),
+            ("live_in_rax", "RAX"),
+            ("live_in_rdx", "RDX"),
+            ("dead_test_rax", "RAX"),
+            ("dead_test_rdx", "RDX"),
+        ] {
+            db.rel_push("op_register", row);
+        }
+        db.rel_push(
+            "ptest",
+            (call_result_test, "call_result_rax", "call_result_rdx"),
+        );
+        db.rel_push("ptest", (live_in_test, "live_in_rax", "live_in_rdx"));
+        db.rel_push("ptest", (dead_test, "dead_test_rax", "dead_test_rdx"));
+        seed_raw_test_condition(&mut db, call_result_test, 8);
+        seed_raw_test_condition(&mut db, live_in_test, 8);
+        // CALL is a real reaching AX definition, but the decoder has no exact
+        // writable register operand proving whether the return was extended.
+        db.rel_push(
+            "reg_def_used",
+            (call_definition, Mreg::AX, call_result_test),
+        );
+        db.rel_push("reg_def_used", (call_definition, Mreg::AX, dead_test));
+        db.rel_push(
+            "unrefinedinstruction",
+            (
+                call_definition,
+                5usize,
+                "",
+                "CALL",
+                "call_target",
+                "NO_OP",
+                "NO_OP",
+                "NO_OP",
+                0usize,
+                0usize,
+            ),
+        );
+        db.rel_push(
+            "reg_rtl",
+            (call_result_test, Mreg::AX, call_result_rtl),
+        );
+        db.rel_push("reg_rtl", (live_in_test, Mreg::AX, live_in_rtl));
+        db.rel_push("reg_rtl", (dead_test, Mreg::AX, dead_test_rtl));
+        db.rel_push("instr_in_function", (call_result_test, function));
+        db.rel_push("instr_in_function", (live_in_test, function));
+        db.rel_push("instr_in_function", (dead_test, function));
+
+        materialize_test_operand_extensions(&mut db);
+
+        let diagnostics: BTreeSet<_> = db
+            .rel_iter::<(Address, Address, Symbol)>("unsupported_rtl_condition")
+            .copied()
+            .collect();
+        assert!(diagnostics.contains(&(
+            function,
+            call_result_test,
+            "unknown-test-register-definition",
+        )));
+        assert!(!diagnostics.iter().any(|(_, test, _)| *test == live_in_test));
+        assert!(
+            !diagnostics.iter().any(|(_, test, _)| *test == dead_test),
+            "a decoded TEST with no surviving Ctest condition produced a diagnostic"
+        );
+    }
+
+    #[test]
+    fn e32_extension_provenance_survives_full_width_register_copy() {
+        let mut db = DecompileDB::default();
+        let eax_definition: Address = 0x9010;
+        let rax_to_rcx_copy: Address = 0x9020;
+        let qword_test: Address = 0x9030;
+        let test_rtl: RTLReg = 0xa000;
+
+        for row in [
+            ("copy_source", "RAX"),
+            ("copied_rcx", "RCX"),
+            ("test_rdx", "RDX"),
+        ] {
+            db.rel_push("op_register", row);
+        }
+        db.rel_push("ptest", (qword_test, "copied_rcx", "test_rdx"));
+        seed_raw_test_condition(&mut db, qword_test, 8);
+        db.rel_push(
+            "decoded_reg_write",
+            (eax_definition, Mreg::AX, "EAX", 4usize),
+        );
+        db.rel_push(
+            "decoded_reg_write",
+            (rax_to_rcx_copy, Mreg::CX, "RCX", 8usize),
+        );
+        db.rel_push(
+            "unrefinedinstruction",
+            (
+                rax_to_rcx_copy,
+                3usize,
+                "",
+                "MOV",
+                "copy_source",
+                "copy_destination",
+                "NO_OP",
+                "NO_OP",
+                0usize,
+                0usize,
+            ),
+        );
+        db.rel_push(
+            "reg_def_used",
+            (eax_definition, Mreg::AX, rax_to_rcx_copy),
+        );
+        db.rel_push(
+            "reg_def_used",
+            (rax_to_rcx_copy, Mreg::CX, qword_test),
+        );
+        db.rel_push("reg_rtl", (qword_test, Mreg::CX, test_rtl));
+
+        materialize_test_operand_extensions(&mut db);
+
+        assert!(db
+            .rel_iter::<(RTLReg, TestOperandExtension)>("test_operand_extension")
+            .any(|row| {
+                *row == (test_rtl, TestOperandExtension::ZeroExtended(4))
+            }));
     }
 
     #[test]

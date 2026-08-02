@@ -162,6 +162,9 @@ fn disassemble_x86_sections(
     let mut decoded_memory_writes: Vec<(u64, &'static str)> = Vec::new();
     let mut reg_defs: Vec<(u64, Mreg)> = Vec::new();
     let mut reg_uses: Vec<(u64, Mreg)> = Vec::new();
+    // Preserve exact explicit write spelling/width alongside the parent-Mreg
+    // relations used for value flow.
+    let mut decoded_reg_writes: Vec<(u64, Mreg, &'static str, usize)> = Vec::new();
     let mut adjusts_stack: Vec<(u64, &'static str, i64)> = Vec::new();
     let mut stack_base_moves: Vec<(u64, &'static str, &'static str)> = Vec::new();
 
@@ -286,6 +289,7 @@ fn disassemble_x86_sections(
                         if mreg != Mreg::Unknown && !is_nop {
                             if op.access.map_or(false, |a| a.is_writable()) {
                                 reg_defs.push((addr, mreg));
+                                decoded_reg_writes.push((addr, mreg, name, op.size as usize));
                             }
                             if op.access.map_or(false, |a| a.is_readable()) && !is_xor_self {
                                 reg_uses.push((addr, mreg));
@@ -617,6 +621,12 @@ fn disassemble_x86_sections(
     db.rel_set(
         "decoded_reg_use",
         reg_uses.iter().copied().collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "decoded_reg_write",
+        decoded_reg_writes
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
     );
 
     db.rel_set(
