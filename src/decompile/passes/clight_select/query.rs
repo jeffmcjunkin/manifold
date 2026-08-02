@@ -25,7 +25,7 @@ pub(crate) fn insert_preferred_symbol_name(
 
 const SYNTHETIC_NODE_BITS: Node = (1u64 << 62) | (1u64 << 63);
 
-fn containing_function_owner(node: Node, claimants: &[Address]) -> Option<Address> {
+pub(crate) fn containing_function_owner(node: Node, claimants: &[Address]) -> Option<Address> {
     let real = node & !SYNTHETIC_NODE_BITS;
     claimants
         .iter()
@@ -33,6 +33,27 @@ fn containing_function_owner(node: Node, claimants: &[Address]) -> Option<Addres
         .max()
         .copied()
         .or_else(|| claimants.iter().min().copied())
+}
+
+/// Resolve the multi-valued `instr_in_function` relation to the one function
+/// whose Clight body may own each node. This is the same nearest-preceding
+/// entry rule used for emitted statements, including synthetic-node masking.
+/// Keeping the rule here gives RTL certification, selection, and extraction a
+/// single ownership authority for shared tails and cold fragments.
+pub(crate) fn canonical_function_owners(
+    members: impl IntoIterator<Item = (Node, Address)>,
+) -> BTreeMap<Node, Address> {
+    let mut claimants: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for (node, function) in members {
+        claimants.entry(node).or_default().insert(function);
+    }
+    claimants
+        .into_iter()
+        .filter_map(|(node, functions)| {
+            let functions: Vec<Address> = functions.into_iter().collect();
+            containing_function_owner(node, &functions).map(|owner| (node, owner))
+        })
+        .collect()
 }
 
 fn xtype_to_string(xtype: &XType) -> String {
@@ -441,26 +462,14 @@ pub fn extract_functions(
     let mut func_map: HashMap<Address, FunctionData> = HashMap::new();
     let param_xtypes = build_param_xtypes(db);
 
-    // instr_in_function is multi-valued, so resolve to the function that CONTAINS the node by nearest preceding entry; min-address handed a hot function's shared tail to its .cold clone.
-    let mut node_to_func: HashMap<Node, Address> = HashMap::new();
-    for (node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
-        node_to_func
-            .entry(*node)
-            .and_modify(|e| {
-                let cand_contains = *func <= *node;
-                let cur_contains = *e <= *node;
-                let better = match (cand_contains, cur_contains) {
-                    (true, true) => *func > *e, // both contain the node: nearest preceding = larger entry
-                    (true, false) => true,      // only candidate contains it
-                    (false, true) => false,     // only current contains it
-                    (false, false) => *func < *e, // neither contains (shouldn't happen): smaller for stability
-                };
-                if better {
-                    *e = *func;
-                }
-            })
-            .or_insert(*func);
-    }
+    // `instr_in_function` is multi-valued. Resolve it through the shared
+    // canonical-owner rule so extraction and partial-function certification
+    // cannot disagree about which body receives a shared node.
+    let node_to_func: HashMap<Node, Address> = canonical_function_owners(
+        db.rel_iter::<(Node, Address)>("instr_in_function").copied(),
+    )
+    .into_iter()
+    .collect();
 
     let mut id_to_name: HashMap<usize, String> = HashMap::new();
     for (id, name) in db.rel_iter::<(Ident, Symbol)>("ident_to_symbol") {

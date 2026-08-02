@@ -3,6 +3,7 @@ use crate::run_pass;
 
 use crate::decompile::passes::asm_pass::{is_flag_setting, transl_addressing_rev_sized};
 use crate::decompile::passes::cminor_pass::*;
+use crate::decompile::passes::clight_select::query::canonical_function_owners;
 use crate::decompile::passes::csh_pass::*;
 use crate::decompile::passes::pass::IRPass;
 use crate::mreg::Mreg;
@@ -13931,6 +13932,7 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
         .rel_iter::<(Node, Address)>("instr_in_function")
         .copied()
         .collect();
+    let canonical_owners = canonical_function_owners(final_members.iter().copied());
     let final_edges: BTreeSet<(Node, Node)> = db
         .rel_iter::<(Node, Node)>("rtl_succ_candidate")
         .copied()
@@ -13948,6 +13950,7 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
     for &(function, access, reason) in &unsupported_rows {
         if !old_members.contains(&(access, function))
             || !final_members.contains(&(access, function))
+            || canonical_owners.get(&access) != Some(&function)
             || !decoded_instructions.contains(&access)
         {
             continue;
@@ -14022,6 +14025,7 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
             .filter(|(root, _, _, owner)| *root == access && *owner == function)
         {
             if !final_members.contains(&(*consumer, function))
+                || canonical_owners.get(consumer) != Some(&function)
                 || (*consumer & !SYNTHETIC_NODE_MASK) != *consumer
                 || !decoded_instructions.contains(consumer)
             {
@@ -14044,7 +14048,7 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
         if !cmp_dependency_safe
             || lost_nodes
                 .iter()
-                .any(|node| !final_members.contains(&(*node, function)))
+                .any(|node| canonical_owners.get(node) != Some(&function))
         {
             continue;
         }
@@ -14079,7 +14083,7 @@ fn suppress_unsupported_address_candidates(db: &mut DecompileDB) {
             .insert(*row);
     }
     let mut owned_instructions: BTreeMap<Address, BTreeSet<Node>> = BTreeMap::new();
-    for &(node, function) in &old_members {
+    for (&node, &function) in &canonical_owners {
         if decoded_instructions.contains(&node) {
             owned_instructions.entry(function).or_default().insert(node);
         }
@@ -16740,6 +16744,50 @@ mod encoding_tests {
     }
 
     #[test]
+    fn shared_rejection_certifies_only_the_canonical_clight_owner() {
+        let mut db = DecompileDB::default();
+        let earlier_owner: Address = 0x1100;
+        let canonical_owner: Address = 0x1108;
+        let root: Node = 0x1110;
+        seed_rejected_site(&mut db, earlier_owner, root);
+        db.rel_push(
+            "unsupported_stack_address",
+            (canonical_owner, root, "test-unsupported-address"),
+        );
+        for node in root..root + 8 {
+            seed_decoded_instruction(&mut db, earlier_owner, node);
+            db.rel_push("instr_in_function", (node, canonical_owner));
+        }
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert_eq!(
+            db.rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(
+                canonical_owner,
+                root,
+                "test-unsupported-address"
+            )])
+        );
+        assert_eq!(
+            db.rel_iter::<(Address, Address, Node)>(
+                "suppressed_unsupported_address_node"
+            )
+            .copied()
+            .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(canonical_owner, root, root)])
+        );
+        assert_eq!(
+            db.rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(canonical_owner, 1, 8)])
+        );
+    }
+
+    #[test]
     fn atomic_cmp_rejection_counts_the_dependent_decoded_consumer() {
         let (mut db, root, consumer, fallthrough, taken, _, _) =
             cmp_consumer_rejection_db(
@@ -16771,6 +16819,44 @@ mod encoding_tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([(function, 2, 16)])
         );
+    }
+
+    #[test]
+    fn cmp_rejection_is_not_certified_when_the_lost_consumer_has_another_owner() {
+        let (mut db, root, consumer, fallthrough, taken, _, _) =
+            cmp_consumer_rejection_db(
+                Some("unsupported-stack-address"),
+                CmpConsumerKind::Jcc,
+                false,
+            );
+        let function: Address = 0x7000;
+        for node in [root, consumer, fallthrough, taken] {
+            seed_decoded_instruction(&mut db, function, node);
+        }
+        for node in 0x7100..0x710c {
+            seed_decoded_instruction(&mut db, function, node);
+        }
+        // This entry precedes the consumer but follows the diagnosed root, so
+        // only the dependent decoded instruction changes canonical owner.
+        let another_owner: Address = 0x7018;
+        db.rel_push("instr_in_function", (consumer, another_owner));
+
+        suppress_unsupported_address_candidates(&mut db);
+
+        assert!(db
+            .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
+            .next()
+            .is_none());
+        assert!(db
+            .rel_iter::<(Address, Address, Node)>(
+                "suppressed_unsupported_address_node"
+            )
+            .next()
+            .is_none());
+        assert!(db
+            .rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+            .next()
+            .is_none());
     }
 
     fn outgoing(db: &DecompileDB, source: Node) -> BTreeSet<Node> {

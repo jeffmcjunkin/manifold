@@ -115,6 +115,20 @@ rsp_after_mov_two_accesses:
         movq %rcx, %rsp
         movl 8(%rsp), %eax
         addl 12(%rsp), %eax
+        # Keep the two-instruction loss within the documented 1:8 density
+        # bound so this fixture exercises grouped multi-site certification.
+        nop
+        nop
+        nop
+        nop
+        nop
+        nop
+        nop
+        nop
+        nop
+        nop
+        nop
+        nop
         retq
 
         .globl rsp_after_mov_rmw_chain
@@ -353,6 +367,21 @@ unresolved_indirect_stack:
 unsupported_internal_callee:
         movq %rcx, %rsp
         movl 8(%rsp), %eax
+        retq
+
+        # This function earns an exact partial certificate but is deliberately
+        # excluded by the JSON internal-definition filter. Its diagnostic must
+        # remain unsupported metadata, never a dangling partial record.
+        .globl __partial_filtered
+        .def __partial_filtered; .scl 2; .type 32; .endef
+__partial_filtered:
+        movq %rcx, %rsp
+        movl 8(%rsp), %eax
+        nop
+        nop
+        nop
+        nop
+        nop
         retq
 
         .globl safe_calls_unsupported
@@ -1914,6 +1943,12 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
     let diamond = function_span(&db, "rsp_diamond_stress").0;
     assert!(partial_addresses.contains(&diamond));
     assert!(selected_addresses.contains(&diamond));
+    let multi_site = function_span(&db, "rsp_after_mov_two_accesses").0;
+    assert!(partial_addresses.contains(&multi_site));
+    assert!(selected_addresses.contains(&multi_site));
+    let filtered_partial = function_span(&db, "__partial_filtered").0;
+    assert!(partial_addresses.contains(&filtered_partial));
+    assert!(selected_addresses.contains(&filtered_partial));
     assert!(selected
         .iter()
         .any(|name| is_fixture_name(name, "rsp_safe_cvtsi")));
@@ -1938,6 +1973,10 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
     assert!(selected
         .iter()
         .any(|name| is_fixture_name(name, "addr32_safe_sibling")));
+
+    // Selection still contains this valid partial function, but the adapter's
+    // final internal-definition filter must classify it by emitted identity.
+    db.rel_push("is_external_function", (filtered_partial,));
 
     let omitted = function_span(&db, "unsupported_internal_callee").0;
     assert!(diagnostic_addresses.contains(&omitted));
@@ -1970,6 +2009,12 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
         .iter()
         .filter_map(|function| function["name"].as_str())
         .collect();
+    let json_function_addresses: HashSet<u64> = json["functions"]
+        .as_array()
+        .expect("functions array")
+        .iter()
+        .map(|function| parse_hex_address(&function["address"]))
+        .collect();
     assert!(json_function_names
         .iter()
         .any(|name| is_fixture_name(name, "safe_calls_unsupported")));
@@ -1979,6 +2024,7 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
     assert!(!json_function_names
         .iter()
         .any(|name| is_fixture_name(name, "unsupported_internal_callee")));
+    assert!(!json_function_addresses.contains(&filtered_partial));
 
     let extern_names: Vec<&str> = json["externals"]
         .as_array()
@@ -2042,9 +2088,15 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
         .iter()
         .filter_map(|record| record["name"].as_str())
         .collect();
+    let unsupported_json_addresses: HashSet<u64> = unsupported_json
+        .iter()
+        .map(|record| parse_hex_address(&record["address"]))
+        .collect();
     assert!(unsupported_names
         .iter()
         .all(|name| !json_function_names.contains(name)));
+    assert!(unsupported_json_addresses.is_disjoint(&json_function_addresses));
+    assert!(unsupported_json_addresses.contains(&filtered_partial));
 
     let partial_json = json["partial_functions"]
         .as_array()
@@ -2054,15 +2106,64 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
         .iter()
         .filter_map(|record| record["name"].as_str())
         .collect();
-    assert!(partial_names
+    let partial_record_addresses: Vec<u64> = partial_json
         .iter()
-        .all(|name| json_function_names.contains(name)));
+        .map(|record| parse_hex_address(&record["address"]))
+        .collect();
+    let partial_json_addresses: HashSet<u64> =
+        partial_record_addresses.iter().copied().collect();
+    assert!(partial_json_addresses.is_subset(&json_function_addresses));
     assert!(partial_names.is_disjoint(&unsupported_names));
+    assert!(partial_json_addresses.is_disjoint(&unsupported_json_addresses));
+    assert!(!partial_json_addresses.contains(&filtered_partial));
     assert!(partial_names
         .iter()
         .any(|name| is_fixture_name(name, "rsp_diamond_stress")));
+    let mut sorted_partial_record_addresses = partial_record_addresses.clone();
+    sorted_partial_record_addresses.sort_unstable();
+    sorted_partial_record_addresses.dedup();
+    assert_eq!(partial_record_addresses, sorted_partial_record_addresses);
+
+    // Identity is address + provider name, rather than name alone: aliases or
+    // duplicate names must not make a dangling partial record look emitted.
+    for record in partial_json {
+        let address = parse_hex_address(&record["address"]);
+        let name = record["name"].as_str().expect("partial provider name");
+        assert!(json["functions"]
+            .as_array()
+            .expect("functions array")
+            .iter()
+            .any(|function| {
+                parse_hex_address(&function["address"]) == address
+                    && function["name"].as_str() == Some(name)
+            }));
+    }
+
+    let multi_site_record = partial_json
+        .iter()
+        .find(|record| parse_hex_address(&record["address"]) == multi_site)
+        .expect("grouped multi-site partial record");
+    assert_eq!(
+        multi_site_record["diagnostics"]
+            .as_array()
+            .expect("multi-site diagnostics")
+            .len(),
+        2
+    );
+
+    let mut reasons: HashSet<&str> = unsupported_json
+        .iter()
+        .map(|record| {
+            record["reason"]
+                .as_str()
+                .expect("unsupported reason string")
+        })
+        .collect();
 
     for record in partial_json {
+        assert!(record.get("access_address").is_none());
+        assert!(record.get("reason").is_none());
+        assert!(record.get("suppressed_instructions").is_none());
         let certification = &record["certification"];
         assert_eq!(
             certification["kind"],
@@ -2087,45 +2188,52 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
             8
         );
 
-        let suppressed_instructions: Vec<u64> = record["suppressed_instructions"]
+        let diagnostics = record["diagnostics"]
             .as_array()
-            .expect("suppressed instruction list")
+            .expect("grouped partial diagnostics");
+        assert!(!diagnostics.is_empty());
+        let diagnostic_rows: Vec<(u64, String)> = diagnostics
             .iter()
-            .map(parse_hex_address)
-            .collect();
-        assert!(!suppressed_instructions.is_empty());
-        assert!(suppressed_instructions.contains(&parse_hex_address(
-            &record["access_address"]
-        )));
-        let mut sorted_suppressed = suppressed_instructions.clone();
-        sorted_suppressed.sort_unstable();
-        sorted_suppressed.dedup();
-        assert_eq!(suppressed_instructions, sorted_suppressed);
-
-        let function = parse_hex_address(&record["address"]);
-        let exact_function_nodes: HashSet<u64> = partial_json
-            .iter()
-            .filter(|candidate| parse_hex_address(&candidate["address"]) == function)
-            .flat_map(|candidate| {
-                candidate["suppressed_instructions"]
-                    .as_array()
-                    .expect("suppressed instruction list")
-                    .iter()
-                    .map(parse_hex_address)
+            .map(|diagnostic| {
+                (
+                    parse_hex_address(&diagnostic["access_address"]),
+                    diagnostic["reason"]
+                        .as_str()
+                        .expect("partial reason string")
+                        .to_owned(),
+                )
             })
             .collect();
+        let mut sorted_diagnostic_rows = diagnostic_rows.clone();
+        sorted_diagnostic_rows.sort();
+        sorted_diagnostic_rows.dedup();
+        assert_eq!(diagnostic_rows, sorted_diagnostic_rows);
+
+        let mut exact_function_nodes = HashSet::new();
+        for diagnostic in diagnostics {
+            let access = parse_hex_address(&diagnostic["access_address"]);
+            reasons.insert(
+                diagnostic["reason"]
+                    .as_str()
+                    .expect("partial reason string"),
+            );
+            let suppressed_instructions: Vec<u64> = diagnostic["suppressed_instructions"]
+                .as_array()
+                .expect("site suppressed instruction list")
+                .iter()
+                .map(parse_hex_address)
+                .collect();
+            assert!(!suppressed_instructions.is_empty());
+            assert!(suppressed_instructions.contains(&access));
+            let mut sorted_suppressed = suppressed_instructions.clone();
+            sorted_suppressed.sort_unstable();
+            sorted_suppressed.dedup();
+            assert_eq!(suppressed_instructions, sorted_suppressed);
+            exact_function_nodes.extend(suppressed_instructions);
+        }
         assert_eq!(exact_function_nodes.len() as u64, suppressed_count);
     }
 
-    let reasons: HashSet<&str> = unsupported_json
-        .iter()
-        .chain(partial_json.iter())
-        .map(|record| {
-            record["reason"]
-                .as_str()
-                .expect("unsupported reason string")
-        })
-        .collect();
     assert_eq!(
         reasons,
         HashSet::from(["unsupported-addr32-address", "unsupported-stack-address"])
@@ -2148,24 +2256,6 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
     sorted_unsupported_rows.sort();
     sorted_unsupported_rows.dedup();
     assert_eq!(unsupported_rows, sorted_unsupported_rows);
-
-    let partial_rows: Vec<(u64, u64, String)> = partial_json
-        .iter()
-        .map(|record| {
-            (
-                parse_hex_address(&record["address"]),
-                parse_hex_address(&record["access_address"]),
-                record["reason"]
-                    .as_str()
-                    .expect("partial reason string")
-                    .to_owned(),
-            )
-        })
-        .collect();
-    let mut sorted_partial_rows = partial_rows.clone();
-    sorted_partial_rows.sort();
-    sorted_partial_rows.dedup();
-    assert_eq!(partial_rows, sorted_partial_rows);
 
     let externals = json["externals"].as_array().expect("externals array");
     let external_keys: Vec<(String, u64, String, String)> = externals
@@ -2211,6 +2301,26 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
         "unexpected invalid-reason diagnostic: {invalid_error}"
     );
     let _ = std::fs::remove_file(&invalid_output);
+
+    // The normal selection path must enforce the strict relation bundle even
+    // when JSON export is never requested. A conflicting function budget is
+    // therefore enough to omit an otherwise valid real-TU partial body.
+    let (suppressed, owned) = db
+        .rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+        .find_map(|(function, suppressed, owned)| {
+            (*function == multi_site).then_some((*suppressed, *owned))
+        })
+        .expect("multi-site partial budget");
+    db.rel_push(
+        "partial_unsupported_function",
+        (multi_site, suppressed, owned + 1),
+    );
+    let selected_after_conflict =
+        manifold::decompile::passes::clight_select::select::select_clight_stmts(&db)
+            .expect("default Clight selection after malformed certificate");
+    assert!(!selected_after_conflict
+        .iter()
+        .any(|function| function.address == multi_site));
 }
 
 #[test]

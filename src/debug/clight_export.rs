@@ -5,7 +5,9 @@ use crate::decompile::passes::clight_select::query::{
     build_param_xtypes, build_rtl_to_mreg_at_entry, extract_callee_signatures, extract_globals,
     extract_struct_definitions, insert_preferred_symbol_name,
 };
-use crate::decompile::passes::clight_select::select::{select_clight_stmts, SelectedFunction};
+use crate::decompile::passes::clight_select::select::{
+    select_clight_stmts, validate_partial_unsupported_functions, SelectedFunction,
+};
 use crate::x86::types::*;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -93,169 +95,6 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         id_to_name.insert(*address as usize, name.clone());
     }
 
-    let selected_addresses: std::collections::HashSet<Address> = selected_functions
-        .iter()
-        .map(|function| function.address)
-        .collect();
-    let mut unsupported_stack_rows: Vec<(Address, Address, String)> = db
-        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
-        .map(|(func, access, reason)| (*func, *access, (*reason).to_string()))
-        .collect();
-    unsupported_stack_rows.sort();
-    unsupported_stack_rows.dedup();
-    let mut unsupported_details: BTreeMap<(Address, Address), Vec<String>> = BTreeMap::new();
-    for (func, access, detail) in
-        db.rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail")
-    {
-        unsupported_details
-            .entry((*func, *access))
-            .or_default()
-            .push((*detail).to_string());
-    }
-    for details in unsupported_details.values_mut() {
-        details.sort();
-        details.dedup();
-    }
-    let certified: std::collections::HashSet<(Address, Address, Symbol)> = db
-        .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
-        .copied()
-        .collect();
-    let mut suppressed_nodes: BTreeMap<(Address, Address), Vec<Address>> = BTreeMap::new();
-    for (func, access, node) in
-        db.rel_iter::<(Address, Address, Node)>("suppressed_unsupported_address_node")
-    {
-        suppressed_nodes
-            .entry((*func, *access))
-            .or_default()
-            .push(*node);
-    }
-    for nodes in suppressed_nodes.values_mut() {
-        nodes.sort_unstable();
-        nodes.dedup();
-    }
-    let mut suppressed_nodes_by_function: BTreeMap<Address, std::collections::BTreeSet<Node>> =
-        BTreeMap::new();
-    for ((func, _), nodes) in &suppressed_nodes {
-        suppressed_nodes_by_function
-            .entry(*func)
-            .or_default()
-            .extend(nodes.iter().copied());
-    }
-    let decoded_nodes: std::collections::HashSet<Node> = db
-        .rel_iter::<(
-            Address, usize, &'static str, &'static str, Symbol, Symbol,
-            Symbol, Symbol, usize, usize,
-        )>("instruction")
-        .map(|(node, ..)| *node)
-        .collect();
-    let mut owned_nodes_by_function: BTreeMap<Address, std::collections::BTreeSet<Node>> =
-        BTreeMap::new();
-    for (node, func) in db.rel_iter::<(Node, Address)>("instr_in_function") {
-        if decoded_nodes.contains(node) {
-            owned_nodes_by_function
-                .entry(*func)
-                .or_default()
-                .insert(*node);
-        }
-    }
-    let mut partial_budgets: BTreeMap<Address, (usize, usize)> = BTreeMap::new();
-    for (func, suppressed, owned) in
-        db.rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
-    {
-        let row = (*suppressed, *owned);
-        if let Some(previous) = partial_budgets.insert(*func, row) {
-            if previous != row {
-                return Err(format!(
-                    "partial function 0x{func:x} has conflicting loss budgets: {previous:?} versus {row:?}"
-                ));
-            }
-        }
-    }
-
-    let mut unsupported_functions = Vec::with_capacity(unsupported_stack_rows.len());
-    let mut partial_functions = Vec::new();
-    for (func, access, reason) in unsupported_stack_rows {
-        if !matches!(
-            reason.as_str(),
-            "unsupported-stack-address" | "unsupported-addr32-address"
-        ) {
-            return Err(format!(
-                "unsupported function 0x{func:x} has unknown reason code {reason:?}"
-            ));
-        }
-        let name = provider_names.get(&func).ok_or_else(|| {
-            format!("unsupported function 0x{func:x} has no emit_function provider name")
-        })?;
-        let diagnostic = (func, access, reason.as_str());
-        let base = json!({
-            "name": name,
-            "address": format!("0x{func:x}"),
-            "access_address": format!("0x{access:x}"),
-            "reason": reason,
-            "details": unsupported_details
-                .get(&(func, access))
-                .cloned()
-                .unwrap_or_default(),
-        });
-        if !selected_addresses.contains(&func) {
-            unsupported_functions.push(base);
-            continue;
-        }
-
-        if !certified.contains(&diagnostic) {
-            return Err(format!(
-                "selected partial function 0x{func:x} lacks an atomic suppression certificate at 0x{access:x}"
-            ));
-        }
-        let (suppressed_count, owned_count) = partial_budgets.get(&func).copied().ok_or_else(|| {
-            format!("selected partial function 0x{func:x} lacks a bounded loss certificate")
-        })?;
-        if !crate::decompile::passes::rtl_pass::partial_unsupported_loss_is_bounded(
-            suppressed_count,
-            owned_count,
-        ) {
-            return Err(format!(
-                "selected partial function 0x{func:x} has an invalid loss budget ({suppressed_count}/{owned_count})"
-            ));
-        }
-        let exact_suppressed_count = suppressed_nodes_by_function
-            .get(&func)
-            .map_or(0, std::collections::BTreeSet::len);
-        let exact_owned_count = owned_nodes_by_function
-            .get(&func)
-            .map_or(0, std::collections::BTreeSet::len);
-        if (exact_suppressed_count, exact_owned_count) != (suppressed_count, owned_count) {
-            return Err(format!(
-                "selected partial function 0x{func:x} loss certificate does not match exact provenance: certified ({suppressed_count}/{owned_count}), exact ({exact_suppressed_count}/{exact_owned_count})"
-            ));
-        }
-        let nodes = suppressed_nodes.get(&(func, access)).ok_or_else(|| {
-            format!(
-                "selected partial function 0x{func:x} has no suppressed instruction provenance at 0x{access:x}"
-            )
-        })?;
-        if nodes.is_empty() {
-            return Err(format!(
-                "selected partial function 0x{func:x} has empty suppressed instruction provenance at 0x{access:x}"
-            ));
-        }
-        let mut partial = base;
-        partial["suppressed_instructions"] = json!(nodes
-            .iter()
-            .map(|node| format!("0x{node:x}"))
-            .collect::<Vec<_>>());
-        partial["certification"] = json!({
-            "kind": PARTIAL_SUPPRESSION_CERTIFICATE_ID,
-            "atomic_chain_suppressed": true,
-            "all_function_diagnostics_certified": true,
-            "suppressed_instruction_count": suppressed_count,
-            "owned_instruction_count": owned_count,
-            "max_suppressed_instruction_count": crate::decompile::passes::rtl_pass::MAX_PARTIAL_SUPPRESSED_INSTRUCTIONS,
-            "min_owned_instructions_per_suppressed": crate::decompile::passes::rtl_pass::MIN_OWNED_INSTRUCTIONS_PER_SUPPRESSED,
-        });
-        partial_functions.push(partial);
-    }
-
     let external_funcs: std::collections::HashSet<u64> = db
         .rel_iter::<(Address,)>("is_external_function")
         .map(|(a,)| *a)
@@ -275,6 +114,9 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         "__x86.get_pc_thunk.bx",
     ];
 
+    // Partial metadata describes definitions in this exact JSON document, not
+    // merely functions which survived statement selection. Apply the final
+    // emission filter before classifying any diagnostic.
     let internal_functions: Vec<&SelectedFunction> = selected_functions
         .iter()
         .filter(|func| {
@@ -286,6 +128,126 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
                 && !db.should_skip_function(func.name.as_str())
         })
         .collect();
+    let emitted_addresses: std::collections::HashSet<Address> = internal_functions
+        .iter()
+        .map(|function| function.address)
+        .collect();
+
+    let partial_validation = validate_partial_unsupported_functions(db);
+    if !partial_validation.orphan_certificates.is_empty()
+        || !partial_validation.orphan_provenance_sites.is_empty()
+        || !partial_validation.orphan_budget_functions.is_empty()
+        || !partial_validation.orphan_details.is_empty()
+        || !partial_validation.unknown_details.is_empty()
+    {
+        return Err(format!(
+            "invalid partial-suppression relation bundle: orphan certificates={:?}, provenance={:?}, budgets={:?}, details={:?}; unknown details={:?}",
+            partial_validation.orphan_certificates,
+            partial_validation.orphan_provenance_sites,
+            partial_validation.orphan_budget_functions,
+            partial_validation.orphan_details,
+            partial_validation.unknown_details,
+        ));
+    }
+    let mut unsupported_stack_rows: Vec<(Address, Address, String)> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
+        .map(|(func, access, reason)| (*func, *access, (*reason).to_string()))
+        .collect();
+    unsupported_stack_rows.sort();
+    unsupported_stack_rows.dedup();
+    let mut unsupported_details: BTreeMap<(Address, Address), Vec<String>> = BTreeMap::new();
+    for (func, access, detail) in
+        db.rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail")
+    {
+        unsupported_details
+            .entry((*func, *access))
+            .or_default()
+            .push((*detail).to_string());
+    }
+    for details in unsupported_details.values_mut() {
+        details.sort();
+        details.dedup();
+    }
+
+    let mut unsupported_functions = Vec::with_capacity(unsupported_stack_rows.len());
+    for (func, access, reason) in &unsupported_stack_rows {
+        if !matches!(
+            reason.as_str(),
+            "unsupported-stack-address" | "unsupported-addr32-address"
+        ) {
+            return Err(format!(
+                "unsupported function 0x{func:x} has unknown reason code {reason:?}"
+            ));
+        }
+        let name = provider_names.get(func).ok_or_else(|| {
+            format!("unsupported function 0x{func:x} has no emit_function provider name")
+        })?;
+        let base = json!({
+            "name": name,
+            "address": format!("0x{func:x}"),
+            "access_address": format!("0x{access:x}"),
+            "reason": reason,
+            "details": unsupported_details
+                .get(&(*func, *access))
+                .cloned()
+                .unwrap_or_default(),
+        });
+        if !emitted_addresses.contains(func) {
+            unsupported_functions.push(base);
+            continue;
+        }
+        if !partial_validation.partial_functions.contains_key(func) {
+            return Err(format!(
+                "emitted partial function 0x{func:x} failed strict suppression-certificate validation"
+            ));
+        }
+    }
+
+    // Schema v2 groups all sites for a function into one stable record. Site
+    // rows and instruction provenance are sorted by the shared validator; the
+    // counts and policy bounds certify their function-wide union exactly.
+    let mut partial_functions = Vec::new();
+    for (func, certificate) in &partial_validation.partial_functions {
+        if !emitted_addresses.contains(func) {
+            continue;
+        }
+        let name = provider_names.get(func).ok_or_else(|| {
+            format!("partial function 0x{func:x} has no emit_function provider name")
+        })?;
+        let diagnostics: Vec<Value> = certificate
+            .sites
+            .iter()
+            .map(|site| {
+                json!({
+                    "access_address": format!("0x{:x}", site.access),
+                    "reason": site.reason,
+                    "details": unsupported_details
+                        .get(&(*func, site.access))
+                        .cloned()
+                        .unwrap_or_default(),
+                    "suppressed_instructions": site
+                        .suppressed_nodes
+                        .iter()
+                        .map(|node| format!("0x{node:x}"))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        partial_functions.push(json!({
+            "name": name,
+            "address": format!("0x{func:x}"),
+            "diagnostics": diagnostics,
+            "certification": {
+                "kind": PARTIAL_SUPPRESSION_CERTIFICATE_ID,
+                "atomic_chain_suppressed": true,
+                "all_function_diagnostics_certified": true,
+                "suppressed_instruction_count": certificate.suppressed_instruction_count,
+                "owned_instruction_count": certificate.owned_instruction_count,
+                "max_suppressed_instruction_count": crate::decompile::passes::rtl_pass::MAX_PARTIAL_SUPPRESSED_INSTRUCTIONS,
+                "min_owned_instructions_per_suppressed": crate::decompile::passes::rtl_pass::MIN_OWNED_INSTRUCTIONS_PER_SUPPRESSED,
+            }
+        }));
+    }
 
     // Extract struct definitions (composites)
     let struct_defs = extract_struct_definitions(db);

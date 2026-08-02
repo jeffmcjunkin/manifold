@@ -3,11 +3,12 @@
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::clight_pass::is_nonempty_stmt;
 use crate::decompile::passes::clight_select::query::{
-    extract_functions, extract_ite_info, extract_loop_info, FunctionData, IteInfo, LoopInfo,
+    canonical_function_owners, extract_functions, extract_ite_info, extract_loop_info,
+    FunctionData, IteInfo, LoopInfo,
 };
 use crate::decompile::passes::csh_pass::ident_from_node;
 use crate::x86::types::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Per-function selection extracted from the Z3 program state: indices into FunctionData's candidate arrays.
 #[derive(Clone, Debug)]
@@ -58,37 +59,282 @@ pub struct SelectedFunction {
     pub loop_info: HashMap<Node, LoopInfo>,
 }
 
-fn unsupported_functions_requiring_omission(db: &DecompileDB) -> HashSet<Address> {
-    let diagnostics: Vec<(Address, Address, Symbol)> = db
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedPartialSite {
+    pub(crate) access: Address,
+    pub(crate) reason: Symbol,
+    pub(crate) suppressed_nodes: Vec<Node>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedPartialFunction {
+    pub(crate) suppressed_instruction_count: usize,
+    pub(crate) owned_instruction_count: usize,
+    pub(crate) sites: Vec<ValidatedPartialSite>,
+}
+
+pub(crate) const UNSUPPORTED_ADDRESS_DETAIL_CODES: &[Symbol] = &[
+    "addr32-frame-ebp",
+    "addr32-lowering-incomplete",
+    "addr32-multiple-memory-operands",
+    "addr32-pattern",
+    "addr32-register",
+    "addr32-segment",
+    "addr32-shared-ebp",
+    "addr32-unresolved-indirect",
+    "home-cell-shape-unrepresentable",
+    "rbp-coordinate-unknown",
+    "rsp-coordinate-unknown",
+    "rsp-indexed-lowering-missing",
+    "shared-stack-node",
+    "stack-parameter-partial-write",
+    "unmodeled-segment",
+    "unresolved-indirect-control-flow",
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PartialUnsupportedValidation {
+    pub(crate) diagnosed_functions: BTreeSet<Address>,
+    pub(crate) partial_functions: BTreeMap<Address, ValidatedPartialFunction>,
+    pub(crate) orphan_certificates: BTreeSet<(Address, Address, Symbol)>,
+    pub(crate) orphan_provenance_sites: BTreeSet<(Address, Address)>,
+    pub(crate) orphan_budget_functions: BTreeSet<Address>,
+    pub(crate) orphan_details: BTreeSet<(Address, Address, Symbol)>,
+    pub(crate) unknown_details: BTreeSet<(Address, Address, Symbol)>,
+}
+
+/// Validate the complete partial-function certificate as one fail-closed
+/// object. The producer relations are intentionally redundant: diagnostics,
+/// per-site certificates and provenance, and the function-wide budget must
+/// all agree exactly. Ownership is the canonical Clight ownership rule, not
+/// raw multi-valued `instr_in_function` membership.
+pub(crate) fn validate_partial_unsupported_functions(
+    db: &DecompileDB,
+) -> PartialUnsupportedValidation {
+    let diagnostic_rows: BTreeSet<(Address, Address, Symbol)> = db
         .rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
         .copied()
         .collect();
-    let certified: HashSet<(Address, Address, Symbol)> = db
+    let mut diagnostics_by_function: BTreeMap<Address, BTreeSet<(Address, Symbol)>> =
+        BTreeMap::new();
+    for &(function, access, reason) in &diagnostic_rows {
+        diagnostics_by_function
+            .entry(function)
+            .or_default()
+            .insert((access, reason));
+    }
+
+    let diagnosed_functions = diagnostics_by_function.keys().copied().collect();
+    let certified_rows: BTreeSet<(Address, Address, Symbol)> = db
         .rel_iter::<(Address, Address, Symbol)>("suppressed_unsupported_address")
         .copied()
         .collect();
-    let budgeted: HashSet<Address> = db
-        .rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
-        .filter_map(|(function, suppressed, owned)| {
-            crate::decompile::passes::rtl_pass::partial_unsupported_loss_is_bounded(
-                *suppressed,
-                *owned,
-            )
-            .then_some(*function)
-        })
+    let mut certified_by_function: BTreeMap<Address, BTreeSet<(Address, Symbol)>> =
+        BTreeMap::new();
+    for &(function, access, reason) in &certified_rows {
+        certified_by_function
+            .entry(function)
+            .or_default()
+            .insert((access, reason));
+    }
+
+    // Keep the raw row count as well as a set. A site is certified only by a
+    // nonempty list of unique decoded instructions, including the access
+    // itself; duplicate provenance is malformed rather than silently hidden.
+    let mut provenance_by_site: BTreeMap<(Address, Address), Vec<Node>> = BTreeMap::new();
+    for (function, access, node) in
+        db.rel_iter::<(Address, Address, Node)>("suppressed_unsupported_address_node")
+    {
+        provenance_by_site
+            .entry((*function, *access))
+            .or_default()
+            .push(*node);
+    }
+
+    let mut budgets_by_function: BTreeMap<Address, BTreeSet<(usize, usize)>> = BTreeMap::new();
+    for (function, suppressed, owned) in
+        db.rel_iter::<(Address, usize, usize)>("partial_unsupported_function")
+    {
+        budgets_by_function
+            .entry(*function)
+            .or_default()
+            .insert((*suppressed, *owned));
+    }
+
+    // These relations are a closed certificate bundle. Retain explicit
+    // orphan sets so an adapter can reject stale producer rows rather than
+    // silently omitting them from its wire format.
+    let diagnostic_sites: BTreeSet<(Address, Address)> = diagnostic_rows
+        .iter()
+        .map(|(function, access, _)| (*function, *access))
+        .collect();
+    let provenance_sites: BTreeSet<(Address, Address)> =
+        provenance_by_site.keys().copied().collect();
+    let detail_rows: BTreeSet<(Address, Address, Symbol)> = db
+        .rel_iter::<(Address, Address, Symbol)>("unsupported_address_detail")
+        .copied()
+        .collect();
+    let orphan_certificates = certified_rows
+        .difference(&diagnostic_rows)
+        .copied()
+        .collect();
+    let orphan_provenance_sites = provenance_sites
+        .difference(&diagnostic_sites)
+        .copied()
+        .collect();
+    let orphan_budget_functions = budgets_by_function
+        .keys()
+        .filter(|function| !diagnostics_by_function.contains_key(function))
+        .copied()
+        .collect();
+    let orphan_details = detail_rows
+        .iter()
+        .filter(|(function, access, _)| !diagnostic_sites.contains(&(*function, *access)))
+        .copied()
+        .collect();
+    let unknown_details = detail_rows
+        .iter()
+        .filter(|(_, _, detail)| !UNSUPPORTED_ADDRESS_DETAIL_CODES.contains(detail))
+        .copied()
         .collect();
 
-    let mut by_function: HashMap<Address, Vec<(Address, Address, Symbol)>> = HashMap::new();
-    for row @ (function, _, _) in diagnostics {
-        by_function.entry(function).or_default().push(row);
+    let decoded_nodes: BTreeSet<Node> = db
+        .rel_iter::<(
+            Address, usize, &'static str, &'static str, Symbol, Symbol,
+            Symbol, Symbol, usize, usize,
+        )>("instruction")
+        .map(|(node, ..)| *node)
+        .collect();
+    let canonical_owners = canonical_function_owners(
+        db.rel_iter::<(Node, Address)>("instr_in_function").copied(),
+    );
+    let mut canonical_decoded_by_function: BTreeMap<Address, BTreeSet<Node>> = BTreeMap::new();
+    for (&node, &function) in &canonical_owners {
+        if decoded_nodes.contains(&node) {
+            canonical_decoded_by_function
+                .entry(function)
+                .or_default()
+                .insert(node);
+        }
     }
-    by_function
+
+    let mut partial_functions = BTreeMap::new();
+    for (&function, diagnostics) in &diagnostics_by_function {
+        // Reject stale/missing site certificates, not merely missing rows.
+        if certified_by_function.get(&function) != Some(diagnostics) {
+            continue;
+        }
+
+        let Some(budgets) = budgets_by_function.get(&function) else {
+            continue;
+        };
+        if budgets.len() != 1 {
+            continue;
+        }
+        let (suppressed_instruction_count, owned_instruction_count) =
+            *budgets.iter().next().expect("one checked partial budget");
+        if !crate::decompile::passes::rtl_pass::partial_unsupported_loss_is_bounded(
+            suppressed_instruction_count,
+            owned_instruction_count,
+        ) {
+            continue;
+        }
+
+        let diagnostic_accesses: BTreeSet<Address> =
+            diagnostics.iter().map(|(access, _)| *access).collect();
+        // Provenance is keyed by access, so two reason rows at one site are
+        // ambiguous and would duplicate the same lost-node list on the wire.
+        if diagnostics.len() != diagnostic_accesses.len() {
+            continue;
+        }
+        let provenance_accesses: BTreeSet<Address> = provenance_by_site
+            .keys()
+            .filter_map(|(owner, access)| (*owner == function).then_some(*access))
+            .collect();
+        if provenance_accesses != diagnostic_accesses {
+            continue;
+        }
+
+        let mut site_nodes: BTreeMap<Address, Vec<Node>> = BTreeMap::new();
+        let mut all_suppressed_nodes = BTreeSet::new();
+        let mut provenance_valid = true;
+        for access in diagnostic_accesses {
+            let Some(raw_nodes) = provenance_by_site.get(&(function, access)) else {
+                provenance_valid = false;
+                break;
+            };
+            let nodes: BTreeSet<Node> = raw_nodes.iter().copied().collect();
+            if nodes.is_empty()
+                || nodes.len() != raw_nodes.len()
+                || !nodes.contains(&access)
+                || !all_suppressed_nodes.is_disjoint(&nodes)
+                || nodes.iter().any(|node| {
+                    !decoded_nodes.contains(node)
+                        || canonical_owners.get(node) != Some(&function)
+                })
+            {
+                provenance_valid = false;
+                break;
+            }
+            all_suppressed_nodes.extend(nodes.iter().copied());
+            site_nodes.insert(access, nodes.into_iter().collect());
+        }
+        if !provenance_valid {
+            continue;
+        }
+
+        let exact_owned_nodes = canonical_decoded_by_function
+            .get(&function)
+            .cloned()
+            .unwrap_or_default();
+        if all_suppressed_nodes.len() != suppressed_instruction_count
+            || exact_owned_nodes.len() != owned_instruction_count
+            || !all_suppressed_nodes.is_subset(&exact_owned_nodes)
+        {
+            continue;
+        }
+
+        let sites = diagnostics
+            .iter()
+            .map(|(access, reason)| ValidatedPartialSite {
+                access: *access,
+                reason: *reason,
+                suppressed_nodes: site_nodes
+                    .get(access)
+                    .cloned()
+                    .expect("validated diagnostic site provenance"),
+            })
+            .collect();
+        partial_functions.insert(
+            function,
+            ValidatedPartialFunction {
+                suppressed_instruction_count,
+                owned_instruction_count,
+                sites,
+            },
+        );
+    }
+
+    PartialUnsupportedValidation {
+        diagnosed_functions,
+        partial_functions,
+        orphan_certificates,
+        orphan_provenance_sites,
+        orphan_budget_functions,
+        orphan_details,
+        unknown_details,
+    }
+}
+
+fn unsupported_functions_requiring_omission(db: &DecompileDB) -> HashSet<Address> {
+    let PartialUnsupportedValidation {
+        diagnosed_functions,
+        partial_functions,
+        ..
+    } = validate_partial_unsupported_functions(db);
+    diagnosed_functions
         .into_iter()
-        .filter_map(|(function, rows)| {
-            (!budgeted.contains(&function)
-                || rows.iter().any(|row| !certified.contains(row)))
-            .then_some(function)
-        })
+        .filter(|function| !partial_functions.contains_key(function))
         .collect()
 }
 
@@ -2596,50 +2842,155 @@ mod unsupported_partial_tests {
     const FIRST_ACCESS: Address = 0x1010;
     const SECOND_ACCESS: Address = 0x1020;
 
-    fn diagnostic_db() -> DecompileDB {
+    fn seed_decoded_owned(db: &mut DecompileDB, function: Address, node: Node) {
+        db.rel_push("instr_in_function", (node, function));
+        db.rel_push(
+            "instruction",
+            (node, 1usize, "", "nop", "", "", "", "", 0usize, 0usize),
+        );
+    }
+
+    fn single_site_db(provenance: &[Node], budget: (usize, usize)) -> DecompileDB {
         let mut db = DecompileDB::default();
         db.rel_push(
             "unsupported_stack_address",
             (FUNCTION, FIRST_ACCESS, "unsupported-stack-address"),
         );
+        db.rel_push(
+            "suppressed_unsupported_address",
+            (FUNCTION, FIRST_ACCESS, "unsupported-stack-address"),
+        );
+        for node in provenance {
+            db.rel_push(
+                "suppressed_unsupported_address_node",
+                (FUNCTION, FIRST_ACCESS, *node),
+            );
+        }
+        db.rel_push(
+            "partial_unsupported_function",
+            (FUNCTION, budget.0, budget.1),
+        );
+        for node in FIRST_ACCESS..FIRST_ACCESS + 8 {
+            seed_decoded_owned(&mut db, FUNCTION, node);
+        }
         db
     }
 
     #[test]
-    fn partial_selection_requires_matching_site_and_bounded_function_certificates() {
-        let mut db = diagnostic_db();
-        db.rel_push(
-            "suppressed_unsupported_address",
-            (FUNCTION, FIRST_ACCESS, "unsupported-stack-address"),
-        );
-        db.rel_push(
-            "partial_unsupported_function",
-            (FUNCTION, 1usize, 8usize),
-        );
-        assert!(unsupported_functions_requiring_omission(&db).is_empty());
-
-        let mut db = diagnostic_db();
-        db.rel_push(
-            "suppressed_unsupported_address",
-            (FUNCTION, FIRST_ACCESS, "unsupported-stack-address"),
-        );
-        db.rel_push(
-            "partial_unsupported_function",
-            (FUNCTION, 1usize, 8usize),
-        );
+    fn strict_partial_validation_groups_and_sorts_exact_multisite_certificate() {
+        let mut db = DecompileDB::default();
+        // Deliberately seed the later site first; validation has a stable
+        // function/site order independent of relation insertion order.
         db.rel_push(
             "unsupported_stack_address",
             (FUNCTION, SECOND_ACCESS, "unsupported-stack-address"),
         );
-        assert_eq!(
-            db.rel_iter::<(Address, Address, Symbol)>("unsupported_stack_address")
-                .copied()
-                .collect::<HashSet<_>>(),
-            HashSet::from([
-                (FUNCTION, FIRST_ACCESS, "unsupported-stack-address"),
-                (FUNCTION, SECOND_ACCESS, "unsupported-stack-address"),
-            ])
+        db.rel_push(
+            "unsupported_stack_address",
+            (FUNCTION, FIRST_ACCESS, "unsupported-stack-address"),
         );
+        db.rel_push(
+            "suppressed_unsupported_address",
+            (FUNCTION, SECOND_ACCESS, "unsupported-stack-address"),
+        );
+        db.rel_push(
+            "suppressed_unsupported_address",
+            (FUNCTION, FIRST_ACCESS, "unsupported-stack-address"),
+        );
+        db.rel_push(
+            "suppressed_unsupported_address_node",
+            (FUNCTION, SECOND_ACCESS, SECOND_ACCESS),
+        );
+        db.rel_push(
+            "suppressed_unsupported_address_node",
+            (FUNCTION, FIRST_ACCESS, FIRST_ACCESS),
+        );
+        db.rel_push(
+            "partial_unsupported_function",
+            (FUNCTION, 2usize, 16usize),
+        );
+        for node in (FIRST_ACCESS..FIRST_ACCESS + 15).chain([SECOND_ACCESS]) {
+            seed_decoded_owned(&mut db, FUNCTION, node);
+        }
+
+        let validation = validate_partial_unsupported_functions(&db);
+        let certificate = validation
+            .partial_functions
+            .get(&FUNCTION)
+            .expect("exact multisite certificate validates");
+        assert_eq!(
+            (certificate.suppressed_instruction_count, certificate.owned_instruction_count),
+            (2, 16)
+        );
+        assert_eq!(
+            certificate
+                .sites
+                .iter()
+                .map(|site| (site.access, site.reason, site.suppressed_nodes.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    FIRST_ACCESS,
+                    "unsupported-stack-address",
+                    vec![FIRST_ACCESS]
+                ),
+                (
+                    SECOND_ACCESS,
+                    "unsupported-stack-address",
+                    vec![SECOND_ACCESS]
+                ),
+            ]
+        );
+        assert!(unsupported_functions_requiring_omission(&db).is_empty());
+    }
+
+    #[test]
+    fn default_selection_gate_fails_closed_without_exact_provenance() {
+        let missing = single_site_db(&[], (1, 8));
+        assert_eq!(
+            unsupported_functions_requiring_omission(&missing),
+            HashSet::from([FUNCTION])
+        );
+
+        let missing_access = single_site_db(&[FIRST_ACCESS + 1], (1, 8));
+        assert_eq!(
+            unsupported_functions_requiring_omission(&missing_access),
+            HashSet::from([FUNCTION])
+        );
+    }
+
+    #[test]
+    fn cross_site_overlap_is_not_an_exact_grouped_certificate() {
+        let mut db = DecompileDB::default();
+        let shared_lost_node = FIRST_ACCESS + 1;
+        for access in [FIRST_ACCESS, SECOND_ACCESS] {
+            db.rel_push(
+                "unsupported_stack_address",
+                (FUNCTION, access, "unsupported-stack-address"),
+            );
+            db.rel_push(
+                "suppressed_unsupported_address",
+                (FUNCTION, access, "unsupported-stack-address"),
+            );
+            db.rel_push(
+                "suppressed_unsupported_address_node",
+                (FUNCTION, access, access),
+            );
+            db.rel_push(
+                "suppressed_unsupported_address_node",
+                (FUNCTION, access, shared_lost_node),
+            );
+        }
+        db.rel_push(
+            "partial_unsupported_function",
+            (FUNCTION, 3usize, 24usize),
+        );
+        for node in FIRST_ACCESS..FIRST_ACCESS + 24 {
+            seed_decoded_owned(&mut db, FUNCTION, node);
+        }
+
+        let validation = validate_partial_unsupported_functions(&db);
+        assert!(!validation.partial_functions.contains_key(&FUNCTION));
         assert_eq!(
             unsupported_functions_requiring_omission(&db),
             HashSet::from([FUNCTION])
@@ -2647,26 +2998,119 @@ mod unsupported_partial_tests {
     }
 
     #[test]
-    fn stale_or_over_budget_partial_rows_cannot_enable_selection() {
-        let mut missing_site = diagnostic_db();
-        missing_site.rel_push(
+    fn multiple_reasons_cannot_share_access_keyed_provenance() {
+        let mut db = single_site_db(&[FIRST_ACCESS], (1, 8));
+        db.rel_push(
+            "unsupported_stack_address",
+            (FUNCTION, FIRST_ACCESS, "unsupported-addr32-address"),
+        );
+        db.rel_push(
+            "suppressed_unsupported_address",
+            (FUNCTION, FIRST_ACCESS, "unsupported-addr32-address"),
+        );
+
+        let validation = validate_partial_unsupported_functions(&db);
+        assert!(!validation.partial_functions.contains_key(&FUNCTION));
+        assert_eq!(
+            unsupported_functions_requiring_omission(&db),
+            HashSet::from([FUNCTION])
+        );
+    }
+
+    #[test]
+    fn orphan_certificate_rows_are_reported_to_adapters() {
+        let mut db = single_site_db(&[FIRST_ACCESS], (1, 8));
+        let orphan_function = 0x2000;
+        let orphan_access = 0x2010;
+        db.rel_push(
+            "suppressed_unsupported_address",
+            (orphan_function, orphan_access, "unsupported-stack-address"),
+        );
+        db.rel_push(
+            "suppressed_unsupported_address_node",
+            (orphan_function, orphan_access, orphan_access),
+        );
+        db.rel_push(
             "partial_unsupported_function",
-            (FUNCTION, 1usize, 8usize),
+            (orphan_function, 1usize, 8usize),
+        );
+        db.rel_push(
+            "unsupported_address_detail",
+            (orphan_function, orphan_access, "rsp-coordinate-unknown"),
+        );
+        db.rel_push(
+            "unsupported_address_detail",
+            (FUNCTION, FIRST_ACCESS, "unknown-test-detail"),
+        );
+
+        let validation = validate_partial_unsupported_functions(&db);
+        assert_eq!(
+            validation.orphan_certificates,
+            BTreeSet::from([(
+                orphan_function,
+                orphan_access,
+                "unsupported-stack-address"
+            )])
+        );
+        assert_eq!(
+            validation.orphan_provenance_sites,
+            BTreeSet::from([(orphan_function, orphan_access)])
+        );
+        assert_eq!(
+            validation.orphan_budget_functions,
+            BTreeSet::from([orphan_function])
+        );
+        assert_eq!(
+            validation.orphan_details,
+            BTreeSet::from([(
+                orphan_function,
+                orphan_access,
+                "rsp-coordinate-unknown"
+            )])
+        );
+        assert_eq!(
+            validation.unknown_details,
+            BTreeSet::from([(FUNCTION, FIRST_ACCESS, "unknown-test-detail")])
+        );
+    }
+
+    #[test]
+    fn conflicting_budget_or_noncanonical_ownership_cannot_enable_selection() {
+        let mut conflicting_budget = single_site_db(&[FIRST_ACCESS], (1, 8));
+        conflicting_budget.rel_push(
+            "partial_unsupported_function",
+            (FUNCTION, 1usize, 9usize),
+        );
+        assert_eq!(
+            unsupported_functions_requiring_omission(&conflicting_budget),
+            HashSet::from([FUNCTION])
+        );
+
+        let mut shared_with_nearer_entry = single_site_db(&[FIRST_ACCESS], (1, 8));
+        let nearer_owner = FUNCTION + 8;
+        shared_with_nearer_entry.rel_push(
+            "instr_in_function",
+            (FIRST_ACCESS, nearer_owner),
+        );
+        assert_eq!(
+            unsupported_functions_requiring_omission(&shared_with_nearer_entry),
+            HashSet::from([FUNCTION])
+        );
+    }
+
+    #[test]
+    fn missing_site_certificate_or_over_budget_row_cannot_enable_selection() {
+        let mut missing_site = single_site_db(&[FIRST_ACCESS], (1, 8));
+        missing_site.rel_push(
+            "unsupported_stack_address",
+            (FUNCTION, SECOND_ACCESS, "unsupported-stack-address"),
         );
         assert_eq!(
             unsupported_functions_requiring_omission(&missing_site),
             HashSet::from([FUNCTION])
         );
 
-        let mut over_budget = diagnostic_db();
-        over_budget.rel_push(
-            "suppressed_unsupported_address",
-            (FUNCTION, FIRST_ACCESS, "unsupported-stack-address"),
-        );
-        over_budget.rel_push(
-            "partial_unsupported_function",
-            (FUNCTION, 9usize, 1000usize),
-        );
+        let over_budget = single_site_db(&[FIRST_ACCESS], (9, 1000));
         assert_eq!(
             unsupported_functions_requiring_omission(&over_budget),
             HashSet::from([FUNCTION])

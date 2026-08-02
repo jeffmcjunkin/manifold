@@ -1497,6 +1497,11 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "rtl_reg_used_in_func",
     "struct_id_to_canonical",
     "unknown_extern",
+    // Strict partial-function validation counts decoded instructions under
+    // canonical ownership; default C emission must read the same authority as
+    // JSON export so selection remains fail closed without an export request.
+    "instruction",
+    "unsupported_address_detail",
     "unsupported_stack_address",
     "suppressed_unsupported_address",
     "suppressed_unsupported_address_node",
