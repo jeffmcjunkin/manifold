@@ -3220,6 +3220,14 @@ ascent_par! {
         preg_of(mreg, preg_of_r),
         reg_def(d, mreg),
         if *addr0 < *d && *d < *addr1;
+    flags_args_redefined_between(addr0, addr1) <--
+        secondary_flags_consumer(addr0, addr1),
+        ptest(addr0, _, r2),
+        op_register(r2, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r),
+        reg_def(d, mreg),
+        if *addr0 < *d && *d < *addr1;
 
     #[local] relation secondary_safe(Address, Address);
     secondary_safe(addr0, addr1) <--
@@ -3256,6 +3264,12 @@ ascent_par! {
     reg_use(addr1, mreg) <--
         secondary_safe(addr0, addr1),
         ptest(addr0, r, _),
+        op_register(r, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r);
+    reg_use(addr1, mreg) <--
+        secondary_safe(addr0, addr1),
+        ptest(addr0, _, r),
         op_register(r, reg_str),
         ireg_of(preg_of_r, Ireg::from(reg_str)),
         preg_of(mreg, preg_of_r);
@@ -3435,6 +3449,37 @@ ascent_par! {
             Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, 0),
             other => other,
         };
+
+    // TEST with two distinct register operands computes flags from their
+    // bitwise AND without writing either register.  Keep both values in the
+    // condition instead of dropping the TEST.  In particular, this makes an
+    // ABI return register a real use when code tests a call result against a
+    // mask held in another register.
+    mach_inst(emit_addr, MachInst::Mcond(Condition::Cmaskregzero(*is_64), Arc::new(vec![*arg1, *arg2]), lbl)) <--
+        ptest(addr0, r1, r2),
+        op_register(r1, reg_str1),
+        op_register(r2, reg_str2),
+        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
+        ireg_of(preg_of_r2, Ireg::from(reg_str2)),
+        preg_of(arg1, preg_of_r1),
+        preg_of(arg2, preg_of_r2),
+        if arg1 != arg2,
+        reg_is_64(reg_str1, is_64),
+        mcond_emit_addr(addr0, addr1, emit_addr),
+        pjcc(addr1, TestCond::CondE, lbl);
+
+    mach_inst(emit_addr, MachInst::Mcond(Condition::Cmaskregnotzero(*is_64), Arc::new(vec![*arg1, *arg2]), lbl)) <--
+        ptest(addr0, r1, r2),
+        op_register(r1, reg_str1),
+        op_register(r2, reg_str2),
+        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
+        ireg_of(preg_of_r2, Ireg::from(reg_str2)),
+        preg_of(arg1, preg_of_r1),
+        preg_of(arg2, preg_of_r2),
+        if arg1 != arg2,
+        reg_is_64(reg_str1, is_64),
+        mcond_emit_addr(addr0, addr1, emit_addr),
+        pjcc(addr1, TestCond::CondNe, lbl);
 
 
     // ADD followed by a flags-reading jcc tests the arithmetic RESULT against zero, so emit the Mcond at the jcc's own address; restricted to ZF/signed conditions, since after an ADD carry is not a comparison.
@@ -10470,6 +10515,68 @@ mod privileged_instruction_tests {
                 vec![(function, copy, access)]
             );
             assert!(prog.bp_competing_reaching_def.is_empty());
+        });
+    }
+}
+
+#[cfg(test)]
+mod register_mask_test_tests {
+    use super::*;
+
+    const TEST16: Address = 0x1000;
+    const JZ16: Address = 0x1002;
+    const TEST64: Address = 0x1010;
+    const JNZ64: Address = 0x1013;
+    const TARGET16: Symbol = "register_mask_target16";
+    const TARGET64: Symbol = "register_mask_target64";
+
+    fn on_pipeline_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("register-mask-test".to_string())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn register-mask test")
+            .join()
+            .expect("register-mask test panicked");
+    }
+
+    #[test]
+    fn distinct_register_tests_keep_both_operands_and_width() {
+        on_pipeline_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            prog.op_register.push(("register_mask_ax", "AX"));
+            prog.op_register.push(("register_mask_di", "DI"));
+            prog.op_register.push(("register_mask_rax", "RAX"));
+            prog.op_register.push(("register_mask_rdi", "RDI"));
+            prog.ptest
+                .push((TEST16, "register_mask_ax", "register_mask_di"));
+            prog.ptest
+                .push((TEST64, "register_mask_rax", "register_mask_rdi"));
+            prog.pjcc.push((JZ16, TestCond::CondE, TARGET16));
+            prog.pjcc.push((JNZ64, TestCond::CondNe, TARGET64));
+            prog.next.push((TEST16, JZ16));
+            prog.next.push((TEST64, JNZ64));
+
+            prog.run();
+
+            assert!(prog.mach_inst.iter().any(|(address, inst)| {
+                *address == TEST16
+                    && inst
+                        == &MachInst::Mcond(
+                            Condition::Cmaskregzero(false),
+                            Arc::new(vec![Mreg::AX, Mreg::DI]),
+                            TARGET16,
+                        )
+            }));
+            assert!(prog.mach_inst.iter().any(|(address, inst)| {
+                *address == TEST64
+                    && inst
+                        == &MachInst::Mcond(
+                            Condition::Cmaskregnotzero(true),
+                            Arc::new(vec![Mreg::AX, Mreg::DI]),
+                            TARGET64,
+                        )
+            }));
         });
     }
 }

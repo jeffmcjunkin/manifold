@@ -1898,6 +1898,8 @@ pub(crate) fn invert_condition(cond: &Condition) -> Condition {
         Condition::Ccompluimm(c, imm) => Condition::Ccompluimm(invert_comparison(c), *imm),
         Condition::Cmaskzero(m) => Condition::Cmasknotzero(*m),
         Condition::Cmasknotzero(m) => Condition::Cmaskzero(*m),
+        Condition::Cmaskregzero(is_64) => Condition::Cmaskregnotzero(*is_64),
+        Condition::Cmaskregnotzero(is_64) => Condition::Cmaskregzero(*is_64),
         Condition::Cnotcompf(c) => Condition::Ccompf(*c),
         Condition::Cnotcompfs(c) => Condition::Ccompfs(*c),
         // OF-set <-> OF-clear is an exact logical negation (the flag is a single bit).
@@ -3546,6 +3548,46 @@ pub(crate) fn clight_condition_expr_with_types(
                     ClightBinaryOp::One,
                     Box::new(masked),
                     Box::new(ClightExpr::EconstInt(0, default_int_type())),
+                    default_bool_type(),
+                ))
+            } else {
+                Some(ClightExpr::EconstInt(1, default_bool_type()))
+            }
+        }
+        Condition::Cmaskregzero(is_64) | Condition::Cmaskregnotzero(is_64) => {
+            if args.len() >= 2 {
+                let lhs = clight_expr_from_csharp_with_multi_types(&args[0], var_types);
+                let rhs = clight_expr_from_csharp_with_multi_types(&args[1], var_types);
+                let (lhs, rhs, zero, value_type) = if *is_64 {
+                    (
+                        force_long_type_for_64bit_cmp(lhs, false),
+                        force_long_type_for_64bit_cmp(rhs, false),
+                        ClightExpr::EconstLong(0, default_ulong_type()),
+                        default_ulong_type(),
+                    )
+                } else {
+                    (
+                        force_int_type_for_32bit_cmp(lhs, false),
+                        force_int_type_for_32bit_cmp(rhs, false),
+                        ClightExpr::EconstInt(0, default_uint_type()),
+                        default_uint_type(),
+                    )
+                };
+                let masked = ClightExpr::Ebinop(
+                    ClightBinaryOp::Oand,
+                    Box::new(lhs),
+                    Box::new(rhs),
+                    value_type,
+                );
+                let comparison = if matches!(cond, Condition::Cmaskregzero(_)) {
+                    ClightBinaryOp::Oeq
+                } else {
+                    ClightBinaryOp::One
+                };
+                Some(ClightExpr::Ebinop(
+                    comparison,
+                    Box::new(masked),
+                    Box::new(zero),
                     default_bool_type(),
                 ))
             } else {

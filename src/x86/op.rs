@@ -19,6 +19,11 @@ pub enum Condition {
     Cnotcompfs(Comparison),
     Cmaskzero(i64),
     Cmasknotzero(i64),
+    // TEST reg,reg with distinct operands.  The boolean records whether the
+    // decoded operation is 64-bit; unlike Cmask*, neither mask operand is an
+    // immediate that can be embedded in the condition.
+    Cmaskregzero(bool),
+    Cmaskregnotzero(bool),
     // OF tests (JO/JNO) have no faithful CompCert encoding; these opaque variants exist to keep both Jcc edges.
     Coverflow,
     Cnotoverflow,
