@@ -7,6 +7,7 @@ use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use either::Either;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Map a memory chunk to the XType of the value loaded/stored.
@@ -85,6 +86,165 @@ fn op_output_xtype(op: &Operation) -> Option<XType> {
 
         _ => None,
     }
+}
+
+/// Operations whose destination representation is unambiguously integral,
+/// even when a later fused instruction consumes the same RTL value through a
+/// floating register class.  Keep this deliberately narrower than
+/// `is_int_operation`: add/sub/LEA may carry an address and therefore are not
+/// definition-side integer authority.  Float-to-integer conversions, on the
+/// other hand, define an integer value regardless of subsequent uses.
+fn has_definitionally_integral_result(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::Ointoffloat
+            | Operation::Ointofsingle
+            | Operation::Olongoffloat
+            | Operation::Olongofsingle
+            | Operation::Ocast8signed
+            | Operation::Ocast8unsigned
+            | Operation::Ocast16signed
+            | Operation::Ocast16unsigned
+            | Operation::Ocast32signed
+            | Operation::Ocast32unsigned
+            | Operation::Olowlong
+            | Operation::Ohighlong
+            | Operation::Ocmp(_)
+    )
+}
+
+/// Classify operations which directly define a floating-point value. Uses are
+/// deliberately excluded; copy definitions are handled separately so their
+/// genuine float provenance flows forward, never backward.
+fn has_genuine_float_result(op: &Operation) -> bool {
+    crate::x86::types::is_float_operation(op)
+        || crate::x86::types::is_single_operation(op)
+}
+
+fn definitionally_integral_result_authority(db: &DecompileDB) -> HashSet<RTLReg> {
+    let mut integral_results = HashSet::new();
+    let mut float_results = HashSet::new();
+    let mut copy_edges = Vec::new();
+
+    for (_, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        match inst {
+            RTLInst::Iop(op, _, dst) if has_definitionally_integral_result(op) => {
+                integral_results.insert(*dst);
+            }
+            RTLInst::Iop(op, _, dst) if has_genuine_float_result(op) => {
+                float_results.insert(*dst);
+            }
+            RTLInst::Iload(chunk, _, _, dst)
+                if matches!(chunk, MemoryChunk::MFloat32 | MemoryChunk::MFloat64) =>
+            {
+                float_results.insert(*dst);
+            }
+            RTLInst::Icall(Some(signature), _, _, Some(dst), _)
+                if matches!(signature.sig_res, XType::Xfloat | XType::Xsingle) =>
+            {
+                float_results.insert(*dst);
+            }
+            RTLInst::Iop(Operation::Omove, args, dst) if args.len() == 1 => {
+                copy_edges.push((args[0], *dst));
+            }
+            _ => {}
+        }
+    }
+
+    // A call result may be precisely typed by symbol metadata even when the
+    // lowered Icall signature is absent or still generic.
+    let float_externs: HashSet<Symbol> = db
+        .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
+        .filter_map(|(symbol, _, result, _)| {
+            matches!(result, XType::Xfloat | XType::Xsingle).then_some(*symbol)
+        })
+        .collect();
+    let mut float_call_nodes = HashSet::new();
+    for &(node, symbol) in db.rel_iter::<(Node, Symbol)>("call_site") {
+        if float_externs.contains(&symbol) {
+            float_call_nodes.insert(node);
+        }
+    }
+    let float_internal_functions: HashSet<Address> = db
+        .rel_iter::<(Address,)>("func_returns_float")
+        .map(|(address,)| *address)
+        .collect();
+    for &(node, target) in db.rel_iter::<(Node, Address)>("call_target_func") {
+        if float_internal_functions.contains(&target) {
+            float_call_nodes.insert(node);
+        }
+    }
+    for &(node, reg) in db.rel_iter::<(Node, RTLReg)>("call_return_reg") {
+        if float_call_nodes.contains(&node) {
+            float_results.insert(reg);
+        }
+    }
+
+    // LTL normally has an RTL counterpart, but synthetic/partially lowered
+    // inputs need not. Include its physical-to-RTL mapping so the safety
+    // check fails open for every genuine float definition we can observe.
+    let mut ltl_result_regs: HashMap<(Node, Mreg), Vec<RTLReg>> = HashMap::new();
+    for &(node, mreg, reg) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl") {
+        ltl_result_regs.entry((node, mreg)).or_default().push(reg);
+    }
+    for &(node, ref inst) in db.rel_iter::<(Node, LTLInst)>("ltl_inst") {
+        let float_dst = match inst {
+            LTLInst::Lop(op, _, dst) if has_genuine_float_result(op) => Some(*dst),
+            LTLInst::Lload(chunk, _, _, dst)
+                if matches!(chunk, MemoryChunk::MFloat32 | MemoryChunk::MFloat64) =>
+            {
+                Some(*dst)
+            }
+            _ => None,
+        };
+        if let Some(dst) = float_dst {
+            if let Some(regs) = ltl_result_regs.get(&(node, dst)) {
+                float_results.extend(regs.iter().copied());
+            }
+        }
+    }
+
+    // A copy is a definition of its destination, so genuine floatness flows
+    // forward through copy chains. Never propagate backward: an integer
+    // conversion copied toward a later float use remains integral at its
+    // source web.
+    loop {
+        let mut changed = false;
+        for &(src, dst) in &copy_edges {
+            if float_results.contains(&src) {
+                changed |= float_results.insert(dst);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    integral_results.retain(|reg| !float_results.contains(reg));
+    integral_results
+}
+
+/// Final read-modify-write boundary for float candidates emitted by rules
+/// which predate the value-web authority relations below.  An unambiguous
+/// float-to-integer/cast result cannot be made floating merely by a later use;
+/// a genuinely reused float-producing web remains untouched.
+fn enforce_definitionally_integral_result_types(db: &mut DecompileDB) {
+    let authoritative = definitionally_integral_result_authority(db);
+    if authoritative.is_empty() {
+        return;
+    }
+    let candidates: Vec<(RTLReg, XType)> = db
+        .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+        .filter(|&&(reg, xtype)| {
+            !authoritative.contains(&reg)
+                || !matches!(xtype, XType::Xfloat | XType::Xsingle)
+        })
+        .copied()
+        .collect();
+    db.rel_set(
+        "emit_var_type_candidate",
+        candidates.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
 }
 
 /// Map a comparison condition to the XType of its operands.
@@ -272,6 +432,56 @@ ascent_par! {
         rtl_inst(_, ?RTLInst::Iop(Operation::Omove, args, dst)),
         if args.len() == 1;
 
+    // A fused float compare can name the pre-conversion integer web directly
+    // (for example cvttss2si; movd; cvtdq2ps; comiss).  The conversion's
+    // destination class is stronger than that later use-site annotation.
+    #[local] relation definitionally_integral_result(RTLReg);
+    definitionally_integral_result(*dst) <--
+        rtl_inst(_, ?RTLInst::Iop(op, _, dst)),
+        if has_definitionally_integral_result(op);
+
+    #[local] relation genuine_float_result(RTLReg);
+    genuine_float_result(*dst) <--
+        rtl_inst(_, ?RTLInst::Iop(op, _, dst)),
+        if has_genuine_float_result(op);
+    genuine_float_result(*dst) <--
+        rtl_inst(_, ?RTLInst::Iload(chunk, _, _, dst)),
+        if matches!(chunk, MemoryChunk::MFloat32 | MemoryChunk::MFloat64);
+    genuine_float_result(*dst) <--
+        rtl_inst(_, ?RTLInst::Icall(Some(signature), _, _, Some(dst), _)),
+        if matches!(signature.sig_res, XType::Xfloat | XType::Xsingle);
+    genuine_float_result(rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lop(op, _, dst_mreg)),
+        if has_genuine_float_result(op),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+    genuine_float_result(rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lload(chunk, _, _, dst_mreg)),
+        if matches!(chunk, MemoryChunk::MFloat32 | MemoryChunk::MFloat64),
+        reg_rtl(node, *dst_mreg, rtl_reg);
+    genuine_float_result(dst) <--
+        f64_copy_edge(src, dst),
+        genuine_float_result(src);
+    genuine_float_result(ret_reg) <--
+        call_site(node, func_name),
+        call_return_reg(node, ret_reg),
+        known_extern_signature(func_name, _, ret_type, _),
+        if matches!(ret_type, XType::Xfloat | XType::Xsingle);
+    genuine_float_result(ret_reg) <--
+        call_target_func(node, target),
+        call_return_reg(node, ret_reg),
+        func_returns_float(target);
+
+    #[local] relation authoritative_integral_result(RTLReg);
+    authoritative_integral_result(reg) <--
+        definitionally_integral_result(reg),
+        !genuine_float_result(reg);
+
+    // Preserve a precise typed-Icall float result even when no symbol
+    // signature relation exists for an indirect call.
+    emit_var_type_candidate(*dst, signature.sig_res) <--
+        rtl_inst(_, ?RTLInst::Icall(Some(signature), _, _, Some(dst), _)),
+        if matches!(signature.sig_res, XType::Xfloat | XType::Xsingle);
+
     // Propagate candidates across an Iop(Omove): a forwarded spill/reload is not a stack_var and would otherwise get no candidate at all, defaulting to int and truncating a 64-bit pointer.
     emit_var_type_candidate(*dst, xt.clone()) <--
         rtl_inst(_, ?RTLInst::Iop(Operation::Omove, args, dst)),
@@ -322,56 +532,70 @@ ascent_par! {
     // RC-1 float/pointer brake: suppress a bare-float candidate on a register with pointer evidence, since opening the Z3 float axis renders the pointer as double; genuine floats are never is_ptr.
     emit_var_type_candidate(reg, XType::Xfloat) <--
         emit_var_type_candidate(reg, ?XType::Xany64),
-        flows_to_f64_use(reg), !is_ptr(reg);
+        flows_to_f64_use(reg), !is_ptr(reg), !authoritative_integral_result(reg);
     emit_var_type_candidate(reg, XType::Xfloat) <--
         emit_var_type_candidate(reg, ?XType::Xany64),
-        holds_f64_value(reg), !is_ptr(reg);
+        holds_f64_value(reg), !is_ptr(reg), !authoritative_integral_result(reg);
 
     // 2b. Float VALUE web: value_float_type carries the precise Xsingle/Xfloat a value reg holds, propagated over verbatim Omove copies only, never across arithmetic that could reinterpret bits.
     #[local] relation value_float_type(RTLReg, XType);
     value_float_type(dst, XType::Xfloat) <--
         rtl_inst(_, ?RTLInst::Iop(op, _, dst)),
-        if is_float_operation(op);
+        if is_float_operation(op),
+        !authoritative_integral_result(dst);
     value_float_type(dst, XType::Xsingle) <--
         rtl_inst(_, ?RTLInst::Iop(op, _, dst)),
-        if crate::x86::types::is_single_operation(op);
+        if crate::x86::types::is_single_operation(op),
+        !authoritative_integral_result(dst);
     value_float_type(rtl_reg, XType::Xfloat) <--
         ltl_inst(node, ?LTLInst::Lload(chunk, _, _, dst_mreg)),
         if matches!(chunk, MemoryChunk::MFloat64),
-        reg_rtl(node, *dst_mreg, rtl_reg);
+        reg_rtl(node, *dst_mreg, rtl_reg),
+        !authoritative_integral_result(rtl_reg);
     value_float_type(rtl_reg, XType::Xsingle) <--
         ltl_inst(node, ?LTLInst::Lload(chunk, _, _, dst_mreg)),
         if matches!(chunk, MemoryChunk::MFloat32),
-        reg_rtl(node, *dst_mreg, rtl_reg);
+        reg_rtl(node, *dst_mreg, rtl_reg),
+        !authoritative_integral_result(rtl_reg);
     // Synthetic RTL loads carry no ltl_inst, so derive the same float evidence directly from rtl_inst, whose dst is the post-lowering value reg the backend consumes.
     value_float_type(*dst, XType::Xfloat) <--
         rtl_inst(_, ?RTLInst::Iload(chunk, _, _, dst)),
-        if matches!(chunk, MemoryChunk::MFloat64);
+        if matches!(chunk, MemoryChunk::MFloat64),
+        !authoritative_integral_result(*dst);
     value_float_type(*dst, XType::Xsingle) <--
         rtl_inst(_, ?RTLInst::Iload(chunk, _, _, dst)),
-        if matches!(chunk, MemoryChunk::MFloat32);
+        if matches!(chunk, MemoryChunk::MFloat32),
+        !authoritative_integral_result(*dst);
     // Operands of a floating conditional branch are floats; keyed on rtl_inst so synthetic branches count, since cond_operand_xtype covers only Ocmp and misses a param compared by a branch.
     value_float_type(*arg, XType::Xsingle) <--
         rtl_inst(_, ?RTLInst::Icond(cond, args, _, _)),
         if matches!(cond, Condition::Ccompfs(_) | Condition::Cnotcompfs(_)),
-        for arg in args.iter();
+        for arg in args.iter(),
+        !authoritative_integral_result(*arg);
     value_float_type(*arg, XType::Xfloat) <--
         rtl_inst(_, ?RTLInst::Icond(cond, args, _, _)),
         if matches!(cond, Condition::Ccompf(_) | Condition::Cnotcompf(_)),
-        for arg in args.iter();
+        for arg in args.iter(),
+        !authoritative_integral_result(*arg);
     // Verbatim-copy propagation in both directions: src and dst of an Omove are the same value, so floatness of either end carries to the other.
-    value_float_type(dst, xt) <-- f64_copy_edge(src, dst), value_float_type(src, xt);
-    value_float_type(src, xt) <-- f64_copy_edge(src, dst), value_float_type(dst, xt);
+    value_float_type(dst, xt) <--
+        f64_copy_edge(src, dst), value_float_type(src, xt),
+        !authoritative_integral_result(dst);
+    value_float_type(src, xt) <--
+        f64_copy_edge(src, dst), value_float_type(dst, xt),
+        !authoritative_integral_result(src);
 
     // A stack slot accessed with a float chunk holds a floating value, so its canonical reg keeps float-ness across a non-forwarded spill/reload the Omove-only edge misses. LOOSE candidate.
     value_float_type(rtl_reg, XType::Xsingle) <--
         stack_var_chunk(func, ofs, chunk),
         if matches!(chunk, MemoryChunk::MFloat32),
-        stack_var(func, _, ofs, rtl_reg);
+        stack_var(func, _, ofs, rtl_reg),
+        !authoritative_integral_result(rtl_reg);
     value_float_type(rtl_reg, XType::Xfloat) <--
         stack_var_chunk(func, ofs, chunk),
         if matches!(chunk, MemoryChunk::MFloat64),
-        stack_var(func, _, ofs, rtl_reg);
+        stack_var(func, _, ofs, rtl_reg),
+        !authoritative_integral_result(rtl_reg);
 
     // A value reg with float evidence gets the float candidate so the solver keeps only float types, except on a pointer-evidenced register, where the bare-float candidate is suppressed.
     emit_var_type_candidate(reg, xt) <-- value_float_type(reg, xt), !is_ptr(reg);
@@ -1055,6 +1279,7 @@ impl IRPass for TypePass {
 
         prog.swap_db_fields(db);
         crate::decompile::passes::rtl_pass::enforce_win64_home_types(db);
+        enforce_definitionally_integral_result_types(db);
     }
 
     fn extra_reads(&self) -> &'static [&'static str] {
@@ -1065,4 +1290,429 @@ impl IRPass for TypePass {
     }
 
     declare_io_from!(TypePassProgram);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integral_result_authority_is_narrower_than_address_arithmetic() {
+        assert!(has_definitionally_integral_result(
+            &Operation::Ointofsingle
+        ));
+        assert!(has_definitionally_integral_result(
+            &Operation::Olongoffloat
+        ));
+        assert!(!has_definitionally_integral_result(
+            &Operation::Oaddimm(4)
+        ));
+        assert!(!has_definitionally_integral_result(&Operation::Omulfs));
+    }
+
+    #[test]
+    fn float_compare_does_not_refloat_integer_conversion_result() {
+        const FLOAT_VALUE: RTLReg = 0x2000;
+        const INT_RESULT: RTLReg = 0x2001;
+        const OTHER_FLOAT: RTLReg = 0x2002;
+        const COPIED_RESULT: RTLReg = 0x2003;
+        const CONVERT: Node = 0x1010;
+        const DECREMENT: Node = 0x1020;
+        const COMPARE: Node = 0x1030;
+        const FLOAT_MUL: Node = 0x1040;
+        const FLOAT_COPY: Node = 0x1048;
+
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+
+        db.rel_push(
+            "ltl_inst",
+            (
+                CONVERT,
+                LTLInst::Lop(
+                    Operation::Ointofsingle,
+                    Arc::new(vec![Mreg::X1]),
+                    Mreg::CX,
+                ),
+            ),
+        );
+        db.rel_push("reg_rtl", (CONVERT, Mreg::CX, INT_RESULT));
+        db.rel_push(
+            "rtl_inst",
+            (
+                CONVERT,
+                RTLInst::Iop(
+                    Operation::Ointofsingle,
+                    Arc::new(vec![FLOAT_VALUE]),
+                    INT_RESULT,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                DECREMENT,
+                RTLInst::Iop(
+                    Operation::Oaddimm(-1),
+                    Arc::new(vec![INT_RESULT]),
+                    INT_RESULT,
+                ),
+            ),
+        );
+        db.rel_push(
+            "ltl_inst",
+            (
+                COMPARE,
+                LTLInst::Lop(
+                    Operation::Ocmp(Condition::Ccompfs(Comparison::Cle)),
+                    Arc::new(vec![Mreg::CX, Mreg::DX]),
+                    Mreg::AX,
+                ),
+            ),
+        );
+        db.rel_push("reg_rtl", (COMPARE, Mreg::CX, INT_RESULT));
+        db.rel_push("reg_rtl", (COMPARE, Mreg::DX, COPIED_RESULT));
+        db.rel_push(
+            "rtl_inst",
+            (
+                COMPARE,
+                RTLInst::Icond(
+                    Condition::Ccompfs(Comparison::Cle),
+                    Arc::new(vec![INT_RESULT, COPIED_RESULT]),
+                    Either::Right(0x1050),
+                    Either::Right(0x1060),
+                ),
+            ),
+        );
+        // Float use evidence on a forward copy may type the destination, but
+        // it must never propagate genuine float-definition evidence backward
+        // to the integer conversion source.
+        db.rel_push(
+            "rtl_inst",
+            (
+                FLOAT_COPY,
+                RTLInst::Iop(
+                    Operation::Omove,
+                    Arc::new(vec![INT_RESULT]),
+                    COPIED_RESULT,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                FLOAT_MUL,
+                RTLInst::Iop(
+                    Operation::Omulfs,
+                    Arc::new(vec![FLOAT_VALUE, OTHER_FLOAT]),
+                    FLOAT_VALUE,
+                ),
+            ),
+        );
+
+        TypePass.run(&mut db);
+
+        let types_for = |reg| {
+            db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+                .filter_map(|(candidate, xtype)| (*candidate == reg).then_some(*xtype))
+                .collect::<HashSet<_>>()
+        };
+        let integer_types = types_for(INT_RESULT);
+        assert!(integer_types.contains(&XType::Xint));
+        assert!(!integer_types.contains(&XType::Xsingle));
+        assert!(!integer_types.contains(&XType::Xfloat));
+        assert!(types_for(COPIED_RESULT).contains(&XType::Xsingle));
+
+        // The veto belongs to the integer conversion destination, not to the
+        // floating comparison or the function as a whole.
+        assert!(types_for(FLOAT_VALUE).contains(&XType::Xsingle));
+    }
+
+    #[test]
+    fn genuine_float_copy_into_integral_web_fails_open_only_at_destination() {
+        const FLOAT_SOURCE: RTLReg = 0x2800;
+        const INT_SOURCE: RTLReg = 0x2801;
+        const SHARED_DEST: RTLReg = 0x2802;
+        const FLOAT_DEF: Node = 0x1810;
+        const INT_DEF: Node = 0x1820;
+        const SHARED_INT_DEF: Node = 0x1830;
+        const FLOAT_COPY: Node = 0x1840;
+
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+
+        db.rel_push(
+            "ltl_inst",
+            (
+                FLOAT_DEF,
+                LTLInst::Lop(
+                    Operation::Omulfs,
+                    Arc::new(vec![Mreg::X1, Mreg::X2]),
+                    Mreg::X1,
+                ),
+            ),
+        );
+        db.rel_push("reg_rtl", (FLOAT_DEF, Mreg::X1, FLOAT_SOURCE));
+        db.rel_push(
+            "rtl_inst",
+            (
+                FLOAT_DEF,
+                RTLInst::Iop(
+                    Operation::Omulfs,
+                    Arc::new(vec![FLOAT_SOURCE, FLOAT_SOURCE]),
+                    FLOAT_SOURCE,
+                ),
+            ),
+        );
+
+        for (node, dst) in [(INT_DEF, INT_SOURCE), (SHARED_INT_DEF, SHARED_DEST)] {
+            db.rel_push(
+                "ltl_inst",
+                (
+                    node,
+                    LTLInst::Lop(
+                        Operation::Ointofsingle,
+                        Arc::new(vec![Mreg::X1]),
+                        Mreg::CX,
+                    ),
+                ),
+            );
+            db.rel_push("reg_rtl", (node, Mreg::CX, dst));
+            db.rel_push(
+                "rtl_inst",
+                (
+                    node,
+                    RTLInst::Iop(
+                        Operation::Ointofsingle,
+                        Arc::new(vec![FLOAT_SOURCE]),
+                        dst,
+                    ),
+                ),
+            );
+        }
+        db.rel_push(
+            "rtl_inst",
+            (
+                FLOAT_COPY,
+                RTLInst::Iop(
+                    Operation::Omove,
+                    Arc::new(vec![FLOAT_SOURCE]),
+                    SHARED_DEST,
+                ),
+            ),
+        );
+
+        TypePass.run(&mut db);
+
+        let types_for = |reg| {
+            db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+                .filter_map(|(candidate, xtype)| (*candidate == reg).then_some(*xtype))
+                .collect::<HashSet<_>>()
+        };
+        assert!(types_for(INT_SOURCE).contains(&XType::Xint));
+        assert!(!types_for(INT_SOURCE).contains(&XType::Xsingle));
+        assert!(types_for(SHARED_DEST).contains(&XType::Xint));
+        assert!(types_for(SHARED_DEST).contains(&XType::Xsingle));
+    }
+
+    #[test]
+    fn float_call_results_make_reused_integral_webs_fail_open() {
+        const INPUT: RTLReg = 0x2a00;
+        const TYPED_RESULT: RTLReg = 0x2a01;
+        const EXTERN_RESULT: RTLReg = 0x2a02;
+        const INTERNAL_RESULT: RTLReg = 0x2a03;
+        const TYPED_CONVERT: Node = 0x1910;
+        const EXTERN_CONVERT: Node = 0x1920;
+        const INTERNAL_CONVERT: Node = 0x1930;
+        const TYPED_CALL: Node = 0x1940;
+        const EXTERN_CALL: Node = 0x1950;
+        const INTERNAL_CALL: Node = 0x1960;
+        const INTERNAL_TARGET: Address = 0x3000;
+
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+
+        for (node, dst) in [
+            (TYPED_CONVERT, TYPED_RESULT),
+            (EXTERN_CONVERT, EXTERN_RESULT),
+            (INTERNAL_CONVERT, INTERNAL_RESULT),
+        ] {
+            db.rel_push(
+                "ltl_inst",
+                (
+                    node,
+                    LTLInst::Lop(
+                        Operation::Ointofsingle,
+                        Arc::new(vec![Mreg::X1]),
+                        Mreg::CX,
+                    ),
+                ),
+            );
+            db.rel_push("reg_rtl", (node, Mreg::CX, dst));
+            db.rel_push(
+                "rtl_inst",
+                (
+                    node,
+                    RTLInst::Iop(
+                        Operation::Ointofsingle,
+                        Arc::new(vec![INPUT]),
+                        dst,
+                    ),
+                ),
+            );
+        }
+
+        db.rel_push(
+            "rtl_inst",
+            (
+                TYPED_CALL,
+                RTLInst::Icall(
+                    Some(Signature {
+                        sig_args: Arc::new(Vec::new()),
+                        sig_res: XType::Xsingle,
+                        sig_cc: CallConv::default(),
+                    }),
+                    Either::Right(Either::Right("typed_float_call")),
+                    Arc::new(Vec::new()),
+                    Some(TYPED_RESULT),
+                    TYPED_CALL + 1,
+                ),
+            ),
+        );
+
+        db.rel_push("call_site", (EXTERN_CALL, "known_float_call"));
+        db.rel_push("call_return_reg", (EXTERN_CALL, EXTERN_RESULT));
+        db.rel_push(
+            "rtl_inst",
+            (
+                EXTERN_CALL,
+                RTLInst::Icall(
+                    None,
+                    Either::Right(Either::Right("known_float_call")),
+                    Arc::new(Vec::new()),
+                    Some(EXTERN_RESULT),
+                    EXTERN_CALL + 1,
+                ),
+            ),
+        );
+        db.rel_push(
+            "known_extern_signature",
+            (
+                "known_float_call",
+                0usize,
+                XType::Xfloat,
+                Arc::new(Vec::<XType>::new()),
+            ),
+        );
+
+        db.rel_push(
+            "emit_function",
+            (INTERNAL_TARGET, "internal_float_call", INTERNAL_TARGET),
+        );
+        db.rel_push("call_target_func", (INTERNAL_CALL, INTERNAL_TARGET));
+        db.rel_push("call_return_reg", (INTERNAL_CALL, INTERNAL_RESULT));
+        db.rel_push("func_returns_float", (INTERNAL_TARGET,));
+        db.rel_push(
+            "rtl_inst",
+            (
+                INTERNAL_CALL,
+                RTLInst::Icall(
+                    None,
+                    Either::Right(Either::Left(INTERNAL_TARGET)),
+                    Arc::new(Vec::new()),
+                    Some(INTERNAL_RESULT),
+                    INTERNAL_CALL + 1,
+                ),
+            ),
+        );
+        db.rel_push(
+            "emit_function_return_type_xtype_candidate",
+            (INTERNAL_TARGET, XType::Xsingle),
+        );
+
+        TypePass.run(&mut db);
+
+        let types_for = |reg| {
+            db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+                .filter_map(|(candidate, xtype)| (*candidate == reg).then_some(*xtype))
+                .collect::<HashSet<_>>()
+        };
+        for (reg, float_type) in [
+            (TYPED_RESULT, XType::Xsingle),
+            (EXTERN_RESULT, XType::Xfloat),
+            (INTERNAL_RESULT, XType::Xsingle),
+        ] {
+            let types = types_for(reg);
+            assert!(types.contains(&XType::Xint));
+            assert!(types.contains(&float_type));
+        }
+    }
+
+    #[test]
+    fn genuine_float_definition_makes_reused_integral_web_fail_open() {
+        const FLOAT_VALUE: RTLReg = 0x3000;
+        const SHARED_RESULT: RTLReg = 0x3001;
+        const CONVERT: Node = 0x2010;
+        const FLOAT_MUL: Node = 0x2020;
+
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+
+        db.rel_push(
+            "ltl_inst",
+            (
+                CONVERT,
+                LTLInst::Lop(
+                    Operation::Ointofsingle,
+                    Arc::new(vec![Mreg::X1]),
+                    Mreg::CX,
+                ),
+            ),
+        );
+        db.rel_push("reg_rtl", (CONVERT, Mreg::CX, SHARED_RESULT));
+        db.rel_push(
+            "rtl_inst",
+            (
+                CONVERT,
+                RTLInst::Iop(
+                    Operation::Ointofsingle,
+                    Arc::new(vec![FLOAT_VALUE]),
+                    SHARED_RESULT,
+                ),
+            ),
+        );
+
+        db.rel_push(
+            "ltl_inst",
+            (
+                FLOAT_MUL,
+                LTLInst::Lop(
+                    Operation::Omulfs,
+                    Arc::new(vec![Mreg::X1, Mreg::X2]),
+                    Mreg::X1,
+                ),
+            ),
+        );
+        db.rel_push("reg_rtl", (FLOAT_MUL, Mreg::X1, SHARED_RESULT));
+        db.rel_push(
+            "rtl_inst",
+            (
+                FLOAT_MUL,
+                RTLInst::Iop(
+                    Operation::Omulfs,
+                    Arc::new(vec![FLOAT_VALUE, FLOAT_VALUE]),
+                    SHARED_RESULT,
+                ),
+            ),
+        );
+
+        TypePass.run(&mut db);
+
+        let types: HashSet<XType> = db
+            .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .filter_map(|(reg, xtype)| (*reg == SHARED_RESULT).then_some(*xtype))
+            .collect();
+        assert!(types.contains(&XType::Xint));
+        assert!(types.contains(&XType::Xsingle));
+    }
 }
