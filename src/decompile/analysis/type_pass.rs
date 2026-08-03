@@ -41,7 +41,8 @@ fn op_output_xtype(op: &Operation) -> Option<XType> {
 
         // Ambiguous 32-bit (add/sub/mul/logic, same for signed and unsigned)
         Oadd | Osub | Omul | Oaddimm(_) | Omulimm(_) | Oand | Oor | Oxor | Onot | Oneg
-        | Oandimm(_) | Oorimm(_) | Oxorimm(_) | Oshl | Oshlimm(_) | Olowlong | Ointconst(_)
+        | Oandimm(_) | Oorimm(_) | Oxorimm(_) | Oshl | Oshlimm(_) | Olowlong | Ohighlong
+        | Ointconst(_)
         | Ointoffloat | Ointofsingle => Some(XType::Xint),
 
         // 64-bit LEA gets an integer-width floor (Xlong) only: gcc emits lea for plain integer arithmetic too, so forcing Xptr broke branchless selects; use-based is_ptr supplies Xptr in section 7.
@@ -179,6 +180,14 @@ fn definitionally_integral_result_authority(db: &DecompileDB) -> HashSet<RTLReg>
             float_results.insert(reg);
         }
     }
+    // Canonical Win64 home storage is authenticated before this post-pass and
+    // is stronger than a reused value-web operation.  Never let conversion
+    // authority undo an exact floating home-cell type.
+    for &(reg, xtype) in db.rel_iter::<(RTLReg, XType)>("win64_home_slot_type") {
+        if matches!(xtype, XType::Xfloat | XType::Xsingle) {
+            float_results.insert(reg);
+        }
+    }
 
     // LTL normally has an RTL counterpart, but synthetic/partially lowered
     // inputs need not. Include its physical-to-RTL mapping so the safety
@@ -233,7 +242,7 @@ fn enforce_definitionally_integral_result_types(db: &mut DecompileDB) {
     if authoritative.is_empty() {
         return;
     }
-    let candidates: Vec<(RTLReg, XType)> = db
+    let mut candidates: Vec<(RTLReg, XType)> = db
         .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
         .filter(|&&(reg, xtype)| {
             !authoritative.contains(&reg)
@@ -241,6 +250,18 @@ fn enforce_definitionally_integral_result_types(db: &mut DecompileDB) {
         })
         .copied()
         .collect();
+    // Synthetic or partially lowered inputs can have an RTL definition without
+    // a corresponding LTL row.  Removing the impossible floating candidate is
+    // not enough in that case: retain the operation's exact integral result
+    // width as positive evidence too.
+    candidates.extend(db
+        .rel_iter::<(Node, RTLInst)>("rtl_inst")
+        .filter_map(|(_, inst)| match inst {
+            RTLInst::Iop(op, _, destination) if authoritative.contains(destination) => {
+                op_output_xtype(op).map(|xtype| (*destination, xtype))
+            }
+            _ => None,
+        }));
     db.rel_set(
         "emit_var_type_candidate",
         candidates.into_iter().collect::<ascent::boxcar::Vec<_>>(),
@@ -1308,6 +1329,62 @@ mod tests {
             &Operation::Oaddimm(4)
         ));
         assert!(!has_definitionally_integral_result(&Operation::Omulfs));
+        assert_eq!(op_output_xtype(&Operation::Ohighlong), Some(XType::Xint));
+    }
+
+    #[test]
+    fn rtl_only_highlong_keeps_positive_integer_width_evidence() {
+        const RESULT: RTLReg = 0x2a00;
+        const HIGH: Node = 0x1a10;
+        let mut db = DecompileDB::default();
+        db.rel_push(
+            "rtl_inst",
+            (
+                HIGH,
+                RTLInst::Iop(
+                    Operation::Ohighlong,
+                    Arc::new(vec![0x2a01]),
+                    RESULT,
+                ),
+            ),
+        );
+        db.rel_push("emit_var_type_candidate", (RESULT, XType::Xfloat));
+
+        enforce_definitionally_integral_result_types(&mut db);
+
+        let types = db
+            .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .filter_map(|(reg, xtype)| (*reg == RESULT).then_some(*xtype))
+            .collect::<HashSet<_>>();
+        assert_eq!(types, HashSet::from([XType::Xint]));
+    }
+
+    #[test]
+    fn exact_float_home_slot_overrides_reused_integral_web_authority() {
+        const RESULT: RTLReg = 0x2b00;
+        const CONVERT: Node = 0x1b10;
+        let mut db = DecompileDB::default();
+        db.rel_push("win64_home_slot_type", (RESULT, XType::Xsingle));
+        db.rel_push(
+            "rtl_inst",
+            (
+                CONVERT,
+                RTLInst::Iop(
+                    Operation::Ointofsingle,
+                    Arc::new(vec![0x2b01]),
+                    RESULT,
+                ),
+            ),
+        );
+        db.rel_push("emit_var_type_candidate", (RESULT, XType::Xsingle));
+
+        enforce_definitionally_integral_result_types(&mut db);
+
+        let types = db
+            .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .filter_map(|(reg, xtype)| (*reg == RESULT).then_some(*xtype))
+            .collect::<HashSet<_>>();
+        assert_eq!(types, HashSet::from([XType::Xsingle]));
     }
 
     #[test]
