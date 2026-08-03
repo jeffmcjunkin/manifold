@@ -106,6 +106,17 @@ fn win64_home_condition_is_signed(condition: &Condition) -> bool {
     )
 }
 
+fn register_test_condition_width(condition: &Condition) -> Option<u8> {
+    match condition {
+        Condition::Cmaskregzero(lhs, rhs) | Condition::Cmaskregnotzero(lhs, rhs)
+            if lhs.width_bits() == rhs.width_bits() =>
+        {
+            Some(lhs.width_bits())
+        }
+        _ => None,
+    }
+}
+
 fn win64_home_inst_signed_condition(inst: &RTLInst) -> bool {
     match inst {
         RTLInst::Icond(condition, _, _, _)
@@ -10856,11 +10867,26 @@ ascent_par! {
             | Condition::Ccompimm(_, _) | Condition::Ccompuimm(_, _)),
         if !is_null_comparison_cond(cond);
 
+    // Register TEST slices narrower than 64 bits consume integer data just as
+    // the 32-bit comparison family above does. Keeping this evidence keyed on
+    // the slice prevents a narrow mask predicate from inheriting a pointer
+    // type merely because every architectural subregister shares one RTL reg.
+    is_not_ptr(reg) <--
+        comparison_operand(_, cond, reg),
+        if matches!(register_test_condition_width(cond), Some(8 | 16 | 32));
+
     // USE-SIDE 64-bit width floor (c16): operands of a genuine 64-bit comparison are 64-bit, but contribute is_long ONLY, since a 64-bit comparison may compare two pointers.
     is_long(reg) <--
         comparison_operand(_, cond, reg),
         if matches!(cond, Condition::Ccompl(_) | Condition::Ccomplu(_)
             | Condition::Ccomplimm(_, _) | Condition::Ccompluimm(_, _));
+
+    // A full-width register TEST needs the same declaration-width floor. The
+    // Clight cast alone cannot recover high bits if the RTL value was declared
+    // as a 32-bit int before condition emission.
+    is_long(reg) <--
+        comparison_operand(_, cond, reg),
+        if register_test_condition_width(cond) == Some(64);
 
     must_be_ptr(reg) <-- arg_constrained_as_ptr(_, reg);
     must_be_ptr(ret_reg) <--

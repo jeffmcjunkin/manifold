@@ -3,6 +3,30 @@ use std::ops::{Add, Div, Mul, Sub};
 
 pub type Ptrofs = i64;
 
+/// The architectural register slice read by a register operand of TEST.
+/// General-purpose subregisters share one Mach/RTL register, so the slice has
+/// to survive in the condition to distinguish (for example) AL from AH and to
+/// keep bits above a byte/word TEST from influencing the predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TestRegisterSlice {
+    Low8,
+    High8,
+    Low16,
+    Low32,
+    Full64,
+}
+
+impl TestRegisterSlice {
+    pub const fn width_bits(self) -> u8 {
+        match self {
+            Self::Low8 | Self::High8 => 8,
+            Self::Low16 => 16,
+            Self::Low32 => 32,
+            Self::Full64 => 64,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Condition {
     Ccomp(Comparison),
@@ -19,6 +43,10 @@ pub enum Condition {
     Cnotcompfs(Comparison),
     Cmaskzero(i64),
     Cmasknotzero(i64),
+    // TEST reg,reg with distinct operand spellings. Unlike Cmask*, neither
+    // mask operand is immediate, and both architectural slices must survive.
+    Cmaskregzero(TestRegisterSlice, TestRegisterSlice),
+    Cmaskregnotzero(TestRegisterSlice, TestRegisterSlice),
     // OF tests (JO/JNO) have no faithful CompCert encoding; these opaque variants exist to keep both Jcc edges.
     Coverflow,
     Cnotoverflow,

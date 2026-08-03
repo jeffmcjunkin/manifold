@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::mreg::Mreg;
-use crate::x86::op::{Addressing, Comparison, Condition, Operation};
+use crate::x86::op::{Addressing, Comparison, Condition, Operation, TestRegisterSlice};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use either::Either;
@@ -1898,6 +1898,8 @@ pub(crate) fn invert_condition(cond: &Condition) -> Condition {
         Condition::Ccompluimm(c, imm) => Condition::Ccompluimm(invert_comparison(c), *imm),
         Condition::Cmaskzero(m) => Condition::Cmasknotzero(*m),
         Condition::Cmasknotzero(m) => Condition::Cmaskzero(*m),
+        Condition::Cmaskregzero(lhs, rhs) => Condition::Cmaskregnotzero(*lhs, *rhs),
+        Condition::Cmaskregnotzero(lhs, rhs) => Condition::Cmaskregzero(*lhs, *rhs),
         Condition::Cnotcompf(c) => Condition::Ccompf(*c),
         Condition::Cnotcompfs(c) => Condition::Ccompfs(*c),
         // OF-set <-> OF-clear is an exact logical negation (the flag is a single bit).
@@ -3324,6 +3326,40 @@ fn force_long_type_for_64bit_cmp(expr: ClightExpr, signed: bool) -> ClightExpr {
     }
 }
 
+fn clight_test_register_slice(expr: ClightExpr, slice: TestRegisterSlice) -> ClightExpr {
+    if slice == TestRegisterSlice::Full64 {
+        return force_long_type_for_64bit_cmp(expr, false);
+    }
+
+    let value_type = default_uint_type();
+    // This must be a real truncating cast. The comparison coercion helper
+    // deliberately refuses long-to-int narrowing, which would let bits above
+    // EAX/AX/AL survive into a TEST predicate.
+    let value = ClightExpr::Ecast(Box::new(expr), value_type.clone());
+    let (value, mask) = match slice {
+        TestRegisterSlice::High8 => (
+            ClightExpr::Ebinop(
+                ClightBinaryOp::Oshr,
+                Box::new(value),
+                Box::new(ClightExpr::EconstInt(8, default_int_type())),
+                value_type.clone(),
+            ),
+            0xff,
+        ),
+        TestRegisterSlice::Low8 => (value, 0xff),
+        TestRegisterSlice::Low16 => (value, 0xffff),
+        TestRegisterSlice::Low32 => return value,
+        TestRegisterSlice::Full64 => unreachable!(),
+    };
+
+    ClightExpr::Ebinop(
+        ClightBinaryOp::Oand,
+        Box::new(value),
+        Box::new(ClightExpr::EconstInt(mask, value_type.clone())),
+        value_type,
+    )
+}
+
 fn is_int32_type(ty: &ClightType) -> bool {
     matches!(ty, ClightType::Tint(ClightIntSize::I32, _, _))
 }
@@ -3546,6 +3582,39 @@ pub(crate) fn clight_condition_expr_with_types(
                     ClightBinaryOp::One,
                     Box::new(masked),
                     Box::new(ClightExpr::EconstInt(0, default_int_type())),
+                    default_bool_type(),
+                ))
+            } else {
+                Some(ClightExpr::EconstInt(1, default_bool_type()))
+            }
+        }
+        Condition::Cmaskregzero(lhs_slice, rhs_slice)
+        | Condition::Cmaskregnotzero(lhs_slice, rhs_slice) => {
+            if args.len() >= 2 {
+                let lhs = clight_expr_from_csharp_with_multi_types(&args[0], var_types);
+                let rhs = clight_expr_from_csharp_with_multi_types(&args[1], var_types);
+                let lhs = clight_test_register_slice(lhs, *lhs_slice);
+                let rhs = clight_test_register_slice(rhs, *rhs_slice);
+                let (zero, value_type) = if lhs_slice.width_bits() == 64 {
+                    (ClightExpr::EconstLong(0, default_ulong_type()), default_ulong_type())
+                } else {
+                    (ClightExpr::EconstInt(0, default_uint_type()), default_uint_type())
+                };
+                let masked = ClightExpr::Ebinop(
+                    ClightBinaryOp::Oand,
+                    Box::new(lhs),
+                    Box::new(rhs),
+                    value_type,
+                );
+                let comparison = if matches!(cond, Condition::Cmaskregzero(_, _)) {
+                    ClightBinaryOp::Oeq
+                } else {
+                    ClightBinaryOp::One
+                };
+                Some(ClightExpr::Ebinop(
+                    comparison,
+                    Box::new(masked),
+                    Box::new(zero),
                     default_bool_type(),
                 ))
             } else {

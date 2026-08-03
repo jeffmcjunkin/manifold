@@ -6,7 +6,7 @@ use crate::{declare_io_from, run_pass};
 
 use crate::mreg::Mreg;
 use crate::x86::asm::{Freg, Ireg, Preg, TestCond};
-use crate::x86::op::{Addressing, Comparison, Condition, Operation};
+use crate::x86::op::{Addressing, Comparison, Condition, Operation, TestRegisterSlice};
 use crate::x86::types::*;
 use ascent::aggregators;
 use ascent::ascent_par;
@@ -3220,6 +3220,14 @@ ascent_par! {
         preg_of(mreg, preg_of_r),
         reg_def(d, mreg),
         if *addr0 < *d && *d < *addr1;
+    flags_args_redefined_between(addr0, addr1) <--
+        secondary_flags_consumer(addr0, addr1),
+        ptest(addr0, _, r2),
+        op_register(r2, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r),
+        reg_def(d, mreg),
+        if *addr0 < *d && *d < *addr1;
 
     #[local] relation secondary_safe(Address, Address);
     secondary_safe(addr0, addr1) <--
@@ -3256,6 +3264,12 @@ ascent_par! {
     reg_use(addr1, mreg) <--
         secondary_safe(addr0, addr1),
         ptest(addr0, r, _),
+        op_register(r, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(mreg, preg_of_r);
+    reg_use(addr1, mreg) <--
+        secondary_safe(addr0, addr1),
+        ptest(addr0, _, r),
         op_register(r, reg_str),
         ireg_of(preg_of_r, Ireg::from(reg_str)),
         preg_of(mreg, preg_of_r);
@@ -3435,6 +3449,43 @@ ascent_par! {
             Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, 0),
             other => other,
         };
+
+    // TEST with two distinct register spellings computes flags from their
+    // bitwise AND without writing either register. Keep both values and their
+    // exact architectural slices in the condition: Mach registers collapse
+    // AL/AH/AX/EAX/RAX, but bits outside testb/testw must not affect ZF.
+    // TEST also clears CF, so JBE reduces to JE and JA reduces to JNE.
+    mach_inst(emit_addr, MachInst::Mcond(Condition::Cmaskregzero(slice1, slice2), Arc::new(vec![*arg1, *arg2]), lbl)) <--
+        ptest(addr0, r1, r2),
+        op_register(r1, reg_str1),
+        op_register(r2, reg_str2),
+        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
+        ireg_of(preg_of_r2, Ireg::from(reg_str2)),
+        preg_of(arg1, preg_of_r1),
+        preg_of(arg2, preg_of_r2),
+        if reg_str1 != reg_str2,
+        if let Some(slice1) = test_register_slice(reg_str1),
+        if let Some(slice2) = test_register_slice(reg_str2),
+        if slice1.width_bits() == slice2.width_bits(),
+        mcond_emit_addr(addr0, addr1, emit_addr),
+        pjcc(addr1, test_cond, lbl),
+        if matches!(*test_cond, TestCond::CondE | TestCond::CondBe);
+
+    mach_inst(emit_addr, MachInst::Mcond(Condition::Cmaskregnotzero(slice1, slice2), Arc::new(vec![*arg1, *arg2]), lbl)) <--
+        ptest(addr0, r1, r2),
+        op_register(r1, reg_str1),
+        op_register(r2, reg_str2),
+        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
+        ireg_of(preg_of_r2, Ireg::from(reg_str2)),
+        preg_of(arg1, preg_of_r1),
+        preg_of(arg2, preg_of_r2),
+        if reg_str1 != reg_str2,
+        if let Some(slice1) = test_register_slice(reg_str1),
+        if let Some(slice2) = test_register_slice(reg_str2),
+        if slice1.width_bits() == slice2.width_bits(),
+        mcond_emit_addr(addr0, addr1, emit_addr),
+        pjcc(addr1, test_cond, lbl),
+        if matches!(*test_cond, TestCond::CondNe | TestCond::CondA);
 
 
     // ADD followed by a flags-reading jcc tests the arithmetic RESULT against zero, so emit the Mcond at the jcc's own address; restricted to ZF/signed conditions, since after an ADD carry is not a comparison.
@@ -9780,6 +9831,58 @@ pub fn is_reg_16(name: &str) -> bool {
     )
 }
 
+fn test_register_slice(name: &str) -> Option<TestRegisterSlice> {
+    if is_reg_high8(name) {
+        Some(TestRegisterSlice::High8)
+    } else if is_reg_8(name) {
+        Some(TestRegisterSlice::Low8)
+    } else if is_reg_16(name) {
+        Some(TestRegisterSlice::Low16)
+    } else if matches!(
+        name,
+        "EAX"
+            | "EBX"
+            | "ECX"
+            | "EDX"
+            | "ESI"
+            | "EDI"
+            | "EBP"
+            | "ESP"
+            | "R8D"
+            | "R9D"
+            | "R10D"
+            | "R11D"
+            | "R12D"
+            | "R13D"
+            | "R14D"
+            | "R15D"
+    ) {
+        Some(TestRegisterSlice::Low32)
+    } else if matches!(
+        name,
+        "RAX"
+            | "RBX"
+            | "RCX"
+            | "RDX"
+            | "RSI"
+            | "RDI"
+            | "RBP"
+            | "RSP"
+            | "R8"
+            | "R9"
+            | "R10"
+            | "R11"
+            | "R12"
+            | "R13"
+            | "R14"
+            | "R15"
+    ) {
+        Some(TestRegisterSlice::Full64)
+    } else {
+        None
+    }
+}
+
 // Conditions for which a jcc after an add tests the signed RESULT against zero exactly: ZF and the signed conditions qualify, unsigned CF-based ones do not, since CF is carry-out.
 fn arith_result_testcond_ok(c: TestCond) -> bool {
     matches!(
@@ -10470,6 +10573,116 @@ mod privileged_instruction_tests {
                 vec![(function, copy, access)]
             );
             assert!(prog.bp_competing_reaching_def.is_empty());
+        });
+    }
+}
+
+#[cfg(test)]
+mod register_mask_test_tests {
+    use super::*;
+
+    const TEST8: Address = 0x1000;
+    const JNZ8: Address = 0x1002;
+    const TEST16: Address = 0x1010;
+    const JZ16: Address = 0x1013;
+    const TEST32: Address = 0x1020;
+    const JA32: Address = 0x1022;
+    const TEST64: Address = 0x1030;
+    const JBE64: Address = 0x1033;
+    const TARGET8: Symbol = "register_mask_target8";
+    const TARGET16: Symbol = "register_mask_target16";
+    const TARGET32: Symbol = "register_mask_target32";
+    const TARGET64: Symbol = "register_mask_target64";
+
+    fn on_pipeline_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("register-mask-test".to_string())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn register-mask test")
+            .join()
+            .expect("register-mask test panicked");
+    }
+
+    #[test]
+    fn register_tests_keep_exact_slices_and_test_flag_equivalences() {
+        on_pipeline_stack(|| {
+            let mut prog = AsmPassProgram::default();
+            prog.op_register.push(("register_mask_al", "AL"));
+            prog.op_register.push(("register_mask_ah", "AH"));
+            prog.op_register.push(("register_mask_ax", "AX"));
+            prog.op_register.push(("register_mask_di", "DI"));
+            prog.op_register.push(("register_mask_eax", "EAX"));
+            prog.op_register.push(("register_mask_edi", "EDI"));
+            prog.op_register.push(("register_mask_rax", "RAX"));
+            prog.op_register.push(("register_mask_rdi", "RDI"));
+            prog.ptest
+                .push((TEST8, "register_mask_al", "register_mask_ah"));
+            prog.ptest
+                .push((TEST16, "register_mask_ax", "register_mask_di"));
+            prog.ptest
+                .push((TEST32, "register_mask_eax", "register_mask_edi"));
+            prog.ptest
+                .push((TEST64, "register_mask_rax", "register_mask_rdi"));
+            prog.pjcc.push((JNZ8, TestCond::CondNe, TARGET8));
+            prog.pjcc.push((JZ16, TestCond::CondE, TARGET16));
+            prog.pjcc.push((JA32, TestCond::CondA, TARGET32));
+            prog.pjcc.push((JBE64, TestCond::CondBe, TARGET64));
+            prog.next.push((TEST8, JNZ8));
+            prog.next.push((TEST16, JZ16));
+            prog.next.push((TEST32, JA32));
+            prog.next.push((TEST64, JBE64));
+
+            prog.run();
+
+            assert!(prog.mach_inst.iter().any(|(address, inst)| {
+                *address == TEST8
+                    && inst
+                        == &MachInst::Mcond(
+                            Condition::Cmaskregnotzero(
+                                TestRegisterSlice::Low8,
+                                TestRegisterSlice::High8,
+                            ),
+                            Arc::new(vec![Mreg::AX, Mreg::AX]),
+                            TARGET8,
+                        )
+            }));
+            assert!(prog.mach_inst.iter().any(|(address, inst)| {
+                *address == TEST16
+                    && inst
+                        == &MachInst::Mcond(
+                            Condition::Cmaskregzero(
+                                TestRegisterSlice::Low16,
+                                TestRegisterSlice::Low16,
+                            ),
+                            Arc::new(vec![Mreg::AX, Mreg::DI]),
+                            TARGET16,
+                        )
+            }));
+            assert!(prog.mach_inst.iter().any(|(address, inst)| {
+                *address == TEST32
+                    && inst
+                        == &MachInst::Mcond(
+                            Condition::Cmaskregnotzero(
+                                TestRegisterSlice::Low32,
+                                TestRegisterSlice::Low32,
+                            ),
+                            Arc::new(vec![Mreg::AX, Mreg::DI]),
+                            TARGET32,
+                        )
+            }));
+            assert!(prog.mach_inst.iter().any(|(address, inst)| {
+                *address == TEST64
+                    && inst
+                        == &MachInst::Mcond(
+                            Condition::Cmaskregzero(
+                                TestRegisterSlice::Full64,
+                                TestRegisterSlice::Full64,
+                            ),
+                            Arc::new(vec![Mreg::AX, Mreg::DI]),
+                            TARGET64,
+                        )
+            }));
         });
     }
 }
