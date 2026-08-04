@@ -7,7 +7,7 @@ use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use either::Either;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Map a memory chunk to the XType of the value loaded/stored.
@@ -32,12 +32,14 @@ fn op_output_xtype(op: &Operation) -> Option<XType> {
     use Operation::*;
     match op {
         // Signed 32-bit
-        Odiv | Omod | Oshr | Oshrimm(_) | Oshrximm(_) | Odivimm(_) | Omodimm(_) | Ocast32signed
-        | Omulhs => Some(XType::Xint),
+        Odiv | Omod | Oshr | Oshrimm(_) | Oshrximm(_) | Odivimm(_) | Omodimm(_) | Omulhs => {
+            Some(XType::Xint)
+        }
 
         // Unsigned 32-bit
-        Odivu | Omodu | Oshru | Oshruimm(_) | Odivuimm(_) | Omoduimm(_) | Ocast32unsigned
-        | Omulhu => Some(XType::Xintunsigned),
+        Odivu | Omodu | Oshru | Oshruimm(_) | Odivuimm(_) | Omoduimm(_) | Omulhu => {
+            Some(XType::Xintunsigned)
+        }
 
         // Ambiguous 32-bit (add/sub/mul/logic, same for signed and unsigned)
         Oadd | Osub | Omul | Oaddimm(_) | Omulimm(_) | Oand | Oor | Oxor | Onot | Oneg
@@ -50,12 +52,11 @@ fn op_output_xtype(op: &Operation) -> Option<XType> {
 
         // Signed 64-bit
         Odivl | Omodl | Oshrl | Oshrlimm(_) | Oshrxlimm(_) | Odivlimm(_) | Omodlimm(_)
-        | Omullhs => Some(XType::Xlong),
+        | Omullhs | Ocast32signed => Some(XType::Xlong),
 
         // Unsigned 64-bit
-        Odivlu | Omodlu | Oshrlu | Oshrluimm(_) | Odivluimm(_) | Omodluimm(_) | Omullhu => {
-            Some(XType::Xlongunsigned)
-        }
+        Odivlu | Omodlu | Oshrlu | Oshrluimm(_) | Odivluimm(_) | Omodluimm(_) | Omullhu
+        | Ocast32unsigned => Some(XType::Xlongunsigned),
 
         // Ambiguous 64-bit
         Oaddl | Osubl | Omull | Oaddlimm(_) | Omullimm(_) | Oandl | Oorl | Oxorl | Onotl
@@ -122,28 +123,34 @@ fn has_genuine_float_result(op: &Operation) -> bool {
         || crate::x86::types::is_single_operation(op)
 }
 
-/// A generic-width memory transfer is not float evidence by itself.  On x86,
-/// however, a scalar value transferred through an XMM register is enough to
-/// make the destructive integral-authority cleanup fail open.  This remains a
-/// veto only: it does not manufacture an Xfloat/Xsingle candidate.
-fn has_xmm_float_transport(chunk: &MemoryChunk, mreg: &Mreg) -> bool {
+/// A generic-width memory transfer is not float evidence by itself.  A scalar
+/// value transferred through an architecture's floating register file (XMM on
+/// x86, V on AArch64) is enough to make destructive integral cleanup fail
+/// open.  This remains a veto only: it does not manufacture a float candidate.
+fn has_float_register_transport(chunk: &MemoryChunk, mreg: &Mreg) -> bool {
     matches!(chunk, MemoryChunk::MAny32 | MemoryChunk::MAny64)
-        && mreg.as_x86().is_some_and(|reg| reg.is_xmm())
+        && match mreg {
+            Mreg::X86(reg) => reg.is_xmm(),
+            Mreg::A64(reg) => reg.is_vec(),
+            Mreg::Unknown => false,
+        }
 }
 
 fn has_explicit_float_transport(chunk: &MemoryChunk) -> bool {
     matches!(chunk, MemoryChunk::MFloat32 | MemoryChunk::MFloat64)
 }
 
-fn definitionally_integral_result_authority(db: &DecompileDB) -> HashSet<RTLReg> {
-    let mut integral_results = HashSet::new();
-    let mut float_results = HashSet::new();
-    let mut copy_edges = Vec::new();
+fn definitionally_integral_result_authority(db: &DecompileDB) -> BTreeMap<RTLReg, XType> {
+    let mut integral_results: BTreeMap<RTLReg, BTreeSet<XType>> = BTreeMap::new();
+    let mut float_results = BTreeSet::new();
+    let mut copy_edges = BTreeSet::new();
 
     for (_, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
         match inst {
             RTLInst::Iop(op, _, dst) if has_definitionally_integral_result(op) => {
-                integral_results.insert(*dst);
+                if let Some(xtype) = op_output_xtype(op) {
+                    integral_results.entry(*dst).or_default().insert(xtype);
+                }
             }
             RTLInst::Iop(op, _, dst) if has_genuine_float_result(op) => {
                 float_results.insert(*dst);
@@ -162,27 +169,48 @@ fn definitionally_integral_result_authority(db: &DecompileDB) -> HashSet<RTLReg>
                 float_results.insert(*dst);
             }
             RTLInst::Iop(Operation::Omove, args, dst) if args.len() == 1 => {
-                copy_edges.push((args[0], *dst));
+                copy_edges.insert((args[0], *dst));
             }
             _ => {}
         }
     }
 
+    // Exact own-return metadata attaches the function's explicit float result
+    // type to the particular RTL register selected for its return.  It is
+    // stronger than the reused register web's conversion-shaped definition.
+    let float_return_functions: BTreeSet<Address> = db
+        .rel_iter::<(Address, XType)>("emit_function_return_type_xtype_candidate")
+        .filter_map(|(function, xtype)| {
+            matches!(xtype, XType::Xfloat | XType::Xsingle).then_some(*function)
+        })
+        .collect();
+    for &(function, reg) in db.rel_iter::<(Address, RTLReg)>("emit_function_return") {
+        if float_return_functions.contains(&function) {
+            float_results.insert(reg);
+        }
+    }
+
+    // A validated incoming floating ABI parameter is genuine value-class
+    // evidence even when its body contains only forwarding copies.
+    for &(_, reg) in db.rel_iter::<(Address, RTLReg)>("emit_function_float_param") {
+        float_results.insert(reg);
+    }
+
     // A call result may be precisely typed by symbol metadata even when the
     // lowered Icall signature is absent or still generic.
-    let float_externs: HashSet<Symbol> = db
+    let float_externs: BTreeSet<Symbol> = db
         .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
         .filter_map(|(symbol, _, result, _)| {
             matches!(result, XType::Xfloat | XType::Xsingle).then_some(*symbol)
         })
         .collect();
-    let mut float_call_nodes = HashSet::new();
+    let mut float_call_nodes = BTreeSet::new();
     for &(node, symbol) in db.rel_iter::<(Node, Symbol)>("call_site") {
         if float_externs.contains(&symbol) {
             float_call_nodes.insert(node);
         }
     }
-    let float_internal_functions: HashSet<Address> = db
+    let float_internal_functions: BTreeSet<Address> = db
         .rel_iter::<(Address,)>("func_returns_float")
         .map(|(address,)| *address)
         .collect();
@@ -208,22 +236,22 @@ fn definitionally_integral_result_authority(db: &DecompileDB) -> HashSet<RTLReg>
     // LTL normally has an RTL counterpart, but synthetic/partially lowered
     // inputs need not. Include its physical-to-RTL mapping so the safety
     // check fails open for every genuine float definition we can observe.
-    let mut ltl_result_regs: HashMap<(Node, Mreg), Vec<RTLReg>> = HashMap::new();
+    let mut ltl_result_regs: BTreeMap<(Node, Mreg), BTreeSet<RTLReg>> = BTreeMap::new();
     for &(node, mreg, reg) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl") {
-        ltl_result_regs.entry((node, mreg)).or_default().push(reg);
+        ltl_result_regs.entry((node, mreg)).or_default().insert(reg);
     }
     for &(node, ref inst) in db.rel_iter::<(Node, LTLInst)>("ltl_inst") {
         let float_mreg = match inst {
             LTLInst::Lop(op, _, dst) if has_genuine_float_result(op) => Some(*dst),
             LTLInst::Lload(chunk, _, _, dst)
                 if has_explicit_float_transport(chunk)
-                    || has_xmm_float_transport(chunk, dst) =>
+                    || has_float_register_transport(chunk, dst) =>
             {
                 Some(*dst)
             }
             LTLInst::Lstore(chunk, _, _, src)
                 if has_explicit_float_transport(chunk)
-                    || has_xmm_float_transport(chunk, src) =>
+                    || has_float_register_transport(chunk, src) =>
             {
                 Some(*src)
             }
@@ -252,39 +280,52 @@ fn definitionally_integral_result_authority(db: &DecompileDB) -> HashSet<RTLReg>
         }
     }
 
-    integral_results.retain(|reg| !float_results.contains(reg));
     integral_results
+        .into_iter()
+        .filter_map(|(reg, types)| {
+            (!float_results.contains(&reg) && types.len() == 1)
+                .then(|| (reg, *types.iter().next().expect("one checked result type")))
+        })
+        .collect()
 }
 
-/// Final read-modify-write boundary for float candidates emitted by rules
-/// which predate the value-web authority relations below.  An unambiguous
-/// float-to-integer/cast result cannot be made floating merely by a later use;
-/// a genuinely reused float-producing web remains untouched.
+/// Final read-modify-write boundary for candidates emitted by rules which
+/// predate the value-web authority relations below.  An unambiguous integral
+/// conversion result keeps only its exact definition-side type; a genuinely
+/// reused float-producing web remains untouched.  Exact Win64 home types are
+/// stronger storage locks and therefore take precedence over a reused web's
+/// operation type.
 pub(crate) fn enforce_definitionally_integral_result_types(db: &mut DecompileDB) {
     let authoritative = definitionally_integral_result_authority(db);
-    if authoritative.is_empty() {
+    let mut home_types: BTreeMap<RTLReg, BTreeSet<XType>> = BTreeMap::new();
+    for &(reg, xtype) in db.rel_iter::<(RTLReg, XType)>("win64_home_slot_type") {
+        home_types.entry(reg).or_default().insert(xtype);
+    }
+    if authoritative.is_empty() && home_types.is_empty() {
         return;
     }
-    let mut candidates: Vec<(RTLReg, XType)> = db
-        .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
-        .filter(|&&(reg, xtype)| {
-            !authoritative.contains(&reg)
-                || !matches!(xtype, XType::Xfloat | XType::Xsingle)
-        })
-        .copied()
-        .collect();
-    // Synthetic or partially lowered inputs can have an RTL definition without
-    // a corresponding LTL row.  Removing the impossible floating candidate is
-    // not enough in that case: retain the operation's exact integral result
-    // width as positive evidence too.
-    candidates.extend(db
-        .rel_iter::<(Node, RTLInst)>("rtl_inst")
-        .filter_map(|(_, inst)| match inst {
-            RTLInst::Iop(op, _, destination) if authoritative.contains(destination) => {
-                op_output_xtype(op).map(|xtype| (*destination, xtype))
-            }
-            _ => None,
-        }));
+
+    let mut candidates = BTreeSet::new();
+    for &(reg, xtype) in db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate") {
+        let compatible = if let Some(locked) = home_types.get(&reg) {
+            locked.contains(&xtype)
+        } else if let Some(exact) = authoritative.get(&reg) {
+            *exact == xtype
+        } else {
+            true
+        };
+        if compatible {
+            candidates.insert((reg, xtype));
+        }
+    }
+    for (reg, types) in &home_types {
+        candidates.extend(types.iter().map(|xtype| (*reg, *xtype)));
+    }
+    for (&reg, &xtype) in &authoritative {
+        if !home_types.contains_key(&reg) {
+            candidates.insert((reg, xtype));
+        }
+    }
     db.rel_set(
         "emit_var_type_candidate",
         candidates.into_iter().collect::<ascent::boxcar::Vec<_>>(),
@@ -396,6 +437,7 @@ ascent_par! {
     relation emit_function(Address, Symbol, Node);
     relation emit_function_return_type_xtype_candidate(Address, XType);
     relation emit_function_return(Address, RTLReg);
+    relation emit_function_float_param(Address, RTLReg);
     relation func_returns_float(Address);
     relation call_target_func(Node, Address);
 
@@ -504,12 +546,12 @@ ascent_par! {
     genuine_float_result(rtl_reg) <--
         ltl_inst(node, ?LTLInst::Lload(chunk, _, _, dst_mreg)),
         if has_explicit_float_transport(chunk)
-            || has_xmm_float_transport(chunk, dst_mreg),
+            || has_float_register_transport(chunk, dst_mreg),
         reg_rtl(node, *dst_mreg, rtl_reg);
     genuine_float_result(rtl_reg) <--
         ltl_inst(node, ?LTLInst::Lstore(chunk, _, _, src_mreg)),
         if has_explicit_float_transport(chunk)
-            || has_xmm_float_transport(chunk, src_mreg),
+            || has_float_register_transport(chunk, src_mreg),
         reg_rtl(node, *src_mreg, rtl_reg);
     genuine_float_result(dst) <--
         f64_copy_edge(src, dst),
@@ -523,6 +565,8 @@ ascent_par! {
         call_target_func(node, target),
         call_return_reg(node, ret_reg),
         func_returns_float(target);
+    genuine_float_result(reg) <--
+        emit_function_float_param(_, reg);
 
     #[local] relation authoritative_integral_result(RTLReg);
     authoritative_integral_result(reg) <--
@@ -1348,6 +1392,19 @@ impl IRPass for TypePass {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    fn candidates_for(db: &DecompileDB, target: RTLReg) -> BTreeSet<XType> {
+        db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .filter_map(|(reg, xtype)| (*reg == target).then_some(*xtype))
+            .collect()
+    }
+
+    fn candidate_rows(db: &DecompileDB) -> Vec<(RTLReg, XType)> {
+        db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .copied()
+            .collect()
+    }
 
     #[test]
     fn integral_result_authority_is_narrower_than_address_arithmetic() {
@@ -1362,6 +1419,40 @@ mod tests {
         ));
         assert!(!has_definitionally_integral_result(&Operation::Omulfs));
         assert_eq!(op_output_xtype(&Operation::Ohighlong), Some(XType::Xint));
+        assert_eq!(
+            op_output_xtype(&Operation::Ocast32signed),
+            Some(XType::Xlong)
+        );
+        assert_eq!(
+            op_output_xtype(&Operation::Ocast32unsigned),
+            Some(XType::Xlongunsigned)
+        );
+    }
+
+    #[test]
+    fn generic_float_transport_uses_each_architectures_float_register_file() {
+        use crate::aarch64::mach::A64Mreg;
+
+        assert!(has_float_register_transport(
+            &MemoryChunk::MAny32,
+            &Mreg::X0
+        ));
+        assert!(has_float_register_transport(
+            &MemoryChunk::MAny64,
+            &Mreg::a64(A64Mreg::V0)
+        ));
+        assert!(!has_float_register_transport(
+            &MemoryChunk::MAny64,
+            &Mreg::AX
+        ));
+        assert!(!has_float_register_transport(
+            &MemoryChunk::MAny64,
+            &Mreg::a64(A64Mreg::X0)
+        ));
+        assert!(!has_float_register_transport(
+            &MemoryChunk::MInt64,
+            &Mreg::a64(A64Mreg::V0)
+        ));
     }
 
     #[test]
@@ -1392,6 +1483,37 @@ mod tests {
     }
 
     #[test]
+    fn rtl_only_cast32_extensions_keep_exact_64_bit_result_types() {
+        for (case, operation, expected) in [
+            (0_u64, Operation::Ocast32signed, XType::Xlong),
+            (1_u64, Operation::Ocast32unsigned, XType::Xlongunsigned),
+        ] {
+            let result = 0x2a10 + case;
+            let node = 0x1a20 + case;
+            let mut db = DecompileDB::default();
+            db.rel_push(
+                "rtl_inst",
+                (
+                    node,
+                    RTLInst::Iop(operation, Arc::new(vec![result + 0x100]), result),
+                ),
+            );
+            for incompatible in [
+                XType::Xptr,
+                XType::Xint8unsigned,
+                XType::Xint,
+                XType::Xfloat,
+            ] {
+                db.rel_push("emit_var_type_candidate", (result, incompatible));
+            }
+
+            enforce_definitionally_integral_result_types(&mut db);
+
+            assert_eq!(candidates_for(&db, result), BTreeSet::from([expected]));
+        }
+    }
+
+    #[test]
     fn exact_float_home_slot_overrides_reused_integral_web_authority() {
         const RESULT: RTLReg = 0x2b00;
         const CONVERT: Node = 0x1b10;
@@ -1417,6 +1539,54 @@ mod tests {
             .filter_map(|(reg, xtype)| (*reg == RESULT).then_some(*xtype))
             .collect::<HashSet<_>>();
         assert_eq!(types, HashSet::from([XType::Xsingle]));
+    }
+
+    #[test]
+    fn exact_narrow_home_lock_wins_in_either_order_and_is_idempotent() {
+        const RESULT: RTLReg = 0x2c00;
+        const CONVERT: Node = 0x1c10;
+
+        let seed = || {
+            let mut db = DecompileDB::default();
+            db.rel_push("win64_home_slot_type", (RESULT, XType::Xint8unsigned));
+            db.rel_push(
+                "rtl_inst",
+                (
+                    CONVERT,
+                    RTLInst::Iop(
+                        Operation::Ointofsingle,
+                        Arc::new(vec![RESULT + 1]),
+                        RESULT,
+                    ),
+                ),
+            );
+            for candidate in [
+                XType::Xptr,
+                XType::Xint16unsigned,
+                XType::Xint,
+                XType::Xint8unsigned,
+                XType::Xptr,
+            ] {
+                db.rel_push("emit_var_type_candidate", (RESULT, candidate));
+            }
+            db.rel_push("is_ptr", (RESULT,));
+            db
+        };
+
+        let mut home_first = seed();
+        crate::decompile::passes::rtl_pass::enforce_win64_home_types(&mut home_first);
+        enforce_definitionally_integral_result_types(&mut home_first);
+        let stable = candidate_rows(&home_first);
+        assert_eq!(stable, vec![(RESULT, XType::Xint8unsigned)]);
+        crate::decompile::passes::rtl_pass::enforce_win64_home_types(&mut home_first);
+        enforce_definitionally_integral_result_types(&mut home_first);
+        assert_eq!(candidate_rows(&home_first), stable);
+
+        let mut conversion_first = seed();
+        enforce_definitionally_integral_result_types(&mut conversion_first);
+        crate::decompile::passes::rtl_pass::enforce_win64_home_types(&mut conversion_first);
+        enforce_definitionally_integral_result_types(&mut conversion_first);
+        assert_eq!(candidate_rows(&conversion_first), stable);
     }
 
     #[test]
@@ -1622,6 +1792,76 @@ mod tests {
         assert!(!types_for(INT_SOURCE).contains(&XType::Xsingle));
         assert!(types_for(SHARED_DEST).contains(&XType::Xint));
         assert!(types_for(SHARED_DEST).contains(&XType::Xsingle));
+    }
+
+    #[test]
+    fn own_return_and_incoming_param_metadata_keep_forwarded_float_webs_open() {
+        const RETURN_FUNC: Address = 0x3800;
+        const PARAM_FUNC: Address = 0x3900;
+        const RETURN_RESULT: RTLReg = 0x2d00;
+        const PARAM_RESULT: RTLReg = 0x2d10;
+        const FORWARDED_RESULT: RTLReg = 0x2d20;
+        const RETURN_CONVERT: Node = 0x1d10;
+        const PARAM_CONVERT: Node = 0x1d20;
+        const FORWARDED_CONVERT: Node = 0x1d30;
+        const FORWARD_COPY: Node = 0x1d40;
+
+        let mut db = DecompileDB::default();
+        for (node, result) in [
+            (RETURN_CONVERT, RETURN_RESULT),
+            (PARAM_CONVERT, PARAM_RESULT),
+            (FORWARDED_CONVERT, FORWARDED_RESULT),
+        ] {
+            db.rel_push(
+                "rtl_inst",
+                (
+                    node,
+                    RTLInst::Iop(
+                        Operation::Ointofsingle,
+                        Arc::new(vec![result + 1]),
+                        result,
+                    ),
+                ),
+            );
+            db.rel_push("emit_var_type_candidate", (result, XType::Xint));
+        }
+
+        // No float operation, load, store, or call exists in this fixture:
+        // the exact own-return row is the only float evidence for this web.
+        db.rel_push("emit_function_return", (RETURN_FUNC, RETURN_RESULT));
+        db.rel_push(
+            "emit_function_return_type_xtype_candidate",
+            (RETURN_FUNC, XType::Xfloat),
+        );
+        db.rel_push(
+            "emit_var_type_candidate",
+            (RETURN_RESULT, XType::Xfloat),
+        );
+
+        // The validated ABI parameter marks both its own register and a pure
+        // forwarding-copy destination as genuinely floating.
+        db.rel_push("emit_function_float_param", (PARAM_FUNC, PARAM_RESULT));
+        db.rel_push(
+            "emit_var_type_candidate",
+            (PARAM_RESULT, XType::Xsingle),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                FORWARD_COPY,
+                RTLInst::Iop(
+                    Operation::Omove,
+                    Arc::new(vec![PARAM_RESULT]),
+                    FORWARDED_RESULT,
+                ),
+            ),
+        );
+
+        TypePass.run(&mut db);
+
+        assert!(candidates_for(&db, RETURN_RESULT).contains(&XType::Xfloat));
+        assert!(candidates_for(&db, PARAM_RESULT).contains(&XType::Xsingle));
+        assert!(candidates_for(&db, FORWARDED_RESULT).contains(&XType::Xsingle));
     }
 
     #[test]
