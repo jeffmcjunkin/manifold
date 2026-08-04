@@ -1672,8 +1672,10 @@ ascent_par! {
     ptest(addr, dst, src) <--
         instruction(addr, _, _, "TEST", src, dst, _, _, _, _);
 
-    // TEST reg, reg is semantically CMP reg, 0: emit pcmp with a synthesized zero immediate
-    pcmp(addr, dst, zero_sym), op_immediate(zero_sym, 0, 0) <--
+    // Preserve the legacy TEST-self -> CMP-zero view for non-Jcc consumers,
+    // while tagging it so Jcc lowering can use the exact-slice TEST path only.
+    #[local] relation synthesized_test_cmp(Address);
+    pcmp(addr, dst, zero_sym), op_immediate(zero_sym, 0, 0), synthesized_test_cmp(addr) <--
         ptest(addr, dst, src),
         op_register(dst, r1),
         op_register(src, r2),
@@ -3361,6 +3363,7 @@ ascent_par! {
         pcmp(addr0, r1, r2),
         op_register(r1, reg_str1),
         op_immediate(r2, imm_val, _),
+        !synthesized_test_cmp(addr0),
         reg_64(reg_str1),
         ireg_of(preg_of_r1, Ireg::from(reg_str1)),
         preg_of(arg1, preg_of_r1),
@@ -3377,6 +3380,7 @@ ascent_par! {
         pcmp(addr0, r1, r2),
         op_register(r1, reg_str1),
         op_immediate(r2, imm_val, _),
+        !synthesized_test_cmp(addr0),
         !reg_64(reg_str1),
         ireg_of(preg_of_r1, Ireg::from(reg_str1)),
         preg_of(arg1, preg_of_r1),
@@ -3415,45 +3419,12 @@ ascent_par! {
         pjcc(addr1, test_cond, lbl),
         testcond_to_cond(*test_cond, condition);
 
-
-    mach_inst(emit_addr, MachInst::Mcond(condition, Arc::new(vec![*arg1]), lbl)) <--
-        ptest(addr0, r1, r2),
-        op_register(r1, reg_str1),
-        op_register(r2, reg_str2),
-        if reg_str1 == reg_str2,
-        reg_64(reg_str1),
-        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
-        preg_of(arg1, preg_of_r1),
-        mcond_emit_addr(addr0, addr1, emit_addr),
-        pjcc(addr1, test_cond, lbl),
-        let base_cond = condition_for_testcond_sized(*test_cond, true),
-        let condition = match base_cond {
-            Condition::Ccomp(cmp) | Condition::Ccompl(cmp) => Condition::Ccomplimm(cmp, 0),
-            Condition::Ccompu(cmp) | Condition::Ccomplu(cmp) => Condition::Ccompluimm(cmp, 0),
-            other => other,
-        };
-
-    mach_inst(emit_addr, MachInst::Mcond(condition, Arc::new(vec![*arg1]), lbl)) <--
-        ptest(addr0, r1, r2),
-        op_register(r1, reg_str1),
-        op_register(r2, reg_str2),
-        if reg_str1 == reg_str2,
-        !reg_64(reg_str1),
-        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
-        preg_of(arg1, preg_of_r1),
-        mcond_emit_addr(addr0, addr1, emit_addr),
-        pjcc(addr1, test_cond, lbl),
-        let base_cond = condition_for_testcond_sized(*test_cond, false),
-        let condition = match base_cond {
-            Condition::Ccomp(cmp) => Condition::Ccompimm(cmp, 0),
-            Condition::Ccompu(cmp) => Condition::Ccompuimm(cmp, 0),
-            other => other,
-        };
-
-    // TEST with two distinct register spellings computes flags from their
-    // bitwise AND without writing either register. Keep both values and their
-    // exact architectural slices in the condition: Mach registers collapse
-    // AL/AH/AX/EAX/RAX, but bits outside testb/testw must not affect ZF.
+    // Register-register TEST computes flags from the bitwise AND without
+    // writing either operand. This includes textual self-tests such as AL,AL;
+    // they must not fall back to the width-insensitive synthesized CMP path.
+    // Keep both values and their exact architectural slices in the condition:
+    // Mach registers collapse AL/AH/AX/EAX/RAX, but bits outside testb/testw
+    // must not affect ZF.
     // TEST also clears CF, so JBE reduces to JE and JA reduces to JNE.
     mach_inst(emit_addr, MachInst::Mcond(Condition::Cmaskregzero(slice1, slice2), Arc::new(vec![*arg1, *arg2]), lbl)) <--
         ptest(addr0, r1, r2),
@@ -3463,7 +3434,6 @@ ascent_par! {
         ireg_of(preg_of_r2, Ireg::from(reg_str2)),
         preg_of(arg1, preg_of_r1),
         preg_of(arg2, preg_of_r2),
-        if reg_str1 != reg_str2,
         if let Some(slice1) = test_register_slice(reg_str1),
         if let Some(slice2) = test_register_slice(reg_str2),
         if slice1.width_bits() == slice2.width_bits(),
@@ -3479,7 +3449,6 @@ ascent_par! {
         ireg_of(preg_of_r2, Ireg::from(reg_str2)),
         preg_of(arg1, preg_of_r1),
         preg_of(arg2, preg_of_r2),
-        if reg_str1 != reg_str2,
         if let Some(slice1) = test_register_slice(reg_str1),
         if let Some(slice2) = test_register_slice(reg_str2),
         if slice1.width_bits() == slice2.width_bits(),
@@ -10683,6 +10652,115 @@ mod register_mask_test_tests {
                             TARGET64,
                         )
             }));
+        });
+    }
+
+    #[test]
+    fn textual_self_tests_have_one_exact_slice_condition() {
+        on_pipeline_stack(|| {
+            const SELF8: Address = 0x1100;
+            const JZ8: Address = 0x1102;
+            const SELF16: Address = 0x1110;
+            const JNZ16: Address = 0x1113;
+            const SELF32: Address = 0x1120;
+            const JBE32: Address = 0x1122;
+            const SELF64: Address = 0x1130;
+            const JA64: Address = 0x1133;
+
+            let mut prog = AsmPassProgram::default();
+            for (symbol, register) in [
+                ("self_al_lhs", "AL"),
+                ("self_al_rhs", "AL"),
+                ("self_ax_lhs", "AX"),
+                ("self_ax_rhs", "AX"),
+                ("self_eax_lhs", "EAX"),
+                ("self_eax_rhs", "EAX"),
+                ("self_rax_lhs", "RAX"),
+                ("self_rax_rhs", "RAX"),
+            ] {
+                prog.op_register.push((symbol, register));
+            }
+            prog.ptest.push((SELF8, "self_al_lhs", "self_al_rhs"));
+            prog.ptest.push((SELF16, "self_ax_lhs", "self_ax_rhs"));
+            prog.ptest
+                .push((SELF32, "self_eax_lhs", "self_eax_rhs"));
+            prog.ptest
+                .push((SELF64, "self_rax_lhs", "self_rax_rhs"));
+            prog.pjcc.push((JZ8, TestCond::CondE, "self_target8"));
+            prog.pjcc
+                .push((JNZ16, TestCond::CondNe, "self_target16"));
+            prog.pjcc
+                .push((JBE32, TestCond::CondBe, "self_target32"));
+            prog.pjcc
+                .push((JA64, TestCond::CondA, "self_target64"));
+            prog.next.push((SELF8, JZ8));
+            prog.next.push((SELF16, JNZ16));
+            prog.next.push((SELF32, JBE32));
+            prog.next.push((SELF64, JA64));
+
+            prog.run();
+
+            let expected = [
+                (
+                    SELF8,
+                    MachInst::Mcond(
+                        Condition::Cmaskregzero(
+                            TestRegisterSlice::Low8,
+                            TestRegisterSlice::Low8,
+                        ),
+                        Arc::new(vec![Mreg::AX, Mreg::AX]),
+                        "self_target8",
+                    ),
+                ),
+                (
+                    SELF16,
+                    MachInst::Mcond(
+                        Condition::Cmaskregnotzero(
+                            TestRegisterSlice::Low16,
+                            TestRegisterSlice::Low16,
+                        ),
+                        Arc::new(vec![Mreg::AX, Mreg::AX]),
+                        "self_target16",
+                    ),
+                ),
+                (
+                    SELF32,
+                    MachInst::Mcond(
+                        Condition::Cmaskregzero(
+                            TestRegisterSlice::Low32,
+                            TestRegisterSlice::Low32,
+                        ),
+                        Arc::new(vec![Mreg::AX, Mreg::AX]),
+                        "self_target32",
+                    ),
+                ),
+                (
+                    SELF64,
+                    MachInst::Mcond(
+                        Condition::Cmaskregnotzero(
+                            TestRegisterSlice::Full64,
+                            TestRegisterSlice::Full64,
+                        ),
+                        Arc::new(vec![Mreg::AX, Mreg::AX]),
+                        "self_target64",
+                    ),
+                ),
+            ];
+            for (address, expected_inst) in expected {
+                let candidates: Vec<_> = prog
+                    .mach_inst
+                    .iter()
+                    .filter_map(|(candidate_address, inst)| {
+                        (*candidate_address == address).then_some(inst)
+                    })
+                    .collect();
+                assert_eq!(
+                    candidates.len(),
+                    1,
+                    "self TEST at {address:#x} produced ambiguous Mach candidates: {candidates:?}",
+                );
+                assert_eq!(candidates[0], &expected_inst);
+            }
         });
     }
 }

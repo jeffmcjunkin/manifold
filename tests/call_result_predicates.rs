@@ -80,6 +80,42 @@ testl_je_ignores_high_bits:
         movl $1, %eax
         retq
 
+        .globl testb_self_je_ignores_high_bits
+        .def testb_self_je_ignores_high_bits; .scl 2; .type 32; .endef
+testb_self_je_ignores_high_bits:
+        movl $0x100, %eax
+        testb %al, %al
+        je .Lself_byte_zero
+        xorl %eax, %eax
+        retq
+.Lself_byte_zero:
+        movl $1, %eax
+        retq
+
+        .globl testw_self_jne_ignores_high_bits
+        .def testw_self_jne_ignores_high_bits; .scl 2; .type 32; .endef
+testw_self_jne_ignores_high_bits:
+        movl $0x10000, %eax
+        testw %ax, %ax
+        jne .Lself_word_nonzero
+        xorl %eax, %eax
+        retq
+.Lself_word_nonzero:
+        movl $1, %eax
+        retq
+
+        .globl testl_self_je_ignores_high_bits
+        .def testl_self_je_ignores_high_bits; .scl 2; .type 32; .endef
+testl_self_je_ignores_high_bits:
+        movabsq $0x100000000, %rax
+        testl %eax, %eax
+        je .Lself_dword_zero
+        xorl %eax, %eax
+        retq
+.Lself_dword_zero:
+        movl $1, %eax
+        retq
+
         .globl testq_jne_keeps_high_bits
         .def testq_jne_keeps_high_bits; .scl 2; .type 32; .endef
 testq_jne_keeps_high_bits:
@@ -96,13 +132,16 @@ testq_jne_keeps_high_bits:
         .globl testb_jne_mixed_same_parent_slices
         .def testb_jne_mixed_same_parent_slices; .scl 2; .type 32; .endef
 testb_jne_mixed_same_parent_slices:
-        movl $0x101, %eax
+        movl $0x100, %eax
         testb %al, %ah
-        jne .Lmixed_nonzero
-        xorl %eax, %eax
-        retq
-.Lmixed_nonzero:
+        jne .Lmixed_wrong_slice
+        movl $0x1, %eax
+        testb %al, %ah
+        jne .Lmixed_wrong_slice
         movl $1, %eax
+        retq
+.Lmixed_wrong_slice:
+        xorl %eax, %eax
         retq
 "#,
     )
@@ -139,20 +178,28 @@ fn assert_emitted_c_preserves_test_widths(object: &PathBuf) {
     std::fs::write(
         &harness,
         r#"
+int coff_fn_call_result_register_mask(void);
 int coff_fn_testb_je_ignores_high_bits(void);
 int coff_fn_testw_jne_ignores_high_bits(void);
 int coff_fn_testl_je_ignores_high_bits(void);
+int coff_fn_testb_self_je_ignores_high_bits(void);
+int coff_fn_testw_self_jne_ignores_high_bits(void);
+int coff_fn_testl_self_je_ignores_high_bits(void);
 int coff_fn_testq_jne_keeps_high_bits(void);
 int coff_fn_testb_jne_mixed_same_parent_slices(void);
 
 int coff_ext_masked_value(void) { return 0x8000; }
 
 int main(void) {
+    if (coff_fn_call_result_register_mask() != 1) return 10;
     if (coff_fn_testb_je_ignores_high_bits() != 1) return 11;
     if (coff_fn_testw_jne_ignores_high_bits() != 0) return 12;
     if (coff_fn_testl_je_ignores_high_bits() != 1) return 13;
     if (coff_fn_testq_jne_keeps_high_bits() != 1) return 14;
     if (coff_fn_testb_jne_mixed_same_parent_slices() != 1) return 15;
+    if (coff_fn_testb_self_je_ignores_high_bits() != 1) return 16;
+    if (coff_fn_testw_self_jne_ignores_high_bits() != 0) return 17;
+    if (coff_fn_testl_self_je_ignores_high_bits() != 1) return 18;
     return 0;
 }
 "#,
