@@ -298,6 +298,9 @@ impl IRPass for StructuringPass {
             "call_target_func",
             "call_return_reg",
             "func_returns_float",
+            "emit_function_return",
+            "emit_function_return_type_xtype_candidate",
+            "emit_function_float_param",
             "is_ptr",
         ]
     }
@@ -4025,7 +4028,7 @@ mod copy_propagation_tests {
     }
 
     #[test]
-    fn conversion_result_stays_integral_through_structuring_and_clight() {
+    fn pointer_and_narrow_copy_types_stay_off_conversion_result_through_clight() {
         const FUNC: Address = 0x4000;
         const CONVERT: Node = 0x4010;
         const COPY: Node = 0x4020;
@@ -4061,10 +4064,13 @@ mod copy_propagation_tests {
             ),
         );
 
-        // Structuring eliminates this copy and transfers COPY_DST's type back
-        // to RESULT.  The destination's float candidate models the later
-        // float-class use that originally exposed this regression.
-        db.rel_push("emit_var_type_candidate", (COPY_DST, XType::Xsingle));
+        // Structuring eliminates this copy and transfers COPY_DST's types back
+        // to RESULT.  Float, pointer, and narrow candidates all model later
+        // use-side classifications which must not override the conversion's
+        // exact definition-side result type.
+        for incompatible in [XType::Xsingle, XType::Xptr, XType::Xint8unsigned] {
+            db.rel_push("emit_var_type_candidate", (COPY_DST, incompatible));
+        }
         db.rel_push(
             "csharp_stmt_candidate",
             (COPY, CsharpminorStmt::Sset(COPY_DST, CsharpminorExpr::Evar(RESULT))),
@@ -4084,6 +4090,8 @@ mod copy_propagation_tests {
 
         TypePass.run(&mut db);
         assert_eq!(candidate_types(&db, RESULT), HashSet::from([XType::Xint]));
+        assert!(candidate_types(&db, COPY_DST).contains(&XType::Xptr));
+        assert!(candidate_types(&db, COPY_DST).contains(&XType::Xint8unsigned));
 
         StructuringPass.run(&mut db);
         assert!(db
