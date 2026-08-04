@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
 use manifold::decompile::analysis::canary_vla_pass::CanaryVlaPass;
@@ -9,7 +10,7 @@ use manifold::decompile::passes::linear_pass::LinearPass;
 use manifold::decompile::passes::mach_pass::MachPass;
 use manifold::decompile::passes::pass::IRPass;
 use manifold::decompile::passes::rtl_pass::RTLPass;
-use manifold::x86::op::{Condition, TestRegisterSlice};
+use manifold::x86::op::{Condition, TestRegisterPredicate, TestRegisterSlice};
 use manifold::x86::types::{Address, Node, RTLInst, RTLReg, Symbol};
 
 fn build_fixture() -> PathBuf {
@@ -143,6 +144,219 @@ testb_jne_mixed_same_parent_slices:
 .Lmixed_wrong_slice:
         xorl %eax, %eax
         retq
+
+        .globl testb_high8_self_js_uses_slice_sign
+        .def testb_high8_self_js_uses_slice_sign; .scl 2; .type 32; .endef
+testb_high8_self_js_uses_slice_sign:
+        movl $0x8000, %eax
+        testb %ah, %ah
+        js .Lhigh8_sign_set
+        xorl %eax, %eax
+        retq
+.Lhigh8_sign_set:
+        movl $1, %eax
+        retq
+
+        .globl testw_self_js_uses_word_sign
+        .def testw_self_js_uses_word_sign; .scl 2; .type 32; .endef
+testw_self_js_uses_word_sign:
+        movl $0x8000, %eax
+        testw %ax, %ax
+        js .Lword_sign_set
+        xorl %eax, %eax
+        retq
+.Lword_sign_set:
+        movl $1, %eax
+        retq
+
+        .globl testl_distinct_jns_ignores_qword_sign
+        .def testl_distinct_jns_ignores_qword_sign; .scl 2; .type 32; .endef
+testl_distinct_jns_ignores_qword_sign:
+        movabsq $0x8000000000000001, %rax
+        movabsq $0x8000000000000001, %rcx
+        testl %eax, %ecx
+        jns .Ldword_sign_clear
+        xorl %eax, %eax
+        retq
+.Ldword_sign_clear:
+        movl $1, %eax
+        retq
+
+        .globl testq_self_jl_uses_qword_sign
+        .def testq_self_jl_uses_qword_sign; .scl 2; .type 32; .endef
+testq_self_jl_uses_qword_sign:
+        movabsq $0x8000000000000000, %rax
+        testq %rax, %rax
+        jl .Lqword_sign_set
+        xorl %eax, %eax
+        retq
+.Lqword_sign_set:
+        movl $1, %eax
+        retq
+
+        .globl testw_self_jp_uses_low_byte
+        .def testw_self_jp_uses_low_byte; .scl 2; .type 32; .endef
+testw_self_jp_uses_low_byte:
+        movl $0x100, %eax
+        testw %ax, %ax
+        jp .Lword_low_byte_even
+        xorl %eax, %eax
+        retq
+.Lword_low_byte_even:
+        movl $1, %eax
+        retq
+
+        .globl testb_self_all_jcc_families
+        .def testb_self_all_jcc_families; .scl 2; .type 32; .endef
+testb_self_all_jcc_families:
+        movl $0, %eax
+        testb %al, %al
+        je .Lself_after_je
+        jmp .Lself_family_fail
+.Lself_after_je:
+        movl $1, %eax
+        testb %al, %al
+        jne .Lself_after_jne
+        jmp .Lself_family_fail
+.Lself_after_jne:
+        testb %al, %al
+        jb .Lself_family_fail
+        testb %al, %al
+        jae .Lself_after_jae
+        jmp .Lself_family_fail
+.Lself_after_jae:
+        movl $0, %eax
+        testb %al, %al
+        jbe .Lself_after_jbe
+        jmp .Lself_family_fail
+.Lself_after_jbe:
+        movl $1, %eax
+        testb %al, %al
+        ja .Lself_after_ja
+        jmp .Lself_family_fail
+.Lself_after_ja:
+        movl $0x80, %eax
+        testb %al, %al
+        js .Lself_after_js
+        jmp .Lself_family_fail
+.Lself_after_js:
+        movl $0x7f, %eax
+        testb %al, %al
+        jns .Lself_after_jns
+        jmp .Lself_family_fail
+.Lself_after_jns:
+        movl $0x80, %eax
+        testb %al, %al
+        jl .Lself_after_jl
+        jmp .Lself_family_fail
+.Lself_after_jl:
+        movl $0, %eax
+        testb %al, %al
+        jle .Lself_after_jle
+        jmp .Lself_family_fail
+.Lself_after_jle:
+        movl $1, %eax
+        testb %al, %al
+        jg .Lself_after_jg
+        jmp .Lself_family_fail
+.Lself_after_jg:
+        movl $0x7f, %eax
+        testb %al, %al
+        jge .Lself_after_jge
+        jmp .Lself_family_fail
+.Lself_after_jge:
+        movl $3, %eax
+        testb %al, %al
+        jp .Lself_after_jp
+        jmp .Lself_family_fail
+.Lself_after_jp:
+        movl $1, %eax
+        testb %al, %al
+        jnp .Lself_after_jnp
+        jmp .Lself_family_fail
+.Lself_after_jnp:
+        testb %al, %al
+        jo .Lself_family_fail
+        testb %al, %al
+        jno .Lself_family_pass
+        jmp .Lself_family_fail
+.Lself_family_pass:
+        movl $1, %eax
+        retq
+.Lself_family_fail:
+        xorl %eax, %eax
+        retq
+
+        .globl testb_distinct_all_jcc_families
+        .def testb_distinct_all_jcc_families; .scl 2; .type 32; .endef
+testb_distinct_all_jcc_families:
+        movl $1, %eax
+        movl $1, %ecx
+        testb %al, %cl
+        je .Ldistinct_family_fail
+        movl $1, %eax
+        movl $2, %ecx
+        testb %al, %cl
+        jne .Ldistinct_family_fail
+        movl $1, %eax
+        movl $1, %ecx
+        testb %al, %cl
+        jb .Ldistinct_family_fail
+        testb %al, %cl
+        jae .Ldistinct_after_jae
+        jmp .Ldistinct_family_fail
+.Ldistinct_after_jae:
+        testb %al, %cl
+        jbe .Ldistinct_family_fail
+        movl $1, %eax
+        movl $2, %ecx
+        testb %al, %cl
+        ja .Ldistinct_family_fail
+        movl $0x80, %eax
+        movl $0x7f, %ecx
+        testb %al, %cl
+        js .Ldistinct_family_fail
+        movl $0x80, %eax
+        movl $0x80, %ecx
+        testb %al, %cl
+        jns .Ldistinct_family_fail
+        movl $0x80, %eax
+        movl $0x7f, %ecx
+        testb %al, %cl
+        jl .Ldistinct_family_fail
+        movl $0x81, %eax
+        movl $1, %ecx
+        testb %al, %cl
+        jle .Ldistinct_family_fail
+        movl $1, %eax
+        movl $2, %ecx
+        testb %al, %cl
+        jg .Ldistinct_family_fail
+        movl $0x80, %eax
+        movl $0x81, %ecx
+        testb %al, %cl
+        jge .Ldistinct_family_fail
+        movl $3, %eax
+        movl $5, %ecx
+        testb %al, %cl
+        jp .Ldistinct_family_fail
+        movl $1, %eax
+        movl $2, %ecx
+        testb %al, %cl
+        jnp .Ldistinct_family_fail
+        movl $1, %eax
+        movl $1, %ecx
+        testb %al, %cl
+        jo .Ldistinct_family_fail
+        testb %al, %cl
+        jno .Ldistinct_family_pass
+        jmp .Ldistinct_family_fail
+.Ldistinct_family_pass:
+        movl $1, %eax
+        retq
+.Ldistinct_family_fail:
+        xorl %eax, %eax
+        retq
 "#,
     )
     .expect("write call-result fixture assembly");
@@ -187,6 +401,13 @@ int coff_fn_testw_self_jne_ignores_high_bits(void);
 int coff_fn_testl_self_je_ignores_high_bits(void);
 int coff_fn_testq_jne_keeps_high_bits(void);
 int coff_fn_testb_jne_mixed_same_parent_slices(void);
+int coff_fn_testb_high8_self_js_uses_slice_sign(void);
+int coff_fn_testw_self_js_uses_word_sign(void);
+int coff_fn_testl_distinct_jns_ignores_qword_sign(void);
+int coff_fn_testq_self_jl_uses_qword_sign(void);
+int coff_fn_testw_self_jp_uses_low_byte(void);
+int coff_fn_testb_self_all_jcc_families(void);
+int coff_fn_testb_distinct_all_jcc_families(void);
 
 int coff_ext_masked_value(void) { return 0x8000; }
 
@@ -200,6 +421,13 @@ int main(void) {
     if (coff_fn_testb_self_je_ignores_high_bits() != 1) return 16;
     if (coff_fn_testw_self_jne_ignores_high_bits() != 0) return 17;
     if (coff_fn_testl_self_je_ignores_high_bits() != 1) return 18;
+    if (coff_fn_testb_self_all_jcc_families() != 1) return 19;
+    if (coff_fn_testb_distinct_all_jcc_families() != 1) return 20;
+    if (coff_fn_testb_high8_self_js_uses_slice_sign() != 1) return 21;
+    if (coff_fn_testw_self_js_uses_word_sign() != 1) return 22;
+    if (coff_fn_testl_distinct_jns_ignores_qword_sign() != 1) return 23;
+    if (coff_fn_testq_self_jl_uses_qword_sign() != 1) return 24;
+    if (coff_fn_testw_self_jp_uses_low_byte() != 1) return 25;
     return 0;
 }
 "#,
@@ -296,9 +524,9 @@ fn register_mask_test_keeps_call_result_live_and_preserves_emitted_behavior() {
             .find_map(|(node, result)| (*node == call).then_some(*result))
             .expect("TEST did not keep the call return value live");
         assert!(
-            db.rel_iter::<(RTLReg,)>("is_not_ptr")
+            !db.rel_iter::<(RTLReg,)>("is_not_ptr")
                 .any(|(reg,)| *reg == return_value),
-            "narrow TEST result bypassed RTL integer classification",
+            "a narrow TEST alone incorrectly proved that its operand is not a pointer",
         );
 
         assert!(db
@@ -317,7 +545,8 @@ fn register_mask_test_keeps_call_result_live_and_preserves_emitted_behavior() {
                     && matches!(
                         inst,
                         RTLInst::Icond(
-                            Condition::Cmaskregzero(
+                            Condition::Ctestregister(
+                                TestRegisterPredicate::Zero,
                                 TestRegisterSlice::Low16,
                                 TestRegisterSlice::Low16,
                             ),
@@ -332,7 +561,8 @@ fn register_mask_test_keeps_call_result_live_and_preserves_emitted_behavior() {
             .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
             .find_map(|(_, inst)| match inst {
                 RTLInst::Icond(
-                    Condition::Cmaskregnotzero(
+                    Condition::Ctestregister(
+                        TestRegisterPredicate::Nonzero,
                         TestRegisterSlice::Full64,
                         TestRegisterSlice::Full64,
                     ),
@@ -349,6 +579,82 @@ fn register_mask_test_keeps_call_result_live_and_preserves_emitted_behavior() {
                     .any(|(reg,)| reg == arg),
                 "full-width TEST operand bypassed RTL width classification",
             );
+        }
+
+        for function_name in [
+            "testb_self_all_jcc_families",
+            "testb_distinct_all_jcc_families",
+        ] {
+            let (family_start, family_end) = db
+                .rel_iter::<(Symbol, Address, Address)>("func_span")
+                .find_map(|(name, start, end)| {
+                    (*name == function_name || *name == format!("coff_fn_{function_name}"))
+                        .then_some((*start, *end))
+                })
+                .unwrap_or_else(|| panic!("missing TEST/Jcc family function {function_name}"));
+            let test_nodes: HashSet<_> = db
+                .rel_iter::<(Address, Symbol, Symbol)>("ptest")
+                .filter_map(|(address, _, _)| {
+                    (family_start <= *address && *address < family_end).then_some(*address)
+                })
+                .collect();
+            assert_eq!(
+                test_nodes.len(),
+                16,
+                "{function_name} lost a decoded TEST/Jcc family",
+            );
+
+            let conditional_candidates: Vec<_> = db
+                .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+                .filter_map(|(node, inst)| {
+                    (family_start <= *node && *node < family_end)
+                        .then_some((*node, inst))
+                        .and_then(|(node, inst)| match inst {
+                            RTLInst::Icond(condition, args, if_true, if_false) => {
+                                Some((node, condition, args, if_true, if_false))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect();
+
+            // Linear/RTL may preserve both the physical fallthrough through
+            // an unconditional jump and its CFG-equivalent collapsed target.
+            // Those candidates differ only in their false successor. Every
+            // TEST must nevertheless have one condition/argument/taken-edge
+            // lowering, and no condition may remain at the raw Jcc address.
+            let mut lowering_by_test = HashMap::new();
+            for (node, condition, args, if_true, _) in &conditional_candidates {
+                assert!(
+                    test_nodes.contains(node),
+                    "{function_name} retained a competing Jcc-address candidate at {node:#x}: {condition:?}",
+                );
+                let lowering = (*condition, *args, *if_true);
+                if let Some(previous) = lowering_by_test.insert(*node, lowering) {
+                    assert_eq!(
+                        previous, lowering,
+                        "{function_name} produced conflicting RTL lowerings at {node:#x}",
+                    );
+                }
+            }
+            assert_eq!(
+                lowering_by_test.keys().copied().collect::<HashSet<_>>(),
+                test_nodes,
+                "{function_name} produced a missing or misplaced RTL branch lowering: {conditional_candidates:#x?}",
+            );
+            for (node, condition, args, _, _) in conditional_candidates {
+                match condition {
+                    Condition::Ctestregister(_, lhs, rhs) => {
+                        assert_eq!(lhs.width_bits(), 8);
+                        assert_eq!(rhs.width_bits(), 8);
+                        assert_eq!(args.len(), 2);
+                    }
+                    Condition::Cconst(_) => assert!(args.is_empty()),
+                    other => panic!(
+                        "{function_name} used a non-TEST condition at {node:#x}: {other:?}"
+                    ),
+                }
+            }
         }
 
         drop(db);

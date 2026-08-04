@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::mreg::Mreg;
-use crate::x86::op::{Addressing, Comparison, Condition, Operation, TestRegisterSlice};
+use crate::x86::op::{
+    Addressing, Comparison, Condition, Operation, TestRegisterPredicate, TestRegisterSlice,
+};
 use crate::x86::types::*;
 use ascent::ascent_par;
 use either::Either;
@@ -1898,8 +1900,10 @@ pub(crate) fn invert_condition(cond: &Condition) -> Condition {
         Condition::Ccompluimm(c, imm) => Condition::Ccompluimm(invert_comparison(c), *imm),
         Condition::Cmaskzero(m) => Condition::Cmasknotzero(*m),
         Condition::Cmasknotzero(m) => Condition::Cmaskzero(*m),
-        Condition::Cmaskregzero(lhs, rhs) => Condition::Cmaskregnotzero(*lhs, *rhs),
-        Condition::Cmaskregnotzero(lhs, rhs) => Condition::Cmaskregzero(*lhs, *rhs),
+        Condition::Ctestregister(predicate, lhs, rhs) => {
+            Condition::Ctestregister(predicate.negate(), *lhs, *rhs)
+        }
+        Condition::Cconst(value) => Condition::Cconst(!value),
         Condition::Cnotcompf(c) => Condition::Ccompf(*c),
         Condition::Cnotcompfs(c) => Condition::Ccompfs(*c),
         // OF-set <-> OF-clear is an exact logical negation (the flag is a single bit).
@@ -3360,6 +3364,178 @@ fn clight_test_register_slice(expr: ClightExpr, slice: TestRegisterSlice) -> Cli
     )
 }
 
+fn clight_test_register_zero(width: u8, value_type: ClightType) -> ClightExpr {
+    if width == 64 {
+        ClightExpr::EconstLong(0, value_type)
+    } else {
+        ClightExpr::EconstInt(0, value_type)
+    }
+}
+
+fn clight_test_register_compare_zero(
+    value: ClightExpr,
+    width: u8,
+    value_type: ClightType,
+    comparison: ClightBinaryOp,
+) -> ClightExpr {
+    ClightExpr::Ebinop(
+        comparison,
+        Box::new(value),
+        Box::new(clight_test_register_zero(width, value_type)),
+        default_bool_type(),
+    )
+}
+
+fn clight_test_register_predicate(
+    predicate: TestRegisterPredicate,
+    lhs: ClightExpr,
+    rhs: ClightExpr,
+    lhs_slice: TestRegisterSlice,
+    rhs_slice: TestRegisterSlice,
+) -> ClightExpr {
+    let width = lhs_slice.width_bits();
+    debug_assert_eq!(width, rhs_slice.width_bits());
+    let value_type = if width == 64 {
+        default_ulong_type()
+    } else {
+        default_uint_type()
+    };
+    let result = ClightExpr::Ebinop(
+        ClightBinaryOp::Oand,
+        Box::new(clight_test_register_slice(lhs, lhs_slice)),
+        Box::new(clight_test_register_slice(rhs, rhs_slice)),
+        value_type.clone(),
+    );
+
+    match predicate {
+        TestRegisterPredicate::Zero => clight_test_register_compare_zero(
+            result,
+            width,
+            value_type,
+            ClightBinaryOp::Oeq,
+        ),
+        TestRegisterPredicate::Nonzero => clight_test_register_compare_zero(
+            result,
+            width,
+            value_type,
+            ClightBinaryOp::One,
+        ),
+        TestRegisterPredicate::Negative | TestRegisterPredicate::Nonnegative => {
+            let sign = ClightExpr::Ebinop(
+                ClightBinaryOp::Oshr,
+                Box::new(result),
+                Box::new(ClightExpr::EconstInt(
+                    i32::from(width - 1),
+                    default_int_type(),
+                )),
+                value_type.clone(),
+            );
+            let comparison = if predicate == TestRegisterPredicate::Negative {
+                ClightBinaryOp::One
+            } else {
+                ClightBinaryOp::Oeq
+            };
+            clight_test_register_compare_zero(sign, width, value_type, comparison)
+        }
+        TestRegisterPredicate::Nonpositive | TestRegisterPredicate::Positive => {
+            let zero = clight_test_register_compare_zero(
+                result.clone(),
+                width,
+                value_type.clone(),
+                ClightBinaryOp::Oeq,
+            );
+            let nonzero = clight_test_register_compare_zero(
+                result.clone(),
+                width,
+                value_type.clone(),
+                ClightBinaryOp::One,
+            );
+            let sign = ClightExpr::Ebinop(
+                ClightBinaryOp::Oshr,
+                Box::new(result),
+                Box::new(ClightExpr::EconstInt(
+                    i32::from(width - 1),
+                    default_int_type(),
+                )),
+                value_type.clone(),
+            );
+            let negative = clight_test_register_compare_zero(
+                sign.clone(),
+                width,
+                value_type.clone(),
+                ClightBinaryOp::One,
+            );
+            let nonnegative = clight_test_register_compare_zero(
+                sign,
+                width,
+                value_type,
+                ClightBinaryOp::Oeq,
+            );
+            if predicate == TestRegisterPredicate::Nonpositive {
+                ClightExpr::Ebinop(
+                    ClightBinaryOp::Oor,
+                    Box::new(zero),
+                    Box::new(negative),
+                    default_bool_type(),
+                )
+            } else {
+                ClightExpr::Ebinop(
+                    ClightBinaryOp::Oand,
+                    Box::new(nonzero),
+                    Box::new(nonnegative),
+                    default_bool_type(),
+                )
+            }
+        }
+        TestRegisterPredicate::EvenParity | TestRegisterPredicate::OddParity => {
+            // PF is the even parity of the result's low byte. Fold that byte
+            // to one nibble, then use the standard 0x6996 odd-parity bitmap;
+            // zero in the selected bit therefore means even parity.
+            let uint_type = default_uint_type();
+            let byte = ClightExpr::Ebinop(
+                ClightBinaryOp::Oand,
+                Box::new(ClightExpr::Ecast(Box::new(result), uint_type.clone())),
+                Box::new(ClightExpr::EconstInt(0xff, uint_type.clone())),
+                uint_type.clone(),
+            );
+            let folded = ClightExpr::Ebinop(
+                ClightBinaryOp::Oxor,
+                Box::new(byte.clone()),
+                Box::new(ClightExpr::Ebinop(
+                    ClightBinaryOp::Oshr,
+                    Box::new(byte),
+                    Box::new(ClightExpr::EconstInt(4, default_int_type())),
+                    uint_type.clone(),
+                )),
+                uint_type.clone(),
+            );
+            let nibble = ClightExpr::Ebinop(
+                ClightBinaryOp::Oand,
+                Box::new(folded),
+                Box::new(ClightExpr::EconstInt(0xf, uint_type.clone())),
+                uint_type.clone(),
+            );
+            let parity_bit = ClightExpr::Ebinop(
+                ClightBinaryOp::Oand,
+                Box::new(ClightExpr::Ebinop(
+                    ClightBinaryOp::Oshr,
+                    Box::new(ClightExpr::EconstInt(0x6996, uint_type.clone())),
+                    Box::new(nibble),
+                    uint_type.clone(),
+                )),
+                Box::new(ClightExpr::EconstInt(1, uint_type.clone())),
+                uint_type.clone(),
+            );
+            let comparison = if predicate == TestRegisterPredicate::EvenParity {
+                ClightBinaryOp::Oeq
+            } else {
+                ClightBinaryOp::One
+            };
+            clight_test_register_compare_zero(parity_bit, 32, uint_type, comparison)
+        }
+    }
+}
+
 fn is_int32_type(ty: &ClightType) -> bool {
     matches!(ty, ClightType::Tint(ClightIntSize::I32, _, _))
 }
@@ -3588,39 +3764,25 @@ pub(crate) fn clight_condition_expr_with_types(
                 Some(ClightExpr::EconstInt(1, default_bool_type()))
             }
         }
-        Condition::Cmaskregzero(lhs_slice, rhs_slice)
-        | Condition::Cmaskregnotzero(lhs_slice, rhs_slice) => {
+        Condition::Ctestregister(predicate, lhs_slice, rhs_slice) => {
             if args.len() >= 2 {
                 let lhs = clight_expr_from_csharp_with_multi_types(&args[0], var_types);
                 let rhs = clight_expr_from_csharp_with_multi_types(&args[1], var_types);
-                let lhs = clight_test_register_slice(lhs, *lhs_slice);
-                let rhs = clight_test_register_slice(rhs, *rhs_slice);
-                let (zero, value_type) = if lhs_slice.width_bits() == 64 {
-                    (ClightExpr::EconstLong(0, default_ulong_type()), default_ulong_type())
-                } else {
-                    (ClightExpr::EconstInt(0, default_uint_type()), default_uint_type())
-                };
-                let masked = ClightExpr::Ebinop(
-                    ClightBinaryOp::Oand,
-                    Box::new(lhs),
-                    Box::new(rhs),
-                    value_type,
-                );
-                let comparison = if matches!(cond, Condition::Cmaskregzero(_, _)) {
-                    ClightBinaryOp::Oeq
-                } else {
-                    ClightBinaryOp::One
-                };
-                Some(ClightExpr::Ebinop(
-                    comparison,
-                    Box::new(masked),
-                    Box::new(zero),
-                    default_bool_type(),
+                Some(clight_test_register_predicate(
+                    *predicate,
+                    lhs,
+                    rhs,
+                    *lhs_slice,
+                    *rhs_slice,
                 ))
             } else {
                 Some(ClightExpr::EconstInt(1, default_bool_type()))
             }
         }
+        Condition::Cconst(value) => Some(ClightExpr::EconstInt(
+            i32::from(*value),
+            default_bool_type(),
+        )),
         Condition::Cnotcompf(comp) => {
             let inner =
                 clight_condition_expr_with_types(&Condition::Ccompf(*comp), args, var_types)?;

@@ -108,8 +108,7 @@ fn win64_home_condition_is_signed(condition: &Condition) -> bool {
 
 fn register_test_condition_width(condition: &Condition) -> Option<u8> {
     match condition {
-        Condition::Cmaskregzero(lhs, rhs) | Condition::Cmaskregnotzero(lhs, rhs)
-            if lhs.width_bits() == rhs.width_bits() =>
+        Condition::Ctestregister(_, lhs, rhs) if lhs.width_bits() == rhs.width_bits() =>
         {
             Some(lhs.width_bits())
         }
@@ -10866,14 +10865,6 @@ ascent_par! {
         if matches!(cond, Condition::Ccomp(_) | Condition::Ccompu(_)
             | Condition::Ccompimm(_, _) | Condition::Ccompuimm(_, _)),
         if !is_null_comparison_cond(cond);
-
-    // Register TEST slices narrower than 64 bits consume integer data just as
-    // the 32-bit comparison family above does. Keeping this evidence keyed on
-    // the slice prevents a narrow mask predicate from inheriting a pointer
-    // type merely because every architectural subregister shares one RTL reg.
-    is_not_ptr(reg) <--
-        comparison_operand(_, cond, reg),
-        if matches!(register_test_condition_width(cond), Some(8 | 16 | 32));
 
     // USE-SIDE 64-bit width floor (c16): operands of a genuine 64-bit comparison are 64-bit, but contribute is_long ONLY, since a 64-bit comparison may compare two pointers.
     is_long(reg) <--

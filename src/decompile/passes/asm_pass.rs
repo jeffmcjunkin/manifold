@@ -6,7 +6,9 @@ use crate::{declare_io_from, run_pass};
 
 use crate::mreg::Mreg;
 use crate::x86::asm::{Freg, Ireg, Preg, TestCond};
-use crate::x86::op::{Addressing, Comparison, Condition, Operation, TestRegisterSlice};
+use crate::x86::op::{
+    Addressing, Comparison, Condition, Operation, TestRegisterPredicate, TestRegisterSlice,
+};
 use crate::x86::types::*;
 use ascent::aggregators;
 use ascent::ascent_par;
@@ -3176,11 +3178,21 @@ ascent_par! {
         flags_and_jump_pair(addr0, addr1, _),
         pcmp(addr0, _, _);
 
+    // Normalized TEST flag consumers. JO/JNO intentionally remain outside
+    // the global pjcc relation: generic CMP/SUB lowering cannot model OF, but
+    // TEST determines it exactly (always clear).
+    #[local] relation test_jcc(Address, TestCond, Symbol);
+    test_jcc(addr, *condition, lbl) <-- pjcc(addr, condition, lbl);
+    test_jcc(addr, TestCond::CondO, lbl) <--
+        instruction(addr, _, _, "JO", lbl, _, _, _, _, _);
+    test_jcc(addr, TestCond::CondNo, lbl) <--
+        instruction(addr, _, _, "JNO", lbl, _, _, _, _, _);
+
     #[local] relation test_jcc_link(Address, Address);
     test_jcc_link(addr0, addr1) <--
         ptest(addr0, _, _),
         next(addr0, addr1),
-        pjcc(addr1, _, _);
+        test_jcc(addr1, _, _);
     test_jcc_link(addr0, addr1) <--
         flags_and_jump_pair(addr0, addr1, _),
         ptest(addr0, _, _);
@@ -3419,29 +3431,23 @@ ascent_par! {
         pjcc(addr1, test_cond, lbl),
         testcond_to_cond(*test_cond, condition);
 
-    // Register-register TEST computes flags from the bitwise AND without
-    // writing either operand. This includes textual self-tests such as AL,AL;
-    // they must not fall back to the width-insensitive synthesized CMP path.
-    // Keep both values and their exact architectural slices in the condition:
-    // Mach registers collapse AL/AH/AX/EAX/RAX, but bits outside testb/testw
-    // must not affect ZF.
-    // TEST also clears CF, so JBE reduces to JE and JA reduces to JNE.
-    mach_inst(emit_addr, MachInst::Mcond(Condition::Cmaskregzero(slice1, slice2), Arc::new(vec![*arg1, *arg2]), lbl)) <--
-        ptest(addr0, r1, r2),
-        op_register(r1, reg_str1),
-        op_register(r2, reg_str2),
-        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
-        ireg_of(preg_of_r2, Ireg::from(reg_str2)),
-        preg_of(arg1, preg_of_r1),
-        preg_of(arg2, preg_of_r2),
-        if let Some(slice1) = test_register_slice(reg_str1),
-        if let Some(slice2) = test_register_slice(reg_str2),
-        if slice1.width_bits() == slice2.width_bits(),
+    // CF and OF are clear after every TEST form, independent of its operands.
+    // Preserve those branches explicitly even when a non-register TEST form
+    // has no data-dependent condition lowering.
+    mach_inst(emit_addr, MachInst::Mcond(Condition::Cconst(value), Arc::new(vec![]), lbl)) <--
+        ptest(addr0, _, _),
         mcond_emit_addr(addr0, addr1, emit_addr),
-        pjcc(addr1, test_cond, lbl),
-        if matches!(*test_cond, TestCond::CondE | TestCond::CondBe);
+        test_jcc(addr1, test_cond, lbl),
+        if let Some(value) = test_jcc_constant_value(*test_cond);
 
-    mach_inst(emit_addr, MachInst::Mcond(Condition::Cmaskregnotzero(slice1, slice2), Arc::new(vec![*arg1, *arg2]), lbl)) <--
+    // Register-register TEST computes flags from an exact-width bitwise AND
+    // without writing either operand. This includes textual self-tests such
+    // as AL,AL; they must not fall back to the width-insensitive synthesized
+    // CMP path. Mach registers collapse AL/AH/AX/EAX/RAX, so both operand
+    // slices remain in the condition. TEST also clears CF and OF, making the
+    // corresponding carry/overflow branches exact constants; SF, ZF and PF
+    // remain predicates over the sliced AND result.
+    mach_inst(emit_addr, MachInst::Mcond(condition.clone(), Arc::new(args.clone()), lbl)) <--
         ptest(addr0, r1, r2),
         op_register(r1, reg_str1),
         op_register(r2, reg_str2),
@@ -3451,10 +3457,11 @@ ascent_par! {
         preg_of(arg2, preg_of_r2),
         if let Some(slice1) = test_register_slice(reg_str1),
         if let Some(slice2) = test_register_slice(reg_str2),
-        if slice1.width_bits() == slice2.width_bits(),
         mcond_emit_addr(addr0, addr1, emit_addr),
-        pjcc(addr1, test_cond, lbl),
-        if matches!(*test_cond, TestCond::CondNe | TestCond::CondA);
+        test_jcc(addr1, test_cond, lbl),
+        if let Some(condition) = register_test_jcc_condition(*test_cond, slice1, slice2),
+        if !matches!(condition, Condition::Cconst(_)),
+        let args = vec![*arg1, *arg2];
 
 
     // ADD followed by a flags-reading jcc tests the arithmetic RESULT against zero, so emit the Mcond at the jcc's own address; restricted to ZF/signed conditions, since after an ADD carry is not a comparison.
@@ -4034,11 +4041,16 @@ ascent_par! {
     mach_inst(addr, MachInst::Mcond(Condition::Ccomplimm(Comparison::Ceq, 0), Arc::new(vec![Mreg::CX]), dst)) <--
         instruction(addr, _, _, "JRCXZ", dst, _, _, _, _, _);
 
-    // ASM-5: JO/JNO lift to the opaque Coverflow/Cnotoverflow, emitted self-contained at the jump's own address so a preceding CMP is never folded into a false comparison.
+    // ASM-5: Without a modeled CMP/SUB/TEST producer, JO/JNO lift to opaque
+    // overflow predicates at the jump itself. A paired TEST uses its exact
+    // constant OF=0 condition instead; excluding it here prevents a second
+    // branch candidate without changing legacy CMP/SUB handling.
     mach_inst(addr, MachInst::Mcond(Condition::Coverflow, Arc::new(vec![]), dst)) <--
-        instruction(addr, _, _, "JO", dst, _, _, _, _, _);
+        instruction(addr, _, _, "JO", dst, _, _, _, _, _),
+        !test_jcc_link(_, addr);
     mach_inst(addr, MachInst::Mcond(Condition::Cnotoverflow, Arc::new(vec![]), dst)) <--
-        instruction(addr, _, _, "JNO", dst, _, _, _, _, _);
+        instruction(addr, _, _, "JNO", dst, _, _, _, _, _),
+        !test_jcc_link(_, addr);
 
     // ASM-5: LOOP/LOOPE/LOOPNE branch iff the decremented RCX != 0, which as a function of RCX at the instruction is exactly Ccomplimm(Cne, 1); the RCX write-back and ZF refinement are not modelled.
     mach_inst(addr, MachInst::Mcond(Condition::Ccomplimm(Comparison::Cne, 1), Arc::new(vec![Mreg::CX]), dst)) <--
@@ -4050,7 +4062,11 @@ ascent_par! {
     single_inst_cond_jump(addr) <--
         instruction(addr, _, _, mnem, _, _, _, _, _, _),
         if matches!(*mnem,
-            "JCXZ" | "JECXZ" | "JRCXZ" | "JO" | "JNO" | "LOOP" | "LOOPE" | "LOOPNE");
+            "JCXZ" | "JECXZ" | "JRCXZ" | "LOOP" | "LOOPE" | "LOOPNE");
+    single_inst_cond_jump(addr) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "JO" | "JNO"),
+        !test_jcc_link(_, addr);
     mcond_at_jcc(addr) <-- single_inst_cond_jump(addr);
 
 
@@ -9852,6 +9868,47 @@ fn test_register_slice(name: &str) -> Option<TestRegisterSlice> {
     }
 }
 
+/// Exact condition produced by a Jcc consuming register-register TEST flags.
+/// AF is the only undefined TEST flag and no Jcc reads it. CF and OF are
+/// cleared; every remaining condition is a predicate over the exact-width AND
+/// result carried by the two architectural slices.
+fn register_test_jcc_condition(
+    test: TestCond,
+    lhs: TestRegisterSlice,
+    rhs: TestRegisterSlice,
+) -> Option<Condition> {
+    if lhs.width_bits() != rhs.width_bits() {
+        return None;
+    }
+    if let Some(value) = test_jcc_constant_value(test) {
+        return Some(Condition::Cconst(value));
+    }
+
+    let predicate = match test {
+        TestCond::CondE | TestCond::CondBe => TestRegisterPredicate::Zero,
+        TestCond::CondNe | TestCond::CondA => TestRegisterPredicate::Nonzero,
+        TestCond::CondL => TestRegisterPredicate::Negative,
+        TestCond::CondGe => TestRegisterPredicate::Nonnegative,
+        TestCond::CondLe => TestRegisterPredicate::Nonpositive,
+        TestCond::CondG => TestRegisterPredicate::Positive,
+        TestCond::CondP => TestRegisterPredicate::EvenParity,
+        TestCond::CondNp => TestRegisterPredicate::OddParity,
+        TestCond::CondB | TestCond::CondAe | TestCond::CondO | TestCond::CondNo => {
+            unreachable!("constant TEST condition handled above")
+        }
+        TestCond::Unknown => return None,
+    };
+    Some(Condition::Ctestregister(predicate, lhs, rhs))
+}
+
+fn test_jcc_constant_value(test: TestCond) -> Option<bool> {
+    match test {
+        TestCond::CondB | TestCond::CondO => Some(false),
+        TestCond::CondAe | TestCond::CondNo => Some(true),
+        _ => None,
+    }
+}
+
 // Conditions for which a jcc after an add tests the signed RESULT against zero exactly: ZF and the signed conditions qualify, unsigned CF-based ones do not, since CF is carry-out.
 fn arith_result_testcond_ok(c: TestCond) -> bool {
     matches!(
@@ -10608,7 +10665,8 @@ mod register_mask_test_tests {
                 *address == TEST8
                     && inst
                         == &MachInst::Mcond(
-                            Condition::Cmaskregnotzero(
+                            Condition::Ctestregister(
+                                TestRegisterPredicate::Nonzero,
                                 TestRegisterSlice::Low8,
                                 TestRegisterSlice::High8,
                             ),
@@ -10620,7 +10678,8 @@ mod register_mask_test_tests {
                 *address == TEST16
                     && inst
                         == &MachInst::Mcond(
-                            Condition::Cmaskregzero(
+                            Condition::Ctestregister(
+                                TestRegisterPredicate::Zero,
                                 TestRegisterSlice::Low16,
                                 TestRegisterSlice::Low16,
                             ),
@@ -10632,7 +10691,8 @@ mod register_mask_test_tests {
                 *address == TEST32
                     && inst
                         == &MachInst::Mcond(
-                            Condition::Cmaskregnotzero(
+                            Condition::Ctestregister(
+                                TestRegisterPredicate::Nonzero,
                                 TestRegisterSlice::Low32,
                                 TestRegisterSlice::Low32,
                             ),
@@ -10644,7 +10704,8 @@ mod register_mask_test_tests {
                 *address == TEST64
                     && inst
                         == &MachInst::Mcond(
-                            Condition::Cmaskregzero(
+                            Condition::Ctestregister(
+                                TestRegisterPredicate::Zero,
                                 TestRegisterSlice::Full64,
                                 TestRegisterSlice::Full64,
                             ),
@@ -10704,7 +10765,8 @@ mod register_mask_test_tests {
                 (
                     SELF8,
                     MachInst::Mcond(
-                        Condition::Cmaskregzero(
+                        Condition::Ctestregister(
+                            TestRegisterPredicate::Zero,
                             TestRegisterSlice::Low8,
                             TestRegisterSlice::Low8,
                         ),
@@ -10715,7 +10777,8 @@ mod register_mask_test_tests {
                 (
                     SELF16,
                     MachInst::Mcond(
-                        Condition::Cmaskregnotzero(
+                        Condition::Ctestregister(
+                            TestRegisterPredicate::Nonzero,
                             TestRegisterSlice::Low16,
                             TestRegisterSlice::Low16,
                         ),
@@ -10726,7 +10789,8 @@ mod register_mask_test_tests {
                 (
                     SELF32,
                     MachInst::Mcond(
-                        Condition::Cmaskregzero(
+                        Condition::Ctestregister(
+                            TestRegisterPredicate::Zero,
                             TestRegisterSlice::Low32,
                             TestRegisterSlice::Low32,
                         ),
@@ -10737,7 +10801,8 @@ mod register_mask_test_tests {
                 (
                     SELF64,
                     MachInst::Mcond(
-                        Condition::Cmaskregnotzero(
+                        Condition::Ctestregister(
+                            TestRegisterPredicate::Nonzero,
                             TestRegisterSlice::Full64,
                             TestRegisterSlice::Full64,
                         ),
@@ -10761,6 +10826,165 @@ mod register_mask_test_tests {
                 );
                 assert_eq!(candidates[0], &expected_inst);
             }
+        });
+    }
+
+    #[test]
+    fn every_test_jcc_family_has_one_sound_self_and_distinct_condition() {
+        on_pipeline_stack(|| {
+            let dynamic = |predicate| {
+                Condition::Ctestregister(
+                    predicate,
+                    TestRegisterSlice::Low8,
+                    TestRegisterSlice::Low8,
+                )
+            };
+            let cases = [
+                (TestCond::CondE, dynamic(TestRegisterPredicate::Zero)),
+                (TestCond::CondNe, dynamic(TestRegisterPredicate::Nonzero)),
+                (TestCond::CondB, Condition::Cconst(false)),
+                (TestCond::CondBe, dynamic(TestRegisterPredicate::Zero)),
+                (TestCond::CondAe, Condition::Cconst(true)),
+                (TestCond::CondA, dynamic(TestRegisterPredicate::Nonzero)),
+                (TestCond::CondL, dynamic(TestRegisterPredicate::Negative)),
+                (
+                    TestCond::CondLe,
+                    dynamic(TestRegisterPredicate::Nonpositive),
+                ),
+                (
+                    TestCond::CondGe,
+                    dynamic(TestRegisterPredicate::Nonnegative),
+                ),
+                (TestCond::CondG, dynamic(TestRegisterPredicate::Positive)),
+                (
+                    TestCond::CondP,
+                    dynamic(TestRegisterPredicate::EvenParity),
+                ),
+                (
+                    TestCond::CondNp,
+                    dynamic(TestRegisterPredicate::OddParity),
+                ),
+                (TestCond::CondO, Condition::Cconst(false)),
+                (TestCond::CondNo, Condition::Cconst(true)),
+            ];
+
+            let mut prog = AsmPassProgram::default();
+            for (symbol, register) in [
+                ("family_self_lhs", "AL"),
+                ("family_self_rhs", "AL"),
+                ("family_distinct_lhs", "AL"),
+                ("family_distinct_rhs", "CL"),
+            ] {
+                prog.op_register.push((symbol, register));
+            }
+
+            const SELF_BASE: Address = 0x1200;
+            const DISTINCT_BASE: Address = 0x1400;
+            const NONREGISTER_TEST: Address = 0x1600;
+            const NONREGISTER_JNO: Address = 0x1602;
+            for (index, (test_cond, _)) in cases.iter().enumerate() {
+                let offset = (index as Address) * 0x10;
+                let self_test = SELF_BASE + offset;
+                let distinct_test = DISTINCT_BASE + offset;
+                prog.ptest
+                    .push((self_test, "family_self_lhs", "family_self_rhs"));
+                prog.ptest.push((
+                    distinct_test,
+                    "family_distinct_lhs",
+                    "family_distinct_rhs",
+                ));
+                prog.pjcc
+                    .push((self_test + 2, *test_cond, "family_self_target"));
+                prog.pjcc.push((
+                    distinct_test + 2,
+                    *test_cond,
+                    "family_distinct_target",
+                ));
+                prog.next.push((self_test, self_test + 2));
+                prog.next.push((distinct_test, distinct_test + 2));
+            }
+            prog.ptest.push((
+                NONREGISTER_TEST,
+                "family_nonregister_value",
+                "family_nonregister_mask",
+            ));
+            prog.next.push((NONREGISTER_TEST, NONREGISTER_JNO));
+            prog.instruction.push((
+                NONREGISTER_JNO,
+                2,
+                "",
+                "JNO",
+                "family_nonregister_target",
+                "family_unused",
+                "family_unused",
+                "family_unused",
+                0,
+                0,
+            ));
+
+            prog.run();
+
+            for (index, (_, expected_condition)) in cases.iter().enumerate() {
+                let offset = (index as Address) * 0x10;
+                for (address, args, target) in [
+                    (
+                        SELF_BASE + offset,
+                        vec![Mreg::AX, Mreg::AX],
+                        "family_self_target",
+                    ),
+                    (
+                        DISTINCT_BASE + offset,
+                        vec![Mreg::AX, Mreg::CX],
+                        "family_distinct_target",
+                    ),
+                ] {
+                    let expected_args = if matches!(expected_condition, Condition::Cconst(_)) {
+                        vec![]
+                    } else {
+                        args
+                    };
+                    let expected = MachInst::Mcond(
+                        *expected_condition,
+                        Arc::new(expected_args),
+                        target,
+                    );
+                    let candidates: Vec<_> = prog
+                        .mach_inst
+                        .iter()
+                        .filter_map(|(candidate_address, inst)| {
+                            (*candidate_address == address).then_some(inst)
+                        })
+                        .collect();
+                    assert_eq!(
+                        candidates.len(),
+                        1,
+                        "TEST/Jcc family at {address:#x} produced ambiguous Mach candidates: {candidates:?}",
+                    );
+                    assert_eq!(candidates[0], &expected);
+                }
+            }
+
+            let nonregister_test_candidates: Vec<_> = prog
+                .mach_inst
+                .iter()
+                .filter_map(|(address, inst)| {
+                    (*address == NONREGISTER_TEST).then_some(inst)
+                })
+                .collect();
+            assert_eq!(
+                nonregister_test_candidates,
+                vec![&MachInst::Mcond(
+                    Condition::Cconst(true),
+                    Arc::new(vec![]),
+                    "family_nonregister_target",
+                )],
+            );
+            assert!(
+                prog.mach_inst
+                    .iter()
+                    .all(|(address, _)| *address != NONREGISTER_JNO),
+                "an exact TEST/JNO constant retained a competing opaque JNO candidate",
+            );
         });
     }
 }

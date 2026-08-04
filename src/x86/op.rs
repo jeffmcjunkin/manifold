@@ -27,6 +27,38 @@ impl TestRegisterSlice {
     }
 }
 
+/// Predicate over the exact-width result of a register-register TEST.
+///
+/// TEST computes `lhs & rhs` without writing it.  Carry and overflow are
+/// handled as constants before this predicate reaches the IR; these variants
+/// cover every data-dependent Jcc flag combination produced by TEST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TestRegisterPredicate {
+    Zero,
+    Nonzero,
+    Negative,
+    Nonnegative,
+    Nonpositive,
+    Positive,
+    EvenParity,
+    OddParity,
+}
+
+impl TestRegisterPredicate {
+    pub const fn negate(self) -> Self {
+        match self {
+            Self::Zero => Self::Nonzero,
+            Self::Nonzero => Self::Zero,
+            Self::Negative => Self::Nonnegative,
+            Self::Nonnegative => Self::Negative,
+            Self::Nonpositive => Self::Positive,
+            Self::Positive => Self::Nonpositive,
+            Self::EvenParity => Self::OddParity,
+            Self::OddParity => Self::EvenParity,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Condition {
     Ccomp(Comparison),
@@ -43,10 +75,17 @@ pub enum Condition {
     Cnotcompfs(Comparison),
     Cmaskzero(i64),
     Cmasknotzero(i64),
-    // TEST reg,reg with distinct operand spellings. Unlike Cmask*, neither
-    // mask operand is immediate, and both architectural slices must survive.
-    Cmaskregzero(TestRegisterSlice, TestRegisterSlice),
-    Cmaskregnotzero(TestRegisterSlice, TestRegisterSlice),
+    // Register-register TEST. Unlike Cmask*, neither operand is immediate;
+    // both architectural slices and the flag-derived predicate must survive.
+    Ctestregister(
+        TestRegisterPredicate,
+        TestRegisterSlice,
+        TestRegisterSlice,
+    ),
+    // A flag producer may determine a following condition independently of
+    // its operands (TEST clears CF and OF). Keep that branch explicit rather
+    // than dropping either CFG successor while lowering.
+    Cconst(bool),
     // OF tests (JO/JNO) have no faithful CompCert encoding; these opaque variants exist to keep both Jcc edges.
     Coverflow,
     Cnotoverflow,
