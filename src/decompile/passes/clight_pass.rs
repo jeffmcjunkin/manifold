@@ -1903,6 +1903,9 @@ pub(crate) fn invert_condition(cond: &Condition) -> Condition {
         Condition::Ctestregister(predicate, lhs, rhs) => {
             Condition::Ctestregister(predicate.negate(), *lhs, *rhs)
         }
+        Condition::Ctestimmediate(predicate, slice, immediate) => {
+            Condition::Ctestimmediate(predicate.negate(), *slice, *immediate)
+        }
         Condition::Cconst(value) => Condition::Cconst(!value),
         Condition::Cnotcompf(c) => Condition::Ccompf(*c),
         Condition::Cnotcompfs(c) => Condition::Ccompfs(*c),
@@ -3536,6 +3539,39 @@ fn clight_test_register_predicate(
     }
 }
 
+fn low_test_slice(width: u8) -> TestRegisterSlice {
+    match width {
+        8 => TestRegisterSlice::Low8,
+        16 => TestRegisterSlice::Low16,
+        32 => TestRegisterSlice::Low32,
+        64 => TestRegisterSlice::Full64,
+        _ => unreachable!("unsupported TEST width {width}"),
+    }
+}
+
+fn clight_test_immediate_predicate(
+    predicate: TestRegisterPredicate,
+    value: ClightExpr,
+    slice: TestRegisterSlice,
+    immediate: i64,
+) -> ClightExpr {
+    let width = slice.width_bits();
+    let immediate_expr = if width == 64 {
+        ClightExpr::EconstLong(immediate, default_ulong_type())
+    } else {
+        // EconstInt carries an i32 payload; its unsigned type preserves the
+        // intended low-bit pattern for masks such as 0x8000_0000.
+        ClightExpr::EconstInt(immediate as i32, default_uint_type())
+    };
+    clight_test_register_predicate(
+        predicate,
+        value,
+        immediate_expr,
+        slice,
+        low_test_slice(width),
+    )
+}
+
 fn is_int32_type(ty: &ClightType) -> bool {
     matches!(ty, ClightType::Tint(ClightIntSize::I32, _, _))
 }
@@ -3774,6 +3810,19 @@ pub(crate) fn clight_condition_expr_with_types(
                     rhs,
                     *lhs_slice,
                     *rhs_slice,
+                ))
+            } else {
+                Some(ClightExpr::EconstInt(1, default_bool_type()))
+            }
+        }
+        Condition::Ctestimmediate(predicate, slice, immediate) => {
+            if let Some(arg) = args.first() {
+                let value = clight_expr_from_csharp_with_multi_types(arg, var_types);
+                Some(clight_test_immediate_predicate(
+                    *predicate,
+                    value,
+                    *slice,
+                    *immediate,
                 ))
             } else {
                 Some(ClightExpr::EconstInt(1, default_bool_type()))

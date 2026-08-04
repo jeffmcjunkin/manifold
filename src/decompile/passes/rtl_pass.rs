@@ -112,6 +112,7 @@ fn register_test_condition_width(condition: &Condition) -> Option<u8> {
         {
             Some(lhs.width_bits())
         }
+        Condition::Ctestimmediate(_, slice, _) => Some(slice.width_bits()),
         _ => None,
     }
 }

@@ -89,6 +89,11 @@ pub enum Condition {
     // OF tests (JO/JNO) have no faithful CompCert encoding; these opaque variants exist to keep both Jcc edges.
     Coverflow,
     Cnotoverflow,
+    // Register/immediate or loaded-memory/immediate TEST. The sole runtime
+    // operand is projected to the exact architectural width before it is
+    // ANDed with the normalized immediate bit pattern. Keep new variants at
+    // the tail so derived ordering for legacy conditions remains stable.
+    Ctestimmediate(TestRegisterPredicate, TestRegisterSlice, i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -2078,6 +2078,22 @@ ascent_par! {
         if *disp > 0,
         let target = *disp as Address;
 
+    abs_target_addr(addr, target) <--
+        ptest(addr, mem, _),
+        op_indirect(mem, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
+    abs_target_addr(addr, target) <--
+        ptest(addr, _, mem),
+        op_indirect(mem, _, base_str, idx_str, _, disp, _),
+        if *base_str == "NONE" || base_str.is_empty(),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *disp > 0,
+        let target = *disp as Address;
+
     // Absolute addressing for padd/psub (arith_store patterns)
     abs_target_addr(addr, target) <--
         padd(addr, dst, _),
@@ -3431,12 +3447,134 @@ ascent_par! {
         pjcc(addr1, test_cond, lbl),
         testcond_to_cond(*test_cond, condition);
 
+    #[local] relation test_memory_operand(Address, Symbol, TestRegisterSlice, MemoryChunk);
+    test_memory_operand(addr, *memory, slice, chunk) <--
+        ptest(addr, memory, _),
+        test_jcc_link(addr, _),
+        op_indirect(memory, segment, _, _, _, _, size),
+        if !is_unmodeled_segment(segment),
+        if test_memory_shape(*size).is_some(),
+        let (slice, chunk) = test_memory_shape(*size).expect("checked TEST memory width");
+    test_memory_operand(addr, *memory, slice, chunk) <--
+        ptest(addr, _, memory),
+        test_jcc_link(addr, _),
+        op_indirect(memory, segment, _, _, _, _, size),
+        if !is_unmodeled_segment(segment),
+        if test_memory_shape(*size).is_some(),
+        let (slice, chunk) = test_memory_shape(*size).expect("checked TEST memory width");
+
+    // Keep unsupported segment/frame forms distinct from true register-only
+    // TESTs. They must not take the operand-free constant shortcut because
+    // doing so would silently discard the architectural memory read.
+    #[local] relation test_has_raw_memory_operand(Address);
+    test_has_raw_memory_operand(addr) <--
+        ptest(addr, memory, _),
+        op_indirect(memory, _, _, _, _, _, _);
+    test_has_raw_memory_operand(addr) <--
+        ptest(addr, _, memory),
+        op_indirect(memory, _, _, _, _, _, _);
+
+    // A memory TEST must preserve its read (and possible fault) even when the
+    // consuming Jcc is a TEST constant. Materialize the value into the one
+    // reserved unknown-register scratch at the TEST node, then place the
+    // condition at the Jcc node so the two operations never compete for one
+    // Mach address. The synthetic def/use gives RTL a fresh SSA value.
+    #[local] relation test_memory_loaded_at(Address, TestRegisterSlice);
+    reg_def(addr, Mreg::Unknown) <-- test_memory_loaded_at(addr, _);
+
+    // Ordinary base/index addressing, including base-less scaled indexes.
+    mach_inst(addr, MachInst::Mload(*chunk, addressing, Arc::new(args), Mreg::Unknown)),
+    test_memory_loaded_at(*addr, *slice) <--
+        test_memory_operand(addr, memory, slice, chunk),
+        op_indirect(memory, _, base_str, idx_str, scale, disp, _),
+        !reg_ip(base_str),
+        if *base_str != "RBP" && *base_str != "RSP",
+        let has_base = !is_no_address_register(base_str),
+        let has_index = !is_no_address_register(idx_str),
+        if has_base || has_index,
+        let addrmode = Addrmode {
+            base: if has_base { Some(Ireg::from(base_str)) } else { None },
+            index: if has_index { Some((Ireg::from(idx_str), *scale)) } else { None },
+            disp: Displacement::from(*disp),
+        },
+        effective_address_size(addr, address_size),
+        if let Ok((addressing, args)) = transl_addressing_rev_sized(addrmode, None, *address_size);
+
+    // RIP-relative and absolute scalar memory operands require symbol-backed
+    // addressing; the generic catch-all target relations synthesize a stable
+    // symbol when the object has no named data symbol.
+    mach_inst(addr, MachInst::Mload(*chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::Unknown)),
+    test_memory_loaded_at(*addr, *slice) <--
+        test_memory_operand(addr, memory, slice, chunk),
+        op_indirect(memory, _, base_str, idx_str, _, _, _),
+        reg_ip(*base_str),
+        if is_no_address_register(idx_str),
+        rip_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset);
+
+    mach_inst(addr, MachInst::Mload(*chunk, Addressing::Aglobal(*ident, *offset), Arc::new(vec![]), Mreg::Unknown)),
+    test_memory_loaded_at(*addr, *slice) <--
+        test_memory_operand(addr, memory, slice, chunk),
+        op_indirect(memory, _, base_str, idx_str, _, _, _),
+        if is_no_address_register(base_str),
+        if is_no_address_register(idx_str),
+        abs_target_addr(addr, target_addr),
+        resolved_addr_to_symbol(target_addr, ident, offset);
+
+    // A proved frame-relative scalar access is a real stack cell. Narrow
+    // byte/word loads deliberately stay Mload(Ainstack) because Typ has no
+    // corresponding width; RTL later canonicalizes the slot without widening.
+    mach_inst(addr, MachInst::Mload(*chunk, Addressing::Ainstack(*disp), Arc::new(vec![]), Mreg::Unknown)),
+    test_memory_loaded_at(*addr, *slice) <--
+        test_memory_operand(addr, memory, slice, chunk),
+        op_indirect(memory, _, "RBP", idx_str, _, disp, _),
+        if is_no_address_register(idx_str),
+        bp_frame_at(addr, _);
+
+    mach_inst(addr, MachInst::Mload(*chunk, Addressing::Ainstack(*disp), Arc::new(vec![]), Mreg::Unknown)),
+    test_memory_loaded_at(*addr, *slice) <--
+        test_memory_operand(addr, memory, slice, chunk),
+        op_indirect(memory, _, "RSP", idx_str, _, disp, _),
+        if is_no_address_register(idx_str),
+        rsp_frame_at(addr, _);
+
+    // An unproved RBP remains an ordinary pointer, and an indexed proved RBP
+    // remains base+index. The shared helper rejects invalid RSP-derived BP.
+    mach_inst(addr, MachInst::Mload(*chunk, addressing.clone(), args.clone(), Mreg::Unknown)),
+    test_memory_loaded_at(*addr, *slice) <--
+        test_memory_operand(addr, memory, slice, chunk),
+        generic_bp_sp_address(addr, memory, addressing, args);
+
+    // Indexed RSP is representable only while its entry-frame coordinate is
+    // proved; the downstream indexed-stack expansion preserves the base.
+    mach_inst(addr, MachInst::Mload(*chunk, addressing, Arc::new(args), Mreg::Unknown)),
+    test_memory_loaded_at(*addr, *slice) <--
+        test_memory_operand(addr, memory, slice, chunk),
+        op_indirect(memory, _, "RSP", idx_str, scale, disp, _),
+        if !is_no_address_register(idx_str),
+        rsp_frame_at(addr, _),
+        let index = Mreg::x86(*idx_str),
+        let addressing = if *scale > 1 {
+            Addressing::Aindexed2scaled(*scale, *disp)
+        } else {
+            Addressing::Aindexed2(*disp)
+        },
+        let args = vec![Mreg::SP, index];
+
     // CF and OF are clear after every TEST form, independent of its operands.
-    // Preserve those branches explicitly even when a non-register TEST form
-    // has no data-dependent condition lowering.
+    // Non-memory TESTs can keep their branch at the producer. Memory TESTs
+    // place it after the explicit load so the access itself is retained.
     mach_inst(emit_addr, MachInst::Mcond(Condition::Cconst(value), Arc::new(vec![]), lbl)) <--
         ptest(addr0, _, _),
+        !test_has_raw_memory_operand(addr0),
         mcond_emit_addr(addr0, addr1, emit_addr),
+        test_jcc(addr1, test_cond, lbl),
+        if let Some(value) = test_jcc_constant_value(*test_cond);
+
+    mach_inst(addr1, MachInst::Mcond(Condition::Cconst(value), Arc::new(vec![]), lbl)),
+    mcond_at_jcc(*addr1) <--
+        test_memory_loaded_at(addr0, _),
+        test_jcc_link(addr0, addr1),
         test_jcc(addr1, test_cond, lbl),
         if let Some(value) = test_jcc_constant_value(*test_cond);
 
@@ -3462,6 +3600,94 @@ ascent_par! {
         if let Some(condition) = register_test_jcc_condition(*test_cond, slice1, slice2),
         if !matches!(condition, Condition::Cconst(_)),
         let args = vec![*arg1, *arg2];
+
+    // Register-immediate TEST keeps the architectural register slice and the
+    // normalized immediate in the condition. This covers sign, parity and
+    // the signed composites in addition to the traditional zero-mask cases.
+    mach_inst(emit_addr, MachInst::Mcond(condition, Arc::new(vec![*arg]), lbl)) <--
+        ptest(addr0, register, immediate),
+        op_register(register, reg_str),
+        op_immediate(immediate, value, _),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(arg, preg_of_r),
+        if let Some(slice) = test_register_slice(reg_str),
+        mcond_emit_addr(addr0, addr1, emit_addr),
+        test_jcc(addr1, test_cond, lbl),
+        if let Some(condition) = immediate_test_jcc_condition(*test_cond, slice, *value),
+        if !matches!(condition, Condition::Cconst(_));
+
+    mach_inst(emit_addr, MachInst::Mcond(condition, Arc::new(vec![*arg]), lbl)) <--
+        ptest(addr0, immediate, register),
+        op_immediate(immediate, value, _),
+        op_register(register, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(arg, preg_of_r),
+        if let Some(slice) = test_register_slice(reg_str),
+        mcond_emit_addr(addr0, addr1, emit_addr),
+        test_jcc(addr1, test_cond, lbl),
+        if let Some(condition) = immediate_test_jcc_condition(*test_cond, slice, *value),
+        if !matches!(condition, Condition::Cconst(_));
+
+    // Loaded-memory/immediate TEST uses the same exact predicate with the
+    // load's width slice. The runtime operand is the scratch SSA value.
+    mach_inst(addr1, MachInst::Mcond(condition, Arc::new(vec![Mreg::Unknown]), lbl)),
+    mcond_at_jcc(*addr1),
+    reg_use(*addr1, Mreg::Unknown) <--
+        test_memory_loaded_at(addr0, slice),
+        ptest(addr0, memory, immediate),
+        op_indirect(memory, _, _, _, _, _, _),
+        op_immediate(immediate, value, _),
+        test_jcc_link(addr0, addr1),
+        test_jcc(addr1, test_cond, lbl),
+        if let Some(condition) = immediate_test_jcc_condition(*test_cond, *slice, *value),
+        if !matches!(condition, Condition::Cconst(_));
+
+    mach_inst(addr1, MachInst::Mcond(condition, Arc::new(vec![Mreg::Unknown]), lbl)),
+    mcond_at_jcc(*addr1),
+    reg_use(*addr1, Mreg::Unknown) <--
+        test_memory_loaded_at(addr0, slice),
+        ptest(addr0, immediate, memory),
+        op_immediate(immediate, value, _),
+        op_indirect(memory, _, _, _, _, _, _),
+        test_jcc_link(addr0, addr1),
+        test_jcc(addr1, test_cond, lbl),
+        if let Some(condition) = immediate_test_jcc_condition(*test_cond, *slice, *value),
+        if !matches!(condition, Condition::Cconst(_));
+
+    // Register-memory TEST carries both exact-width runtime values. The
+    // memory load is already truncated by its chunk; its low slice records
+    // that width alongside a possible high-8 register slice.
+    mach_inst(addr1, MachInst::Mcond(condition.clone(), Arc::new(vec![*arg, Mreg::Unknown]), lbl)),
+    mcond_at_jcc(*addr1),
+    reg_use(*addr1, *arg),
+    reg_use(*addr1, Mreg::Unknown) <--
+        test_memory_loaded_at(addr0, memory_slice),
+        ptest(addr0, register, memory),
+        op_register(register, reg_str),
+        op_indirect(memory, _, _, _, _, _, _),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(arg, preg_of_r),
+        if let Some(register_slice) = test_register_slice(reg_str),
+        test_jcc_link(addr0, addr1),
+        test_jcc(addr1, test_cond, lbl),
+        if let Some(condition) = register_test_jcc_condition(*test_cond, register_slice, *memory_slice),
+        if !matches!(condition, Condition::Cconst(_));
+
+    mach_inst(addr1, MachInst::Mcond(condition.clone(), Arc::new(vec![Mreg::Unknown, *arg]), lbl)),
+    mcond_at_jcc(*addr1),
+    reg_use(*addr1, Mreg::Unknown),
+    reg_use(*addr1, *arg) <--
+        test_memory_loaded_at(addr0, memory_slice),
+        ptest(addr0, memory, register),
+        op_indirect(memory, _, _, _, _, _, _),
+        op_register(register, reg_str),
+        ireg_of(preg_of_r, Ireg::from(reg_str)),
+        preg_of(arg, preg_of_r),
+        if let Some(register_slice) = test_register_slice(reg_str),
+        test_jcc_link(addr0, addr1),
+        test_jcc(addr1, test_cond, lbl),
+        if let Some(condition) = register_test_jcc_condition(*test_cond, *memory_slice, register_slice),
+        if !matches!(condition, Condition::Cconst(_));
 
 
     // ADD followed by a flags-reading jcc tests the arithmetic RESULT against zero, so emit the Mcond at the jcc's own address; restricted to ZF/signed conditions, since after an ADD carry is not a comparison.
@@ -3878,28 +4104,6 @@ ascent_par! {
         preg_of(src_mreg, preg_of_src),
         reg_is_64(dst_str, dst_is_64),
         let typ = if *dst_is_64 { Typ::Tany64 } else { Typ::Tint };
-
-
-    mach_inst(emit_addr, MachInst::Mcond(Condition::Cmaskzero(adj_mask), Arc::new(vec![*arg1]), lbl)) <--
-        ptest(addr0, r1, r2),
-        op_register(r1, reg_str1),
-        op_immediate(r2, mask_val, _),
-        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
-        preg_of(arg1, preg_of_r1),
-        mcond_emit_addr(addr0, addr1, emit_addr),
-        pjcc(addr1, TestCond::CondE, lbl),
-        let adj_mask = high8_mask_adjust(reg_str1, *mask_val);
-
-    mach_inst(emit_addr, MachInst::Mcond(Condition::Cmasknotzero(adj_mask), Arc::new(vec![*arg1]), lbl)) <--
-        ptest(addr0, r1, r2),
-        op_register(r1, reg_str1),
-        op_immediate(r2, mask_val, _),
-        ireg_of(preg_of_r1, Ireg::from(reg_str1)),
-        preg_of(arg1, preg_of_r1),
-        mcond_emit_addr(addr0, addr1, emit_addr),
-        pjcc(addr1, TestCond::CondNe, lbl),
-        let adj_mask = high8_mask_adjust(reg_str1, *mask_val);
-
 
     #[local] relation sub_jcc_link(Address, Address);
     sub_jcc_link(addr0, addr1) <--
@@ -9868,6 +10072,59 @@ fn test_register_slice(name: &str) -> Option<TestRegisterSlice> {
     }
 }
 
+fn test_memory_shape(size: usize) -> Option<(TestRegisterSlice, MemoryChunk)> {
+    match size {
+        1 => Some((TestRegisterSlice::Low8, MemoryChunk::MInt8Unsigned)),
+        2 => Some((TestRegisterSlice::Low16, MemoryChunk::MInt16Unsigned)),
+        4 => Some((TestRegisterSlice::Low32, MemoryChunk::MInt32)),
+        8 => Some((TestRegisterSlice::Full64, MemoryChunk::MInt64)),
+        _ => None,
+    }
+}
+
+fn test_jcc_predicate(test: TestCond) -> Option<TestRegisterPredicate> {
+    match test {
+        TestCond::CondE | TestCond::CondBe => Some(TestRegisterPredicate::Zero),
+        TestCond::CondNe | TestCond::CondA => Some(TestRegisterPredicate::Nonzero),
+        TestCond::CondL => Some(TestRegisterPredicate::Negative),
+        TestCond::CondGe => Some(TestRegisterPredicate::Nonnegative),
+        TestCond::CondLe => Some(TestRegisterPredicate::Nonpositive),
+        TestCond::CondG => Some(TestRegisterPredicate::Positive),
+        TestCond::CondP => Some(TestRegisterPredicate::EvenParity),
+        TestCond::CondNp => Some(TestRegisterPredicate::OddParity),
+        TestCond::CondB | TestCond::CondAe | TestCond::CondO | TestCond::CondNo => None,
+        TestCond::Unknown => None,
+    }
+}
+
+fn normalize_test_immediate(value: i64, slice: TestRegisterSlice) -> i64 {
+    match slice.width_bits() {
+        8 => (value as u8) as i64,
+        16 => (value as u16) as i64,
+        32 => (value as u32) as i64,
+        // TEST r/m64 has an imm32 encoding whose bit pattern is sign-extended
+        // before the AND. Normalizing explicitly is stable across decoders
+        // which report that operand as either signed or unsigned.
+        64 => (value as u32 as i32) as i64,
+        _ => unreachable!("unsupported TEST width"),
+    }
+}
+
+fn immediate_test_jcc_condition(
+    test: TestCond,
+    slice: TestRegisterSlice,
+    immediate: i64,
+) -> Option<Condition> {
+    if let Some(value) = test_jcc_constant_value(test) {
+        return Some(Condition::Cconst(value));
+    }
+    Some(Condition::Ctestimmediate(
+        test_jcc_predicate(test)?,
+        slice,
+        normalize_test_immediate(immediate, slice),
+    ))
+}
+
 /// Exact condition produced by a Jcc consuming register-register TEST flags.
 /// AF is the only undefined TEST flag and no Jcc reads it. CF and OF are
 /// cleared; every remaining condition is a predicate over the exact-width AND
@@ -9884,20 +10141,7 @@ fn register_test_jcc_condition(
         return Some(Condition::Cconst(value));
     }
 
-    let predicate = match test {
-        TestCond::CondE | TestCond::CondBe => TestRegisterPredicate::Zero,
-        TestCond::CondNe | TestCond::CondA => TestRegisterPredicate::Nonzero,
-        TestCond::CondL => TestRegisterPredicate::Negative,
-        TestCond::CondGe => TestRegisterPredicate::Nonnegative,
-        TestCond::CondLe => TestRegisterPredicate::Nonpositive,
-        TestCond::CondG => TestRegisterPredicate::Positive,
-        TestCond::CondP => TestRegisterPredicate::EvenParity,
-        TestCond::CondNp => TestRegisterPredicate::OddParity,
-        TestCond::CondB | TestCond::CondAe | TestCond::CondO | TestCond::CondNo => {
-            unreachable!("constant TEST condition handled above")
-        }
-        TestCond::Unknown => return None,
-    };
+    let predicate = test_jcc_predicate(test)?;
     Some(Condition::Ctestregister(predicate, lhs, rhs))
 }
 
@@ -10985,6 +11229,277 @@ mod register_mask_test_tests {
                     .all(|(address, _)| *address != NONREGISTER_JNO),
                 "an exact TEST/JNO constant retained a competing opaque JNO candidate",
             );
+        });
+    }
+
+    #[test]
+    fn test_immediate_normalization_respects_every_architectural_slice() {
+        for (slice, decoded, normalized) in [
+            (TestRegisterSlice::Low8, 0x1ff, 0xff),
+            (TestRegisterSlice::High8, -1, 0xff),
+            (TestRegisterSlice::Low16, 0x1_8000, 0x8000),
+            (TestRegisterSlice::Low32, 0x1_8000_0000, 0x8000_0000),
+            (TestRegisterSlice::Full64, 0x8000_0000, -0x8000_0000),
+            (TestRegisterSlice::Full64, 0xffff_ffff, -1),
+        ] {
+            assert_eq!(normalize_test_immediate(decoded, slice), normalized);
+            assert_eq!(
+                immediate_test_jcc_condition(TestCond::CondL, slice, decoded),
+                Some(Condition::Ctestimmediate(
+                    TestRegisterPredicate::Negative,
+                    slice,
+                    normalized,
+                )),
+            );
+        }
+    }
+
+    #[test]
+    fn every_test_jcc_family_lowers_register_immediate_and_memory_forms() {
+        on_pipeline_stack(|| {
+            const MASK: i64 = 0x81;
+            let immediate = |predicate| {
+                Condition::Ctestimmediate(predicate, TestRegisterSlice::Low8, MASK)
+            };
+            let register_memory = |predicate| {
+                Condition::Ctestregister(
+                    predicate,
+                    TestRegisterSlice::Low8,
+                    TestRegisterSlice::Low8,
+                )
+            };
+            let cases = [
+                (
+                    TestCond::CondE,
+                    immediate(TestRegisterPredicate::Zero),
+                    register_memory(TestRegisterPredicate::Zero),
+                ),
+                (
+                    TestCond::CondNe,
+                    immediate(TestRegisterPredicate::Nonzero),
+                    register_memory(TestRegisterPredicate::Nonzero),
+                ),
+                (
+                    TestCond::CondB,
+                    Condition::Cconst(false),
+                    Condition::Cconst(false),
+                ),
+                (
+                    TestCond::CondBe,
+                    immediate(TestRegisterPredicate::Zero),
+                    register_memory(TestRegisterPredicate::Zero),
+                ),
+                (
+                    TestCond::CondAe,
+                    Condition::Cconst(true),
+                    Condition::Cconst(true),
+                ),
+                (
+                    TestCond::CondA,
+                    immediate(TestRegisterPredicate::Nonzero),
+                    register_memory(TestRegisterPredicate::Nonzero),
+                ),
+                (
+                    TestCond::CondL,
+                    immediate(TestRegisterPredicate::Negative),
+                    register_memory(TestRegisterPredicate::Negative),
+                ),
+                (
+                    TestCond::CondLe,
+                    immediate(TestRegisterPredicate::Nonpositive),
+                    register_memory(TestRegisterPredicate::Nonpositive),
+                ),
+                (
+                    TestCond::CondGe,
+                    immediate(TestRegisterPredicate::Nonnegative),
+                    register_memory(TestRegisterPredicate::Nonnegative),
+                ),
+                (
+                    TestCond::CondG,
+                    immediate(TestRegisterPredicate::Positive),
+                    register_memory(TestRegisterPredicate::Positive),
+                ),
+                (
+                    TestCond::CondP,
+                    immediate(TestRegisterPredicate::EvenParity),
+                    register_memory(TestRegisterPredicate::EvenParity),
+                ),
+                (
+                    TestCond::CondNp,
+                    immediate(TestRegisterPredicate::OddParity),
+                    register_memory(TestRegisterPredicate::OddParity),
+                ),
+                (
+                    TestCond::CondO,
+                    Condition::Cconst(false),
+                    Condition::Cconst(false),
+                ),
+                (
+                    TestCond::CondNo,
+                    Condition::Cconst(true),
+                    Condition::Cconst(true),
+                ),
+            ];
+
+            const REGISTER_IMMEDIATE_BASE: Address = 0x1800;
+            const MEMORY_IMMEDIATE_BASE: Address = 0x1a00;
+            const MEMORY_REGISTER_BASE: Address = 0x1c00;
+            const NONE: Symbol = "nonregister_none";
+            const REGISTER: Symbol = "nonregister_al";
+            const BASE: Symbol = "nonregister_rcx";
+            const IMMEDIATE: Symbol = "nonregister_mask";
+            const MEMORY: Symbol = "nonregister_memory";
+
+            let mut prog = AsmPassProgram::default();
+            prog.op_register.push((REGISTER, "AL"));
+            prog.op_register.push((BASE, "RCX"));
+            prog.op_immediate.push((IMMEDIATE, MASK, 1));
+            prog.op_indirect
+                .push((MEMORY, "NONE", "RCX", "NONE", 1, 0, 1));
+
+            for (index, (test_cond, _, _)) in cases.iter().enumerate() {
+                let offset = (index as Address) * 0x10;
+                let register_test = REGISTER_IMMEDIATE_BASE + offset;
+                let memory_immediate_test = MEMORY_IMMEDIATE_BASE + offset;
+                let memory_register_test = MEMORY_REGISTER_BASE + offset;
+
+                prog.ptest.push((register_test, REGISTER, IMMEDIATE));
+                prog.ptest
+                    .push((memory_immediate_test, MEMORY, IMMEDIATE));
+                prog.ptest
+                    .push((memory_register_test, REGISTER, MEMORY));
+                for (test, target) in [
+                    (register_test, "register_immediate_target"),
+                    (memory_immediate_test, "memory_immediate_target"),
+                    (memory_register_test, "memory_register_target"),
+                ] {
+                    prog.pjcc.push((test + 2, *test_cond, target));
+                    prog.next.push((test, test + 2));
+                }
+
+                // The instruction row supplies the default 64-bit address
+                // size and raw operand ownership used by memory translation.
+                prog.instruction.push((
+                    memory_immediate_test,
+                    2,
+                    "",
+                    "TEST",
+                    IMMEDIATE,
+                    MEMORY,
+                    NONE,
+                    NONE,
+                    0,
+                    0,
+                ));
+                prog.instruction.push((
+                    memory_register_test,
+                    2,
+                    "",
+                    "TEST",
+                    MEMORY,
+                    REGISTER,
+                    NONE,
+                    NONE,
+                    0,
+                    0,
+                ));
+            }
+
+            prog.run();
+
+            for (index, (_, expected_immediate, expected_register_memory)) in
+                cases.iter().enumerate()
+            {
+                let offset = (index as Address) * 0x10;
+                let register_test = REGISTER_IMMEDIATE_BASE + offset;
+                let memory_immediate_test = MEMORY_IMMEDIATE_BASE + offset;
+                let memory_register_test = MEMORY_REGISTER_BASE + offset;
+
+                let expected_register_args =
+                    if matches!(expected_immediate, Condition::Cconst(_)) {
+                        vec![]
+                    } else {
+                        vec![Mreg::AX]
+                    };
+                let register_candidates: Vec<_> = prog
+                    .mach_inst
+                    .iter()
+                    .filter_map(|(address, inst)| (*address == register_test).then_some(inst))
+                    .collect();
+                assert_eq!(
+                    register_candidates,
+                    vec![&MachInst::Mcond(
+                        *expected_immediate,
+                        Arc::new(expected_register_args),
+                        "register_immediate_target",
+                    )],
+                    "register-immediate TEST family at {register_test:#x} was not exact",
+                );
+
+                for memory_test in [memory_immediate_test, memory_register_test] {
+                    let load_candidates: Vec<_> = prog
+                        .mach_inst
+                        .iter()
+                        .filter_map(|(address, inst)| (*address == memory_test).then_some(inst))
+                        .collect();
+                    assert!(!load_candidates.is_empty());
+                    assert!(load_candidates.iter().all(|inst| matches!(
+                        inst,
+                        MachInst::Mload(
+                            MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned,
+                            Addressing::Aindexed(0),
+                            args,
+                            Mreg::Unknown,
+                        ) if args.as_ref() == &[Mreg::CX]
+                    )));
+                }
+
+                let expected_memory_immediate_args =
+                    if matches!(expected_immediate, Condition::Cconst(_)) {
+                        vec![]
+                    } else {
+                        vec![Mreg::Unknown]
+                    };
+                let memory_immediate_candidates: Vec<_> = prog
+                    .mach_inst
+                    .iter()
+                    .filter_map(|(address, inst)| {
+                        (*address == memory_immediate_test + 2).then_some(inst)
+                    })
+                    .collect();
+                assert_eq!(
+                    memory_immediate_candidates,
+                    vec![&MachInst::Mcond(
+                        *expected_immediate,
+                        Arc::new(expected_memory_immediate_args),
+                        "memory_immediate_target",
+                    )],
+                    "memory-immediate TEST family at {memory_immediate_test:#x} was not exact",
+                );
+
+                let expected_memory_register_args =
+                    if matches!(expected_register_memory, Condition::Cconst(_)) {
+                        vec![]
+                    } else {
+                        vec![Mreg::AX, Mreg::Unknown]
+                    };
+                let memory_register_candidates: Vec<_> = prog
+                    .mach_inst
+                    .iter()
+                    .filter_map(|(address, inst)| {
+                        (*address == memory_register_test + 2).then_some(inst)
+                    })
+                    .collect();
+                assert_eq!(
+                    memory_register_candidates,
+                    vec![&MachInst::Mcond(
+                        *expected_register_memory,
+                        Arc::new(expected_memory_register_args),
+                        "memory_register_target",
+                    )],
+                    "memory-register TEST family at {memory_register_test:#x} was not exact",
+                );
+            }
         });
     }
 }

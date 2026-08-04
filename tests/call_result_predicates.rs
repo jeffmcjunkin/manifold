@@ -357,6 +357,161 @@ testb_distinct_all_jcc_families:
 .Ldistinct_family_fail:
         xorl %eax, %eax
         retq
+
+        .globl testb_immediate_all_jcc_families
+        .def testb_immediate_all_jcc_families; .scl 2; .type 32; .endef
+testb_immediate_all_jcc_families:
+        movl $0, %eax
+        testb $1, %al
+        je .Limmediate_after_je
+        jmp .Limmediate_family_fail
+.Limmediate_after_je:
+        movl $1, %eax
+        testb $1, %al
+        jne .Limmediate_after_jne
+        jmp .Limmediate_family_fail
+.Limmediate_after_jne:
+        testb $1, %al
+        jb .Limmediate_family_fail
+        testb $1, %al
+        jae .Limmediate_after_jae
+        jmp .Limmediate_family_fail
+.Limmediate_after_jae:
+        movl $0, %eax
+        testb $1, %al
+        jbe .Limmediate_after_jbe
+        jmp .Limmediate_family_fail
+.Limmediate_after_jbe:
+        movl $1, %eax
+        testb $1, %al
+        ja .Limmediate_after_ja
+        jmp .Limmediate_family_fail
+.Limmediate_after_ja:
+        movl $0x8000, %eax
+        testb $0x80, %ah
+        jl .Limmediate_after_jl
+        jmp .Limmediate_family_fail
+.Limmediate_after_jl:
+        movl $0, %eax
+        testb $1, %al
+        jle .Limmediate_after_jle
+        jmp .Limmediate_family_fail
+.Limmediate_after_jle:
+        movl $0x7f, %eax
+        testb $0x7f, %al
+        jge .Limmediate_after_jge
+        jmp .Limmediate_family_fail
+.Limmediate_after_jge:
+        movl $1, %eax
+        testb $1, %al
+        jg .Limmediate_after_jg
+        jmp .Limmediate_family_fail
+.Limmediate_after_jg:
+        movl $3, %eax
+        testb $3, %al
+        jp .Limmediate_after_jp
+        jmp .Limmediate_family_fail
+.Limmediate_after_jp:
+        movl $1, %eax
+        testb $1, %al
+        jnp .Limmediate_after_jnp
+        jmp .Limmediate_family_fail
+.Limmediate_after_jnp:
+        testb $1, %al
+        jo .Limmediate_family_fail
+        testb $1, %al
+        jno .Limmediate_family_pass
+        jmp .Limmediate_family_fail
+.Limmediate_family_pass:
+        movl $1, %eax
+        retq
+.Limmediate_family_fail:
+        xorl %eax, %eax
+        retq
+
+        .globl testb_memory_immediate_all_jcc_families
+        .def testb_memory_immediate_all_jcc_families; .scl 2; .type 32; .endef
+testb_memory_immediate_all_jcc_families:
+        movb $0, (%rcx)
+        testb $1, (%rcx)
+        je .Lmemory_immediate_after_je
+        jmp .Lmemory_immediate_family_fail
+.Lmemory_immediate_after_je:
+        movb $1, (%rcx)
+        testb $1, (%rcx)
+        jne .Lmemory_immediate_after_jne
+        jmp .Lmemory_immediate_family_fail
+.Lmemory_immediate_after_jne:
+        testb $1, (%rcx)
+        jb .Lmemory_immediate_family_fail
+        testb $1, (%rcx)
+        jae .Lmemory_immediate_after_jae
+        jmp .Lmemory_immediate_family_fail
+.Lmemory_immediate_after_jae:
+        movb $0, (%rcx)
+        testb $1, (%rcx)
+        jbe .Lmemory_immediate_after_jbe
+        jmp .Lmemory_immediate_family_fail
+.Lmemory_immediate_after_jbe:
+        movb $1, (%rcx)
+        testb $1, (%rcx)
+        ja .Lmemory_immediate_after_ja
+        jmp .Lmemory_immediate_family_fail
+.Lmemory_immediate_after_ja:
+        movb $0x80, (%rcx)
+        testb $0x80, (%rcx)
+        jl .Lmemory_immediate_after_jl
+        jmp .Lmemory_immediate_family_fail
+.Lmemory_immediate_after_jl:
+        movb $0, (%rcx)
+        testb $1, (%rcx)
+        jle .Lmemory_immediate_after_jle
+        jmp .Lmemory_immediate_family_fail
+.Lmemory_immediate_after_jle:
+        movb $0x7f, (%rcx)
+        testb $0x7f, (%rcx)
+        jge .Lmemory_immediate_after_jge
+        jmp .Lmemory_immediate_family_fail
+.Lmemory_immediate_after_jge:
+        movb $1, (%rcx)
+        testb $1, (%rcx)
+        jg .Lmemory_immediate_after_jg
+        jmp .Lmemory_immediate_family_fail
+.Lmemory_immediate_after_jg:
+        movb $3, (%rcx)
+        testb $3, (%rcx)
+        jp .Lmemory_immediate_after_jp
+        jmp .Lmemory_immediate_family_fail
+.Lmemory_immediate_after_jp:
+        movb $1, (%rcx)
+        testb $1, (%rcx)
+        jnp .Lmemory_immediate_after_jnp
+        jmp .Lmemory_immediate_family_fail
+.Lmemory_immediate_after_jnp:
+        testb $1, (%rcx)
+        jo .Lmemory_immediate_family_fail
+        testb $1, (%rcx)
+        jno .Lmemory_immediate_family_pass
+        jmp .Lmemory_immediate_family_fail
+.Lmemory_immediate_family_pass:
+        movl $1, %eax
+        retq
+.Lmemory_immediate_family_fail:
+        xorl %eax, %eax
+        retq
+
+        .globl testb_memory_register_dynamic
+        .def testb_memory_register_dynamic; .scl 2; .type 32; .endef
+testb_memory_register_dynamic:
+        movb $3, (%rcx)
+        movl $3, %eax
+        testb %al, (%rcx)
+        jp .Lmemory_register_pass
+        xorl %eax, %eax
+        retq
+.Lmemory_register_pass:
+        movl $1, %eax
+        retq
 "#,
     )
     .expect("write call-result fixture assembly");
@@ -408,6 +563,9 @@ int coff_fn_testq_self_jl_uses_qword_sign(void);
 int coff_fn_testw_self_jp_uses_low_byte(void);
 int coff_fn_testb_self_all_jcc_families(void);
 int coff_fn_testb_distinct_all_jcc_families(void);
+int coff_fn_testb_immediate_all_jcc_families(void);
+int coff_fn_testb_memory_immediate_all_jcc_families(unsigned char *value);
+int coff_fn_testb_memory_register_dynamic(unsigned char *value);
 
 int coff_ext_masked_value(void) { return 0x8000; }
 
@@ -428,6 +586,10 @@ int main(void) {
     if (coff_fn_testl_distinct_jns_ignores_qword_sign() != 1) return 23;
     if (coff_fn_testq_self_jl_uses_qword_sign() != 1) return 24;
     if (coff_fn_testw_self_jp_uses_low_byte() != 1) return 25;
+    if (coff_fn_testb_immediate_all_jcc_families() != 1) return 26;
+    unsigned char value = 0;
+    if (coff_fn_testb_memory_immediate_all_jcc_families(&value) != 1) return 27;
+    if (coff_fn_testb_memory_register_dynamic(&value) != 1) return 28;
     return 0;
 }
 "#,
@@ -435,7 +597,7 @@ int main(void) {
     .expect("write TEST-width C harness");
 
     let compile_output = Command::new("clang")
-        .args(["-std=c11", "-O0"])
+        .args(["-std=c11", "-O0", "-fms-extensions"])
         .arg(&emitted)
         .arg(&harness)
         .arg("-o")
@@ -656,6 +818,171 @@ fn register_mask_test_keeps_call_result_live_and_preserves_emitted_behavior() {
                 }
             }
         }
+
+        let find_span = |function_name: &str| {
+            db.rel_iter::<(Symbol, Address, Address)>("func_span")
+                .find_map(|(name, start, end)| {
+                    (*name == function_name || *name == format!("coff_fn_{function_name}"))
+                        .then_some((*start, *end))
+                })
+                .unwrap_or_else(|| panic!("missing TEST/Jcc function {function_name}"))
+        };
+        let tests_in_span = |span: (Address, Address)| -> HashSet<Address> {
+            db.rel_iter::<(Address, Symbol, Symbol)>("ptest")
+                .filter_map(|(address, _, _)| {
+                    (span.0 <= *address && *address < span.1).then_some(*address)
+                })
+                .collect()
+        };
+
+        let immediate_span = find_span("testb_immediate_all_jcc_families");
+        let immediate_tests = tests_in_span(immediate_span);
+        assert_eq!(immediate_tests.len(), 14);
+        let mut immediate_lowerings = HashMap::new();
+        let mut immediate_dynamic = 0;
+        let mut immediate_constants = 0;
+        let mut immediate_slices = HashSet::new();
+        for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate") {
+            if !(immediate_span.0 <= *node && *node < immediate_span.1) {
+                continue;
+            }
+            let RTLInst::Icond(condition, args, _, _) = inst else {
+                continue;
+            };
+            assert!(
+                immediate_tests.contains(node),
+                "register-immediate TEST retained a branch at Jcc {node:#x}: {condition:?}",
+            );
+            match condition {
+                Condition::Ctestimmediate(_, slice, mask) => {
+                    immediate_slices.insert(*slice);
+                    assert_eq!(args.len(), 1);
+                    assert!(matches!(*mask, 1 | 3 | 0x7f | 0x80));
+                }
+                Condition::Cconst(_) => {
+                    assert!(args.is_empty());
+                }
+                other => panic!(
+                    "register-immediate TEST used a non-exact condition at {node:#x}: {other:?}"
+                ),
+            }
+            let lowering = (*condition, args.clone());
+            if let Some(previous) = immediate_lowerings.insert(*node, lowering.clone()) {
+                assert_eq!(previous, lowering);
+            } else if matches!(condition, Condition::Cconst(_)) {
+                immediate_constants += 1;
+            } else {
+                immediate_dynamic += 1;
+            }
+        }
+        assert_eq!(
+            immediate_lowerings.keys().copied().collect::<HashSet<_>>(),
+            immediate_tests,
+        );
+        assert_eq!(immediate_dynamic, 10);
+        assert_eq!(immediate_constants, 4);
+        assert!(immediate_slices.contains(&TestRegisterSlice::Low8));
+        assert!(immediate_slices.contains(&TestRegisterSlice::High8));
+
+        let memory_immediate_span = find_span("testb_memory_immediate_all_jcc_families");
+        let memory_immediate_tests = tests_in_span(memory_immediate_span);
+        assert_eq!(memory_immediate_tests.len(), 14);
+        let memory_immediate_jccs: HashMap<_, _> = db
+            .rel_iter::<(Address, Address)>("next")
+            .filter_map(|(test, jcc)| {
+                memory_immediate_tests
+                    .contains(test)
+                    .then_some((*test, *jcc))
+            })
+            .collect();
+        assert_eq!(memory_immediate_jccs.len(), memory_immediate_tests.len());
+        for test_node in &memory_immediate_tests {
+            assert!(
+                db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+                    .any(|(node, inst)| *node == *test_node && matches!(inst, RTLInst::Iload(..))),
+                "memory-immediate TEST at {test_node:#x} lost its memory read",
+            );
+        }
+        let memory_immediate_jcc_nodes: HashSet<_> =
+            memory_immediate_jccs.values().copied().collect();
+        let mut memory_immediate_lowerings = HashMap::new();
+        let mut memory_immediate_dynamic = 0;
+        let mut memory_immediate_constants = 0;
+        for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate") {
+            if !(memory_immediate_span.0 <= *node && *node < memory_immediate_span.1) {
+                continue;
+            }
+            let RTLInst::Icond(condition, args, _, _) = inst else {
+                continue;
+            };
+            assert!(
+                memory_immediate_jcc_nodes.contains(node),
+                "memory-immediate TEST branch was not sequenced after its load at {node:#x}",
+            );
+            match condition {
+                Condition::Ctestimmediate(_, TestRegisterSlice::Low8, mask) => {
+                    assert_eq!(args.len(), 1);
+                    assert!(matches!(*mask, 1 | 3 | 0x7f | 0x80));
+                }
+                Condition::Cconst(_) => {
+                    assert!(args.is_empty());
+                }
+                other => panic!(
+                    "memory-immediate TEST used a non-exact condition at {node:#x}: {other:?}"
+                ),
+            }
+            let lowering = (*condition, args.clone());
+            if let Some(previous) = memory_immediate_lowerings.insert(*node, lowering.clone()) {
+                assert_eq!(previous, lowering);
+            } else if matches!(condition, Condition::Cconst(_)) {
+                memory_immediate_constants += 1;
+            } else {
+                memory_immediate_dynamic += 1;
+            }
+        }
+        assert_eq!(
+            memory_immediate_lowerings
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>(),
+            memory_immediate_jcc_nodes,
+        );
+        assert_eq!(memory_immediate_dynamic, 10);
+        assert_eq!(memory_immediate_constants, 4);
+
+        let memory_register_span = find_span("testb_memory_register_dynamic");
+        let memory_register_tests = tests_in_span(memory_register_span);
+        assert_eq!(memory_register_tests.len(), 1);
+        let memory_register_test = *memory_register_tests.iter().next().unwrap();
+        let memory_register_jcc = db
+            .rel_iter::<(Address, Address)>("next")
+            .find_map(|(test, jcc)| (*test == memory_register_test).then_some(*jcc))
+            .expect("memory-register TEST was not followed by a Jcc");
+        assert!(
+            db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+                .any(|(node, inst)| *node == memory_register_test
+                    && matches!(inst, RTLInst::Iload(..))),
+        );
+        assert!(
+            db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+                .any(|(node, inst)| {
+                    *node == memory_register_jcc
+                        && matches!(
+                            inst,
+                            RTLInst::Icond(
+                                Condition::Ctestregister(
+                                    TestRegisterPredicate::EvenParity,
+                                    TestRegisterSlice::Low8,
+                                    TestRegisterSlice::Low8,
+                                ),
+                                args,
+                                _,
+                                _,
+                            ) if args.len() == 2
+                        )
+                }),
+            "dynamic memory-register TEST did not lower at its Jcc",
+        );
 
         drop(db);
         assert_emitted_c_preserves_test_widths(&object);
