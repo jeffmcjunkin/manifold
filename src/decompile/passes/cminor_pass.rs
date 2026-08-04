@@ -682,7 +682,10 @@ pub(crate) fn cast_call_args_to_signature_with_node(
         .map(crate::x86::types::clight_type_from_xtype)
         .collect();
 
-    let mut result = Vec::with_capacity(args.len().max(expected_types.len()));
+    // This pass may cast recovered operands, but it must never manufacture or
+    // delete them to satisfy a prototype. Arity disagreement is represented
+    // on the callee's call-site signature instead.
+    let mut result = Vec::with_capacity(args.len());
     for (i, arg) in args.into_iter().enumerate() {
         if i < expected_types.len() {
             let expected = expected_types[i].clone();
@@ -695,14 +698,45 @@ pub(crate) fn cast_call_args_to_signature_with_node(
                 result.push(crate::x86::types::cast_expr_to_type(arg, expected));
             }
         } else {
-            // Preserve extra args for varargs; narrowed at C AST emission
+            // Preserve every extra recovered operand. Variadic and mismatched
+            // fixed calls both carry their arity on the callee type.
             result.push(arg);
         }
     }
-    for i in result.len()..expected_types.len() {
-        result.push(crate::x86::types::default_expr_for_type(&expected_types[i]));
-    }
     result
+}
+
+#[cfg(test)]
+mod call_arg_vector_tests {
+    use super::*;
+
+    #[test]
+    fn argument_casting_preserves_short_exact_and_surplus_vectors() {
+        let long_type = crate::x86::types::clight_type_from_xtype(&XType::Xlong);
+        let make_args = |count: usize| {
+            (0..count)
+                .map(|value| ClightExpr::EconstLong(value as i64, long_type.clone()))
+                .collect::<Vec<_>>()
+        };
+        let signature = |count: usize| {
+            Some(Signature {
+                sig_args: Arc::new(vec![XType::Xlong; count]),
+                sig_res: XType::Xvoid,
+                sig_cc: CallConv::default(),
+            })
+        };
+
+        for (actual_count, signature_count) in [(1, 3), (2, 2), (4, 2)] {
+            let actual = make_args(actual_count);
+            assert_eq!(
+                cast_call_args_to_signature_with_node(
+                    actual.clone(),
+                    &signature(signature_count),
+                ),
+                actual
+            );
+        }
+    }
 }
 
 pub(crate) fn csharp_expr_from_cminor(expr: &CminorExpr) -> Option<CsharpminorExpr> {

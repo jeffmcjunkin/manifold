@@ -790,417 +790,195 @@ pub(crate) fn coherent_call_vector(
     Some(Arc::new(by_position.into_values().collect()))
 }
 
-pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
-    let mut signature_facts: BTreeMap<Address, BTreeSet<Signature>> = BTreeMap::new();
-    for (addr, sig) in
-        db.rel_iter::<(Address, Signature)>("emit_function_signature_candidate")
-    {
-        signature_facts
-            .entry(*addr)
-            .or_default()
-            .insert(sig.clone());
-    }
-
-    // RTL's first signature candidate holds register params only; include the
-    // upstream stack-param count as an upper filter bound.  This does not
-    // materialize missing prefix slots: the coherent-vector check below still
-    // requires every semantic position independently.
-    let shared_arg_slots = db.abi().uses_shared_arg_slots();
-    let first_stack_arg_position = db.abi().first_stack_arg_position();
-    let mut stack_counts: BTreeMap<Address, BTreeSet<usize>> = BTreeMap::new();
-    for &(addr, stack_count) in
-        db.rel_iter::<(Address, usize)>("emit_function_stack_param_count")
-    {
-        stack_counts.entry(addr).or_default().insert(stack_count);
-    }
-    let mut callee_arity = HashMap::new();
-    for (&addr, signatures) in &signature_facts {
-        if signatures.len() != 1 {
-            continue;
-        }
-        let stack_count = match stack_counts.get(&addr) {
-            Some(counts) if counts.len() == 1 => *counts.iter().next().unwrap(),
-            Some(_) => continue,
-            None => 0,
+fn sysv_actual_site_signature(
+    prior: &Signature,
+    integer_args: &[RTLReg],
+    float_args: &[RTLReg],
+    observed_types: &HashMap<RTLReg, BTreeSet<XType>>,
+) -> Signature {
+    let choose_type = |position: usize, reg: RTLReg, float_class: bool| {
+        let compatible = |xtype: XType| {
+            xtype != XType::Xvoid && matches!(xtype, XType::Xfloat | XType::Xsingle) == float_class
         };
-        let mut arity = signatures.iter().next().unwrap().sig_args.len();
-        if shared_arg_slots && stack_count > 0 {
-            arity = arity.max(first_stack_arg_position + stack_count);
-        } else {
-            arity += stack_count;
-        }
-        callee_arity.insert(addr, arity);
-    }
-
-    let mut target_candidates: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
-    for &(call_node, target) in db.rel_iter::<(Node, Address)>("call_target_func") {
-        target_candidates
-            .entry(call_node)
-            .or_default()
-            .insert(target);
-    }
-    let call_targets: HashMap<Node, Address> = target_candidates
-        .iter()
-        .filter_map(|(&node, targets)| {
-            (targets.len() == 1).then(|| (node, *targets.iter().next().unwrap()))
-        })
-        .collect();
-
-    // Variadic callees receive more args than their fixed signature, so detect them structurally via the SysV variadic XMM register-save-area prologue rather than trimming their tail args.
-    let mut varargs_callees: HashSet<Address> = db
-        .rel_iter::<(Address,)>("func_has_variadic_xmm_prologue")
-        .map(|&(addr,)| addr)
-        .collect();
-    let known_varargs_names: HashSet<Symbol> = db
-        .rel_iter::<(Symbol, usize)>("known_varargs_function")
-        .map(|&(name, _)| name)
-        .collect();
-    let loader_function_addresses: HashSet<Address> = db
-        .rel_iter::<(Address, LoaderSymbolKind, Symbol, Symbol)>(
-            "loader_symbol_identity",
-        )
-        .filter_map(|&(address, kind, _, _)| {
-            (kind == LoaderSymbolKind::Function).then_some(address)
-        })
-        .collect();
-    for &(addr, name, _) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
-        if !loader_function_addresses.contains(&addr) && known_varargs_names.contains(&name) {
-            varargs_callees.insert(addr);
-        }
-    }
-    for &(addr, name) in db.rel_iter::<(Address, Symbol)>("plt_block") {
-        if !loader_function_addresses.contains(&addr) && known_varargs_names.contains(&name) {
-            varargs_callees.insert(addr);
-        }
-    }
-
-    type ExactLoaderIdentity = (Address, LoaderSymbolKind);
-    let mut loader_signature_facts: BTreeMap<
-        ExactLoaderIdentity,
-        BTreeSet<(usize, XType, Arc<Vec<XType>>, bool)>,
-    > = BTreeMap::new();
-    let mut loader_fixed_vetoes = HashSet::new();
-    for (address, kind, _provider, _original, arity, ret, params, variadic) in db.rel_iter::<(
-        Address,
-        LoaderSymbolKind,
-        Symbol,
-        Symbol,
-        usize,
-        XType,
-        Arc<Vec<XType>>,
-        bool,
-    )>("known_loader_signature") {
-        let identity = (*address, *kind);
-        if *arity != params.len() {
-            loader_fixed_vetoes.insert(identity);
-            continue;
-        }
-        loader_signature_facts
-            .entry(identity)
-            .or_default()
-            .insert((*arity, *ret, params.clone(), *variadic));
-    }
-    for &(address, kind, _, _) in db.rel_iter::<(
-        Address,
-        LoaderSymbolKind,
-        Symbol,
-        Symbol,
-    )>("known_loader_variadic") {
-        loader_fixed_vetoes.insert((address, kind));
-    }
-    for &(address, kind, _, _) in db.rel_iter::<(
-        Address,
-        LoaderSymbolKind,
-        Symbol,
-        Symbol,
-    )>("loader_signature_conflict") {
-        loader_fixed_vetoes.insert((address, kind));
-    }
-    let fixed_loader_arities: BTreeMap<ExactLoaderIdentity, usize> =
-        loader_signature_facts
-            .iter()
-            .filter_map(|(identity, facts)| {
-                if facts.len() != 1 || loader_fixed_vetoes.contains(identity) {
-                    return None;
-                }
-                let (arity, _, _, variadic) = facts.iter().next().unwrap();
-                (!*variadic).then_some((*identity, *arity))
-            })
-            .collect();
-    let variadic_loader_identities: HashSet<ExactLoaderIdentity> = loader_signature_facts
-        .iter()
-        .filter_map(|(identity, facts)| {
-            facts
-                .iter()
-                .any(|(_, _, _, variadic)| *variadic)
-                .then_some(*identity)
-        })
-        .chain(loader_fixed_vetoes.iter().copied())
-        .collect();
-    let mut call_loader_identities: BTreeMap<Node, BTreeSet<ExactLoaderIdentity>> =
-        BTreeMap::new();
-    for &(node, address, kind, _provider, _original) in db.rel_iter::<(
-        Node,
-        Address,
-        LoaderSymbolKind,
-        Symbol,
-        Symbol,
-    )>("call_loader_identity") {
-        call_loader_identities
-            .entry(node)
-            .or_default()
-            .insert((address, kind));
-    }
-    let loader_candidate_calls: HashSet<Node> = db
-        .rel_iter::<(Node, Address, LoaderSymbolKind, Symbol, Symbol)>(
-            "call_loader_identity_candidate",
-        )
-        .map(|&(node, _, _, _, _)| node)
-        .collect();
-    let ambiguous_loader_calls: HashSet<Node> = db
-        .rel_iter::<(Node,)>("call_loader_identity_ambiguous")
-        .map(|&(node,)| node)
-        .collect();
-
-    let fixed_arity_for_call = |node: Node| -> Option<usize> {
-        if ambiguous_loader_calls.contains(&node) {
-            return None;
-        }
-        if let Some(identities) = call_loader_identities.get(&node) {
-            if identities.len() != 1 {
-                return None;
-            }
-            return fixed_loader_arities
-                .get(identities.iter().next().unwrap())
-                .copied();
-        }
-        if loader_candidate_calls.contains(&node) {
-            return None;
-        }
-        call_targets
-            .get(&node)
-            .and_then(|target| callee_arity.get(target))
-            .copied()
-    };
-    let call_is_variadic = |node: Node| -> bool {
-        if ambiguous_loader_calls.contains(&node) {
-            return true;
-        }
-        if let Some(identities) = call_loader_identities.get(&node) {
-            return identities.len() != 1
-                || variadic_loader_identities.contains(identities.iter().next().unwrap());
-        }
-        if loader_candidate_calls.contains(&node) {
-            return true;
-        }
-        call_targets
-            .get(&node)
-            .map_or(false, |target| varargs_callees.contains(target))
-    };
-
-    let original_provenance: Vec<(Node, usize, RTLReg, CallArgProvenance)> = db
-        .rel_iter::<(Node, usize, RTLReg, CallArgProvenance)>("call_arg_provenance")
-        .copied()
-        .collect();
-    let calls_with_original_provenance: HashSet<Node> = original_provenance
-        .iter()
-        .map(|(node, _, _, _)| *node)
-        .collect();
-    let filtered_provenance: Vec<(Node, usize, RTLReg, CallArgProvenance)> = original_provenance
-        .into_iter()
-        .filter_map(|(node, pos, reg, provenance)| {
-            // Root E: variadic or conflicting identities keep their complete
-            // tail.  A fixed trim occurs only for one conflict-free arity.
-            if !call_is_variadic(node) {
-                if let Some(arity) = fixed_arity_for_call(node) {
-                    if pos >= arity {
-                        return None;
-                    }
-                }
-            }
-            Some((node, pos, reg, provenance))
-        })
-        .collect();
-
-    db.rel_set(
-        "call_arg_provenance",
-        filtered_provenance
-            .iter()
-            .copied()
-            .collect::<ascent::boxcar::Vec<_>>(),
-    );
-
-    let filtered_mapping: BTreeSet<(Node, usize, RTLReg)> = filtered_provenance
-        .iter()
-        .map(|&(node, pos, reg, _)| (node, pos, reg))
-        .collect();
-
-    db.rel_set(
-        "call_arg_mapping",
-        filtered_mapping
-            .iter()
-            .copied()
-            .collect::<ascent::boxcar::Vec<_>>(),
-    );
-
-    let mut provenance_by_call: HashMap<
-        Node,
-        Vec<(usize, RTLReg, CallArgProvenance)>,
-    > = HashMap::new();
-    for &(node, pos, reg, provenance) in &filtered_provenance {
-        provenance_by_call
-            .entry(node)
-            .or_default()
-            .push((pos, reg, provenance));
-    }
-    let coherent_args: HashMap<Node, Arc<Vec<RTLReg>>> = provenance_by_call
-        .iter()
-        .filter_map(|(&node, rows)| {
-            coherent_call_vector(rows.iter().copied()).map(|args| (node, args))
-        })
-        .collect();
-
-    // Downstream arity reconciliation sees only positions belonging to a
-    // coherent vector.  Raw sparse/conflicting rows remain in the mapping and
-    // provenance relations for diagnostics but cannot imply prefix slots.
-    let coherent_call_arg: ascent::boxcar::Vec<(Node, usize, RTLReg)> = filtered_mapping
-        .iter()
-        .filter(|(node, pos, reg)| {
-            coherent_args
-                .get(node)
-                .and_then(|args| args.get(*pos))
-                == Some(reg)
-        })
-        .copied()
-        .collect();
-    db.rel_set("call_arg", coherent_call_arg);
-
-    let mut call_nodes: HashSet<Node> = db
-        .rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
-        .map(|(node, _)| *node)
-        .collect();
-    call_nodes.extend(provenance_by_call.keys().copied());
-    call_nodes.extend(calls_with_original_provenance.iter().copied());
-
-    let mut existing_call_arg_sets: BTreeMap<Node, BTreeSet<Arc<Vec<RTLReg>>>> =
-        BTreeMap::new();
-    for (node, args) in
-        db.rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
-    {
-        existing_call_arg_sets
-            .entry(*node)
-            .or_default()
-            .insert(args.clone());
-    }
-    let existing_call_args: HashMap<Node, Arc<Vec<RTLReg>>> = existing_call_arg_sets
-        .iter()
-        .filter_map(|(&node, args)| {
-            (args.len() == 1).then(|| (node, args.iter().next().unwrap().clone()))
-        })
-        .collect();
-    let ambiguous_existing_calls: HashSet<Node> = existing_call_arg_sets
-        .iter()
-        .filter_map(|(&node, args)| (args.len() > 1).then_some(node))
-        .collect();
-
-    let new_call_args: ascent::boxcar::Vec<(Node, Arc<Vec<RTLReg>>)> = call_nodes
-        .into_iter()
-        .flat_map(|node| {
-            if !calls_with_original_provenance.contains(&node) {
-                if let Some(args) = existing_call_arg_sets.get(&node) {
-                    return args
-                        .iter()
-                        .cloned()
-                        .map(|args| (node, args))
-                        .collect::<Vec<_>>();
-                }
-            }
-            let args = coherent_args.get(&node).cloned().unwrap_or_else(|| {
-                // A site whose positional rows were filtered to zero, or whose
-                // surviving rows are sparse/ambiguous, is represented as
-                // empty rather than falling back to its stale pre-filter
-                // vector or acquiring invented prefix values.
-                if calls_with_original_provenance.contains(&node) {
-                    Arc::new(vec![])
-                } else {
-                    existing_call_args
-                        .get(&node)
-                        .cloned()
-                        .unwrap_or_else(|| Arc::new(vec![]))
-                }
-            });
-            vec![(node, args)]
-        })
-        .collect();
-    db.rel_set("call_args_collected_candidate", new_call_args);
-
-    let mut rebuilt_args: HashMap<Node, Arc<Vec<RTLReg>>> = {
-        let mut groups: BTreeMap<Node, BTreeSet<Arc<Vec<RTLReg>>>> = BTreeMap::new();
-        for (node, args) in
-            db.rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
-        {
-            groups.entry(*node).or_default().insert(args.clone());
-        }
-        groups
+        observed_types
+            .get(&reg)
             .into_iter()
-            .filter_map(|(node, args)| {
-                (args.len() == 1).then(|| (node, args.into_iter().next().unwrap()))
+            .flat_map(|types| types.iter().copied())
+            .chain(prior.sig_args.get(position).copied())
+            .filter(|xtype| compatible(*xtype))
+            .max_by_key(|xtype| {
+                (
+                    crate::decompile::passes::clight_pass::xtype_refine_priority(xtype),
+                    *xtype,
+                )
             })
-            .collect()
+            .unwrap_or(if float_class {
+                XType::Xfloat
+            } else {
+                XType::Xany64
+            })
     };
 
-    // Merge float args after integer args only when the float vector is
-    // itself unique.  Conflicting vectors leave the original RTL call intact.
-    let mut float_arg_sets: BTreeMap<Node, BTreeSet<Arc<Vec<RTLReg>>>> = BTreeMap::new();
-    for (call_node, float_args) in
-        db.rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_float_args_collected")
-    {
-        float_arg_sets
-            .entry(*call_node)
-            .or_default()
-            .insert(float_args.clone());
+    let mut params = Vec::with_capacity(integer_args.len() + float_args.len());
+    params.extend(
+        integer_args
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(position, reg)| choose_type(position, reg, false)),
+    );
+    params.extend(
+        float_args
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(float_position, reg)| {
+                choose_type(integer_args.len() + float_position, reg, true)
+            }),
+    );
+    Signature {
+        sig_args: Arc::new(params),
+        sig_res: prior.sig_res,
+        sig_cc: prior.sig_cc,
     }
-    for (&call_node, float_args) in &float_arg_sets {
-        if float_args.len() != 1 {
-            rebuilt_args.remove(&call_node);
-            continue;
-        }
-        let float_args = float_args.iter().next().unwrap();
-        if !float_args.is_empty() && !ambiguous_existing_calls.contains(&call_node) {
-            let int_args = rebuilt_args
-                .entry(call_node)
-                .or_insert_with(|| Arc::new(vec![]));
-            let mut combined = (**int_args).clone();
-            combined.extend_from_slice(float_args);
-            *int_args = Arc::new(combined);
-        }
-    }
-
-    let new_rtl_inst: ascent::boxcar::Vec<(Node, RTLInst)> = db
-        .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
-        .map(|(node, inst)| {
-            let replacement_args = rebuilt_args.get(node);
-            let patched = match inst {
-                RTLInst::Icall(sig, callee, args, dst, next) => RTLInst::Icall(
-                    sig.clone(),
-                    callee.clone(),
-                    replacement_args.cloned().unwrap_or_else(|| args.clone()),
-                    *dst,
-                    *next,
-                ),
-                RTLInst::Itailcall(sig, callee, args) => RTLInst::Itailcall(
-                    sig.clone(),
-                    callee.clone(),
-                    replacement_args.cloned().unwrap_or_else(|| args.clone()),
-                ),
-                _ => inst.clone(),
-            };
-            (*node, patched)
-        })
-        .collect();
-    db.rel_set("rtl_inst_candidate", new_rtl_inst);
 }
 
+/// SysV recovers GP and XMM call operands as two independent dense vectors.
+/// Materialize their established GP-then-XMM RTL order only when both source
+/// vectors and the candidate instruction are unique.  This is deliberately
+/// independent of every callee signature: it concatenates complete evidence
+/// and never filters, pads, deduplicates, or otherwise repairs arity.  The GP
+/// and XMM evidence relations remain byte-for-byte unchanged because signature
+/// analysis counts those two SysV classes independently.  The call signature
+/// is reshaped to the exact combined cardinality from per-register type facts;
+/// its return type and calling-convention flags are copied unchanged.
+pub(crate) fn merge_unique_sysv_float_call_args(db: &mut DecompileDB) {
+    if db.abi().uses_shared_arg_slots() {
+        return;
+    }
+
+    let collect_unique_vectors = |relation: &'static str| {
+        let mut grouped: BTreeMap<Node, BTreeSet<Arc<Vec<RTLReg>>>> = BTreeMap::new();
+        for (node, args) in db.rel_iter::<(Node, Arc<Vec<RTLReg>>)>(relation) {
+            grouped.entry(*node).or_default().insert(args.clone());
+        }
+        grouped
+    };
+    let integer_vectors = collect_unique_vectors("call_args_collected_candidate");
+    let float_vectors = collect_unique_vectors("call_float_args_collected");
+    let mut observed_types: HashMap<RTLReg, BTreeSet<XType>> = HashMap::new();
+    for (reg, xtype) in db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate") {
+        observed_types.entry(*reg).or_default().insert(*xtype);
+    }
+
+    // Candidate rows are node-global.  A second distinct instruction at the
+    // same node vetoes the merge even when its operand vector happens to
+    // match, so we never resolve an instruction ambiguity by rewriting it.
+    let mut candidate_rows: BTreeMap<Node, Vec<RTLInst>> = BTreeMap::new();
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate") {
+        let rows = candidate_rows.entry(*node).or_default();
+        if !rows.contains(inst) {
+            rows.push(inst.clone());
+        }
+    }
+
+    let mut merges: BTreeMap<Node, (Arc<Vec<RTLReg>>, Arc<Vec<RTLReg>>, Signature)> =
+        BTreeMap::new();
+    for (&node, integer_set) in &integer_vectors {
+        let Some(float_set) = float_vectors.get(&node) else {
+            continue;
+        };
+        if integer_set.len() != 1 || float_set.len() != 1 {
+            continue;
+        }
+        let integer_args = integer_set.iter().next().unwrap();
+        let float_args = float_set.iter().next().unwrap();
+        if float_args.is_empty()
+            || integer_args
+                .iter()
+                .chain(float_args.iter())
+                .any(|reg| *reg == crate::util::DEFAULT_VAR as RTLReg)
+        {
+            continue;
+        }
+
+        let Some(rows) = candidate_rows.get(&node) else {
+            continue;
+        };
+        if rows.len() != 1 {
+            continue;
+        }
+        // rtl_pass emits typed call candidates.  A malformed signatureless
+        // row fails closed because synthesizing return/CC semantics here would
+        // be less safe than declining to merge it.
+        let (prior_signature, candidate_args) = match &rows[0] {
+            RTLInst::Icall(Some(signature), _, args, _, _)
+            | RTLInst::Itailcall(Some(signature), _, args) => (signature, args),
+            _ => continue,
+        };
+
+        let mut combined = Vec::with_capacity(integer_args.len() + float_args.len());
+        combined.extend_from_slice(integer_args);
+        combined.extend_from_slice(float_args);
+        let combined = Arc::new(combined);
+        // Accept the unmaterialized source or the exact merged result so the
+        // pass is idempotent.  Any other candidate vector is an ambiguity,
+        // not permission to append another suffix.
+        if candidate_args != integer_args && candidate_args != &combined {
+            continue;
+        }
+        let actual_signature =
+            sysv_actual_site_signature(prior_signature, integer_args, float_args, &observed_types);
+        merges.insert(node, (integer_args.clone(), combined, actual_signature));
+    }
+
+    if merges.is_empty() {
+        return;
+    }
+    let mut changed = false;
+    let new_candidates: ascent::boxcar::Vec<(Node, RTLInst)> = db
+        .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+        .map(|(node, inst)| {
+            let Some((integer_args, combined_args, actual_signature)) = merges.get(node) else {
+                return (*node, inst.clone());
+            };
+            let rewritten = match inst {
+                RTLInst::Icall(Some(sig), callee, args, dst, next)
+                    if args == integer_args || args == combined_args =>
+                {
+                    changed |= args != combined_args || sig != actual_signature;
+                    RTLInst::Icall(
+                        Some(actual_signature.clone()),
+                        callee.clone(),
+                        combined_args.clone(),
+                        *dst,
+                        *next,
+                    )
+                }
+                RTLInst::Itailcall(Some(sig), callee, args)
+                    if args == integer_args || args == combined_args =>
+                {
+                    changed |= args != combined_args || sig != actual_signature;
+                    RTLInst::Itailcall(
+                        Some(actual_signature.clone()),
+                        callee.clone(),
+                        combined_args.clone(),
+                    )
+                }
+                _ => inst.clone(),
+            };
+            (*node, rewritten)
+        })
+        .collect();
+    if changed {
+        db.rel_set("rtl_inst_candidate", new_candidates);
+    }
+}
+
+// Call arguments are immutable call-site evidence.  In particular, an
+// inferred or header-backed callee signature is not authority to filter the
+// positional relations, rebuild a shorter vector, or replace operands.  The
+// SysV merge above only concatenates its two independently recovered classes.
 pub struct RTLOptimizePass;
 
 impl IRPass for RTLOptimizePass {
@@ -1209,7 +987,7 @@ impl IRPass for RTLOptimizePass {
     }
 
     fn run(&self, db: &mut DecompileDB) {
-        trim_direct_call_args_to_callee_arity(db);
+        merge_unique_sysv_float_call_args(db);
         if let Some(stats) = optimize_rtl_candidates(db) {
             if stats.has_changes() {
                 info!(
@@ -1232,24 +1010,9 @@ impl IRPass for RTLOptimizePass {
             "emit_function",
             "emit_function_param_candidate",
             "emit_var_type_candidate",
-            "emit_function_signature_candidate",
-            "emit_function_stack_param_count",
             "emit_function_return",
-            "call_target_func",
-            "call_arg_mapping",
-            "call_arg_provenance",
             "call_args_collected_candidate",
             "call_float_args_collected",
-            "func_has_variadic_xmm_prologue",
-            "known_varargs_function",
-            "known_loader_signature",
-            "known_loader_variadic",
-            "loader_signature_conflict",
-            "loader_symbol_identity",
-            "call_loader_identity_candidate",
-            "call_loader_identity",
-            "call_loader_identity_ambiguous",
-            "plt_block",
         ]
     }
 
@@ -1260,10 +1023,6 @@ impl IRPass for RTLOptimizePass {
             "rtl_next",
             "single_def_const",
             "emit_inline_temp",
-            "call_arg_mapping",
-            "call_arg_provenance",
-            "call_arg",
-            "call_args_collected_candidate",
             // Static-eq branch folding can retype a function void; these signal that to the signature reconciliation pass.
             "emit_function_void_candidate",
             "emit_function_has_return_candidate",
@@ -2698,12 +2457,113 @@ mod call_vector_tests {
         assert_eq!(coherent_call_vector(rows).unwrap().as_slice(), &[7]);
     }
 
+    fn seed_single_call_optimizer(
+        db: &mut DecompileDB,
+        caller: Address,
+        call: Node,
+        inst: RTLInst,
+    ) {
+        db.rel_push("emit_function", (caller, "caller" as Symbol, call));
+        db.rel_push("instr_in_function", (call, caller));
+        db.rel_push("rtl_inst_candidate", (call, inst));
+    }
+
+    fn run_single_call_optimizer(db: &mut DecompileDB, caller: Address, call: Node, inst: RTLInst) {
+        seed_single_call_optimizer(db, caller, call, inst);
+        RTLOptimizePass.run(db);
+    }
+
+    fn seed_split_call_args(
+        db: &mut DecompileDB,
+        call: Node,
+        integer_args: Arc<Vec<RTLReg>>,
+        float_args: Arc<Vec<RTLReg>>,
+    ) {
+        for (position, value) in integer_args.iter().copied().enumerate() {
+            db.rel_push(
+                "call_arg_provenance",
+                (call, position, value, CallArgProvenance::ExplicitRegister),
+            );
+            db.rel_push("call_arg_mapping", (call, position, value));
+            db.rel_push("call_arg", (call, position, value));
+        }
+        db.rel_push("call_args_collected_candidate", (call, integer_args));
+        db.rel_push("call_float_args_collected", (call, float_args));
+    }
+
+    fn assert_rtl_call_args(
+        db: &DecompileDB,
+        relation: &'static str,
+        call: Node,
+        expected: &[RTLReg],
+    ) {
+        let actual: Vec<&[RTLReg]> = db
+            .rel_iter::<(Node, RTLInst)>(relation)
+            .filter_map(|(node, inst)| {
+                if *node != call {
+                    return None;
+                }
+                match inst {
+                    RTLInst::Icall(_, _, args, _, _) | RTLInst::Itailcall(_, _, args) => {
+                        Some(args.as_slice())
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0], expected);
+    }
+
+    fn unique_rtl_call_signature(
+        db: &DecompileDB,
+        relation: &'static str,
+        call: Node,
+    ) -> Option<Signature> {
+        let signatures: Vec<Option<Signature>> =
+            db.rel_iter::<(Node, RTLInst)>(relation)
+                .filter_map(|(node, inst)| {
+                    if *node != call {
+                        return None;
+                    }
+                    match inst {
+                        RTLInst::Icall(signature, _, _, _, _)
+                        | RTLInst::Itailcall(signature, _, _) => Some(signature.clone()),
+                        _ => None,
+                    }
+                })
+                .collect();
+        assert_eq!(signatures.len(), 1);
+        signatures.into_iter().next().unwrap()
+    }
+
+    fn test_site_signature(count: usize) -> Signature {
+        Signature {
+            sig_args: Arc::new(vec![XType::Xany64; count]),
+            sig_res: XType::Xint,
+            sig_cc: CallConv::default(),
+        }
+    }
+
+    fn assert_cxx_call_site_cardinality(signature: &Signature, actual_count: usize) {
+        assert_eq!(signature.sig_args.len(), actual_count);
+        let pointer_type =
+            crate::decompile::passes::csh_pass::clight_function_pointer_type(signature);
+        assert!(matches!(
+            pointer_type,
+            ClightType::Tpointer(inner, _)
+                if matches!(inner.as_ref(), ClightType::Tfunction(params, _, _)
+                    if params.len() == actual_count && !params.is_empty())
+        ));
+    }
+
     #[test]
-    fn zero_arity_filter_does_not_restore_the_pre_filter_vector() {
+    fn zero_arity_signature_does_not_filter_icall_vector() {
         let mut db = DecompileDB::default();
         db.target_abi = Some(crate::abi::AbiConfig::win64());
         let call = 0x10u64;
         let callee = 0x20u64;
+        let args = Arc::new(vec![0xc0u64]);
         db.rel_push(
             "emit_function_signature_candidate",
             (
@@ -2722,239 +2582,394 @@ mod call_vector_tests {
         );
         db.rel_push("call_arg_mapping", (call, 0usize, 0xc0u64));
         db.rel_push("call_arg", (call, 0usize, 0xc0u64));
-        db.rel_push(
-            "call_args_collected_candidate",
-            (call, Arc::new(vec![0xc0u64])),
+        db.rel_push("call_args_collected_candidate", (call, args.clone()));
+        run_single_call_optimizer(
+            &mut db,
+            0x100,
+            call,
+            RTLInst::Icall(
+                None,
+                Either::Right(Either::Left(callee)),
+                args,
+                None,
+                call + 1,
+            ),
         );
-
-        trim_direct_call_args_to_callee_arity(&mut db);
 
         assert!(db
             .rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
-            .any(|(node, args)| *node == call && args.is_empty()));
-        assert!(!db
+            .any(|(node, args)| *node == call && args.as_slice() == &[0xc0]));
+        assert!(db
             .rel_iter::<(Node, usize, RTLReg)>("call_arg")
-            .any(|(node, _, _)| *node == call));
-    }
-
-    #[test]
-    fn conflicting_callee_arities_and_targets_do_not_trim() {
-        let mut db = DecompileDB::default();
-        db.target_abi = Some(crate::abi::AbiConfig::win64());
-        let call = 0x30u64;
-        let callee = 0x40u64;
-        for count in [1usize, 2] {
-            db.rel_push(
-                "emit_function_signature_candidate",
-                (
-                    callee,
-                    Signature {
-                        sig_args: Arc::new(vec![XType::Xany64; count]),
-                        sig_res: XType::Xvoid,
-                        sig_cc: CallConv::default(),
-                    },
-                ),
-            );
-        }
-        db.rel_push("call_target_func", (call, callee));
-        db.rel_push("call_target_func", (call, callee + 0x10));
-        seed_call_args(&mut db, call, 3);
-
-        trim_direct_call_args_to_callee_arity(&mut db);
-
+            .any(|row| *row == (call, 0usize, 0xc0u64)));
         assert!(db
-            .rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
-            .any(|(node, args)| *node == call && args.len() == 3));
+            .rel_iter::<(Node, RTLInst)>("rtl_inst")
+            .any(|(node, inst)| {
+                *node == call
+                    && matches!(inst, RTLInst::Icall(_, _, args, _, _) if args.as_slice() == &[0xc0])
+            }));
     }
 
     #[test]
-    fn conflicting_preexisting_vectors_do_not_select_or_rewrite_one() {
+    fn fixed_arity_signature_does_not_filter_itailcall_surplus() {
         let mut db = DecompileDB::default();
         db.target_abi = Some(crate::abi::AbiConfig::win64());
-        let call = 0x45u64;
-        for args in [vec![1u64], vec![2u64]] {
-            db.rel_push(
-                "call_args_collected_candidate",
-                (call, Arc::new(args)),
-            );
-        }
-        let original = RTLInst::Icall(
-            None,
-            Either::Right(Either::Right("ambiguous" as Symbol)),
-            Arc::new(vec![9u64]),
-            None,
-            0x46u64,
-        );
-        db.rel_push("rtl_inst_candidate", (call, original.clone()));
-
-        trim_direct_call_args_to_callee_arity(&mut db);
-
-        assert_eq!(
-            db.rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
-                .filter(|(node, _)| *node == call)
-                .count(),
-            2
-        );
-        assert!(db
-            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
-            .any(|(node, inst)| *node == call && inst == &original));
-    }
-
-    #[test]
-    fn known_varargs_and_exact_loader_varargs_protect_win64_tails() {
-        let mut db = DecompileDB::default();
-        db.target_abi = Some(crate::abi::AbiConfig::win64());
-        let internal_call = 0x50u64;
-        let internal_callee = 0x60u64;
-        db.rel_push(
-            "emit_function",
-            (internal_callee, "variadic_body" as Symbol, internal_callee),
-        );
-        db.rel_push(
-            "known_varargs_function",
-            ("variadic_body" as Symbol, 1usize),
-        );
+        let call = 0x90u64;
+        let callee = 0xa0u64;
+        let args = Arc::new(vec![0xc000, 0xc001, 0xc002, 0xc003]);
         db.rel_push(
             "emit_function_signature_candidate",
             (
-                internal_callee,
+                callee,
                 Signature {
-                    sig_args: Arc::new(vec![XType::Xany64]),
+                    sig_args: Arc::new(vec![XType::Xany64, XType::Xany64]),
                     sig_res: XType::Xvoid,
                     sig_cc: CallConv::default(),
                 },
             ),
         );
-        db.rel_push("call_target_func", (internal_call, internal_callee));
-        seed_call_args(&mut db, internal_call, 3);
-
-        let loader_call = 0x70u64;
-        let loader_address = 0x80u64;
-        db.rel_push(
-            "known_loader_signature",
-            (
-                loader_address,
-                LoaderSymbolKind::Function,
-                "provider" as Symbol,
-                "printf" as Symbol,
-                1usize,
-                XType::Xint,
-                Arc::new(vec![XType::Xcharptr]),
-                true,
-            ),
-        );
-        db.rel_push(
-            "call_loader_identity",
-            (
-                loader_call,
-                loader_address,
-                LoaderSymbolKind::Function,
-                "provider" as Symbol,
-                "printf" as Symbol,
-            ),
-        );
-        db.rel_push("call_target_func", (loader_call, loader_address));
-        seed_call_args(&mut db, loader_call, 4);
-
-        trim_direct_call_args_to_callee_arity(&mut db);
-
-        let lengths: HashMap<Node, usize> = db
-            .rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
-            .map(|(node, args)| (*node, args.len()))
-            .collect();
-        assert_eq!(lengths.get(&internal_call), Some(&3));
-        assert_eq!(lengths.get(&loader_call), Some(&4));
-    }
-
-    #[test]
-    fn dedicated_exact_variadic_and_conflict_veto_stale_fixed_rows() {
-        let mut db = DecompileDB::default();
-        db.target_abi = Some(crate::abi::AbiConfig::win64());
-        for (call, address, relation) in [
-            (0x71u64, 0x81u64, "known_loader_variadic"),
-            (0x72u64, 0x82u64, "loader_signature_conflict"),
-        ] {
-            db.rel_push(
-                "known_loader_signature",
-                (
-                    address,
-                    LoaderSymbolKind::Function,
-                    "stale_provider" as Symbol,
-                    "stale_raw" as Symbol,
-                    1usize,
-                    XType::Xint,
-                    Arc::new(vec![XType::Xany64]),
-                    false,
-                ),
-            );
-            db.rel_push(
-                relation,
-                (
-                    address,
-                    LoaderSymbolKind::Function,
-                    "stale_provider" as Symbol,
-                    "stale_raw" as Symbol,
-                ),
-            );
-            db.rel_push(
-                "call_loader_identity",
-                (
-                    call,
-                    address,
-                    LoaderSymbolKind::Function,
-                    "stale_provider" as Symbol,
-                    "stale_raw" as Symbol,
-                ),
-            );
-            seed_call_args(&mut db, call, 3);
-        }
-
-        trim_direct_call_args_to_callee_arity(&mut db);
-
-        for call in [0x71u64, 0x72u64] {
-            assert!(db
-                .rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
-                .any(|(node, args)| *node == call && args.len() == 3));
-        }
-    }
-
-    #[test]
-    fn exact_fixed_win64_signature_trims_without_padding() {
-        let mut db = DecompileDB::default();
-        db.target_abi = Some(crate::abi::AbiConfig::win64());
-        let call = 0x90u64;
-        let address = 0xa0u64;
-        db.rel_push(
-            "known_loader_signature",
-            (
-                address,
-                LoaderSymbolKind::Function,
-                "fixed_provider" as Symbol,
-                "fixed_raw" as Symbol,
-                2usize,
-                XType::Xvoid,
-                Arc::new(vec![XType::Xany64, XType::Xany64]),
-                false,
-            ),
-        );
-        db.rel_push(
-            "call_loader_identity",
-            (
-                call,
-                address,
-                LoaderSymbolKind::Function,
-                "fixed_provider" as Symbol,
-                "fixed_raw" as Symbol,
-            ),
-        );
-        db.rel_push("call_target_func", (call, address));
+        db.rel_push("call_target_func", (call, callee));
         seed_call_args(&mut db, call, 4);
-
-        trim_direct_call_args_to_callee_arity(&mut db);
+        run_single_call_optimizer(
+            &mut db,
+            0x200,
+            call,
+            RTLInst::Itailcall(None, Either::Right(Either::Left(callee)), args),
+        );
 
         assert!(db
             .rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
-            .any(|(node, args)| *node == call && args.as_slice() == &[0xc000, 0xc001]));
+            .any(|(node, args)| {
+                *node == call && args.as_slice() == &[0xc000, 0xc001, 0xc002, 0xc003]
+            }));
+        assert_eq!(
+            db.rel_iter::<(Node, usize, RTLReg)>("call_arg")
+                .filter(|(node, _, _)| *node == call)
+                .count(),
+            4
+        );
+        assert!(db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst")
+            .any(|(node, inst)| {
+                *node == call
+                    && matches!(inst, RTLInst::Itailcall(_, _, args) if args.as_slice() == &[0xc000, 0xc001, 0xc002, 0xc003])
+            }));
+    }
+
+    #[test]
+    fn sysv_known_direct_icall_materializes_typed_gp_then_xmm_vector() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
+        let call = 0x310u64;
+        let callee = 0x320u64;
+        let integer_args = Arc::new(vec![0x11, 0x22]);
+        // Repeating 0x11 proves concatenation preserves duplicate operand
+        // values as well as the GP-then-XMM order.
+        let float_args = Arc::new(vec![0x11, 0xf1]);
+        let expected = [0x11, 0x22, 0x11, 0xf1];
+        let prior_signature = Signature {
+            sig_args: Arc::new(vec![XType::Xlong, XType::Xlong]),
+            sig_res: XType::Xintunsigned,
+            sig_cc: CallConv {
+                varargs: Some(1),
+                unproto: false,
+                structured_ret: false,
+            },
+        };
+        for (reg, xtype) in [
+            (0x11u64, XType::Xcharptr),
+            (0x11u64, XType::Xsingle),
+            (0x22u64, XType::Xintptr),
+            (0xf1u64, XType::Xfloat),
+        ] {
+            db.rel_push("emit_var_type_candidate", (reg, xtype));
+        }
+        seed_split_call_args(&mut db, call, integer_args.clone(), float_args.clone());
+        seed_single_call_optimizer(
+            &mut db,
+            0x300,
+            call,
+            RTLInst::Icall(
+                Some(prior_signature.clone()),
+                Either::Right(Either::Left(callee)),
+                integer_args.clone(),
+                None,
+                call + 1,
+            ),
+        );
+
+        merge_unique_sysv_float_call_args(&mut db);
+        assert_rtl_call_args(&db, "rtl_inst_candidate", call, &expected);
+        let expected_signature = Signature {
+            sig_args: Arc::new(vec![
+                XType::Xcharptr,
+                XType::Xintptr,
+                XType::Xsingle,
+                XType::Xfloat,
+            ]),
+            sig_res: prior_signature.sig_res,
+            sig_cc: prior_signature.sig_cc,
+        };
+        assert_eq!(
+            unique_rtl_call_signature(&db, "rtl_inst_candidate", call),
+            Some(expected_signature.clone())
+        );
+        assert_cxx_call_site_cardinality(&expected_signature, expected.len());
+        assert!(db
+            .rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
+            .any(|(node, args)| *node == call && args == &integer_args));
+        let positional: BTreeMap<usize, RTLReg> = db
+            .rel_iter::<(Node, usize, RTLReg)>("call_arg")
+            .filter_map(|(node, position, value)| (*node == call).then_some((*position, *value)))
+            .collect();
+        assert_eq!(
+            positional.into_values().collect::<Vec<_>>(),
+            integer_args.as_ref().clone()
+        );
+        assert!(db
+            .rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_float_args_collected")
+            .any(|(node, args)| *node == call && args == &float_args));
+
+        // Running the complete pass invokes the merge a second time.  The
+        // exact already-merged vector is accepted without appending twice.
+        RTLOptimizePass.run(&mut db);
+        assert_rtl_call_args(&db, "rtl_inst", call, &expected);
+        assert_eq!(
+            unique_rtl_call_signature(&db, "rtl_inst", call),
+            Some(expected_signature)
+        );
+    }
+
+    #[test]
+    fn sysv_unknown_indirect_itailcall_materializes_typed_gp_then_xmm_vector() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
+        let call = 0x410u64;
+        let callee = 0x420u64;
+        let integer_args = Arc::new(vec![0x31]);
+        let float_args = Arc::new(vec![0xf2, 0xf3]);
+        let expected = [0x31, 0xf2, 0xf3];
+        let prior_signature = Signature {
+            sig_args: Arc::new(vec![XType::Xlong]),
+            sig_res: XType::Xlongunsigned,
+            sig_cc: CallConv {
+                varargs: None,
+                unproto: true,
+                structured_ret: false,
+            },
+        };
+        for (reg, xtype) in [
+            (0x31u64, XType::Xcharptr),
+            (0xf2u64, XType::Xsingle),
+            (0xf3u64, XType::Xfloat),
+        ] {
+            db.rel_push("emit_var_type_candidate", (reg, xtype));
+        }
+        seed_split_call_args(&mut db, call, integer_args.clone(), float_args.clone());
+        seed_single_call_optimizer(
+            &mut db,
+            0x400,
+            call,
+            RTLInst::Itailcall(
+                Some(prior_signature.clone()),
+                Either::Left(callee),
+                integer_args.clone(),
+            ),
+        );
+
+        merge_unique_sysv_float_call_args(&mut db);
+        assert_rtl_call_args(&db, "rtl_inst_candidate", call, &expected);
+        let expected_signature = Signature {
+            sig_args: Arc::new(vec![XType::Xcharptr, XType::Xsingle, XType::Xfloat]),
+            sig_res: prior_signature.sig_res,
+            sig_cc: prior_signature.sig_cc,
+        };
+        assert_eq!(
+            unique_rtl_call_signature(&db, "rtl_inst_candidate", call),
+            Some(expected_signature.clone())
+        );
+        assert_cxx_call_site_cardinality(&expected_signature, expected.len());
+        assert!(db
+            .rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
+            .any(|(node, args)| *node == call && args == &integer_args));
+        let positional: BTreeMap<usize, RTLReg> = db
+            .rel_iter::<(Node, usize, RTLReg)>("call_arg")
+            .filter_map(|(node, position, value)| (*node == call).then_some((*position, *value)))
+            .collect();
+        assert_eq!(
+            positional.into_values().collect::<Vec<_>>(),
+            integer_args.as_ref().clone()
+        );
+        assert!(db
+            .rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_float_args_collected")
+            .any(|(node, args)| *node == call && args == &float_args));
+
+        RTLOptimizePass.run(&mut db);
+        assert_rtl_call_args(&db, "rtl_inst", call, &expected);
+        assert_eq!(
+            unique_rtl_call_signature(&db, "rtl_inst", call),
+            Some(expected_signature)
+        );
+    }
+
+    #[test]
+    fn sysv_float_merge_fails_closed_on_vector_or_instruction_ambiguity() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
+
+        let ambiguous_integer = 0x510u64;
+        for args in [vec![0x51u64], vec![0x52u64]] {
+            db.rel_push(
+                "call_args_collected_candidate",
+                (ambiguous_integer, Arc::new(args)),
+            );
+        }
+        db.rel_push(
+            "call_float_args_collected",
+            (ambiguous_integer, Arc::new(vec![0xf5u64])),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                ambiguous_integer,
+                RTLInst::Itailcall(
+                    Some(test_site_signature(1)),
+                    Either::Right(Either::Left(0x520)),
+                    Arc::new(vec![0x51]),
+                ),
+            ),
+        );
+
+        let ambiguous_float = 0x610u64;
+        db.rel_push(
+            "call_args_collected_candidate",
+            (ambiguous_float, Arc::new(vec![0x61u64])),
+        );
+        for args in [vec![0xf6u64], vec![0xf7u64]] {
+            db.rel_push(
+                "call_float_args_collected",
+                (ambiguous_float, Arc::new(args)),
+            );
+        }
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                ambiguous_float,
+                RTLInst::Icall(
+                    Some(test_site_signature(1)),
+                    Either::Right(Either::Left(0x620)),
+                    Arc::new(vec![0x61]),
+                    None,
+                    ambiguous_float + 1,
+                ),
+            ),
+        );
+
+        let ambiguous_instruction = 0x710u64;
+        db.rel_push(
+            "call_args_collected_candidate",
+            (ambiguous_instruction, Arc::new(vec![0x71u64])),
+        );
+        db.rel_push(
+            "call_float_args_collected",
+            (ambiguous_instruction, Arc::new(vec![0xf8u64])),
+        );
+        for callee in [0x720u64, 0x730u64] {
+            db.rel_push(
+                "rtl_inst_candidate",
+                (
+                    ambiguous_instruction,
+                    RTLInst::Icall(
+                        Some(test_site_signature(1)),
+                        Either::Right(Either::Left(callee)),
+                        Arc::new(vec![0x71]),
+                        None,
+                        ambiguous_instruction + 1,
+                    ),
+                ),
+            );
+        }
+
+        let sentinel_site = 0x810u64;
+        let sentinel = crate::util::DEFAULT_VAR as RTLReg;
+        db.rel_push(
+            "call_args_collected_candidate",
+            (sentinel_site, Arc::new(vec![sentinel])),
+        );
+        db.rel_push(
+            "call_float_args_collected",
+            (sentinel_site, Arc::new(vec![0xf9u64])),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                sentinel_site,
+                RTLInst::Itailcall(
+                    Some(test_site_signature(1)),
+                    Either::Right(Either::Left(0x820)),
+                    Arc::new(vec![sentinel]),
+                ),
+            ),
+        );
+
+        merge_unique_sysv_float_call_args(&mut db);
+        assert_rtl_call_args(&db, "rtl_inst_candidate", ambiguous_integer, &[0x51]);
+        assert_rtl_call_args(&db, "rtl_inst_candidate", ambiguous_float, &[0x61]);
+        assert_eq!(
+            db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+                .filter(|(node, _)| *node == ambiguous_instruction)
+                .filter(|(_, inst)| {
+                    matches!(inst, RTLInst::Icall(_, _, args, _, _) if args.as_slice() == &[0x71])
+                })
+                .count(),
+            2
+        );
+        assert_rtl_call_args(
+            &db,
+            "rtl_inst_candidate",
+            sentinel_site,
+            &[sentinel],
+        );
+        assert_eq!(
+            unique_rtl_call_signature(&db, "rtl_inst_candidate", sentinel_site),
+            Some(test_site_signature(1))
+        );
+    }
+
+    #[test]
+    fn win64_shared_slots_do_not_append_separate_float_vector() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        let call = 0x910u64;
+        let integer_args = Arc::new(vec![0x91]);
+        let float_args = Arc::new(vec![0xfa]);
+        let signature = test_site_signature(1);
+        seed_split_call_args(
+            &mut db,
+            call,
+            integer_args.clone(),
+            float_args,
+        );
+        seed_single_call_optimizer(
+            &mut db,
+            0x900,
+            call,
+            RTLInst::Icall(
+                Some(signature.clone()),
+                Either::Right(Either::Left(0x920)),
+                integer_args,
+                None,
+                call + 1,
+            ),
+        );
+
+        RTLOptimizePass.run(&mut db);
+        assert_rtl_call_args(&db, "rtl_inst_candidate", call, &[0x91]);
+        assert_rtl_call_args(&db, "rtl_inst", call, &[0x91]);
+        assert_eq!(
+            unique_rtl_call_signature(&db, "rtl_inst", call),
+            Some(signature)
+        );
     }
 }
 

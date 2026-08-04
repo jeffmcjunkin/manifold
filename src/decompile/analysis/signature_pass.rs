@@ -1467,6 +1467,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
 #[cfg(test)]
 mod consensus_veto_tests {
     use super::*;
+    use either::Either;
 
     fn on_signature_program_stack(test: impl FnOnce() + Send + 'static) {
         std::thread::Builder::new()
@@ -1629,6 +1630,181 @@ mod consensus_veto_tests {
                 .rel_iter::<(Address,)>("call_site_consensus_veto")
                 .any(|&(address,)| address == target));
         });
+    }
+
+    #[test]
+    fn internal_reconciliation_preserves_icall_and_itailcall_vectors() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        let target: Address = 0x401000;
+        let call: Node = 0x402000;
+        let tail: Node = 0x402010;
+        let exact: Node = 0x402020;
+        let call_args = Arc::new(vec![0x11, 0x12, 0x13, 0x14]);
+        let tail_args = Arc::new(vec![0x21, 0x22]);
+        let exact_args = Arc::new(vec![0x31, 0x32, 0x33]);
+
+        for node in [call, tail, exact] {
+            db.rel_push("call_target_func", (node, target));
+        }
+        for (node, args) in [
+            (call, call_args.clone()),
+            (tail, tail_args.clone()),
+            (exact, exact_args.clone()),
+        ] {
+            db.rel_push("call_args_collected_candidate", (node, args));
+        }
+        db.rel_push(
+            "rtl_inst",
+            (
+                call,
+                RTLInst::Icall(
+                    Some(Signature {
+                        sig_args: Arc::new(vec![XType::Xany64; call_args.len()]),
+                        sig_res: XType::Xint,
+                        sig_cc: CallConv::default(),
+                    }),
+                    Either::Right(Either::Left(target)),
+                    call_args.clone(),
+                    None,
+                    call + 1,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                tail,
+                RTLInst::Itailcall(
+                    Some(Signature {
+                        sig_args: Arc::new(vec![XType::Xany64; tail_args.len()]),
+                        sig_res: XType::Xint,
+                        sig_cc: CallConv::default(),
+                    }),
+                    Either::Right(Either::Left(target)),
+                    tail_args.clone(),
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                exact,
+                RTLInst::Icall(
+                    None,
+                    Either::Right(Either::Left(target)),
+                    exact_args.clone(),
+                    None,
+                    exact + 1,
+                ),
+            ),
+        );
+
+        let prototypes = [FunctionPrototype {
+            address: target,
+            name: "internal_three_args",
+            param_count: 3,
+            param_types: vec![XType::Xlong, XType::Xint, XType::Xptr],
+            return_type: XType::Xint,
+            confidence: SignatureConfidence::CallSiteMajority,
+            is_varargs: false,
+        }];
+        patch_db(&mut db, &prototypes, &HashSet::new());
+
+        let insts: HashMap<Node, RTLInst> = db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst")
+            .cloned()
+            .collect();
+        for (node, expected_args) in [(call, &call_args), (tail, &tail_args)] {
+            let (sig, actual_args) = match insts.get(&node).expect("patched call") {
+                RTLInst::Icall(Some(sig), _, args, _, _)
+                | RTLInst::Itailcall(Some(sig), _, args) => (sig, args),
+                other => panic!("unexpected patched instruction: {other:?}"),
+            };
+            assert_eq!(actual_args, expected_args);
+            assert!(sig.sig_cc.unproto);
+            assert_eq!(sig.sig_args.len(), expected_args.len());
+        }
+
+        let RTLInst::Icall(Some(exact_sig), _, actual_exact_args, _, _) =
+            insts.get(&exact).expect("matching call")
+        else {
+            panic!("matching internal call changed instruction kind");
+        };
+        assert_eq!(actual_exact_args, &exact_args);
+        assert_eq!(
+            exact_sig.sig_args.as_ref(),
+            &[XType::Xlong, XType::Xint, XType::Xptr]
+        );
+        assert!(!exact_sig.sig_cc.unproto);
+
+        let candidate_vectors: HashMap<Node, Arc<Vec<RTLReg>>> = db
+            .rel_iter::<(Node, Args)>("call_args_collected_candidate")
+            .cloned()
+            .collect();
+        assert_eq!(candidate_vectors.get(&call), Some(&call_args));
+        assert_eq!(candidate_vectors.get(&tail), Some(&tail_args));
+        assert_eq!(candidate_vectors.get(&exact), Some(&exact_args));
+
+        let final_vectors: HashMap<Node, Arc<Vec<RTLReg>>> = db
+            .rel_iter::<(Node, Args)>("call_args_collected")
+            .cloned()
+            .collect();
+        assert_eq!(final_vectors, candidate_vectors);
+    }
+
+    #[test]
+    fn reconciliation_shapes_exact_mismatch_and_variadic_sites_without_vector_edits() {
+        let fixed = Signature {
+            sig_args: Arc::new(vec![XType::Xlong, XType::Xptr]),
+            sig_res: XType::Xint,
+            sig_cc: CallConv::default(),
+        };
+        let short_prior = Signature {
+            sig_args: Arc::new(vec![XType::Xsingle]),
+            ..fixed.clone()
+        };
+        let surplus_prior = Signature {
+            sig_args: Arc::new(vec![XType::Xlong, XType::Xptr, XType::Xfloat]),
+            ..fixed.clone()
+        };
+
+        let exact = reconciled_call_site_signature(&fixed, None, 2, false);
+        assert_eq!(exact.sig_args.as_ref(), &[XType::Xlong, XType::Xptr]);
+        assert!(!exact.sig_cc.unproto);
+
+        let short =
+            reconciled_call_site_signature(&fixed, Some(&short_prior), 1, false);
+        assert_eq!(short.sig_args.as_ref(), &[XType::Xsingle]);
+        assert!(short.sig_cc.unproto);
+
+        let surplus =
+            reconciled_call_site_signature(&fixed, Some(&surplus_prior), 3, false);
+        assert_eq!(
+            surplus.sig_args.as_ref(),
+            &[XType::Xlong, XType::Xptr, XType::Xfloat]
+        );
+        assert!(surplus.sig_cc.unproto);
+
+        let variadic_prefix = reconciled_call_site_signature(&fixed, None, 2, true);
+        assert_eq!(
+            variadic_prefix.sig_args.as_ref(),
+            &[XType::Xlong, XType::Xptr]
+        );
+        assert_eq!(variadic_prefix.sig_cc.varargs, Some(2));
+        assert!(!variadic_prefix.sig_cc.unproto);
+
+        let variadic = reconciled_call_site_signature(&fixed, Some(&surplus_prior), 3, true);
+        assert_eq!(
+            variadic.sig_args.as_ref(),
+            &[XType::Xlong, XType::Xptr, XType::Xfloat]
+        );
+        assert_eq!(variadic.sig_cc.varargs, Some(2));
+        assert!(!variadic.sig_cc.unproto);
+
+        let short_variadic = reconciled_call_site_signature(&fixed, None, 1, true);
+        assert_eq!(short_variadic.sig_args.as_ref(), &[XType::Xlong]);
+        assert!(short_variadic.sig_cc.unproto);
     }
 }
 
@@ -1838,6 +2014,76 @@ fn inherit_win64_tail_forwarder_prototypes(
         }
     }
     inherited_tailcalls
+}
+
+fn reconciled_call_site_signature(
+    final_signature: &Signature,
+    prior_signature: Option<&Signature>,
+    actual_arg_count: usize,
+    is_varargs: bool,
+) -> Signature {
+    let fixed_count = final_signature.sig_args.len();
+    let arity_compatible = if is_varargs {
+        actual_arg_count >= fixed_count
+    } else {
+        actual_arg_count == fixed_count
+    };
+
+    if !arity_compatible {
+        // Keep one type slot for every recovered value.  `unproto` makes C
+        // emission materialize a per-site function-pointer cast, while the
+        // actual cardinality keeps that cast valid in C++ too.  Reuse the
+        // site's prior types when they describe the same immutable vector;
+        // otherwise retain the authoritative fixed prefix and give only the
+        // surplus positions their natural machine-width fallback.
+        let sig_args = prior_signature
+            .filter(|signature| signature.sig_args.len() == actual_arg_count)
+            .map(|signature| signature.sig_args.as_ref().clone())
+            .unwrap_or_else(|| {
+                let mut args: Vec<XType> = final_signature
+                    .sig_args
+                    .iter()
+                    .take(actual_arg_count)
+                    .copied()
+                    .collect();
+                args.resize(actual_arg_count, XType::Xany64);
+                args
+            });
+        return Signature {
+            sig_args: Arc::new(sig_args),
+            sig_res: final_signature.sig_res,
+            sig_cc: CallConv {
+                varargs: None,
+                unproto: true,
+                structured_ret: final_signature.sig_cc.structured_ret,
+            },
+        };
+    }
+
+    let mut sig_args = final_signature.sig_args.as_ref().clone();
+    if is_varargs {
+        // Preserve any already-recovered tail types, with Xany64 only as the
+        // fallback.  The authoritative fixed prefix and its marker remain
+        // unchanged.
+        let prior_args = prior_signature
+            .filter(|signature| signature.sig_args.len() == actual_arg_count)
+            .map(|signature| signature.sig_args.as_ref());
+        sig_args.extend((fixed_count..actual_arg_count).map(|position| {
+            prior_args
+                .and_then(|args| args.get(position))
+                .copied()
+                .unwrap_or(XType::Xany64)
+        }));
+    }
+    Signature {
+        sig_args: Arc::new(sig_args),
+        sig_res: final_signature.sig_res,
+        sig_cc: CallConv {
+            varargs: is_varargs.then_some(fixed_count as i64),
+            unproto: false,
+            structured_ret: final_signature.sig_cc.structured_ret,
+        },
+    }
 }
 
 fn patch_db(
@@ -2200,80 +2446,28 @@ fn patch_db(
         .map(|(address,)| *address)
         .collect();
 
-    {
-        let mut new_call_args: Vec<(Node, Arc<Vec<RTLReg>>)> = Vec::new();
-        let mut patched_calls: std::collections::HashSet<Node> = std::collections::HashSet::new();
+    // Publish the recovered vectors byte-for-byte as the final relation.  A
+    // prototype may change only the type attached to a call; it is never
+    // authority to rewrite the call's semantic operands.
+    let final_call_args: Vec<(Node, Args)> = db
+        .rel_iter::<(Node, Args)>("call_args_collected_candidate")
+        .cloned()
+        .collect();
+    db.rel_set(
+        "call_args_collected",
+        final_call_args
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
 
-        for &(call_node, ref args) in db.rel_iter::<(Node, Args)>("call_args_collected_candidate") {
-            let target = match call_targets.get(&call_node) {
-                Some(&t) => t,
-                None => {
-                    new_call_args.push((call_node, args.clone()));
-                    continue;
-                }
-            };
-
-            // Preserve the historical no-op for calls whose target prototype
-            // did not change during reconciliation.
-            if !proto_map.contains_key(&target)
-                && !inherited_tailcalls.contains(&call_node)
-            {
-                new_call_args.push((call_node, args.clone()));
-                continue;
-            }
-
-            let signature = match final_signatures.get(&target) {
-                Some(signature) => signature,
-                None => {
-                    new_call_args.push((call_node, args.clone()));
-                    continue;
-                }
-            };
-
-            if variadic_targets.contains(&target) {
-                new_call_args.push((call_node, args.clone()));
-                continue;
-            }
-
-            let param_count = signature.sig_args.len();
-            if args.len() == param_count {
-                new_call_args.push((call_node, args.clone()));
-                continue;
-            }
-
-            if args.len() > param_count {
-                // Truncate unconditionally: Signature/FuncDef/FuncDecl model only fixed-arity sigs.
-                let trimmed: Vec<RTLReg> = args.iter().take(param_count).cloned().collect();
-                new_call_args.push((call_node, Arc::new(trimmed)));
-                patched_calls.insert(call_node);
-                continue;
-            }
-
-            // A fixed prototype is not authority to manufacture values at a
-            // short site.  Preserve that site's recovered evidence verbatim;
-            // only surplus fixed arguments can be safely removed.
-            new_call_args.push((call_node, args.clone()));
-        }
-
-        if !patched_calls.is_empty() {
-            log::info!("SignatureReconciliation: trimmed args at {} call sites", patched_calls.len());
-            db.rel_set("call_args_collected", new_call_args.into_iter().collect::<ascent::boxcar::Vec<_>>());
-        }
-    }
-
-    // Patch rtl_inst Icall sigs to reconciled return/param types; otherwise stale Xvoid guesses make clight drop the dst reg and DCE the call.
+    // Patch RTL call signatures to reconciled return/parameter types;
+    // otherwise stale Xvoid guesses make Clight drop the destination and DCE
+    // the call.  The recovered Icall/Itailcall argument vectors themselves
+    // are immutable evidence: a mismatching fixed prototype is expressed as
+    // an unprototyped call-site signature, never by deleting or adding args.
     {
         let mut new_insts: Vec<(Node, RTLInst)> = Vec::new();
         let mut patched_insts: usize = 0;
-
-        // Reconcile a call's argument list to the callee's reconciled arity, since cminor builds Scall directly from Icall.args and clang checks it against the already-reconciled declaration.
-        let reconcile_args = |args: &Args, param_types: &[XType]| -> Args {
-            let param_count = param_types.len();
-            if args.len() <= param_count {
-                return args.clone();
-            }
-            Arc::new(args.iter().take(param_count).copied().collect())
-        };
 
         for &(node, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
             match inst {
@@ -2288,60 +2482,22 @@ fn patch_db(
                     if let Some(final_signature) = final_signature {
                         let is_varargs = target
                             .is_some_and(|address| variadic_targets.contains(&address));
-                        // Variadic callees keep their full (tail-bearing) arg list; only fixed-arity calls are reconciled to the prototype count.
-                        let new_args = if is_varargs {
-                            args.clone()
-                        } else {
-                            reconcile_args(args, final_signature.sig_args.as_slice())
-                        };
-                        // Type the variadic tail at its natural 64-bit width; an untyped tail slot defaults to int and truncates a pointer vararg.
-                        let short_site = new_args.len() < final_signature.sig_args.len();
-                        let mut sig_args = if short_site {
-                            // Keep the site's prior signature shape when the
-                            // semantic vector is short.  If none exists, type
-                            // only the values that actually exist.
-                            sig_opt
-                                .as_ref()
-                                .filter(|signature| signature.sig_args.len() == new_args.len())
-                                .map(|signature| signature.sig_args.as_ref().clone())
-                                .unwrap_or_else(|| vec![XType::Xany64; new_args.len()])
-                        } else {
-                            final_signature.sig_args.as_ref().clone()
-                        };
-                        if is_varargs {
-                            while sig_args.len() < new_args.len() {
-                                sig_args.push(XType::Xany64);
-                            }
-                        }
-                        let fixed_count = final_signature.sig_args.len();
-                        let new_sig = Signature {
-                            sig_args: Arc::new(sig_args),
-                            sig_res: final_signature.sig_res,
-                            sig_cc: if short_site {
-                                CallConv {
-                                    varargs: None,
-                                    unproto: true,
-                                    structured_ret: final_signature.sig_cc.structured_ret,
-                                }
-                            } else {
-                                CallConv {
-                                    varargs: is_varargs.then_some(fixed_count as i64),
-                                    unproto: false,
-                                    structured_ret: final_signature.sig_cc.structured_ret,
-                                }
-                            },
-                        };
+                        let new_sig = reconciled_call_site_signature(
+                            final_signature,
+                            sig_opt.as_ref(),
+                            args.len(),
+                            is_varargs,
+                        );
                         let sig_changed = sig_opt.as_ref()
                             .map(|s| s.sig_res != new_sig.sig_res
                                   || s.sig_args.as_slice() != new_sig.sig_args.as_slice()
                                   || s.sig_cc != new_sig.sig_cc)
                             .unwrap_or(true);
-                        let args_changed = new_args.as_slice() != args.as_slice();
-                        if sig_changed || args_changed {
+                        if sig_changed {
                             let new_inst = RTLInst::Icall(
                                 Some(new_sig),
                                 callee.clone(),
-                                new_args,
+                                args.clone(),
                                 *dst,
                                 *succ,
                             );
@@ -2363,57 +2519,22 @@ fn patch_db(
                     if let Some(final_signature) = final_signature {
                         let is_varargs = target
                             .is_some_and(|address| variadic_targets.contains(&address));
-                        // Variadic callees keep their full (tail-bearing) arg list; only fixed-arity calls are reconciled to the prototype count.
-                        let new_args = if is_varargs {
-                            args.clone()
-                        } else {
-                            reconcile_args(args, final_signature.sig_args.as_slice())
-                        };
-                        // Type the variadic tail at its natural 64-bit width; an untyped tail slot defaults to int and truncates a pointer vararg.
-                        let short_site = new_args.len() < final_signature.sig_args.len();
-                        let mut sig_args = if short_site {
-                            sig_opt
-                                .as_ref()
-                                .filter(|signature| signature.sig_args.len() == new_args.len())
-                                .map(|signature| signature.sig_args.as_ref().clone())
-                                .unwrap_or_else(|| vec![XType::Xany64; new_args.len()])
-                        } else {
-                            final_signature.sig_args.as_ref().clone()
-                        };
-                        if is_varargs {
-                            while sig_args.len() < new_args.len() {
-                                sig_args.push(XType::Xany64);
-                            }
-                        }
-                        let fixed_count = final_signature.sig_args.len();
-                        let new_sig = Signature {
-                            sig_args: Arc::new(sig_args),
-                            sig_res: final_signature.sig_res,
-                            sig_cc: if short_site {
-                                CallConv {
-                                    varargs: None,
-                                    unproto: true,
-                                    structured_ret: final_signature.sig_cc.structured_ret,
-                                }
-                            } else {
-                                CallConv {
-                                    varargs: is_varargs.then_some(fixed_count as i64),
-                                    unproto: false,
-                                    structured_ret: final_signature.sig_cc.structured_ret,
-                                }
-                            },
-                        };
+                        let new_sig = reconciled_call_site_signature(
+                            final_signature,
+                            sig_opt.as_ref(),
+                            args.len(),
+                            is_varargs,
+                        );
                         let sig_changed = sig_opt.as_ref()
                             .map(|s| s.sig_res != new_sig.sig_res
                                   || s.sig_args.as_slice() != new_sig.sig_args.as_slice()
                                   || s.sig_cc != new_sig.sig_cc)
                             .unwrap_or(true);
-                        let args_changed = new_args.as_slice() != args.as_slice();
-                        if sig_changed || args_changed {
+                        if sig_changed {
                             let new_inst = RTLInst::Itailcall(
                                 Some(new_sig),
                                 callee.clone(),
-                                new_args,
+                                args.clone(),
                             );
                             new_insts.push((node, new_inst));
                             patched_insts += 1;

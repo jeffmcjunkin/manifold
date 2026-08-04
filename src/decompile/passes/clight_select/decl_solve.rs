@@ -54,6 +54,7 @@ fn xtype_to_ctype(xt: &XType) -> CType {
 
 fn function_pointer_global_type(
     name: &str,
+    observed_arities: &BTreeSet<usize>,
     shared_fixed_arities: &HashMap<String, usize>,
     known_fnptr_signatures: &HashMap<String, (XType, Vec<XType>, bool)>,
 ) -> CType {
@@ -73,7 +74,10 @@ fn function_pointer_global_type(
                 false,
             )
         }
-    } else if let Some(&arity) = shared_fixed_arities.get(name) {
+    } else if let Some(&arity) = shared_fixed_arities
+        .get(name)
+        .filter(|&&arity| observed_arities.len() == 1 && observed_arities.contains(&arity))
+    {
         CType::Function(
             Box::new(CType::long()),
             vec![CType::long(); arity],
@@ -924,7 +928,7 @@ pub fn run(
         id_to_name,
         &out.field_int_veto,
     );
-    for (name, _arg_counts) in &c.called_globals {
+    for (name, arg_counts) in &c.called_globals {
         // An authoritative known prototype wins.  Otherwise a data-global
         // callee receives a fixed type only from the same anchored coherent
         // cross-site proof used for ordinary externs.  Single-site,
@@ -934,6 +938,7 @@ pub fn run(
             name.clone(),
             function_pointer_global_type(
                 name,
+                arg_counts,
                 shared_fixed_arities,
                 known_fnptr_signatures,
             ),
@@ -979,9 +984,10 @@ mod function_pointer_declaration_tests {
             (XType::Xint, Vec::new(), true),
         )]);
         let shared = HashMap::from([("shared".to_string(), 2usize)]);
+        let observed_two = BTreeSet::from([2usize]);
 
         assert_eq!(
-            function_pointer_global_type("known", &shared, &known),
+            function_pointer_global_type("known", &observed_two, &shared, &known),
             CType::ptr(CType::Function(
                 Box::new(CType::ptr(CType::Void)),
                 vec![CType::ptr(CType::char_signed()), CType::long()],
@@ -990,7 +996,7 @@ mod function_pointer_declaration_tests {
             ))
         );
         assert_eq!(
-            function_pointer_global_type("shared", &shared, &known),
+            function_pointer_global_type("shared", &observed_two, &shared, &known),
             CType::ptr(CType::Function(
                 Box::new(CType::long()),
                 vec![CType::long(), CType::long()],
@@ -999,7 +1005,7 @@ mod function_pointer_declaration_tests {
             ))
         );
         assert_eq!(
-            function_pointer_global_type("takes_cb", &shared, &known),
+            function_pointer_global_type("takes_cb", &observed_two, &shared, &known),
             CType::ptr(CType::Function(
                 Box::new(CType::Void),
                 vec![CType::ptr(CType::Function(
@@ -1013,12 +1019,34 @@ mod function_pointer_declaration_tests {
             ))
         );
         assert_eq!(
-            function_pointer_global_type("ambiguous", &HashMap::new(), &HashMap::new()),
+            function_pointer_global_type(
+                "ambiguous",
+                &BTreeSet::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            ),
             CType::ptr(CType::func_unprototyped(CType::long()))
         );
         assert_eq!(
-            function_pointer_global_type("invalid_zero_va", &shared, &known),
+            function_pointer_global_type(
+                "invalid_zero_va",
+                &BTreeSet::new(),
+                &shared,
+                &known,
+            ),
             CType::ptr(CType::func_unprototyped(CType::int()))
+        );
+
+        // A shared zero-arity guess must not retype a selected four-argument
+        // IAT call.  The per-site vector wins and the object remains K&R.
+        assert_eq!(
+            function_pointer_global_type(
+                "__imp_opaque_fixed_arity_target",
+                &BTreeSet::from([4usize]),
+                &HashMap::from([("__imp_opaque_fixed_arity_target".to_string(), 0usize)]),
+                &HashMap::new(),
+            ),
+            CType::ptr(CType::func_unprototyped(CType::long()))
         );
     }
 

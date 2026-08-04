@@ -299,6 +299,19 @@ fn resolved_signature_call_conv(param_count: usize, variadic: bool) -> CallConv 
     }
 }
 
+fn actual_site_signature_params(
+    known_params: &[XType],
+    actual_arg_count: usize,
+) -> Arc<Vec<XType>> {
+    let mut params: Vec<XType> = known_params
+        .iter()
+        .take(actual_arg_count)
+        .copied()
+        .collect();
+    params.resize(actual_arg_count, XType::Xany64);
+    Arc::new(params)
+}
+
 // Operand decoding collapses subregister spellings into one Mreg family. That
 // is useful for value flow, but unsafe for frame analysis: every E*-based
 // memory operand has 32-bit address-size semantics. In particular, a proven
@@ -3728,15 +3741,24 @@ ascent_par! {
         call_args_collected_candidate(addr, first),
         call_args_collected_candidate(addr, second),
         if first != second;
-    #[local] relation call_signature_short(Node);
-    call_signature_short(addr) <--
+    // A recovered argument vector is call-site evidence.  A fixed callee
+    // signature may type a matching site, but it is never authority to drop
+    // surplus values or synthesize missing ones.  Represent any fixed-arity
+    // disagreement as an unprototyped call-site cast; a variadic signature is
+    // compatible with every vector at least as long as its fixed prefix.
+    #[local] relation call_signature_arity_mismatch(Node);
+    call_signature_arity_mismatch(addr) <--
         call_args_collected_candidate(addr, args),
-        call_resolved_signature(addr, _, param_count, _, _, _),
+        call_resolved_signature(addr, _, param_count, _, _, false),
+        if args.len() != *param_count;
+    call_signature_arity_mismatch(addr) <--
+        call_args_collected_candidate(addr, args),
+        call_resolved_signature(addr, _, param_count, _, _, true),
         if args.len() < *param_count;
 
     #[local] relation call_args_for_signature_incoherent(Node);
     call_args_for_signature_incoherent(addr) <-- call_args_materialization_incoherent(addr);
-    call_args_for_signature_incoherent(addr) <-- call_signature_short(addr);
+    call_args_for_signature_incoherent(addr) <-- call_signature_arity_mismatch(addr);
 
     #[local] relation materialized_call_args(Node, Args);
     materialized_call_args(addr, args) <--
@@ -3754,9 +3776,16 @@ ascent_par! {
         call_resolved_signature(addr, _, param_count, ret_type, known_params, variadic),
         !call_args_for_signature_incoherent(addr),
         let call_conv = resolved_signature_call_conv(*param_count, *variadic);
+    resolved_rtl_call_signature(addr, *ret_type, site_params, call_conv) <--
+        call_resolved_signature(addr, _, _, ret_type, known_params, _),
+        call_signature_arity_mismatch(addr),
+        call_args_collected_candidate(addr, args),
+        !call_args_materialization_incoherent(addr),
+        let site_params = actual_site_signature_params(known_params.as_slice(), args.len()),
+        let call_conv = CallConv { unproto: true, ..CallConv::default() };
     resolved_rtl_call_signature(addr, *ret_type, Arc::new(vec![]), call_conv) <--
         call_resolved_signature(addr, _, _, ret_type, _, _),
-        call_args_for_signature_incoherent(addr),
+        call_args_materialization_incoherent(addr),
         let call_conv = CallConv { unproto: true, ..CallConv::default() };
 
     rtl_inst_candidate(addr, inst) <--
@@ -17563,6 +17592,65 @@ mod encoding_tests {
     }
 
     #[test]
+    fn actual_site_signature_params_never_change_recovered_cardinality() {
+        let known = [XType::Xptr, XType::Xint, XType::Xfloat];
+        assert_eq!(
+            actual_site_signature_params(&known, 2).as_ref(),
+            &[XType::Xptr, XType::Xint]
+        );
+        assert_eq!(
+            actual_site_signature_params(&known, 4).as_ref(),
+            &[XType::Xptr, XType::Xint, XType::Xfloat, XType::Xany64]
+        );
+        assert!(actual_site_signature_params(&known, 0).is_empty());
+    }
+
+    #[test]
+    fn fixed_external_arity_mismatch_keeps_recovered_icall_arguments() {
+        on_rtl_program_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let call: Node = 0x4010;
+            let next: Node = 0x4020;
+            let callee: Symbol = "opaque_external_target";
+            let arguments = [0xa1, 0xa2];
+
+            prog.ltl_inst
+                .push((call, LTLInst::Lcall(Either::Right(Either::Right(callee)))));
+            prog.next.push((call, next));
+            // Model a stale shared/curated zero-arity declaration against a
+            // concrete two-value machine call.
+            prog.known_extern_signature
+                .push((callee, 0usize, XType::Xvoid, Arc::new(Vec::new())));
+            for (position, argument) in arguments.into_iter().enumerate() {
+                prog.call_arg_mapping.push((call, position, argument));
+            }
+
+            prog.run();
+
+            let calls: Vec<&RTLInst> = prog
+                .rtl_inst_candidate
+                .iter()
+                .filter_map(|(node, inst)| (*node == call).then_some(inst))
+                .collect();
+            assert_eq!(calls.len(), 1);
+            assert!(matches!(
+                calls[0],
+                RTLInst::Icall(
+                    Some(Signature { sig_args, sig_cc, .. }),
+                    Either::Right(Either::Right(name)),
+                    args,
+                    None,
+                    succ,
+                ) if *name == callee
+                    && args.as_ref() == &arguments
+                    && *succ == next
+                    && sig_args.as_ref() == &[XType::Xany64, XType::Xany64]
+                    && sig_cc.unproto
+            ));
+        });
+    }
+
+    #[test]
     fn home_div_operation_preserves_signedness_result_and_width() {
         for (signed, remainder, width, expected) in [
             (true, false, 4, Operation::Odiv),
@@ -18083,6 +18171,73 @@ mod encoding_tests {
                 .call_forwarding_unresolved
                 .iter()
                 .any(|&(site,)| site == callee_call));
+        });
+    }
+
+    #[test]
+    fn fixed_import_pointer_mismatch_keeps_recovered_itailcall_arguments() {
+        on_rtl_program_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let function: Address = 0x6000;
+            let tail: Node = 0x6010;
+            let iat: Address = 0x9000;
+            let operand: Symbol = "rip_cpp_iat_operand";
+            let provider: Symbol = "opaque_import_provider";
+            let original: Symbol = "__imp_?opaque_import_target@@YAXXZ";
+            let arguments = [0xb1, 0xb2];
+
+            prog.instruction
+                .push((tail, 6usize, "", "JMP", operand, "", "", "", 0usize, 0usize));
+            prog.op_indirect
+                .push((operand, "NONE", "RIP", "NONE", 1, 0x20, 8));
+            prog.ltl_inst.push((
+                tail,
+                LTLInst::Ltailcall(Either::Right(Either::Right(provider))),
+            ));
+            prog.rip_target_addr.push((tail, iat));
+            prog.instr_in_function.push((tail, function));
+            prog.loader_symbol_identity.push((
+                iat,
+                LoaderSymbolKind::ImportPointer,
+                provider,
+                original,
+            ));
+            prog.known_loader_signature.push((
+                iat,
+                LoaderSymbolKind::ImportPointer,
+                provider,
+                original,
+                1usize,
+                XType::Xvoid,
+                Arc::new(vec![XType::Xany64]),
+                false,
+            ));
+            for (position, argument) in arguments.into_iter().enumerate() {
+                prog.call_arg_mapping.push((tail, position, argument));
+            }
+
+            prog.run();
+
+            let tailcalls: Vec<&RTLInst> = prog
+                .rtl_inst_candidate
+                .iter()
+                .filter_map(|(node, inst)| (*node == tail).then_some(inst))
+                .collect();
+            assert_eq!(tailcalls.len(), 1);
+            assert!(matches!(
+                tailcalls[0],
+                RTLInst::Itailcall(
+                    Some(Signature { sig_args, sig_cc, .. }),
+                    Either::Left(_),
+                    args,
+                ) if args.as_ref() == &arguments
+                    && sig_args.as_ref() == &[XType::Xany64, XType::Xany64]
+                    && sig_cc.unproto
+            ));
+            assert!(prog
+                .global_var_ref
+                .iter()
+                .any(|&(ident,)| ident == iat as Ident));
         });
     }
 

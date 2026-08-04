@@ -1214,11 +1214,17 @@ pub fn print_stmt(stmt: &CStmt) -> String {
 
 fn collect_called_names(tu: &TranslationUnit) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
+    let global_objects: std::collections::HashSet<String> = tu
+        .decls
+        .iter()
+        .filter_map(|decl| match decl {
+            TopLevelDecl::VarDecl(var) => Some(var.name.clone()),
+            _ => None,
+        })
+        .collect();
     for decl in &tu.decls {
-        match decl {
-            TopLevelDecl::FuncDef(f) => collect_called_names_stmt(&f.body, &mut names),
-            TopLevelDecl::FuncDecl(f) => { names.insert(f.name.clone()); }
-            _ => {}
+        if let TopLevelDecl::FuncDef(function) = decl {
+            collect_function_called_names(function, &global_objects, &mut names);
         }
     }
     names
@@ -1226,82 +1232,250 @@ fn collect_called_names(tu: &TranslationUnit) -> std::collections::HashSet<Strin
 
 fn collect_invoked_names(tu: &TranslationUnit) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
+    let global_objects: std::collections::HashSet<String> = tu
+        .decls
+        .iter()
+        .filter_map(|decl| match decl {
+            TopLevelDecl::VarDecl(var) => Some(var.name.clone()),
+            _ => None,
+        })
+        .collect();
     for decl in &tu.decls {
-        if let TopLevelDecl::FuncDef(f) = decl {
-            collect_called_names_stmt(&f.body, &mut names);
+        if let TopLevelDecl::FuncDef(function) = decl {
+            collect_function_called_names(function, &global_objects, &mut names);
         }
     }
     names
 }
 
-fn collect_called_names_stmt(stmt: &CStmt, names: &mut std::collections::HashSet<String>) {
-    match stmt {
-        CStmt::Expr(e) | CStmt::Return(Some(e)) => collect_called_names_expr(e, names),
-        CStmt::If(cond, then_s, else_s) => {
-            collect_called_names_expr(cond, names);
-            collect_called_names_stmt(then_s, names);
-            if let Some(e) = else_s { collect_called_names_stmt(e, names); }
+fn collect_function_called_names(
+    function: &FuncDef,
+    global_objects: &std::collections::HashSet<String>,
+    names: &mut std::collections::HashSet<String>,
+) {
+    let mut shadowed = global_objects.clone();
+    shadowed.extend(
+        function
+            .params
+            .iter()
+            .filter_map(|param| param.name.clone()),
+    );
+    // Function locals are printed in this order before the body. An
+    // identifier enters scope before its own initializer, while later locals
+    // do not shadow an earlier initializer.
+    for local in &function.local_vars {
+        shadowed.insert(local.name.clone());
+        if let Some(initializer) = &local.init {
+            collect_called_names_initializer(initializer, &mut shadowed, names);
         }
-        CStmt::While(cond, body) => {
-            collect_called_names_expr(cond, names);
-            collect_called_names_stmt(body, names);
+    }
+    collect_called_names_stmt(&function.body, &mut shadowed, names);
+}
+
+fn callee_name_through_transparent_wrappers(expr: &CExpr) -> Option<&str> {
+    match expr {
+        CExpr::Var(name) => Some(name),
+        CExpr::Cast(_, inner) | CExpr::Paren(inner) => {
+            callee_name_through_transparent_wrappers(inner)
         }
-        CStmt::DoWhile(body, cond) => {
-            collect_called_names_stmt(body, names);
-            collect_called_names_expr(cond, names);
-        }
-        CStmt::For(init, cond, update, body) => {
-            if let Some(ForInit::Expr(e)) = init { collect_called_names_expr(e, names); }
-            if let Some(c) = cond { collect_called_names_expr(c, names); }
-            if let Some(u) = update { collect_called_names_expr(u, names); }
-            collect_called_names_stmt(body, names);
-        }
-        CStmt::Switch(e, body) => {
-            collect_called_names_expr(e, names);
-            collect_called_names_stmt(body, names);
-        }
-        CStmt::Block(items) => {
-            for item in items {
-                match item {
-                    CBlockItem::Stmt(s) => collect_called_names_stmt(s, names),
-                    _ => {}
-                }
-            }
-        }
-        CStmt::Labeled(_, inner) => collect_called_names_stmt(inner, names),
-        CStmt::Sequence(stmts) => {
-            for s in stmts { collect_called_names_stmt(s, names); }
-        }
-        _ => {}
+        _ => None,
     }
 }
 
-fn collect_called_names_expr(expr: &CExpr, names: &mut std::collections::HashSet<String>) {
+fn collect_called_names_decls(
+    declarations: &[VarDecl],
+    shadowed: &mut std::collections::HashSet<String>,
+    names: &mut std::collections::HashSet<String>,
+) {
+    for declaration in declarations {
+        shadowed.insert(declaration.name.clone());
+        if let Some(initializer) = &declaration.init {
+            collect_called_names_initializer(initializer, shadowed, names);
+        }
+    }
+}
+
+fn collect_called_names_initializer(
+    initializer: &Initializer,
+    shadowed: &mut std::collections::HashSet<String>,
+    names: &mut std::collections::HashSet<String>,
+) {
+    match initializer {
+        Initializer::Expr(expr) => collect_called_names_expr(expr, shadowed, names),
+        Initializer::List(items) => {
+            for item in items {
+                if let Some(designator) = &item.designator {
+                    match designator {
+                        Designator::Index(expr) => {
+                            collect_called_names_expr(expr, shadowed, names)
+                        }
+                        Designator::Range(first, last) => {
+                            collect_called_names_expr(first, shadowed, names);
+                            collect_called_names_expr(last, shadowed, names);
+                        }
+                        Designator::Field(_) => {}
+                    }
+                }
+                collect_called_names_initializer(&item.init, shadowed, names);
+            }
+        }
+        Initializer::String(_) => {}
+    }
+}
+
+fn collect_called_names_stmt(
+    stmt: &CStmt,
+    shadowed: &mut std::collections::HashSet<String>,
+    names: &mut std::collections::HashSet<String>,
+) {
+    match stmt {
+        CStmt::Expr(expr) | CStmt::Return(Some(expr)) => {
+            collect_called_names_expr(expr, shadowed, names)
+        }
+        CStmt::If(cond, then_s, else_s) => {
+            collect_called_names_expr(cond, shadowed, names);
+            let mut then_scope = shadowed.clone();
+            collect_called_names_stmt(then_s, &mut then_scope, names);
+            if let Some(else_stmt) = else_s {
+                let mut else_scope = shadowed.clone();
+                collect_called_names_stmt(else_stmt, &mut else_scope, names);
+            }
+        }
+        CStmt::While(cond, body) => {
+            collect_called_names_expr(cond, shadowed, names);
+            let mut body_scope = shadowed.clone();
+            collect_called_names_stmt(body, &mut body_scope, names);
+        }
+        CStmt::DoWhile(body, cond) => {
+            let mut body_scope = shadowed.clone();
+            collect_called_names_stmt(body, &mut body_scope, names);
+            collect_called_names_expr(cond, shadowed, names);
+        }
+        CStmt::For(init, cond, update, body) => {
+            let mut for_scope = shadowed.clone();
+            match init {
+                Some(ForInit::Expr(expr)) => {
+                    collect_called_names_expr(expr, &mut for_scope, names)
+                }
+                Some(ForInit::Decl(declarations)) => {
+                    collect_called_names_decls(declarations, &mut for_scope, names)
+                }
+                None => {}
+            }
+            if let Some(cond) = cond {
+                collect_called_names_expr(cond, &mut for_scope, names);
+            }
+            if let Some(update) = update {
+                collect_called_names_expr(update, &mut for_scope, names);
+            }
+            let mut body_scope = for_scope;
+            collect_called_names_stmt(body, &mut body_scope, names);
+        }
+        CStmt::Switch(expr, body) => {
+            collect_called_names_expr(expr, shadowed, names);
+            let mut body_scope = shadowed.clone();
+            collect_called_names_stmt(body, &mut body_scope, names);
+        }
+        CStmt::Block(items) => {
+            let mut block_scope = shadowed.clone();
+            for item in items {
+                match item {
+                    CBlockItem::Stmt(stmt) => {
+                        collect_called_names_stmt(stmt, &mut block_scope, names)
+                    }
+                    CBlockItem::Decl(declarations) => {
+                        collect_called_names_decls(declarations, &mut block_scope, names)
+                    }
+                }
+            }
+        }
+        CStmt::Labeled(label, inner) => {
+            if let Label::Case(expr) = label {
+                collect_called_names_expr(expr, shadowed, names);
+            }
+            // A label does not introduce a scope; an inner compound statement
+            // will clone the scope itself.
+            collect_called_names_stmt(inner, shadowed, names);
+        }
+        CStmt::Decl(declarations) => {
+            collect_called_names_decls(declarations, shadowed, names)
+        }
+        CStmt::Sequence(stmts) => {
+            for stmt in stmts {
+                collect_called_names_stmt(stmt, shadowed, names);
+            }
+        }
+        CStmt::Empty
+        | CStmt::Goto(_)
+        | CStmt::Continue
+        | CStmt::Break
+        | CStmt::Return(None) => {}
+    }
+}
+
+fn collect_called_names_expr(
+    expr: &CExpr,
+    shadowed: &mut std::collections::HashSet<String>,
+    names: &mut std::collections::HashSet<String>,
+) {
     match expr {
         CExpr::Call(func, args) => {
-            if let CExpr::Var(name) = func.as_ref() {
-                names.insert(name.clone());
+            if let Some(name) = callee_name_through_transparent_wrappers(func) {
+                if !shadowed.contains(name) {
+                    names.insert(name.to_string());
+                }
             }
-            collect_called_names_expr(func, names);
-            for a in args { collect_called_names_expr(a, names); }
+            collect_called_names_expr(func, shadowed, names);
+            for arg in args {
+                collect_called_names_expr(arg, shadowed, names);
+            }
         }
         CExpr::Binary(_, l, r) | CExpr::Assign(_, l, r) => {
-            collect_called_names_expr(l, names);
-            collect_called_names_expr(r, names);
+            collect_called_names_expr(l, shadowed, names);
+            collect_called_names_expr(r, shadowed, names);
         }
-        CExpr::Unary(_, inner) | CExpr::Cast(_, inner) | CExpr::Member(inner, _) | CExpr::MemberPtr(inner, _) => {
-            collect_called_names_expr(inner, names);
+        CExpr::Unary(_, inner)
+        | CExpr::Cast(_, inner)
+        | CExpr::Member(inner, _)
+        | CExpr::MemberPtr(inner, _)
+        | CExpr::SizeofExpr(inner)
+        | CExpr::Paren(inner) => {
+            collect_called_names_expr(inner, shadowed, names);
         }
         CExpr::Ternary(c, t, e) => {
-            collect_called_names_expr(c, names);
-            collect_called_names_expr(t, names);
-            collect_called_names_expr(e, names);
+            collect_called_names_expr(c, shadowed, names);
+            collect_called_names_expr(t, shadowed, names);
+            collect_called_names_expr(e, shadowed, names);
         }
         CExpr::Index(a, i) => {
-            collect_called_names_expr(a, names);
-            collect_called_names_expr(i, names);
+            collect_called_names_expr(a, shadowed, names);
+            collect_called_names_expr(i, shadowed, names);
         }
-        _ => {}
+        CExpr::CompoundLit(_, initializers) => {
+            for initializer in initializers {
+                collect_called_names_initializer(initializer, shadowed, names);
+            }
+        }
+        CExpr::Generic(selection, arms) => {
+            collect_called_names_expr(selection, shadowed, names);
+            for (_, arm) in arms {
+                collect_called_names_expr(arm, shadowed, names);
+            }
+        }
+        CExpr::StmtExpr(stmts, result) => {
+            let mut statement_scope = shadowed.clone();
+            for stmt in stmts {
+                collect_called_names_stmt(stmt, &mut statement_scope, names);
+            }
+            collect_called_names_expr(result, &mut statement_scope, names);
+        }
+        CExpr::IntLit(_)
+        | CExpr::FloatLit(_)
+        | CExpr::StringLit(_)
+        | CExpr::CharLit(_)
+        | CExpr::Var(_)
+        | CExpr::SizeofType(_)
+        | CExpr::AlignofType(_) => {}
     }
 }
 
@@ -1346,6 +1520,165 @@ mod tests {
             loc: SourceLoc::unknown(),
         });
         tu
+    }
+
+    fn actual_site_function_pointer_type() -> CType {
+        CType::ptr(CType::Function(
+            Box::new(CType::long()),
+            vec![CType::long()],
+            false,
+            true,
+        ))
+    }
+
+    fn cast_wrapped_actual_site_call(name: &str) -> CExpr {
+        CExpr::Call(
+            Box::new(CExpr::Paren(Box::new(CExpr::Cast(
+                actual_site_function_pointer_type(),
+                Box::new(CExpr::Var(name.to_string())),
+            )))),
+            vec![CExpr::int(7)],
+        )
+    }
+
+    fn caller_with(
+        call: CExpr,
+        params: Vec<FuncParam>,
+        local_vars: Vec<VarDecl>,
+    ) -> FuncDef {
+        FuncDef {
+            name: "caller".to_string(),
+            return_type: CType::Void,
+            params,
+            is_variadic: false,
+            storage_class: StorageClass::Auto,
+            body: CStmt::Expr(call),
+            local_vars,
+            loc: SourceLoc::unknown(),
+        }
+    }
+
+    fn first_header_function() -> (&'static str, &'static str) {
+        super::super::header_db::header_db()
+            .includes
+            .iter()
+            .find_map(|(header, functions)| {
+                functions
+                    .first()
+                    .copied()
+                    .map(|function| (*header, function))
+            })
+            .expect("header database must contain a callable header entry")
+    }
+
+    #[test]
+    fn cast_wrapped_nonlocal_call_keeps_header_and_cpp_compatible_arity() {
+        let (header, function) = first_header_function();
+        let mut tu = TranslationUnit::new();
+        tu.add_function(caller_with(
+            cast_wrapped_actual_site_call(function),
+            vec![],
+            vec![],
+        ));
+
+        let output = print_translation_unit(&tu);
+        assert!(output.contains(&format!("#include {header}")));
+        assert!(output.contains(&format!("((long (*)(long)){function})(7)")));
+        assert!(!output.contains(&format!("(*)()){function}")));
+        assert!(!tu.decls.iter().any(
+            |decl| matches!(decl, TopLevelDecl::FuncDecl(decl) if decl.name == function)
+        ));
+    }
+
+    #[test]
+    fn cast_wrapped_shadowed_callees_do_not_trigger_function_headers() {
+        let (header, function) = first_header_function();
+
+        let mut parameter_tu = TranslationUnit::new();
+        parameter_tu.add_function(caller_with(
+            cast_wrapped_actual_site_call(function),
+            vec![FuncParam::named(
+                function,
+                actual_site_function_pointer_type(),
+            )],
+            vec![],
+        ));
+        assert!(!print_translation_unit(&parameter_tu).contains(&format!("#include {header}")));
+
+        let mut local_tu = TranslationUnit::new();
+        local_tu.add_function(caller_with(
+            cast_wrapped_actual_site_call(function),
+            vec![],
+            vec![VarDecl::new(
+                function,
+                actual_site_function_pointer_type(),
+            )],
+        ));
+        assert!(!print_translation_unit(&local_tu).contains(&format!("#include {header}")));
+
+        let mut global_tu = TranslationUnit::new();
+        global_tu.add_global_var(VarDecl::new(
+            function,
+            actual_site_function_pointer_type(),
+        ));
+        global_tu.add_function(caller_with(
+            cast_wrapped_actual_site_call(function),
+            vec![],
+            vec![],
+        ));
+        assert!(!print_translation_unit(&global_tu).contains(&format!("#include {header}")));
+    }
+
+    #[test]
+    fn actual_site_call_cast_is_valid_cpp_syntax() {
+        let callee = "cpp_actual_site_target";
+        let mut tu = TranslationUnit::new();
+        tu.add_func_decl(FuncDecl::new(
+            callee,
+            CType::long(),
+            vec![
+                FuncParam::named("first", CType::long()),
+                FuncParam::named("second", CType::long()),
+                FuncParam::named("third", CType::long()),
+            ],
+        ));
+        tu.add_function(caller_with(
+            cast_wrapped_actual_site_call(callee),
+            vec![],
+            vec![],
+        ));
+        let output = print_translation_unit(&tu);
+        assert!(output.contains(&format!(
+            "long {callee}(long first, long second, long third);"
+        )));
+        assert!(output.contains(&format!("((long (*)(long)){callee})(7)")));
+        assert!(!output.contains("(*)()"));
+
+        let Ok(version) = std::process::Command::new("clang++")
+            .arg("--version")
+            .output()
+        else {
+            return;
+        };
+        if !version.status.success() {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!(
+            "manifold_actual_site_cast_{}.cpp",
+            std::process::id()
+        ));
+        std::fs::write(&path, &output).expect("write C++ syntax fixture");
+        let compiled = std::process::Command::new("clang++")
+            .args(["-std=c++17", "-Wno-everything", "-fsyntax-only"])
+            .arg(&path)
+            .output()
+            .expect("run clang++ over actual-site cast fixture");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            compiled.status.success(),
+            "actual-site function-pointer cast is not valid C++:\n{}\n{output}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
     }
 
     #[test]

@@ -1904,10 +1904,6 @@ impl IRPass for ClightEmitPass {
                 .filter(|(_, _, sym_type, ..)| **sym_type == *"OBJECT")
                 .map(|(.., name)| name.to_string())
                 .collect();
-            let global_var_refs: HashSet<Ident> = db
-                .rel_iter::<(Ident,)>("global_var_ref")
-                .map(|(ident,)| *ident)
-                .collect();
             for &(_, address, kind, provider, original) in db.rel_iter::<(
                 Node,
                 Address,
@@ -1915,9 +1911,7 @@ impl IRPass for ClightEmitPass {
                 Symbol,
                 Symbol,
             )>("call_loader_identity") {
-                if kind != LoaderSymbolKind::ImportPointer
-                    || !global_var_refs.contains(&(address as Ident))
-                {
+                if kind != LoaderSymbolKind::ImportPointer {
                     continue;
                 }
                 // Exact memory-call identity is positive object evidence even
@@ -2205,7 +2199,6 @@ impl IRPass for ClightEmitPass {
                             crate::decompile::passes::c_pass::helpers::inline_rodata_constants_preserving_addrof(e, &rodata_const_map)
                         },
                     );
-                    let cstmt = crate::decompile::passes::c_pass::convert::from_relations::narrow_varargs_in_stmt(&cstmt);
                     statements.push((node, cstmt));
                 }
             }

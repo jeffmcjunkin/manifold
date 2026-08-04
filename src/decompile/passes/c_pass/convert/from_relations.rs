@@ -381,6 +381,18 @@ fn header_collision_policy(selected_functions: &[SelectedFunction]) -> LocalDefP
     policy
 }
 
+/// Whether C emission can rely on a declaration outside this translation
+/// unit. Header groups with `header: null` intentionally have no such source,
+/// so their called names must still receive a compatible declaration here.
+fn function_declaration_is_externally_provided(name: &str) -> bool {
+    let hdb = crate::decompile::passes::c_pass::header_db::header_db();
+    hdb.prefixes.iter().any(|prefix| name.starts_with(prefix))
+        || hdb
+            .includes
+            .iter()
+            .any(|(_, functions)| functions.iter().any(|function| *function == name))
+}
+
 pub fn build_cast_from_relations(
     db: &DecompileDB,
     selected_functions: &[SelectedFunction],
@@ -1583,11 +1595,10 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         tu.add_function(func_def);
     }
 
-    // A function whose declaration the compiler already provides (header prototype or builtin); our own decl only yields "conflicting types". Name/prefix lists live in header_functions.json (parsed once in c_pass::header_db, shared with print.rs's include selection), so this is data, not hardcoded.
-    let is_compiler_provided = |n: &str| {
-        let hdb = crate::decompile::passes::c_pass::header_db::header_db();
-        hdb.functions.contains(n) || hdb.prefixes.iter().any(|p| n.starts_with(p))
-    };
+    // Suppress our declaration only when an emitted header or a compiler
+    // builtin really supplies one. A data-driven header:null entry has no
+    // external declaration and must follow the ordinary compatible-decl path.
+    let is_compiler_provided = function_declaration_is_externally_provided;
 
     // This is the sole typed-declaration authority for loader-owned and
     // ordinary curated externs.  Its projection already vetoes address/kind,
@@ -1904,59 +1915,11 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         }
     }
 
-    // Remove only surplus arguments beyond a declared fixed arity.  Short
-    // sites keep their recovered values verbatim; variadic and unspecified
-    // (K&R) callees are left as-is.
-    {
-        use crate::decompile::passes::c_pass::types::TopLevelDecl;
-        let mut arity_facts: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
-        let mut variadic_vetoes = HashSet::new();
-        for decl in tu.decls.iter() {
-            match decl {
-                TopLevelDecl::FuncDef(f) if !f.is_variadic => {
-                    arity_facts
-                        .entry(f.name.clone())
-                        .or_default()
-                        .insert(f.params.len());
-                }
-                TopLevelDecl::FuncDecl(d) if !d.is_variadic && !d.unspecified_params => {
-                    arity_facts
-                        .entry(d.name.clone())
-                        .or_default()
-                        .insert(d.params.len());
-                }
-                TopLevelDecl::FuncDef(f) => {
-                    variadic_vetoes.insert(f.name.clone());
-                }
-                TopLevelDecl::FuncDecl(d) if d.is_variadic => {
-                    variadic_vetoes.insert(d.name.clone());
-                }
-                _ => {}
-            }
-        }
-        // Seed the curated arity for header-suppressed non-variadic libc functions, whose fixed arity never reaches arity_counts, so an over-recovered call cannot clash with the header prototype.
-        for (name, (_ret, params, variadic)) in known_loader_signatures_from_db(db) {
-            if variadic || is_known_variadic_fn(&name) {
-                variadic_vetoes.insert(name);
-                continue;
-            }
-            arity_facts.entry(name).or_default().insert(params.len());
-        }
-        let arity_counts: HashMap<String, usize> = arity_facts
-            .into_iter()
-            .filter_map(|(name, counts)| {
-                (counts.len() == 1 && !variadic_vetoes.contains(&name))
-                    .then(|| (name, *counts.iter().next().unwrap()))
-            })
-            .collect();
-        for decl in tu.decls.iter_mut() {
-            if let TopLevelDecl::FuncDef(f) = decl {
-                f.body = normalize_call_arity_stmt(&f.body, &arity_counts);
-            }
-        }
-    }
-
-    // Compilability: insert explicit casts at int<->pointer assignment/argument/return mismatches after surplus-argument normalization.
+    // Compilability: insert explicit casts at int<->pointer
+    // assignment/argument/return mismatches after declaration recovery.  Call
+    // argument vectors are immutable evidence; declaration arity is handled
+    // by a per-site unprototyped callee cast or by declining a fixed
+    // declaration, never by rewriting the vector.
     {
         use crate::decompile::passes::c_pass::types::TopLevelDecl;
         let mut callee_params: CalleeParams = HashMap::new();
@@ -4173,119 +4136,6 @@ fn repair_arith_stmt(stmt: &CStmt, types: &HashMap<String, CType>) -> CStmt {
     }
 }
 
-// Truncate surplus arguments to an authoritative fixed arity.  A short call is
-// preserved: declaration recovery is never authority to invent a semantic 0.
-// Variadic and K&R calls are absent from `counts` and remain untouched.
-fn normalize_call_arity_expr(e: &CExpr, counts: &HashMap<String, usize>) -> CExpr {
-    match e {
-        CExpr::Call(func, args) => {
-            let nf = normalize_call_arity_expr(func, counts);
-            let mut nargs: Vec<CExpr> = args
-                .iter()
-                .map(|a| normalize_call_arity_expr(a, counts))
-                .collect();
-            if let CExpr::Var(name) = &nf {
-                if let Some(&pc) = counts.get(name) {
-                    if nargs.len() > pc {
-                        nargs.truncate(pc);
-                    }
-                }
-            }
-            CExpr::Call(Box::new(nf), nargs)
-        }
-        CExpr::Unary(op, i) => CExpr::Unary(*op, Box::new(normalize_call_arity_expr(i, counts))),
-        CExpr::Binary(op, l, r) => CExpr::Binary(
-            *op,
-            Box::new(normalize_call_arity_expr(l, counts)),
-            Box::new(normalize_call_arity_expr(r, counts)),
-        ),
-        CExpr::Assign(op, l, r) => CExpr::Assign(
-            *op,
-            Box::new(normalize_call_arity_expr(l, counts)),
-            Box::new(normalize_call_arity_expr(r, counts)),
-        ),
-        CExpr::Ternary(c, t, f) => CExpr::Ternary(
-            Box::new(normalize_call_arity_expr(c, counts)),
-            Box::new(normalize_call_arity_expr(t, counts)),
-            Box::new(normalize_call_arity_expr(f, counts)),
-        ),
-        CExpr::Cast(ty, i) => {
-            CExpr::Cast(ty.clone(), Box::new(normalize_call_arity_expr(i, counts)))
-        }
-        CExpr::Member(i, f) => {
-            CExpr::Member(Box::new(normalize_call_arity_expr(i, counts)), f.clone())
-        }
-        CExpr::MemberPtr(i, f) => {
-            CExpr::MemberPtr(Box::new(normalize_call_arity_expr(i, counts)), f.clone())
-        }
-        CExpr::Index(a, i) => CExpr::Index(
-            Box::new(normalize_call_arity_expr(a, counts)),
-            Box::new(normalize_call_arity_expr(i, counts)),
-        ),
-        CExpr::SizeofExpr(i) => CExpr::SizeofExpr(Box::new(normalize_call_arity_expr(i, counts))),
-        CExpr::Paren(i) => CExpr::Paren(Box::new(normalize_call_arity_expr(i, counts))),
-        CExpr::StmtExpr(stmts, i) => CExpr::StmtExpr(
-            stmts
-                .iter()
-                .map(|s| normalize_call_arity_stmt(s, counts))
-                .collect(),
-            Box::new(normalize_call_arity_expr(i, counts)),
-        ),
-        other => other.clone(),
-    }
-}
-
-fn normalize_call_arity_stmt(stmt: &CStmt, counts: &HashMap<String, usize>) -> CStmt {
-    match stmt {
-        CStmt::Expr(e) => CStmt::Expr(normalize_call_arity_expr(e, counts)),
-        CStmt::Block(items) => CStmt::Block(
-            items
-                .iter()
-                .map(|item| match item {
-                    CBlockItem::Stmt(s) => CBlockItem::Stmt(normalize_call_arity_stmt(s, counts)),
-                    other => other.clone(),
-                })
-                .collect(),
-        ),
-        CStmt::If(c, t, e) => CStmt::If(
-            normalize_call_arity_expr(c, counts),
-            Box::new(normalize_call_arity_stmt(t, counts)),
-            e.as_ref()
-                .map(|x| Box::new(normalize_call_arity_stmt(x, counts))),
-        ),
-        CStmt::While(c, b) => CStmt::While(
-            normalize_call_arity_expr(c, counts),
-            Box::new(normalize_call_arity_stmt(b, counts)),
-        ),
-        CStmt::DoWhile(b, c) => CStmt::DoWhile(
-            Box::new(normalize_call_arity_stmt(b, counts)),
-            normalize_call_arity_expr(c, counts),
-        ),
-        CStmt::For(init, c, u, b) => CStmt::For(
-            init.clone(),
-            c.as_ref().map(|x| normalize_call_arity_expr(x, counts)),
-            u.as_ref().map(|x| normalize_call_arity_expr(x, counts)),
-            Box::new(normalize_call_arity_stmt(b, counts)),
-        ),
-        CStmt::Return(Some(e)) => CStmt::Return(Some(normalize_call_arity_expr(e, counts))),
-        CStmt::Switch(e, b) => CStmt::Switch(
-            normalize_call_arity_expr(e, counts),
-            Box::new(normalize_call_arity_stmt(b, counts)),
-        ),
-        CStmt::Labeled(lbl, inner) => CStmt::Labeled(
-            lbl.clone(),
-            Box::new(normalize_call_arity_stmt(inner, counts)),
-        ),
-        CStmt::Sequence(stmts) => CStmt::Sequence(
-            stmts
-                .iter()
-                .map(|s| normalize_call_arity_stmt(s, counts))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
 // Compilability: insert explicit casts at int<->pointer mismatches, which modern clang and gcc reject as hard errors even under -w; float<->pointer and unknown-class operands are left alone.
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -4953,84 +4803,6 @@ pub fn convert_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> C
     }
 }
 
-/// For known varargs functions (printf, fprintf, etc.), narrow the argument list by counting format specifiers in the format string.
-fn narrow_varargs_args(func_expr: &CExpr, mut args: Vec<CExpr>) -> Vec<CExpr> {
-    let func_name = match func_expr {
-        CExpr::Var(name) => name.as_str(),
-        _ => return args,
-    };
-
-    // (function_name, format_string_position)
-    let fmt_pos = match func_name {
-        "printf" | "scanf" => Some(0),
-        "fprintf" | "fscanf" | "sprintf" | "sscanf" | "dprintf" => Some(1),
-        "snprintf" => Some(2),
-        "__printf_chk" => Some(1),
-        "__fprintf_chk" => Some(2),
-        "__sprintf_chk" | "__snprintf_chk" => Some(3),
-        _ => None,
-    };
-
-    let fmt_idx = match fmt_pos {
-        Some(i) if i < args.len() => i,
-        _ => return args,
-    };
-
-    // Count format specifiers (%d, %s, %x, etc.) in the format string
-    let specifier_count = match &args[fmt_idx] {
-        CExpr::StringLit(sl) => {
-            let mut count = 0;
-            let mut chars = sl.value.chars().peekable();
-            while let Some(ch) = chars.next() {
-                if ch == '%' {
-                    match chars.peek() {
-                        Some('%') => {
-                            chars.next();
-                        } // %% is literal
-                        Some(_) => count += 1,
-                        None => {}
-                    }
-                }
-            }
-            count
-        }
-        _ => return args, // can't parse, keep all
-    };
-
-    let keep = fmt_idx + 1 + specifier_count;
-    if keep >= args.len() {
-        return args;
-    }
-
-    // Refuse to truncate when any trailing arg has side effects to avoid changing semantics.
-    let trailing_has_effects = args[keep..].iter().any(|a| a.has_side_effects());
-    if trailing_has_effects {
-        log::warn!(
-            "narrow_varargs_args: refusing to truncate {}() args from {} to {} -- trailing arg has side effects",
-            func_name,
-            args.len(),
-            keep,
-        );
-        return args;
-    }
-
-    args.truncate(keep);
-    args
-}
-
-/// Narrow varargs in all Call expressions within a CStmt (call after string inlining).
-pub fn narrow_varargs_in_stmt(stmt: &CStmt) -> CStmt {
-    use crate::decompile::passes::c_pass::helpers::map_stmt_exprs;
-    map_stmt_exprs(stmt, &|expr| {
-        if let CExpr::Call(func, args) = expr {
-            let args = narrow_varargs_args(func, args.to_vec());
-            Some(CExpr::Call(func.clone(), args))
-        } else {
-            None
-        }
-    })
-}
-
 /// Eliminate dead code after unconditional exits, preserving labeled goto targets.
 fn eliminate_dead_code(stmt: &CStmt) -> CStmt {
     match stmt {
@@ -5329,11 +5101,12 @@ pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> C
             } else {
                 func_expr
             };
-            // A short or otherwise incoherent exact call carries a true K&R
-            // call-site type.  Materialize that annotation as a cast so a
-            // fixed declaration (including one supplied by a system header)
-            // cannot make the recovered call ill-formed or tempt a later pass
-            // to synthesize missing arguments.
+            // A short or otherwise incoherent exact call carries an
+            // unprototyped annotation whose parameter slots describe this
+            // site's real arguments. Materialize it as a cast so a fixed
+            // declaration (including one supplied by a system header) cannot
+            // make the recovered call ill-formed or tempt a later pass to
+            // synthesize missing arguments.
             let func_expr = match direct_unprototyped_type {
                 Some(ty) => CExpr::Cast(ty, Box::new(func_expr)),
                 None => func_expr,
@@ -7161,7 +6934,7 @@ fn collect_call_arg_evidence_in_expr(
 ) {
     match expr {
         CExpr::Call(callee, args) => {
-            if let CExpr::Var(name) = callee.as_ref() {
+            if let Some(name) = callee_name_through_casts(callee) {
                 if env.local_types.contains_key(name) {
                     for arg in args {
                         collect_call_arg_evidence_in_expr(arg, env, sites);
@@ -7170,7 +6943,7 @@ fn collect_call_arg_evidence_in_expr(
                 }
                 let evidence: Vec<ArgEvidence> =
                     args.iter().map(|a| arg_evidence_of_expr(a, env)).collect();
-                sites.entry(name.clone()).or_default().push(evidence);
+                sites.entry(name.to_string()).or_default().push(evidence);
             }
             collect_call_arg_evidence_in_expr(callee, env, sites);
             for arg in args {
@@ -8324,10 +8097,10 @@ mod callee_identity_tests {
         )
     }
 
-    fn unprototyped_function_pointer_type() -> ClightType {
+    fn actual_site_unprototyped_function_pointer_type(params: Vec<ClightType>) -> ClightType {
         ClightType::Tpointer(
             Arc::new(ClightType::Tfunction(
-                Arc::new(vec![]),
+                Arc::new(params),
                 Arc::new(ClightType::Tvoid),
                 CallConv {
                     unproto: true,
@@ -8406,7 +8179,9 @@ mod callee_identity_tests {
     #[test]
     fn direct_unprototyped_call_materializes_a_call_site_cast() {
         let function_address: Address = 0x401000;
-        let clight_type = unprototyped_function_pointer_type();
+        let clight_type = actual_site_unprototyped_function_pointer_type(vec![
+            ClightType::Tlong(ClightSignedness::Signed, ClightAttr::default()),
+        ]);
         let expected_type = convert_clight_type(&clight_type);
         let mut context = ConversionContext::new(HashMap::new());
         context.enter_function(function_address, None);
@@ -8580,7 +8355,15 @@ mod callee_identity_tests {
             callee_ret: &callee_ret,
         };
         let expression = CExpr::Call(
-            Box::new(CExpr::Var("var_0".to_string())),
+            Box::new(CExpr::Paren(Box::new(CExpr::Cast(
+                CType::ptr(CType::Function(
+                    Box::new(CType::Void),
+                    vec![CType::long()],
+                    false,
+                    true,
+                )),
+                Box::new(CExpr::Var("var_0".to_string())),
+            )))),
             vec![CExpr::int(1)],
         );
         let mut sites = HashMap::new();
@@ -8590,6 +8373,37 @@ mod callee_identity_tests {
         assert!(
             sites.is_empty(),
             "an indirect local must not synthesize a file-scope function prototype"
+        );
+    }
+
+    #[test]
+    fn cast_wrapped_nonlocal_callee_contributes_actual_argument_evidence() {
+        let global_types = HashMap::new();
+        let callee_ret = HashMap::new();
+        let environment = ArgEvidenceEnv {
+            local_types: HashMap::new(),
+            global_types: &global_types,
+            callee_ret: &callee_ret,
+        };
+        let expression = CExpr::Call(
+            Box::new(CExpr::Paren(Box::new(CExpr::Cast(
+                CType::ptr(CType::Function(
+                    Box::new(CType::int()),
+                    vec![CType::long()],
+                    false,
+                    true,
+                )),
+                Box::new(CExpr::Var("headerless_external".to_string())),
+            )))),
+            vec![CExpr::int(1)],
+        );
+        let mut sites = HashMap::new();
+
+        collect_call_arg_evidence_in_expr(&expression, &environment, &mut sites);
+
+        assert_eq!(
+            sites.get("headerless_external"),
+            Some(&vec![vec![ArgEvidence::Int(32, Signedness::Signed)]])
         );
     }
 }
@@ -9085,19 +8899,6 @@ mod arg_evidence_tests {
             &HashSet::from([2u64]),
         );
         assert!(inferred.is_empty());
-    }
-
-    #[test]
-    fn fixed_arity_normalization_never_pads_a_short_call() {
-        let call = CExpr::Call(
-            Box::new(CExpr::Var("fixed".to_string())),
-            vec![CExpr::int(11)],
-        );
-        let normalized = normalize_call_arity_expr(
-            &call,
-            &HashMap::from([("fixed".to_string(), 3usize)]),
-        );
-        assert_eq!(normalized, call);
     }
 
     #[test]
@@ -9641,6 +9442,73 @@ mod arg_evidence_tests {
                 TopLevelDecl::FuncDecl(func) if func.name == sanitize_c_symbol_name(original)
             )
         }));
+    }
+
+    #[test]
+    fn headerless_compiler_provided_call_gets_a_data_driven_declaration() {
+        let hdb = crate::decompile::passes::c_pass::header_db::header_db();
+        let mut headerless: Vec<&'static str> = hdb
+            .functions
+            .iter()
+            .copied()
+            .filter(|name| !function_declaration_is_externally_provided(name))
+            .collect();
+        headerless.sort_unstable();
+        let name = *headerless
+            .first()
+            .expect("header database must exercise a header:null function");
+
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        let params = Arc::new(vec![XType::Xany64]);
+        db.rel_push(
+            "known_extern_signature",
+            (name, 1usize, XType::Xint, params.clone()),
+        );
+        // This relation is produced only for a resolved external call, so the
+        // fixture models a called header:null entry without naming one.
+        db.rel_push(
+            "resolved_extern_signature",
+            (name, 1usize, XType::Xint, params),
+        );
+
+        let mut tu = build_translation_unit_from_stmt_map_with_types(
+            &db,
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        tu.add_function(FuncDef {
+            name: "headerless_caller".to_string(),
+            return_type: CType::Void,
+            params: vec![],
+            is_variadic: false,
+            storage_class: StorageClass::Auto,
+            body: CStmt::Expr(CExpr::Call(
+                Box::new(CExpr::Var(name.to_string())),
+                vec![CExpr::int(1)],
+            )),
+            local_vars: vec![],
+            loc: SourceLoc::unknown(),
+        });
+        assert!(tu.decls.iter().any(|decl| {
+            matches!(
+                decl,
+                TopLevelDecl::FuncDecl(func)
+                    if func.name == name
+                        && func.params.len() == 1
+                        && !func.unspecified_params
+            )
+        }));
+        let output = crate::decompile::passes::c_pass::print::print_translation_unit(&tu);
+        assert!(output.contains(&format!("int {name}(long arg0);")));
+        assert!(!output.contains("#include"));
     }
 }
 

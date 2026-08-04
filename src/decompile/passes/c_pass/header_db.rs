@@ -1,9 +1,14 @@
-// Single parsed view of header_functions.json, the one source of truth for system-header knowledge so the emitter's prototype suppression, renames, and #include selection can never drift.
+// Single parsed view of header_functions.json, the one source of truth for
+// system-header knowledge. Header-backed names drive declaration suppression
+// and include selection together; header:null names remain available for
+// collision policy while receiving a data-driven declaration in the TU.
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 pub struct HeaderDb {
-    /// Every function name the headers declare (union of all groups). The prototype-suppression set.
+    /// Every curated function name (union of all groups), including
+    /// header:null entries. This is the local-definition collision set, not by
+    /// itself proof that an external declaration will be emitted.
     pub functions: HashSet<&'static str>,
     /// Name prefixes that are compiler-provided (e.g. "__builtin_").
     pub prefixes: Vec<&'static str>,
