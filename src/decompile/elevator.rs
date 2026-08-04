@@ -584,6 +584,7 @@ impl DecompileDB {
             // PhoenixStructurePass removed 2026-06-10: wave-2 adjudication kept it OFF (-3..-10% gotos at 28:1 line churn, UNRESOLVED O-13); recoverable at c291258.
             Box::new(forloop::ForLoopPass),
             Box::new(var_reduce::VarReducePass),
+            Box::new(empty_arm::EmptyArmCanonicalizerPass),
         ];
 
         let schedule = PassScheduler::build_schedule(&passes);
