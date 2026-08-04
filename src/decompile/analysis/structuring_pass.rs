@@ -265,6 +265,11 @@ impl IRPass for StructuringPass {
         }
         db.rel_set("emit_scond_no_join", scond_no_join_rel);
         crate::decompile::passes::rtl_pass::enforce_win64_home_types(db);
+        // Copy elimination transfers the eliminated destination's candidates
+        // back to its source.  Reassert definition-side conversion authority
+        // before Clight consumes those candidates, while retaining every
+        // genuine-float fail-open handled by TypePass's common boundary.
+        crate::decompile::analysis::type_pass::enforce_definitionally_integral_result_types(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -286,6 +291,13 @@ impl IRPass for StructuringPass {
             "win64_home_backing_access",
             "win64_home_backing_selected_candidate",
             "rtl_inst",
+            "ltl_inst",
+            "reg_rtl",
+            "known_extern_signature",
+            "call_site",
+            "call_target_func",
+            "call_return_reg",
+            "func_returns_float",
             "is_ptr",
         ]
     }
@@ -3917,6 +3929,48 @@ fn inline_single_use_temps(working: &mut HashMap<Node, CsharpminorStmt>, db: &De
 #[cfg(test)]
 mod copy_propagation_tests {
     use super::*;
+    use crate::decompile::analysis::type_pass::TypePass;
+    use crate::decompile::passes::clight_pass::ClightPass;
+    use crate::mreg::Mreg;
+    use crate::x86::op::{Addressing, Operation};
+    use crate::x86::types::{
+        ClightFloatSize, ClightStmt, ClightType, LTLInst, MemoryChunk, RTLInst, XType,
+    };
+    use std::sync::Arc;
+
+    fn candidate_types(db: &DecompileDB, reg: RTLReg) -> HashSet<XType> {
+        db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .filter_map(|(candidate, xtype)| (*candidate == reg).then_some(*xtype))
+            .collect()
+    }
+
+    fn clight_return_types(db: &DecompileDB, node: Node) -> Vec<ClightType> {
+        db.rel_iter::<(Node, ClightStmt)>("clight_stmt")
+            .filter_map(|(candidate, stmt)| match stmt {
+                ClightStmt::Sreturn(Some(expr)) if *candidate == node => {
+                    Some(crate::decompile::passes::csh_pass::clight_expr_type(expr))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn seed_single_return(
+        db: &mut DecompileDB,
+        func: Address,
+        node: Node,
+        reg: RTLReg,
+        name: Symbol,
+    ) {
+        db.rel_push(
+            "csharp_stmt_candidate",
+            (node, CsharpminorStmt::Sreturn(CsharpminorExpr::Evar(reg))),
+        );
+        db.rel_push("instr_in_function", (node, func));
+        db.rel_push("code_in_block", (node, node));
+        db.rel_push("func_entry_node", (func, node));
+        db.rel_push("emit_function", (func, name, node));
+    }
 
     fn cross_block_copy(protected: bool) -> CopyPropagationProgram {
         let copy_node = 0x100;
@@ -3968,5 +4022,205 @@ mod copy_propagation_tests {
         db.rel_push("win64_home_escaped", (0x2000_u64, 0x20_u64));
 
         assert_eq!(protected_stack_regs(&db), HashSet::from([0x10, 0x20]));
+    }
+
+    #[test]
+    fn conversion_result_stays_integral_through_structuring_and_clight() {
+        const FUNC: Address = 0x4000;
+        const CONVERT: Node = 0x4010;
+        const COPY: Node = 0x4020;
+        const RETURN: Node = 0x4030;
+        const BLOCK: Node = 0x4000;
+        const INPUT: RTLReg = 0x5000;
+        const RESULT: RTLReg = 0x5001;
+        const COPY_DST: RTLReg = 0x5002;
+
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        db.rel_push(
+            "ltl_inst",
+            (
+                CONVERT,
+                LTLInst::Lop(
+                    Operation::Ointofsingle,
+                    Arc::new(vec![Mreg::X1]),
+                    Mreg::CX,
+                ),
+            ),
+        );
+        db.rel_push("reg_rtl", (CONVERT, Mreg::CX, RESULT));
+        db.rel_push(
+            "rtl_inst",
+            (
+                CONVERT,
+                RTLInst::Iop(
+                    Operation::Ointofsingle,
+                    Arc::new(vec![INPUT]),
+                    RESULT,
+                ),
+            ),
+        );
+
+        // Structuring eliminates this copy and transfers COPY_DST's type back
+        // to RESULT.  The destination's float candidate models the later
+        // float-class use that originally exposed this regression.
+        db.rel_push("emit_var_type_candidate", (COPY_DST, XType::Xsingle));
+        db.rel_push(
+            "csharp_stmt_candidate",
+            (COPY, CsharpminorStmt::Sset(COPY_DST, CsharpminorExpr::Evar(RESULT))),
+        );
+        db.rel_push(
+            "csharp_stmt_candidate",
+            (RETURN, CsharpminorStmt::Sreturn(CsharpminorExpr::Evar(COPY_DST))),
+        );
+        for node in [COPY, RETURN] {
+            db.rel_push("instr_in_function", (node, FUNC));
+            db.rel_push("code_in_block", (node, BLOCK));
+        }
+        db.rel_push("func_entry_node", (FUNC, COPY));
+        db.rel_push("emit_function", (FUNC, "conversion_copy", COPY));
+        db.rel_push("cminor_succ", (COPY, RETURN));
+        db.rel_push("next", (COPY, RETURN));
+
+        TypePass.run(&mut db);
+        assert_eq!(candidate_types(&db, RESULT), HashSet::from([XType::Xint]));
+
+        StructuringPass.run(&mut db);
+        assert!(db
+            .rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt")
+            .any(|(node, stmt)| *node == COPY && matches!(stmt, CsharpminorStmt::Snop)));
+        assert_eq!(candidate_types(&db, RESULT), HashSet::from([XType::Xint]));
+
+        ClightPass.run(&mut db);
+        let return_types = clight_return_types(&db, RETURN);
+        assert!(!return_types.is_empty());
+        assert!(return_types
+            .iter()
+            .all(|ty| matches!(ty, ClightType::Tint(..))));
+    }
+
+    #[test]
+    fn generic_xmm_spill_reload_float_evidence_survives_structuring_and_clight() {
+        for (case, chunk, float_type, expected_size, xmm, gp, conversion) in [
+            (
+                0_u64,
+                MemoryChunk::MAny32,
+                XType::Xsingle,
+                ClightFloatSize::F32,
+                Mreg::X1,
+                Mreg::CX,
+                Operation::Ointofsingle,
+            ),
+            (
+                1_u64,
+                MemoryChunk::MAny64,
+                XType::Xfloat,
+                ClightFloatSize::F64,
+                Mreg::X2,
+                Mreg::DX,
+                Operation::Olongoffloat,
+            ),
+        ] {
+            let func = 0x6000 + case * 0x100;
+            let convert = func + 0x10;
+            let spill = func + 0x20;
+            let reload = func + 0x30;
+            let ret = func + 0x40;
+            let value = 0x7000 + case * 0x10;
+            let input = value + 1;
+            let gp_control = value + 2;
+            let neutral_xmm = value + 3;
+
+            let mut db = DecompileDB::default();
+            db.target_abi = Some(crate::abi::AbiConfig::win64());
+            db.rel_push(
+                "rtl_inst",
+                (
+                    convert,
+                    RTLInst::Iop(conversion.clone(), Arc::new(vec![input]), value),
+                ),
+            );
+            db.rel_push(
+                "ltl_inst",
+                (
+                    spill,
+                    LTLInst::Lstore(
+                        chunk,
+                        Addressing::Aindexed(0),
+                        Arc::new(Vec::new()),
+                        xmm,
+                    ),
+                ),
+            );
+            db.rel_push("reg_rtl", (spill, xmm, value));
+            db.rel_push(
+                "ltl_inst",
+                (
+                    reload,
+                    LTLInst::Lload(
+                        chunk,
+                        Addressing::Aindexed(0),
+                        Arc::new(Vec::new()),
+                        xmm,
+                    ),
+                ),
+            );
+            db.rel_push("reg_rtl", (reload, xmm, value));
+            db.rel_push("emit_var_type_candidate", (value, float_type));
+
+            // A generic-width GP transfer is not float evidence, even if an
+            // unrelated candidate tries to type the reused conversion web as
+            // one.  Likewise XMM transport alone remains veto-only.
+            db.rel_push(
+                "rtl_inst",
+                (
+                    convert + 1,
+                    RTLInst::Iop(conversion, Arc::new(vec![input]), gp_control),
+                ),
+            );
+            db.rel_push(
+                "ltl_inst",
+                (
+                    reload + 1,
+                    LTLInst::Lload(
+                        chunk,
+                        Addressing::Aindexed(0),
+                        Arc::new(Vec::new()),
+                        gp,
+                    ),
+                ),
+            );
+            db.rel_push("reg_rtl", (reload + 1, gp, gp_control));
+            db.rel_push("emit_var_type_candidate", (gp_control, float_type));
+            db.rel_push(
+                "ltl_inst",
+                (
+                    reload + 2,
+                    LTLInst::Lload(
+                        chunk,
+                        Addressing::Aindexed(0),
+                        Arc::new(Vec::new()),
+                        Mreg::X3,
+                    ),
+                ),
+            );
+            db.rel_push("reg_rtl", (reload + 2, Mreg::X3, neutral_xmm));
+
+            seed_single_return(&mut db, func, ret, value, "generic_xmm_roundtrip");
+            TypePass.run(&mut db);
+            StructuringPass.run(&mut db);
+            ClightPass.run(&mut db);
+
+            assert!(candidate_types(&db, value).contains(&float_type));
+            assert!(!candidate_types(&db, gp_control).contains(&float_type));
+            assert!(!candidate_types(&db, neutral_xmm)
+                .iter()
+                .any(|ty| matches!(ty, XType::Xfloat | XType::Xsingle)));
+            let return_types = clight_return_types(&db, ret);
+            assert!(!return_types.is_empty());
+            assert!(return_types.iter().all(|ty| {
+                matches!(ty, ClightType::Tfloat(size, _) if *size == expected_size)
+            }));
+        }
     }
 }
