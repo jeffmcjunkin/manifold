@@ -5203,20 +5203,19 @@ fn record_local_callee_function_type(callee: &clight::ClightExpr, ctx: &mut Conv
 }
 
 fn convert_callee_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -> CExpr {
-    // A provider cast does not turn a direct address callee into a local
-    // function-pointer object.  Emit the designator bare so direct-call
-    // evidence and forward-declaration recovery continue to recognize it.
-    if let clight::ClightExpr::Evar(id, _) = clight_callee_leaf(expr) {
-        if !ctx.is_current_local_evar(*id) && !ctx.id_to_name.contains_key(id) {
-            return CExpr::Var(format!("FUN_{:x}", id));
-        }
-    }
     match expr {
-        // Preserve casts around genuine indirect callees.
+        // Preserve an address-backed per-call contract. Declaration recovery
+        // looks through the cast below; dropping it would silently turn the
+        // call into a global prototype assertion.
         clight::ClightExpr::Ecast(inner, ty) => CExpr::Cast(
             convert_clight_type(ty),
             Box::new(convert_callee_expr(inner, ctx)),
         ),
+        clight::ClightExpr::Evar(id, _)
+            if !ctx.is_current_local_evar(*id) && !ctx.id_to_name.contains_key(id) =>
+        {
+            CExpr::Var(format!("FUN_{:x}", id))
+        }
         _ => convert_expr(expr, ctx),
     }
 }
@@ -6590,7 +6589,11 @@ fn collect_nonlocal_called_names_in_stmt(
 fn collect_called_names_in_expr(expr: &CExpr, names: &mut HashSet<String>) {
     match expr {
         CExpr::Call(callee, args) => {
-            if let CExpr::Var(name) = callee.as_ref() {
+            let mut callee_leaf = callee.as_ref();
+            while let CExpr::Cast(_, inner) = callee_leaf {
+                callee_leaf = inner;
+            }
+            if let CExpr::Var(name) = callee_leaf {
                 names.insert(name.clone());
             }
             collect_called_names_in_expr(callee, names);
@@ -7466,10 +7469,11 @@ mod callee_identity_tests {
     }
 
     #[test]
-    fn cast_wrapped_unmapped_nonlocal_evar_stays_direct() {
+    fn cast_wrapped_unknown_address_retains_per_call_contract() {
         let function_address: Address = 0x401000;
         let callee_id: Ident = 0x402346;
         let function_pointer = function_pointer_type();
+        let expected_type = convert_clight_type(&function_pointer);
         let callee = ClightExpr::Ecast(
             Box::new(ClightExpr::Evar(callee_id, function_pointer.clone())),
             function_pointer,
@@ -7482,13 +7486,19 @@ mod callee_identity_tests {
         assert_eq!(
             converted,
             CStmt::Expr(CExpr::Call(
-                Box::new(CExpr::Var("FUN_402346".to_string())),
+                Box::new(CExpr::Cast(
+                    expected_type,
+                    Box::new(CExpr::Var("FUN_402346".to_string())),
+                )),
                 vec![],
             )),
-            "a provider cast must not hide a direct callee from declaration recovery"
+            "a per-call function contract must survive C conversion"
         );
+        let mut local_names = HashSet::new();
+        collect_var_names_from_stmt(&converted, &mut local_names);
+        assert!(local_names.is_empty());
         let mut called = HashSet::new();
-        collect_nonlocal_called_names_in_stmt(&converted, &HashSet::new(), &mut called);
+        collect_nonlocal_called_names_in_stmt(&converted, &local_names, &mut called);
         assert_eq!(called, HashSet::from(["FUN_402346".to_string()]));
     }
 

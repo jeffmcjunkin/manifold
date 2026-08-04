@@ -48,6 +48,7 @@ ascent_par! {
     relation known_func_returns_long(Symbol);
     relation known_func_returns_ptr(Symbol);
     relation main_function(Address);
+    relation msvc_gs_cookie_guard_call(Node, Address, Node, Node, RTLReg);
     relation reg_def_used(Address, Mreg, Address);
     relation reg_rtl(Node, Mreg, RTLReg);
     relation reg_xtl(Node, Mreg, RTLReg);
@@ -534,6 +535,7 @@ ascent_par! {
 
     clight_stmt(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Scall(dst, sig, Either::Right(Either::Left(addr)), args)),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(args.as_slice()),
         let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
@@ -548,6 +550,7 @@ ascent_par! {
 
     clight_stmt(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Scall(dst, sig, Either::Right(Either::Left(addr)), args)),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         !addr_to_func_ident(addr, _),
         all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(args.as_slice()),
@@ -561,8 +564,32 @@ ascent_par! {
         let call_args = cast_call_args_to_signature_with_node(raw_args, &sig),
         let stmt = ClightStmt::Scall(dst_ident, func_expr, call_args);
 
+    // The guard contract belongs only to this authenticated call instance.
+    // The target has already been proved external and unowned in RTL; an
+    // address-to-name mapping affects spelling only, never target eligibility.
+    clight_stmt(node, stmt) <--
+        csharp_stmt(node, ?CsharpminorStmt::Scall(_, _, Either::Right(Either::Left(addr)), args)),
+        msvc_gs_cookie_guard_call(node, _, _, _, argument),
+        if args.len() == 1 && matches!(&args[0], CsharpminorExpr::Evar(reg) if *reg == *argument),
+        all_var_types_global(all_var_types),
+        let vars_used = extract_vars_from_csharp_exprs(args.as_slice()),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
+        let guard_sig = Signature {
+            sig_args: Arc::new(vec![XType::Xlong]),
+            sig_res: XType::Xvoid,
+            sig_cc: CallConv::default(),
+        },
+        let guard_sig_opt = Some(guard_sig.clone()),
+        let func_ty = clight_function_pointer_type(&guard_sig),
+        let direct = ClightExpr::Evar(*addr as Ident, func_ty.clone()),
+        let func_expr = ClightExpr::Ecast(Box::new(direct), func_ty),
+        let raw_args = clight_exprs_from_csharp_with_multi_types(args.as_slice(), &var_types),
+        let call_args = cast_call_args_to_signature_with_node(raw_args, &guard_sig_opt),
+        let stmt = ClightStmt::Scall(None, func_expr, call_args);
+
     clight_stmt(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Scall(dst, sig, Either::Right(Either::Right(sym)), args)),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         all_var_types_global(all_var_types),
         let vars_used = extract_vars_from_csharp_exprs(args.as_slice()),
         let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
@@ -573,6 +600,26 @@ ascent_par! {
         let raw_args = clight_exprs_from_csharp_with_multi_types(args.as_slice(), &var_types),
         let call_args = cast_call_args_to_signature_with_node(raw_args, &sig),
         let stmt = ClightStmt::Scall(dst_ident, func_expr, call_args);
+
+    clight_stmt(node, stmt) <--
+        csharp_stmt(node, ?CsharpminorStmt::Scall(_, _, Either::Right(Either::Right(sym)), args)),
+        msvc_gs_cookie_guard_call(node, _, _, _, argument),
+        if args.len() == 1 && matches!(&args[0], CsharpminorExpr::Evar(reg) if *reg == *argument),
+        all_var_types_global(all_var_types),
+        let vars_used = extract_vars_from_csharp_exprs(args.as_slice()),
+        let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
+        let guard_sig = Signature {
+            sig_args: Arc::new(vec![XType::Xlong]),
+            sig_res: XType::Xvoid,
+            sig_cc: CallConv::default(),
+        },
+        let guard_sig_opt = Some(guard_sig.clone()),
+        let func_ty = clight_function_pointer_type(&guard_sig),
+        let direct = ClightExpr::EvarSymbol(sym.to_string(), func_ty.clone()),
+        let func_expr = ClightExpr::Ecast(Box::new(direct), func_ty),
+        let raw_args = clight_exprs_from_csharp_with_multi_types(args.as_slice(), &var_types),
+        let call_args = cast_call_args_to_signature_with_node(raw_args, &guard_sig_opt),
+        let stmt = ClightStmt::Scall(None, func_expr, call_args);
 
     clight_stmt(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Sbuiltin(dst, name, args, res)),
