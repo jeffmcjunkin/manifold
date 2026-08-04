@@ -4108,6 +4108,95 @@ mod copy_propagation_tests {
     }
 
     #[test]
+    fn own_float_return_survives_eliminated_conversion_forwarding_copy() {
+        const FUNC: Address = 0x5200;
+        const CONVERT: Node = 0x5210;
+        const COPY: Node = 0x5220;
+        const RETURN: Node = 0x5230;
+        const INPUT: RTLReg = 0x6200;
+        const CONVERSION_RESULT: RTLReg = 0x6201;
+        const RETURN_REG: RTLReg = 0x6202;
+
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        db.rel_push(
+            "rtl_inst",
+            (
+                CONVERT,
+                RTLInst::Iop(
+                    Operation::Ointofsingle,
+                    Arc::new(vec![INPUT]),
+                    CONVERSION_RESULT,
+                ),
+            ),
+        );
+        // This RTL-only fixture bypasses the LTL operation rule that normally
+        // supplies the conversion's definition-side integer candidate.
+        db.rel_push(
+            "emit_var_type_candidate",
+            (CONVERSION_RESULT, XType::Xint),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                COPY,
+                RTLInst::Iop(
+                    Operation::Omove,
+                    Arc::new(vec![CONVERSION_RESULT]),
+                    RETURN_REG,
+                ),
+            ),
+        );
+        db.rel_push(
+            "csharp_stmt_candidate",
+            (
+                COPY,
+                CsharpminorStmt::Sset(
+                    RETURN_REG,
+                    CsharpminorExpr::Evar(CONVERSION_RESULT),
+                ),
+            ),
+        );
+        db.rel_push(
+            "csharp_stmt_candidate",
+            (RETURN, CsharpminorStmt::Sreturn(CsharpminorExpr::Evar(RETURN_REG))),
+        );
+        for node in [COPY, RETURN] {
+            db.rel_push("instr_in_function", (node, FUNC));
+            db.rel_push("code_in_block", (node, FUNC));
+        }
+        db.rel_push("func_entry_node", (FUNC, COPY));
+        db.rel_push("emit_function", (FUNC, "float_conversion_copy", COPY));
+        db.rel_push("cminor_succ", (COPY, RETURN));
+        db.rel_push("next", (COPY, RETURN));
+        db.rel_push("emit_function_return", (FUNC, RETURN_REG));
+        db.rel_push(
+            "emit_function_return_type_xtype_candidate",
+            (FUNC, XType::Xsingle),
+        );
+
+        TypePass.run(&mut db);
+        assert!(candidate_types(&db, CONVERSION_RESULT).contains(&XType::Xint));
+        assert!(candidate_types(&db, RETURN_REG).contains(&XType::Xsingle));
+
+        StructuringPass.run(&mut db);
+        assert!(db
+            .rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt")
+            .any(|(node, stmt)| *node == COPY && matches!(stmt, CsharpminorStmt::Snop)));
+        assert!(
+            candidate_types(&db, CONVERSION_RESULT).contains(&XType::Xsingle),
+            "copy elimination lost authenticated own-return float candidacy",
+        );
+
+        ClightPass.run(&mut db);
+        let return_types = clight_return_types(&db, RETURN);
+        assert!(!return_types.is_empty());
+        assert!(return_types.iter().all(|ty| {
+            matches!(ty, ClightType::Tfloat(ClightFloatSize::F32, _))
+        }));
+    }
+
+    #[test]
     fn generic_xmm_spill_reload_float_evidence_survives_structuring_and_clight() {
         for (case, chunk, float_type, expected_size, xmm, gp, conversion) in [
             (

@@ -143,6 +143,7 @@ fn has_explicit_float_transport(chunk: &MemoryChunk) -> bool {
 fn definitionally_integral_result_authority(db: &DecompileDB) -> BTreeMap<RTLReg, XType> {
     let mut integral_results: BTreeMap<RTLReg, BTreeSet<XType>> = BTreeMap::new();
     let mut float_results = BTreeSet::new();
+    let mut own_float_return_results = BTreeSet::new();
     let mut copy_edges = BTreeSet::new();
 
     for (_, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
@@ -187,6 +188,7 @@ fn definitionally_integral_result_authority(db: &DecompileDB) -> BTreeMap<RTLReg
     for &(function, reg) in db.rel_iter::<(Address, RTLReg)>("emit_function_return") {
         if float_return_functions.contains(&function) {
             float_results.insert(reg);
+            own_float_return_results.insert(reg);
         }
     }
 
@@ -264,10 +266,27 @@ fn definitionally_integral_result_authority(db: &DecompileDB) -> BTreeMap<RTLReg
         }
     }
 
-    // A copy is a definition of its destination, so genuine floatness flows
-    // forward through copy chains. Never propagate backward: an integer
-    // conversion copied toward a later float use remains integral at its
-    // source web.
+    // Exact own-return metadata is authenticated at the ABI boundary, but
+    // Structuring is allowed to eliminate a forwarding copy and substitute
+    // its source into the return. Carry only that strong evidence backward
+    // through Omove chains so the substituted source keeps its float
+    // candidacy. Other float evidence remains forward-only: an arbitrary
+    // later float use must not reclassify an integral conversion source.
+    loop {
+        let mut changed = false;
+        for &(src, dst) in &copy_edges {
+            if own_float_return_results.contains(&dst) {
+                changed |= own_float_return_results.insert(src);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    float_results.extend(own_float_return_results);
+
+    // A copy is a definition of its destination, so every genuine float
+    // source continues to flow forward through copy chains.
     loop {
         let mut changed = false;
         for &(src, dst) in &copy_edges {
