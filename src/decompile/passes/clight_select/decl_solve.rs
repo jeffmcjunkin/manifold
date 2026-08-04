@@ -1,6 +1,6 @@
 //! P5 decl solve: program-level decl decisions from the SELECTED statements, which per-function solves cannot make; v1 has no cross-decl coupling, so it is an exact weighted vote in plain Rust.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::decompile::passes::c_pass::types::{CType, TypeQualifiers};
 use crate::decompile::passes::clight_select::query::CalleeSignature;
@@ -46,9 +46,44 @@ fn xtype_to_ctype(xt: &XType) -> CType {
         XType::Xintptr => CType::ptr(CType::int()),
         XType::Xfloatptr => CType::ptr(CType::double()),
         XType::Xsingleptr => CType::ptr(CType::float()),
-        XType::Xptr | XType::Xfuncptr => CType::ptr(CType::Void),
+        XType::Xptr => CType::ptr(CType::Void),
+        XType::Xfuncptr => CType::ptr(CType::func_unprototyped(CType::Void)),
         _ => CType::long(),
     }
+}
+
+fn function_pointer_global_type(
+    name: &str,
+    shared_fixed_arities: &HashMap<String, usize>,
+    known_fnptr_signatures: &HashMap<String, (XType, Vec<XType>, bool)>,
+) -> CType {
+    let function_type = if let Some((return_type, param_types, is_varargs)) =
+        known_fnptr_signatures.get(name)
+    {
+        if *is_varargs && param_types.is_empty() {
+            // ISO C cannot spell a variadic prototype without at least one
+            // named parameter.  Preserve the call ABI by leaving it
+            // unprototyped instead of fabricating a fixed `(void)` function.
+            CType::func_unprototyped(xtype_to_ctype(return_type))
+        } else {
+            CType::Function(
+                Box::new(xtype_to_ctype(return_type)),
+                param_types.iter().map(xtype_to_ctype).collect::<Vec<_>>(),
+                *is_varargs,
+                false,
+            )
+        }
+    } else if let Some(&arity) = shared_fixed_arities.get(name) {
+        CType::Function(
+            Box::new(CType::long()),
+            vec![CType::long(); arity],
+            false,
+            false,
+        )
+    } else {
+        CType::func_unprototyped(CType::long())
+    };
+    CType::Pointer(Box::new(function_type), TypeQualifiers::none())
 }
 
 /// The annotation type of an expression (leaf accessor; mirrors ctyping::expr_annotation for the shapes a field base can take).
@@ -137,6 +172,50 @@ struct Collector<'a> {
 
 fn all_int_candidates(cands: &[String]) -> bool {
     !cands.is_empty() && cands.iter().all(|c| c.starts_with("int_"))
+}
+
+fn direct_global_object_name(
+    expr: &ClightExpr,
+    id_to_name: &HashMap<usize, String>,
+) -> Option<String> {
+    match expr {
+        ClightExpr::EvarSymbol(name, _) => Some(name.clone()),
+        ClightExpr::Evar(id, _) => id_to_name.get(id).cloned(),
+        ClightExpr::Ecast(inner, _) => direct_global_object_name(inner, id_to_name),
+        _ => None,
+    }
+}
+
+/// Recover the data object supplying a call target.  In addition to the
+/// historical direct Evar/EvarSymbol form, exact IAT lowering is deliberately
+/// `cast(deref(cast(addrof(Evar(slot)))))`: the dereference is semantic and may
+/// not be stripped, but the declaration authority still has to discover the
+/// addressed slot so it can declare that object as a function pointer.
+fn called_global_object_name(
+    expr: &ClightExpr,
+    id_to_name: &HashMap<usize, String>,
+) -> Option<String> {
+    match expr {
+        ClightExpr::Ecast(inner, _) => called_global_object_name(inner, id_to_name),
+        ClightExpr::EvarSymbol(_, _) | ClightExpr::Evar(_, _) => {
+            direct_global_object_name(expr, id_to_name)
+        }
+        ClightExpr::Ederef(address, _) => {
+            let mut address = address.as_ref();
+            while let ClightExpr::Ecast(inner, _) = address {
+                address = inner.as_ref();
+            }
+            let ClightExpr::Eaddrof(object, _) = address else {
+                return None;
+            };
+            direct_global_object_name(object, id_to_name).map(|name| {
+                crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(
+                    &name,
+                )
+            })
+        }
+        _ => None,
+    }
 }
 
 /// True when `op` rejects pointer operands outright: the bitwise/shift/mod set, plus `*`/`/` when the result is not float (a Tfloat `*`/`/` is genuine float arithmetic). A BARE register operand here is integer-used.
@@ -316,11 +395,7 @@ impl<'a> Collector<'a> {
             }
             Scall(_, f, args) => {
                 // A call through a global SYMBOL that is a data object (not a recovered function) is the call-through-non-function family: the decl must become a function pointer.
-                let callee_name: Option<String> = match f {
-                    ClightExpr::EvarSymbol(name, _) => Some(name.clone()),
-                    ClightExpr::Evar(id, _) => self.id_to_name.get(id).cloned(),
-                    _ => None,
-                };
+                let callee_name = called_global_object_name(f, self.id_to_name);
                 if let Some(name) = callee_name {
                     if std::env::var("MANIFOLD_DECL_SOLVE_TRACE").is_ok() {
                         eprintln!(
@@ -383,16 +458,37 @@ fn field_ptr_selection(
 ) -> HashMap<(String, String), String> {
     use crate::decompile::passes::clight_select::query as csq;
 
-    // name -> ident exactly as the retired tr3_field_ptr_selection built it (sorted (id, name), first-wins, both sanitized and raw spellings) so callee_ident_from_expr resolves callee signatures identically.
-    let mut name_to_ident: HashMap<String, Ident> = HashMap::new();
-    let mut sorted_id_name: Vec<(&usize, &String)> = id_to_name.iter().collect();
-    sorted_id_name.sort_by_key(|(id, name)| (**id, (*name).clone()));
-    for (id, name) in sorted_id_name {
+    // Field evidence follows a symbol-form callee only when the spelling has
+    // one Ident owner.  A deterministic first-wins choice is still the wrong
+    // object under an address/kind or sanitizer collision.
+    let mut name_owners: BTreeMap<String, BTreeSet<Ident>> = BTreeMap::new();
+    for (id, name) in id_to_name {
+        let ident = *id as Ident;
         let sanitized =
             crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(name);
-        name_to_ident.entry(sanitized).or_insert(*id as Ident);
-        name_to_ident.entry(name.clone()).or_insert(*id as Ident);
+        name_owners.entry(sanitized).or_default().insert(ident);
+        name_owners.entry(name.clone()).or_default().insert(ident);
     }
+    for func in funcs {
+        let sanitized =
+            crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(
+                &func.name,
+            );
+        name_owners
+            .entry(func.name.clone())
+            .or_default()
+            .insert(func.address as Ident);
+        name_owners
+            .entry(sanitized)
+            .or_default()
+            .insert(func.address as Ident);
+    }
+    let name_to_ident: HashMap<String, Ident> = name_owners
+        .into_iter()
+        .filter_map(|(name, owners)| {
+            (owners.len() == 1).then(|| (name, *owners.iter().next().unwrap()))
+        })
+        .collect();
 
     let mut field_cands: HashMap<(String, String), Vec<String>> = HashMap::new();
     let mut evidence: HashSet<(String, String)> = HashSet::new();
@@ -757,9 +853,10 @@ pub fn run(
     funcs: &[SelectedFunction],
     internal_addrs: &HashSet<Address>,
     callee_sigs: &HashMap<Ident, CalleeSignature>,
-    name_to_ident: &HashMap<String, Ident>,
     global_names: &HashSet<String>,
     id_to_name: &HashMap<usize, String>,
+    shared_fixed_arities: &HashMap<String, usize>,
+    known_fnptr_signatures: &HashMap<String, (XType, Vec<XType>, bool)>,
 ) -> DeclSolveOut {
     let empty: HashMap<crate::x86::types::RTLReg, Vec<String>> = HashMap::new();
     let empty_regs: HashSet<crate::x86::types::RTLReg> = HashSet::new();
@@ -827,38 +924,19 @@ pub fn run(
         id_to_name,
         &out.field_int_veto,
     );
-    for (name, arg_counts) in &c.called_globals {
-        // Signature priority: the recovered callee table when available, else synthesized from the CALL SITES; params are long, since int and pointer arguments both convert silently under -w.
-        let sig = name_to_ident
-            .get(name.as_str())
-            .and_then(|id| callee_sigs.get(id));
-        let fn_ty = match sig {
-            Some(s) if !s.param_types.is_empty() => CType::Function(
-                Box::new(xtype_to_ctype(&s.return_type)),
-                s.param_types.iter().map(xtype_to_ctype).collect::<Vec<_>>(),
-                false,
-                false,
-            ),
-            _ => {
-                // arg_counts is the sorted set of observed call-site arities.
-                let min = arg_counts.iter().next().copied().unwrap_or(0);
-                let max = arg_counts.iter().next_back().copied().unwrap_or(0);
-                // DECL-2: pick the single C function type that accepts every observed arity.
-                if max == min {
-                    // One observed arity: a fixed prototype (min==0 prints `(void)`).
-                    CType::Function(Box::new(CType::long()), vec![CType::long(); min], false, false)
-                } else if min == 0 {
-                    // Mixed 0-arg and N-arg call sites: emit K&R long (*name)(), never (...) which is a hard C error.
-                    CType::func_unprototyped(CType::long())
-                } else {
-                    // Differing arities, all >=1: a variadic tail is well-formed (>=1 named param).
-                    CType::Function(Box::new(CType::long()), vec![CType::long(); min], true, false)
-                }
-            }
-        };
+    for (name, _arg_counts) in &c.called_globals {
+        // An authoritative known prototype wins.  Otherwise a data-global
+        // callee receives a fixed type only from the same anchored coherent
+        // cross-site proof used for ordinary externs.  Single-site,
+        // conflicting, variadic, and forwarded-only observations stay truly
+        // unprototyped so every site's real argument vector is preserved.
         out.fnptr_globals.insert(
             name.clone(),
-            CType::Pointer(Box::new(fn_ty), TypeQualifiers::none()),
+            function_pointer_global_type(
+                name,
+                shared_fixed_arities,
+                known_fnptr_signatures,
+            ),
         );
     }
 
@@ -877,4 +955,150 @@ pub fn run(
     }
 
     out
+}
+
+#[cfg(test)]
+mod function_pointer_declaration_tests {
+    use super::*;
+    use crate::decompile::passes::csh_pass::{
+        clight_function_pointer_type, default_int_type, default_long_type, pointer_to,
+    };
+    use crate::x86::types::{Node, Signature};
+    use std::sync::Arc;
+
+    #[test]
+    fn emitted_function_pointer_uses_authoritative_or_proven_fixed_signature() {
+        let known = HashMap::from([(
+            "known".to_string(),
+            (XType::Xptr, vec![XType::Xcharptr, XType::Xlong], true),
+        ), (
+            "takes_cb".to_string(),
+            (XType::Xvoid, vec![XType::Xfuncptr], false),
+        ), (
+            "invalid_zero_va".to_string(),
+            (XType::Xint, Vec::new(), true),
+        )]);
+        let shared = HashMap::from([("shared".to_string(), 2usize)]);
+
+        assert_eq!(
+            function_pointer_global_type("known", &shared, &known),
+            CType::ptr(CType::Function(
+                Box::new(CType::ptr(CType::Void)),
+                vec![CType::ptr(CType::char_signed()), CType::long()],
+                true,
+                false,
+            ))
+        );
+        assert_eq!(
+            function_pointer_global_type("shared", &shared, &known),
+            CType::ptr(CType::Function(
+                Box::new(CType::long()),
+                vec![CType::long(), CType::long()],
+                false,
+                false,
+            ))
+        );
+        assert_eq!(
+            function_pointer_global_type("takes_cb", &shared, &known),
+            CType::ptr(CType::Function(
+                Box::new(CType::Void),
+                vec![CType::ptr(CType::Function(
+                Box::new(CType::Void),
+                    Vec::new(),
+                    false,
+                    true,
+                ))],
+                false,
+                false,
+            ))
+        );
+        assert_eq!(
+            function_pointer_global_type("ambiguous", &HashMap::new(), &HashMap::new()),
+            CType::ptr(CType::func_unprototyped(CType::long()))
+        );
+        assert_eq!(
+            function_pointer_global_type("invalid_zero_va", &shared, &known),
+            CType::ptr(CType::func_unprototyped(CType::int()))
+        );
+    }
+
+    #[test]
+    fn casted_dereferenced_iat_object_is_typed_as_function_pointer_global() {
+        let function: Address = 0x7000;
+        let node: Node = 0x7010;
+        let iat: Ident = 0x9000;
+        let name = "__imp_imported_callback".to_string();
+        let signature = Signature {
+            sig_args: Arc::new(vec![XType::Xany64]),
+            sig_res: XType::Xvoid,
+            ..Signature::default()
+        };
+        let slot_address = ClightExpr::Eaddrof(
+            Box::new(ClightExpr::Evar(iat, default_int_type())),
+            pointer_to(default_int_type()),
+        );
+        let loaded_slot = ClightExpr::Ederef(
+            Box::new(ClightExpr::Ecast(
+                Box::new(slot_address),
+                pointer_to(default_long_type()),
+            )),
+            default_long_type(),
+        );
+        let callee = ClightExpr::Ecast(
+            Box::new(loaded_slot),
+            clight_function_pointer_type(&signature),
+        );
+        let selected = SelectedFunction {
+            address: function,
+            name: "iat_thunk".to_string(),
+            entry_node: node,
+            return_type: default_int_type(),
+            param_regs: Vec::new(),
+            param_types: Vec::new(),
+            stack_size: 0,
+            statements: HashMap::from([(
+                node,
+                ClightStmt::Scall(
+                    None,
+                    callee,
+                    vec![ClightExpr::EconstLong(7, default_long_type())],
+                ),
+            )]),
+            successors: HashMap::new(),
+            used_regs: HashSet::new(),
+            struct_fields: HashMap::new(),
+            sseq_groups: HashMap::new(),
+            var_types: HashMap::new(),
+            var_type_candidates: HashMap::new(),
+            var_decl_idx: HashMap::new(),
+            loop_headers: HashSet::new(),
+            switch_heads: HashSet::new(),
+            reg_struct_ids: HashMap::new(),
+            loop_info: HashMap::new(),
+        };
+        let known = HashMap::from([(
+            name.clone(),
+            (XType::Xvoid, vec![XType::Xany64], false),
+        )]);
+
+        let out = run(
+            &[selected],
+            &HashSet::from([function]),
+            &HashMap::new(),
+            &HashSet::from([name.clone()]),
+            &HashMap::from([(iat, name.clone())]),
+            &HashMap::new(),
+            &known,
+        );
+
+        assert_eq!(
+            out.fnptr_globals.get(&name),
+            Some(&CType::ptr(CType::Function(
+                Box::new(CType::Void),
+                vec![CType::long()],
+                false,
+                false,
+            )))
+        );
+    }
 }

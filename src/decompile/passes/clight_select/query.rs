@@ -355,55 +355,231 @@ pub(crate) fn extract_callee_signatures(
         .rel_iter::<(Address,)>("is_varargs_fn")
         .map(|&(a,)| a)
         .collect();
-    let known_varargs_syms: HashSet<Symbol> = db
-        .rel_iter::<(Symbol, usize)>("known_varargs_function")
-        .map(|&(name, _)| name)
+    let mut known_vararg_counts: BTreeMap<Symbol, BTreeSet<usize>> = BTreeMap::new();
+    for &(name, count) in db.rel_iter::<(Symbol, usize)>("known_varargs_function") {
+        known_vararg_counts.entry(name).or_default().insert(count);
+    }
+
+    type ExactLoaderIdentity = (Address, LoaderSymbolKind);
+    let mut identity_names: BTreeMap<ExactLoaderIdentity, BTreeSet<Symbol>> = BTreeMap::new();
+    for &(address, kind, provider, original) in db.rel_iter::<(
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("loader_symbol_identity") {
+        let names = identity_names.entry((address, kind)).or_default();
+        names.insert(provider);
+        names.insert(original);
+    }
+    let mut identity_candidates_by_ident: BTreeMap<Ident, BTreeSet<ExactLoaderIdentity>> =
+        BTreeMap::new();
+    for &identity in identity_names.keys() {
+        let ident = identity.0 as Ident;
+        identity_candidates_by_ident
+            .entry(ident)
+            .or_default()
+            .insert(identity);
+    }
+    let loader_owned_names: HashSet<String> = identity_names
+        .values()
+        .flat_map(|names| names.iter().copied())
+        .map(
+            crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name,
+        )
         .collect();
 
-    // resolved_extern_signature is multi-valued per symbol (one row per call-site signature); group and pick the lexicographically smallest tuple so the chosen signature is identical across runs regardless of Ascent set order.
+    let mut exact_signature_rows: BTreeMap<
+        ExactLoaderIdentity,
+        BTreeSet<(usize, XType, Arc<Vec<XType>>, bool)>,
+    > = BTreeMap::new();
+    let mut exact_signature_vetoes = HashSet::new();
+    for (address, kind, _, _, arity, ret, params, variadic) in db.rel_iter::<(
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+        usize,
+        XType,
+        Arc<Vec<XType>>,
+        bool,
+    )>("known_loader_signature") {
+        let identity = (*address, *kind);
+        if *arity != params.len() {
+            exact_signature_vetoes.insert(identity);
+            continue;
+        }
+        exact_signature_rows.entry(identity).or_default().insert((
+            *arity,
+            *ret,
+            params.clone(),
+            *variadic,
+        ));
+    }
+    for &(address, kind, _, _) in db.rel_iter::<(
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("loader_signature_conflict") {
+        exact_signature_vetoes.insert((address, kind));
+    }
+    let exact_variadic: HashSet<ExactLoaderIdentity> = db
+        .rel_iter::<(Address, LoaderSymbolKind, Symbol, Symbol)>("known_loader_variadic")
+        .map(|&(address, kind, _, _)| (address, kind))
+        .collect();
+    let exact_signature_claims: HashSet<ExactLoaderIdentity> = exact_signature_rows
+        .keys()
+        .copied()
+        .chain(exact_signature_vetoes.iter().copied())
+        .chain(exact_variadic.iter().copied())
+        .collect();
+    let exact_signatures: BTreeMap<
+        ExactLoaderIdentity,
+        (usize, XType, Arc<Vec<XType>>, bool),
+    > = exact_signature_rows
+        .into_iter()
+        .filter_map(|(identity, rows)| {
+            if rows.len() != 1 || exact_signature_vetoes.contains(&identity) {
+                return None;
+            }
+            let signature = rows.into_iter().next().unwrap();
+            (exact_variadic.contains(&identity) == signature.3)
+                .then_some((identity, signature))
+        })
+        .collect();
+    for (&ident, identities) in &identity_candidates_by_ident {
+        if identities.len() != 1 {
+            continue;
+        }
+        let identity = identities.iter().next().unwrap();
+        let Some((param_count, return_type, param_types, is_varargs)) =
+            exact_signatures.get(identity)
+        else {
+            continue;
+        };
+        callee_sigs.insert(
+            ident,
+            CalleeSignature {
+                param_count: *param_count,
+                return_type: *return_type,
+                param_types: param_types.as_ref().clone(),
+                is_varargs: *is_varargs,
+            },
+        );
+    }
+
+    // A multi-valued extern signature is an ambiguity, not a deterministic
+    // tie-break opportunity.  Keep only singleton fact sets.
     {
-        let mut by_symbol: BTreeMap<Symbol, Vec<(usize, XType, Arc<Vec<XType>>)>> = BTreeMap::new();
+        let mut by_symbol: BTreeMap<
+            Symbol,
+            BTreeSet<(usize, XType, Arc<Vec<XType>>)>,
+        > = BTreeMap::new();
+        let mut signatures_by_ident: BTreeMap<
+            Ident,
+            BTreeSet<(usize, XType, Arc<Vec<XType>>, bool)>,
+        > = BTreeMap::new();
+        let mut owners_by_ident: BTreeMap<Ident, BTreeSet<Symbol>> = BTreeMap::new();
         for (name, param_count, ret_type, param_types) in
             db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature")
         {
-            by_symbol.entry(*name).or_default().push((
+            by_symbol.entry(*name).or_default().insert((
                 *param_count,
                 *ret_type,
                 param_types.clone(),
             ));
         }
-        for (name, mut sigs) in by_symbol {
-            sigs.sort();
+        for (name, sigs) in by_symbol {
+            // A loader-owned spelling is resolved only through its exact
+            // address+kind rows above.  Projecting it onto every same-named
+            // Ident would type an unrelated plain data object as a function.
+            let emitted_name =
+                crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(
+                    name,
+                );
+            if loader_owned_names.contains(&emitted_name) {
+                continue;
+            }
+            if sigs.len() != 1 {
+                continue;
+            }
             let (param_count, ret_type, param_types) = sigs.into_iter().next().unwrap();
-            let is_varargs = known_varargs_syms.contains(&name);
+            if param_count != param_types.len() {
+                continue;
+            }
+            let vararg_counts = known_vararg_counts.get(&name);
+            if vararg_counts.map_or(false, |counts| counts.len() != 1) {
+                continue;
+            }
+            let is_varargs = match vararg_counts.and_then(|counts| counts.iter().next()) {
+                Some(fixed_count) if *fixed_count == param_count => true,
+                Some(_) => continue,
+                None => false,
+            };
             if let Some(idents) = symbol_to_idents.get(&name) {
                 for &id in idents {
-                    callee_sigs.insert(
-                        id,
-                        CalleeSignature {
-                            param_count,
-                            return_type: ret_type,
-                            param_types: (*param_types).clone(),
-                            is_varargs,
-                        },
-                    );
+                    // Once the loader owns this identifier, only the exact
+                    // address+kind signature above may type it.  Falling back
+                    // to a display name would undo collision and conflict
+                    // vetoes.
+                    if identity_candidates_by_ident.contains_key(&id) {
+                        continue;
+                    }
+                    owners_by_ident.entry(id).or_default().insert(name);
+                    signatures_by_ident.entry(id).or_default().insert((
+                        param_count,
+                        ret_type,
+                        param_types.clone(),
+                        is_varargs,
+                    ));
                 }
             }
         }
+        for (ident, signatures) in signatures_by_ident {
+            if signatures.len() != 1
+                || owners_by_ident
+                    .get(&ident)
+                    .map_or(0, |owners| owners.len())
+                    != 1
+            {
+                continue;
+            }
+            let (param_count, return_type, param_types, is_varargs) =
+                signatures.into_iter().next().unwrap();
+            callee_sigs.insert(
+                ident,
+                CalleeSignature {
+                    param_count,
+                    return_type,
+                    param_types: param_types.as_ref().clone(),
+                    is_varargs,
+                },
+            );
+        }
     }
 
-    // emit_function_param_count may be multi-valued; keep the smallest count per address and iterate in sorted address order for a deterministic result.
-    let mut param_count_by_addr: BTreeMap<Address, usize> = BTreeMap::new();
+    // Conflicting final arities veto a callee signature instead of selecting
+    // the smallest row.
+    let mut param_count_facts: BTreeMap<Address, BTreeSet<usize>> = BTreeMap::new();
     for &(addr, count) in db.rel_iter::<(Address, usize)>("emit_function_param_count") {
-        param_count_by_addr
-            .entry(addr)
-            .and_modify(|c| *c = (*c).min(count))
-            .or_insert(count);
+        param_count_facts.entry(addr).or_default().insert(count);
     }
-    for (addr, count) in param_count_by_addr {
+    for (addr, counts) in param_count_facts {
+        if counts.len() != 1 {
+            continue;
+        }
+        let count = *counts.iter().next().unwrap();
         let ident = addr as Ident;
         if callee_sigs.contains_key(&ident) {
             continue;
+        }
+        if let Some(identities) = identity_candidates_by_ident.get(&ident) {
+            if identities.len() != 1
+                || exact_signature_claims.contains(identities.iter().next().unwrap())
+            {
+                continue;
+            }
         }
         // emit_function_param_type iteration order is non-deterministic and the relation is multi-valued per (addr, reg); take the deduped per-reg type from param_xtypes and order by calling-convention slot so param_types is positional and identical across runs.
         let mut typed: Vec<(RTLReg, XType)> = param_xtypes
@@ -1192,6 +1368,25 @@ pub fn extract_globals(db: &DecompileDB, _binary_path: &Path) -> Result<Vec<Glob
         names.sort();
         id_to_name.insert(id, names.into_iter().next().unwrap());
     }
+    let mut exact_import_pointer_names = HashMap::new();
+    for &(_, address, kind, _, original) in db.rel_iter::<(
+        Node,
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("call_loader_identity") {
+        if kind == LoaderSymbolKind::ImportPointer {
+            insert_preferred_symbol_name(
+                &mut exact_import_pointer_names,
+                address as Ident,
+                original,
+            );
+        }
+    }
+    for (ident, name) in exact_import_pointer_names {
+        id_to_name.insert(ident, name);
+    }
 
     let global_ptr_ids: std::collections::HashSet<usize> = db
         .rel_iter::<(Ident,)>("emit_global_is_ptr")
@@ -1205,6 +1400,20 @@ pub fn extract_globals(db: &DecompileDB, _binary_path: &Path) -> Result<Vec<Glob
     let obj_file = object::File::parse(&***bin_data)
         .map_err(|e| format!("Failed to parse loaded binary image: {}", e))?;
 
+    // A resolved memory call through an ImportPointer proves that this address
+    // is an object slot.  Some COFF metadata carries a stale Function identity
+    // at that same numeric address; that row must not suppress the explicit
+    // global_var_ref produced for the IAT slot.  Real code authorities below
+    // (emit_function, is_external_function, and Text symbols) still win.
+    let exact_import_pointer_call_addrs: HashSet<usize> = db
+        .rel_iter::<(Node, Address, LoaderSymbolKind, Symbol, Symbol)>(
+            "call_loader_identity",
+        )
+        .filter_map(|(_, address, kind, _, _)| {
+            (*kind == LoaderSymbolKind::ImportPointer).then_some(*address as usize)
+        })
+        .collect();
+
     let func_addrs: HashSet<usize> = {
         let mut addrs = HashSet::new();
         for (addr, _, _) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
@@ -1213,25 +1422,21 @@ pub fn extract_globals(db: &DecompileDB, _binary_path: &Path) -> Result<Vec<Glob
         for (addr,) in db.rel_iter::<(Address,)>("is_external_function") {
             addrs.insert(*addr as usize);
         }
-        // Pre-build symbol-to-idents map for O(1) lookup
-        let mut symbol_to_idents: HashMap<Symbol, Vec<Ident>> = HashMap::new();
-        for (id, sym) in db.rel_iter::<(Ident, Symbol)>("ident_to_symbol") {
-            symbol_to_idents.entry(*sym).or_default().push(*id);
-        }
-        for (name, _, _, _) in
-            db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature")
-        {
-            if let Some(idents) = symbol_to_idents.get(name) {
-                for &id in idents {
-                    addrs.insert(id);
-                }
-            }
-        }
-        for (name,) in db.rel_iter::<(Symbol,)>("unknown_extern") {
-            if let Some(idents) = symbol_to_idents.get(name) {
-                for &id in idents {
-                    addrs.insert(id);
-                }
+        // Loader identities are callable objects, but only Function entries
+        // denote code addresses.  ImportPointer entries deliberately remain
+        // globals.  Never classify an identifier as code merely because its
+        // display name also appears in a name-keyed extern table: a plain data
+        // object is allowed to share that spelling.
+        for &(address, kind, _, _) in db.rel_iter::<(
+            Address,
+            LoaderSymbolKind,
+            Symbol,
+            Symbol,
+        )>("loader_symbol_identity") {
+            if kind == LoaderSymbolKind::Function
+                && !exact_import_pointer_call_addrs.contains(&(address as usize))
+            {
+                addrs.insert(address as usize);
             }
         }
         // Every Text-kind ELF symbol address is code, never data: without this an address-taken skip-listed function is materialized as a bogus long in .bss and atexit jumps into data.
@@ -3452,6 +3657,115 @@ pub fn collect_stmt_regs(stmt: &ClightStmt) -> Vec<RTLReg> {
 #[cfg(test)]
 mod tr3_tests {
     use super::*;
+
+    #[test]
+    fn callee_signatures_use_exact_address_and_kind_without_name_grouping() {
+        let mut db = DecompileDB::default();
+        for (address, arity) in [(0x200u64, 1usize), (0x300u64, 2usize)] {
+            db.rel_push("ident_to_symbol", (address as Ident, "shared" as Symbol));
+            db.rel_push(
+                "loader_symbol_identity",
+                (
+                    address,
+                    LoaderSymbolKind::Function,
+                    "shared" as Symbol,
+                    "shared" as Symbol,
+                ),
+            );
+            db.rel_push(
+                "known_loader_signature",
+                (
+                    address,
+                    LoaderSymbolKind::Function,
+                    "shared" as Symbol,
+                    "shared" as Symbol,
+                    arity,
+                    XType::Xint,
+                    Arc::new(vec![XType::Xany64; arity]),
+                    false,
+                ),
+            );
+        }
+
+        let signatures = extract_callee_signatures(&db, &HashMap::new(), &HashMap::new());
+        assert_eq!(signatures.get(&(0x200u64 as Ident)).unwrap().param_count, 1);
+        assert_eq!(signatures.get(&(0x300u64 as Ident)).unwrap().param_count, 2);
+
+        db.rel_push(
+            "loader_symbol_identity",
+            (
+                0x200u64,
+                LoaderSymbolKind::ImportPointer,
+                "shared" as Symbol,
+                "shared_iat" as Symbol,
+            ),
+        );
+        db.rel_push(
+            "known_loader_signature",
+            (
+                0x200u64,
+                LoaderSymbolKind::ImportPointer,
+                "shared" as Symbol,
+                "shared_iat" as Symbol,
+                3usize,
+                XType::Xint,
+                Arc::new(vec![XType::Xany64; 3]),
+                false,
+            ),
+        );
+        db.rel_push("ident_to_symbol", (0x400u64 as Ident, "shared" as Symbol));
+        let collided = extract_callee_signatures(&db, &HashMap::new(), &HashMap::new());
+        assert!(!collided.contains_key(&(0x200u64 as Ident)));
+        assert_eq!(collided.get(&(0x300u64 as Ident)).unwrap().param_count, 2);
+        assert!(!collided.contains_key(&(0x400u64 as Ident)));
+
+        // The exact object and a legacy data Ident may differ in their raw
+        // spelling while colliding after C-identifier sanitization.  The
+        // legacy signature must not leak onto that data object.
+        db.rel_push(
+            "loader_symbol_identity",
+            (
+                0x500u64,
+                LoaderSymbolKind::Function,
+                "foo-bar" as Symbol,
+                "foo-bar" as Symbol,
+            ),
+        );
+        db.rel_push(
+            "known_loader_signature",
+            (
+                0x500u64,
+                LoaderSymbolKind::Function,
+                "foo-bar" as Symbol,
+                "foo-bar" as Symbol,
+                1usize,
+                XType::Xint,
+                Arc::new(vec![XType::Xlong]),
+                false,
+            ),
+        );
+        db.rel_push("ident_to_symbol", (0x500u64 as Ident, "foo-bar" as Symbol));
+        db.rel_push("ident_to_symbol", (0x600u64 as Ident, "foo_bar" as Symbol));
+        db.rel_push(
+            "resolved_extern_signature",
+            (
+                "foo_bar" as Symbol,
+                2usize,
+                XType::Xint,
+                Arc::new(vec![XType::Xlong; 2]),
+            ),
+        );
+        let sanitized_collision =
+            extract_callee_signatures(&db, &HashMap::new(), &HashMap::new());
+        assert_eq!(
+            sanitized_collision
+                .get(&(0x500u64 as Ident))
+                .unwrap()
+                .param_count,
+            1
+        );
+        assert!(!sanitized_collision.contains_key(&(0x600u64 as Ident)));
+    }
 
     #[test]
     fn preferred_symbol_name_is_order_independent_for_equal_length_aliases() {

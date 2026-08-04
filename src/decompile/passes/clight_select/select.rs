@@ -405,29 +405,40 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
     let unsupported_stack_functions = unsupported_functions_requiring_omission(db);
     functions.retain(|func| !unsupported_stack_functions.contains(&func.address));
 
-    let mut name_to_ident: HashMap<String, Ident> = HashMap::new();
-    {
-        // Iterate in sorted (id, name) order so that, on a sanitized-name collision, the surviving Ident is deterministic across runs.
-        let mut sorted_id_name: Vec<(&usize, &String)> = id_to_name.iter().collect();
-        sorted_id_name.sort_by_key(|(id, name)| (**id, (*name).clone()));
-        for (id, name) in sorted_id_name {
-            let sanitized =
-                crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(
-                    name,
-                );
-            name_to_ident.entry(sanitized).or_insert(*id as Ident);
-            name_to_ident.entry(name.clone()).or_insert(*id as Ident);
-        }
+    // Symbol-form calls have no address in their expression, so a name may be
+    // projected to an Ident only when it has one owner.  Picking the smallest
+    // address here would reintroduce exactly the loader/sanitizer collision
+    // that the call-resolution pass rejected.
+    let mut name_owners: BTreeMap<String, BTreeSet<Ident>> = BTreeMap::new();
+    for (id, name) in &id_to_name {
+        let ident = *id as Ident;
+        let sanitized =
+            crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(
+                name,
+            );
+        name_owners.entry(sanitized).or_default().insert(ident);
+        name_owners.entry(name.clone()).or_default().insert(ident);
     }
-    {
-        let mut sorted_funcs: Vec<&FunctionData> = functions.iter().collect();
-        sorted_funcs.sort_by_key(|f| f.address);
-        for func in sorted_funcs {
-            name_to_ident
-                .entry(func.name.clone())
-                .or_insert(func.address as Ident);
-        }
+    for func in &functions {
+        let sanitized =
+            crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(
+                &func.name,
+            );
+        name_owners
+            .entry(func.name.clone())
+            .or_default()
+            .insert(func.address as Ident);
+        name_owners
+            .entry(sanitized)
+            .or_default()
+            .insert(func.address as Ident);
     }
+    let name_to_ident: HashMap<String, Ident> = name_owners
+        .into_iter()
+        .filter_map(|(name, owners)| {
+            (owners.len() == 1).then(|| (name, *owners.iter().next().unwrap()))
+        })
+        .collect();
 
     // Sort candidates deterministically: prefer Efield form over raw pointer-deref-with-cast (so search starts on the recovered-field variant when both compile); secondary key is a deterministic hash (Ascent parallel order is arbitrary).
     for func in &mut functions {

@@ -769,10 +769,23 @@ ascent_par! {
 
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Stailcall(sig, func, args)),
+        !call_through_memory_load(node, _, _, _, _),
         let converted_func = match func.clone() {
             Either::Left(reg) => Either::Left(CsharpminorExpr::Evar(reg)),
             Either::Right(id) => Either::Right(id),
         },
+        let call_args = args.iter().map(|r| CsharpminorExpr::Evar(*r)).collect(),
+        let stmt = CsharpminorStmt::Stailcall(sig.clone(), converted_func, call_args);
+
+    // A memory-indirect tailcall has the same callee-load semantics as an
+    // ordinary indirect call.  In particular, a PE IAT JMP must remain
+    // `(*slot)(...)` downstream rather than becoming a direct call to either
+    // the slot address or its provider spelling.
+    csharp_stmt_candidate(node, stmt) <--
+        active_cminor_stmt(node, ?CminorStmt::Stailcall(sig, _, args)),
+        call_through_memory_load(node, _temp, chunk, addressing, load_args),
+        if let Some(addr_expr) = addressing_to_csharp_expr_sized(addressing, load_args.as_slice(), true),
+        let converted_func = Either::Left(CsharpminorExpr::Eload(*chunk, Box::new(addr_expr))),
         let call_args = args.iter().map(|r| CsharpminorExpr::Evar(*r)).collect(),
         let stmt = CsharpminorStmt::Stailcall(sig.clone(), converted_func, call_args);
 

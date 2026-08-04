@@ -8,7 +8,7 @@ use crate::decompile::passes::c_pass::types::{
 };
 use crate::decompile::passes::pass::IRPass;
 use crate::x86::types::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Known libc functions that take opaque struct pointer parameters; maps function_name -> Vec<(param_position, typedef_name)>.
@@ -1460,7 +1460,21 @@ const CLIGHT_EMIT_INPUTS: &[&str] = &[
     "symbols",
     "reg_to_struct_id",
     "call_target_func",
+    "call_arg",
     "call_arg_mapping",
+    "call_arg_provenance",
+    "call_args_collected_candidate",
+    "call_forwarding_unresolved",
+    "call_has_float_arg_evidence",
+    "call_site",
+    "known_varargs_function",
+    "loader_symbol_identity",
+    "known_loader_signature",
+    "known_loader_variadic",
+    "loader_signature_conflict",
+    "call_loader_identity_candidate",
+    "call_loader_identity",
+    "call_loader_identity_ambiguous",
 ];
 
 const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
@@ -1490,6 +1504,7 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "emit_var_is_struct",
     "func_param_struct_type",
     "known_global_type",
+    "is_varargs_fn",
     "plt_entry",
     "pointer_in_data",
     "reg_rtl",
@@ -1567,8 +1582,34 @@ fn build_emission_name_map(db: &DecompileDB) -> Result<HashMap<usize, String>, S
         }
     }
 
+    let provider_addresses: HashSet<Address> = providers.keys().copied().collect();
     for (address, (name, _)) in providers {
         id_to_name.insert(address as usize, name);
+    }
+
+    // An exact ImportPointer call names an object slot, whose original loader
+    // spelling (for PE, normally __imp_*) must agree with extract_globals and
+    // the later declaration patch.  A real emit_function provider remains the
+    // stronger code-address authority; a stale loader Function row alone does
+    // not create one and therefore cannot steal this object ident.
+    let mut import_pointer_names = HashMap::new();
+    for &(_, address, kind, _, original) in db.rel_iter::<(
+        Node,
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("call_loader_identity") {
+        if kind == LoaderSymbolKind::ImportPointer && !provider_addresses.contains(&address) {
+            insert_preferred_symbol_name(
+                &mut import_pointer_names,
+                address as Ident,
+                original,
+            );
+        }
+    }
+    for (ident, name) in import_pointer_names {
+        id_to_name.insert(ident, name);
     }
     Ok(id_to_name)
 }
@@ -1847,15 +1888,8 @@ impl IRPass for ClightEmitPass {
                     &param_xtypes,
                     &rtl_to_mreg,
                 );
-            // Sort (id, name) before the first-wins insert so the surviving id for a duplicated name is deterministic, not dependent on HashMap iteration order. Mirrors the sibling builder in decl_solve::field_ptr_selection.
-            let mut name_to_ident: HashMap<String, Ident> = HashMap::new();
-            let mut sorted_id_name: Vec<(&usize, &String)> = id_to_name.iter().collect();
-            sorted_id_name.sort_by_key(|(id, name)| (**id, (*name).clone()));
-            for (id, name) in sorted_id_name {
-                name_to_ident.entry(name.clone()).or_insert(*id as Ident);
-            }
             // Data globals = OBJECT-kind symbols; a call through one of these names is the call-through-non-function family.
-            let global_names: HashSet<String> = db
+            let mut global_names: HashSet<String> = db
                 .rel_iter::<(
                     Address,
                     usize,
@@ -1870,6 +1904,45 @@ impl IRPass for ClightEmitPass {
                 .filter(|(_, _, sym_type, ..)| **sym_type == *"OBJECT")
                 .map(|(.., name)| name.to_string())
                 .collect();
+            let global_var_refs: HashSet<Ident> = db
+                .rel_iter::<(Ident,)>("global_var_ref")
+                .map(|(ident,)| *ident)
+                .collect();
+            for &(_, address, kind, provider, original) in db.rel_iter::<(
+                Node,
+                Address,
+                LoaderSymbolKind,
+                Symbol,
+                Symbol,
+            )>("call_loader_identity") {
+                if kind != LoaderSymbolKind::ImportPointer
+                    || !global_var_refs.contains(&(address as Ident))
+                {
+                    continue;
+                }
+                // Exact memory-call identity is positive object evidence even
+                // when a stale same-address Function row polluted symbol-table
+                // classification.  Include every spelling the selected Clight
+                // tree or final C declaration may retain.
+                global_names.insert(provider.to_string());
+                global_names.insert(original.to_string());
+                global_names.insert(
+                    crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(
+                        provider,
+                    ),
+                );
+                global_names.insert(
+                    crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(
+                        original,
+                    ),
+                );
+                if let Some(name) = id_to_name.get(&(address as Ident)) {
+                    global_names.insert(name.clone());
+                    global_names.insert(
+                        crate::decompile::passes::c_pass::convert::from_relations::sanitize_c_symbol_name(name),
+                    );
+                }
+            }
             // The EMITTED function set (same filter as `internal_functions` below): the field-pointer authority decides only from functions that are actually printed, matching the retired TR-3 scan which ran over cast_selected_functions (= internal_functions).
             let external_funcs: HashSet<Address> = db
                 .rel_iter::<(Address,)>("is_external_function")
@@ -1884,13 +1957,23 @@ impl IRPass for ClightEmitPass {
                 })
                 .map(|f| f.address)
                 .collect();
+            let shared_fixed_arities =
+                crate::decompile::passes::c_pass::convert::from_relations::infer_shared_import_pointer_fixed_arities_from_db(db);
+            let known_fnptr_signature_map: HashMap<String, (XType, Vec<XType>, bool)> =
+                crate::decompile::passes::c_pass::convert::from_relations::known_import_pointer_signatures_from_db(db)
+                    .into_iter()
+                    .map(|(name, (ret, params, variadic))| {
+                        (name, (ret, params.as_ref().clone(), variadic))
+                    })
+                    .collect();
             let out = crate::decompile::passes::clight_select::decl_solve::run(
                 &selected_functions,
                 &internal_addrs,
                 &callee_sigs,
-                &name_to_ident,
                 &global_names,
                 &id_to_name,
+                &shared_fixed_arities,
+                &known_fnptr_signature_map,
             );
             let force_long_reg_total: usize = out.force_long_regs.values().map(|s| s.len()).sum();
             let force_ptr_reg_total: usize = out.force_ptr_regs.values().map(|s| s.len()).sum();
@@ -2317,11 +2400,22 @@ impl IRPass for ClightEmitPass {
                 .rel_iter::<(Address, Symbol, Node)>("emit_function")
                 .map(|(addr, name, _)| (*addr, name.to_string()))
                 .collect();
-            let call_targets: HashMap<Node, String> = db
-                .rel_iter::<(Node, Address)>("call_target_func")
-                .filter_map(|(node, addr)| func_names.get(addr).map(|name| (*node, name.clone())))
+            let mut call_target_facts: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+            for &(node, address) in db.rel_iter::<(Node, Address)>("call_target_func") {
+                call_target_facts.entry(node).or_default().insert(address);
+            }
+            let call_targets: HashMap<Node, String> = call_target_facts
+                .into_iter()
+                .filter_map(|(node, targets)| {
+                    if targets.len() != 1 {
+                        return None;
+                    }
+                    func_names
+                        .get(targets.iter().next().unwrap())
+                        .map(|name| (node, name.clone()))
+                })
                 .collect();
-            for &(call_node, pos, reg) in db.rel_iter::<(Node, usize, RTLReg)>("call_arg_mapping") {
+            for &(call_node, pos, reg) in db.rel_iter::<(Node, usize, RTLReg)>("call_arg") {
                 if let Some(&sid) = reg_to_sid.get(&reg) {
                     if let Some(callee_name) = call_targets.get(&call_node) {
                         if let Some(param_info) = opaque_params_flat.get(callee_name.as_str()) {
@@ -2566,6 +2660,86 @@ mod provider_identity_tests {
         assert_eq!(
             forward.get(&0x404000).map(String::as_str),
             Some("shared_provider")
+        );
+    }
+
+    #[test]
+    fn known_fnptr_signature_follows_exact_loader_identity() {
+        let mut db = DecompileDB::default();
+        let node = 0x4010u64;
+        let iat = 0x5000u64;
+        db.rel_push(
+            "loader_symbol_identity",
+            (
+                iat,
+                LoaderSymbolKind::ImportPointer,
+                "coff_ext_memcpy" as Symbol,
+                "__imp_memcpy" as Symbol,
+            ),
+        );
+        db.rel_push(
+            "loader_symbol_identity",
+            (
+                iat,
+                LoaderSymbolKind::Function,
+                "coff_ext_memcpy" as Symbol,
+                "__imp_memcpy" as Symbol,
+            ),
+        );
+        db.rel_push(
+            "call_loader_identity",
+            (
+                node,
+                iat,
+                LoaderSymbolKind::ImportPointer,
+                "coff_ext_memcpy" as Symbol,
+                "__imp_memcpy" as Symbol,
+            ),
+        );
+        db.rel_push("ident_to_symbol", (iat as Ident, "coff_ext_memcpy"));
+        db.rel_push("ident_to_symbol", (iat as Ident, "__imp_memcpy"));
+        db.rel_push(
+            "known_loader_signature",
+            (
+                iat,
+                LoaderSymbolKind::ImportPointer,
+                "coff_ext_memcpy" as Symbol,
+                "__imp_memcpy" as Symbol,
+                3usize,
+                XType::Xptr,
+                Arc::new(vec![XType::Xptr, XType::Xptr, XType::Xany64]),
+                false,
+            ),
+        );
+        db.rel_push(
+            "known_loader_signature",
+            (
+                iat,
+                LoaderSymbolKind::Function,
+                "coff_ext_memcpy" as Symbol,
+                "__imp_memcpy" as Symbol,
+                0usize,
+                XType::Xint,
+                Arc::new(Vec::<XType>::new()),
+                false,
+            ),
+        );
+
+        let signatures = crate::decompile::passes::c_pass::convert::from_relations::known_import_pointer_signatures_from_db(&db);
+        assert_eq!(
+            signatures.get("__imp_memcpy"),
+            Some(&(
+                XType::Xptr,
+                Arc::new(vec![XType::Xptr, XType::Xptr, XType::Xany64]),
+                false,
+            ))
+        );
+        assert_eq!(
+            build_emission_name_map(&db)
+                .expect("exact IAT emission name")
+                .get(&(iat as Ident))
+                .map(String::as_str),
+            Some("__imp_memcpy")
         );
     }
 }

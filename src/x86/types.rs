@@ -13,6 +13,15 @@ pub type Ident = usize;
 
 pub type MregArgs = Arc<Vec<Mreg>>;
 
+/// Callable identity assigned by the object loader.  The address and this
+/// kind are both part of the identity: an IAT cell and a function entry may
+/// legitimately retain the same spelling without denoting the same object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LoaderSymbolKind {
+    Function,
+    ImportPointer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParamType {
     Pointer,
@@ -457,6 +466,28 @@ pub enum LTLInst {
 }
 
 pub type RTLReg = u64;
+
+/// Why a value is present at one source-language call-argument position.
+///
+/// This is deliberately carried alongside the positional mapping instead of
+/// being reconstructed from the final RTL register.  An incoming ABI register
+/// that merely remains live at a call is useful for a validated thunk, but two
+/// such live-ins must never be allowed to "prove" one another's arity.  The
+/// `ExplicitRegister` and `EntrySpStore` are the concrete caller-side anchors;
+/// a corroborated reaching definition remains non-anchoring at its own site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CallArgProvenance {
+    ForwardedEntry,
+    CorroboratedRegister,
+    ExplicitRegister,
+    EntrySpStore,
+}
+
+impl CallArgProvenance {
+    pub fn is_anchor(self) -> bool {
+        matches!(self, Self::ExplicitRegister | Self::EntrySpStore)
+    }
+}
 
 pub type Args = Arc<Vec<RTLReg>>;
 

@@ -198,20 +198,17 @@ fn definitionally_integral_result_authority(db: &DecompileDB) -> BTreeMap<RTLReg
         float_results.insert(reg);
     }
 
-    // A call result may be precisely typed by symbol metadata even when the
-    // lowered Icall signature is absent or still generic.
-    let float_externs: BTreeSet<Symbol> = db
-        .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
-        .filter_map(|(symbol, _, result, _)| {
-            matches!(result, XType::Xfloat | XType::Xsingle).then_some(*symbol)
+    // A call result may be precisely typed by authoritative callee metadata
+    // even when the lowered Icall signature is absent or still generic.  The
+    // resolver has already enforced exact loader identity and conflict vetoes.
+    let mut float_call_nodes: BTreeSet<Node> = db
+        .rel_iter::<(Node, Symbol, usize, XType, Arc<Vec<XType>>, bool)>(
+            "call_resolved_signature",
+        )
+        .filter_map(|(node, _, _, result, _, _)| {
+            matches!(result, XType::Xfloat | XType::Xsingle).then_some(*node)
         })
         .collect();
-    let mut float_call_nodes = BTreeSet::new();
-    for &(node, symbol) in db.rel_iter::<(Node, Symbol)>("call_site") {
-        if float_externs.contains(&symbol) {
-            float_call_nodes.insert(node);
-        }
-    }
     let float_internal_functions: BTreeSet<Address> = db
         .rel_iter::<(Address,)>("func_returns_float")
         .map(|(address,)| *address)
@@ -466,23 +463,18 @@ ascent_par! {
     relation known_func_param_is_ptr(Symbol, usize);
     relation known_func_returns_ptr(Symbol);
     relation known_func_returns_long(Symbol);
-    relation known_extern_signature(Symbol, usize, XType, Arc<Vec<XType>>);
+    relation call_resolved_signature(Node, Symbol, usize, XType, Arc<Vec<XType>>, bool);
+    relation call_loader_identity_candidate(Node, Address, LoaderSymbolKind, Symbol, Symbol);
 
     relation call_site(Node, Symbol);
     relation call_arg(Node, usize, RTLReg);
     relation call_return_reg(Node, RTLReg);
-    relation call_arg_mapping(Node, usize, RTLReg);
     relation abi_shared_arg_slots(bool);
 
     // Derive call_site from call_target_func + emit_function (internal calls)
     call_site(node, *name) <--
         call_target_func(node, target),
         emit_function(target, name, _);
-
-    // Derive call_arg from call_arg_mapping
-    call_arg(node, pos, reg) <--
-        call_arg_mapping(node, pos, reg);
-
 
     // 1. Direct type emission from instructions; each instruction encodes width and signedness, emitting concrete types directly
 
@@ -576,9 +568,8 @@ ascent_par! {
         f64_copy_edge(src, dst),
         genuine_float_result(src);
     genuine_float_result(ret_reg) <--
-        call_site(node, func_name),
         call_return_reg(node, ret_reg),
-        known_extern_signature(func_name, _, ret_type, _),
+        call_resolved_signature(node, _, _, ret_type, _, _),
         if matches!(ret_type, XType::Xfloat | XType::Xsingle);
     genuine_float_result(ret_reg) <--
         call_target_func(node, target),
@@ -755,12 +746,25 @@ ascent_par! {
     must_be_ptr(reg) <--
         call_site(node, func_name),
         call_arg(node, arg_idx, reg),
+        !call_loader_identity_candidate(node, _, _, _, _),
         known_func_param_is_ptr(func_name, arg_idx);
+
+    must_be_ptr(reg) <--
+        call_arg(node, arg_idx, reg),
+        call_resolved_signature(node, _, _, _, params, _),
+        if *arg_idx < params.len(),
+        if is_pointer_xtype(&params[*arg_idx]);
 
     must_be_ptr(ret_reg) <--
         call_site(node, func_name),
         call_return_reg(node, ret_reg),
+        !call_loader_identity_candidate(node, _, _, _, _),
         known_func_returns_ptr(func_name);
+
+    must_be_ptr(ret_reg) <--
+        call_return_reg(node, ret_reg),
+        call_resolved_signature(node, _, _, ret_type, _, _),
+        if is_pointer_xtype(ret_type);
 
     must_be_ptr(rtl_reg) <--
         ltl_inst(node, ?LTLInst::Lop(Operation::Oindirectsymbol(_), _, dst_mreg)),
@@ -778,23 +782,22 @@ ascent_par! {
 
     // From extern signatures
     is_ptr(arg_reg) <--
-        call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
-        known_extern_signature(func_name, _, _, params),
+        call_resolved_signature(node, _, _, _, params, _),
         if *arg_idx < params.len(),
         if matches!(params[*arg_idx], XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
             XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
 
     is_ptr(ret_reg) <--
-        call_site(node, func_name),
         call_return_reg(node, ret_reg),
-        known_extern_signature(func_name, _, ret_type, _),
+        call_resolved_signature(node, _, _, ret_type, _, _),
         if matches!(ret_type, XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
             XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
 
     is_ptr(ret_reg) <--
         call_site(node, func_name),
         call_return_reg(node, ret_reg),
+        !call_loader_identity_candidate(node, _, _, _, _),
         known_func_returns_ptr(func_name);
 
     // From internal function signatures
@@ -936,23 +939,20 @@ ascent_par! {
 
     // From extern signatures
     ptr_element_type(arg_reg, XType::Xint) <--
-        call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
-        known_extern_signature(func_name, _, _, params),
+        call_resolved_signature(node, _, _, _, params, _),
         if *arg_idx < params.len(),
         if params[*arg_idx] == XType::Xintptr;
 
     ptr_element_type(arg_reg, XType::Xfloat) <--
-        call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
-        known_extern_signature(func_name, _, _, params),
+        call_resolved_signature(node, _, _, _, params, _),
         if *arg_idx < params.len(),
         if params[*arg_idx] == XType::Xfloatptr;
 
     ptr_element_type(arg_reg, XType::Xsingle) <--
-        call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
-        known_extern_signature(func_name, _, _, params),
+        call_resolved_signature(node, _, _, _, params, _),
         if *arg_idx < params.len(),
         if params[*arg_idx] == XType::Xsingleptr;
 
@@ -1067,17 +1067,15 @@ ascent_par! {
 
     // Extern call arg: emit param type as candidate
     emit_var_type_candidate(arg_reg, params[*arg_idx].clone()) <--
-        call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
-        known_extern_signature(func_name, _, _, params),
+        call_resolved_signature(node, _, _, _, params, _),
         if *arg_idx < params.len(),
         if params[*arg_idx] != XType::Xany32 && params[*arg_idx] != XType::Xany64;
 
     // Extern call return: emit return type as candidate
     emit_var_type_candidate(ret_reg, *ret_type) <--
-        call_site(node, func_name),
         call_return_reg(node, ret_reg),
-        known_extern_signature(func_name, _, ret_type, _),
+        call_resolved_signature(node, _, _, ret_type, _, _),
         if *ret_type != XType::Xvoid && *ret_type != XType::Xany32 && *ret_type != XType::Xany64;
 
     // Internal function arg: never forward a bare-float param type across the integer-arg boundary, since call_arg carries only integer-register args and a spurious float opens the Z3 float axis.
@@ -1340,8 +1338,7 @@ ascent_par! {
     emit_global_is_ptr(*ident) <--
         global_value_reg(ident, loaded_rtl),
         call_arg(node, arg_idx, loaded_rtl),
-        call_site(node, func_name),
-        known_extern_signature(func_name, _, _, params),
+        call_resolved_signature(node, _, _, _, params, _),
         if *arg_idx < params.len(),
         if matches!(params[*arg_idx], XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
             XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_)),
@@ -1360,6 +1357,7 @@ ascent_par! {
         global_value_reg(ident, loaded_rtl),
         call_arg(node, arg_idx, loaded_rtl),
         call_site(node, func_name),
+        !call_loader_identity_candidate(node, _, _, _, _),
         known_func_param_is_ptr(func_name, arg_idx),
         !global_ptr_vetoed(ident);
 
@@ -1373,8 +1371,7 @@ ascent_par! {
     emit_global_is_char_ptr(*ident) <--
         global_value_reg(ident, loaded_rtl),
         call_arg(node, arg_idx, loaded_rtl),
-        call_site(node, func_name),
-        known_extern_signature(func_name, _, _, params),
+        call_resolved_signature(node, _, _, _, params, _),
         if *arg_idx < params.len(),
         if params[*arg_idx] == XType::Xcharptr,
         !global_ptr_vetoed(ident);
@@ -1964,12 +1961,14 @@ mod tests {
             ),
         );
         db.rel_push(
-            "known_extern_signature",
+            "call_resolved_signature",
             (
+                EXTERN_CALL,
                 "known_float_call",
                 0usize,
                 XType::Xfloat,
                 Arc::new(Vec::<XType>::new()),
+                false,
             ),
         );
 

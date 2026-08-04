@@ -11,7 +11,7 @@ use crate::decompile::passes::clight_select::select::SelectedFunction;
 use crate::x86::types as clight;
 use crate::x86::types::*;
 use log::debug;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 pub(crate) type FunctionObjectTypes = HashMap<Address, HashMap<String, CType>>;
@@ -298,12 +298,7 @@ fn convert_xtype(xt: &XType) -> CType {
             TypeQualifiers::none(),
         ),
         XType::Xfuncptr => CType::Pointer(
-            Box::new(CType::Function(
-                Box::new(CType::Void),
-                Vec::new(),
-                false,
-                false,
-            )),
+            Box::new(CType::func_unprototyped(CType::Void)),
             TypeQualifiers::none(),
         ),
         XType::Xfloat => CType::Float(crate::decompile::passes::c_pass::types::FloatSize::Double),
@@ -489,11 +484,16 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         .map(|(name, xtype)| (sanitize_c_symbol_name(name), convert_xtype(xtype)))
         .collect();
 
-    // Extern return types from abi_pass for variable type inference at call sites
-    let extern_return_types: HashMap<String, CType> = db
-        .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
-        .map(|(name, _, ret_type, _)| (sanitize_c_symbol_name(name), convert_xtype(ret_type)))
-        .filter(|(_, ty)| !matches!(ty, CType::Void))
+    // Extern return types for the final usage-based fallback must pass through
+    // the same exact-loader/conflict reducer as declarations.  Reading the
+    // raw name-keyed table here would let address/kind or sanitizer collisions
+    // pick an arbitrary return type late in C emission.
+    let extern_return_types: HashMap<String, CType> = known_loader_signatures_from_db(db)
+        .into_iter()
+        .filter_map(|(name, (ret_type, _, _))| {
+            let ty = convert_xtype(&ret_type);
+            (!matches!(ty, CType::Void)).then_some((name, ty))
+        })
         .collect();
 
     // Build global load chunk map: prefer integer over float (SSE bulk copies produce spurious floats).
@@ -1589,45 +1589,43 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         hdb.functions.contains(n) || hdb.prefixes.iter().any(|p| n.starts_with(p))
     };
 
-    // resolved_extern_signature has set semantics and may carry several rows per name, so group by sanitized name, pick one deterministically, and emit in sorted order for a byte-stable file.
-    let mut extern_by_name: BTreeMap<String, Vec<(usize, XType, Arc<Vec<XType>>)>> =
-        BTreeMap::new();
-    for (name, param_count, ret_type, param_types) in
+    // This is the sole typed-declaration authority for loader-owned and
+    // ordinary curated externs.  Its projection already vetoes address/kind,
+    // sanitizer, signature, and variadic conflicts.
+    let known_loader_signatures = known_loader_signatures_from_db(db);
+    let exact_import_pointer_object_names = exact_import_pointer_call_names(db);
+
+    let mut resolved_extern_names = BTreeSet::new();
+    for (name, _, _, _) in
         db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature")
     {
-        let sanitized = sanitize_c_symbol_name(name);
-        extern_by_name.entry(sanitized).or_default().push((
-            *param_count,
-            *ret_type,
-            param_types.clone(),
-        ));
+        resolved_extern_names.insert(sanitize_c_symbol_name(name));
     }
-    for (sanitized_name, mut sigs) in extern_by_name {
-        if emitted_func_names.contains(&sanitized_name) || is_compiler_provided(&sanitized_name) {
+    for sanitized_name in resolved_extern_names {
+        if emitted_func_names.contains(&sanitized_name)
+            || is_compiler_provided(&sanitized_name)
+            || exact_import_pointer_object_names.contains(&sanitized_name)
+        {
             continue;
         }
-        // Deterministic pick: prefer the row whose XType vector compares smallest.
-        sigs.sort_by(|a, b| {
-            a.2.cmp(&b.2)
-                .then_with(|| a.1.cmp(&b.1))
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        // RB-1: each Vec holds >= 1 row by construction (.or_default().push(...)); no input shape produces an empty group.
-        let (_param_count, ret_type, param_types) = sigs.into_iter().next().unwrap();
-        let ret_ctype = convert_xtype(&ret_type);
+        let Some((ret_type, param_types, variadic)) =
+            known_loader_signatures.get(&sanitized_name)
+        else {
+            continue;
+        };
+        let ret_ctype = convert_xtype(ret_type);
         let params: Vec<FuncParam> = param_types
             .iter()
             .enumerate()
             .map(|(i, t)| FuncParam::named(format!("arg{}", i), convert_xtype(t)))
             .collect();
 
-        let variadic = is_known_variadic_fn(&sanitized_name);
         let mut decl = crate::decompile::passes::c_pass::types::FuncDecl::new(
             sanitized_name,
             ret_ctype,
             params,
         );
-        decl.is_variadic = variadic;
+        decl.is_variadic = *variadic;
         tu.add_func_decl(decl);
     }
 
@@ -1640,11 +1638,28 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             match decl {
                 crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDef(f) => {
                     callee_ret.insert(f.name.clone(), f.return_type.clone());
+                    global_types.insert(
+                        f.name.clone(),
+                        CType::Function(
+                            Box::new(f.return_type.clone()),
+                            f.params.iter().map(|param| param.ty.clone()).collect(),
+                            f.is_variadic,
+                            false,
+                        ),
+                    );
                 }
                 crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(d) => {
                     callee_ret
                         .entry(d.name.clone())
                         .or_insert_with(|| d.return_type.clone());
+                    global_types.entry(d.name.clone()).or_insert_with(|| {
+                        CType::Function(
+                            Box::new(d.return_type.clone()),
+                            d.params.iter().map(|param| param.ty.clone()).collect(),
+                            d.is_variadic,
+                            d.unspecified_params,
+                        )
+                    });
                 }
                 crate::decompile::passes::c_pass::types::TopLevelDecl::VarDecl(v) => {
                     global_types.insert(v.name.clone(), v.ty.clone());
@@ -1672,7 +1687,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 collect_call_arg_evidence_in_stmt(&fdef.body, &env, &mut call_evidence);
             }
         }
-        join_call_site_evidence(&call_evidence)
+        join_call_site_evidence_by_loader_identity(db, &call_evidence)
     };
     // Recovered return type per callee name, most-refined candidate winning to match clight_select's pick, so a skip-listed internal declares its true return width instead of int.
     let recovered_ret_by_name: HashMap<String, XType> = {
@@ -1702,15 +1717,19 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         by_name
     };
 
-    // Curated signatures keyed by sanitized name, authoritative for skip-listed library functions but used only AFTER call-site evidence, so they never override a call-site-validated prototype.
-    let known_variadic_names: HashSet<String> = db
-        .rel_iter::<(Symbol, usize)>("known_varargs_function")
-        .map(|(n, _)| sanitize_c_symbol_name(n))
+    // Curated signatures are authoritative and keyed by every exact sanitized
+    // loader identity.  Shared call-site inference is consulted only for names
+    // with no such declaration.
+    let shared_fixed_arities = infer_shared_fixed_arities_from_db(db);
+    let known_variadic_names: HashSet<String> = known_loader_signatures
+        .iter()
+        .filter_map(|(name, (_, _, variadic))| (*variadic).then_some(name.clone()))
         .collect();
-    let known_sig_by_name: HashMap<String, (XType, Arc<Vec<XType>>)> = db
-        .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
-        .map(|(n, _, ret, params)| (sanitize_c_symbol_name(n), (*ret, params.clone())))
-        .collect();
+    let known_sig_by_name: HashMap<String, (XType, Arc<Vec<XType>>)> =
+        known_loader_signatures
+            .into_iter()
+            .map(|(name, (ret, params, _))| (name, (ret, params)))
+            .collect();
     let known_decl = |name: &str| -> Option<crate::decompile::passes::c_pass::types::FuncDecl> {
         let (ret, param_tys) = known_sig_by_name.get(name)?;
         let params: Vec<FuncParam> = param_tys
@@ -1745,6 +1764,12 @@ pub fn build_translation_unit_from_stmt_map_with_types(
             params,
         ))
     };
+    let shared_evidence_decl =
+        |name: &str| -> Option<crate::decompile::passes::c_pass::types::FuncDecl> {
+            let arity = *shared_fixed_arities.get(name)?;
+            let decl = evidence_decl(name)?;
+            (decl.params.len() == arity).then_some(decl)
+        };
 
     let resolved_extern_names: HashSet<String> = db
         .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("resolved_extern_signature")
@@ -1757,18 +1782,24 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     unknown_extern_names.sort();
     unknown_extern_names.dedup();
     for sanitized_name in unknown_extern_names {
-        if emitted_func_names.contains(&sanitized_name) || is_compiler_provided(&sanitized_name) {
+        if emitted_func_names.contains(&sanitized_name)
+            || is_compiler_provided(&sanitized_name)
+            || exact_import_pointer_object_names.contains(&sanitized_name)
+        {
             continue;
         }
         if resolved_extern_names.contains(&sanitized_name) {
             continue;
         }
 
-        // A curated extern gets its authoritative typed prototype, while a genuinely unknown extern gets a K&R T name() that cannot clash with the real definition in another TU.
+        // A curated extern gets its authoritative typed prototype.  An
+        // otherwise unknown shared callee gets a fixed prototype only from an
+        // anchored coherent cohort; conflicts and single-site observations
+        // retain a K&R declaration and their per-site argument evidence.
         let ret_ctype = recovered_ret_ctype(&recovered_ret_by_name, &sanitized_name);
         let decl = if known_sig_by_name.contains_key(&sanitized_name) {
-            evidence_decl(&sanitized_name)
-                .or_else(|| known_decl(&sanitized_name))
+            known_decl(&sanitized_name)
+                .or_else(|| evidence_decl(&sanitized_name))
                 .unwrap_or_else(|| {
                     crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
                         sanitized_name.clone(),
@@ -1776,10 +1807,12 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                     )
                 })
         } else {
-            crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
-                sanitized_name.clone(),
-                ret_ctype.clone(),
-            )
+            shared_evidence_decl(&sanitized_name).unwrap_or_else(|| {
+                crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
+                    sanitized_name.clone(),
+                    ret_ctype.clone(),
+                )
+            })
         };
         tu.add_func_decl(decl);
     }
@@ -1816,12 +1849,13 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                 && !is_label
                 && !is_compiler_provided(name)
                 && !emitted_func_names.contains(name)
+                && !exact_import_pointer_object_names.contains(name)
             {
                 // Called-but-undeclared external: a curated one keeps its typed prototype, an unknown one gets a K&R name(); guarded to externals, with the return type from the recovered signature.
                 let ret_ctype = recovered_ret_ctype(&recovered_ret_by_name, name);
                 let decl = if known_sig_by_name.contains_key(name) {
-                    evidence_decl(name)
-                        .or_else(|| known_decl(name))
+                    known_decl(name)
+                        .or_else(|| evidence_decl(name))
                         .unwrap_or_else(|| {
                             crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
                                 name.clone(),
@@ -1829,10 +1863,12 @@ pub fn build_translation_unit_from_stmt_map_with_types(
                             )
                         })
                 } else {
-                    crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
-                        name.clone(),
-                        ret_ctype.clone(),
-                    )
+                    shared_evidence_decl(name).unwrap_or_else(|| {
+                        crate::decompile::passes::c_pass::types::FuncDecl::new_unspecified(
+                            name.clone(),
+                            ret_ctype.clone(),
+                        )
+                    })
                 };
                 forward_decls
                     .push(crate::decompile::passes::c_pass::types::TopLevelDecl::FuncDecl(decl));
@@ -1868,35 +1904,51 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         }
     }
 
-    // Normalize call-site argument counts to each callee's declared fixed arity so calls agree with their (now forward-declared) prototypes/definitions; only fixed-arity callees are collected, variadic and unspecified-prototype (K&R) callees are left as-is.
+    // Remove only surplus arguments beyond a declared fixed arity.  Short
+    // sites keep their recovered values verbatim; variadic and unspecified
+    // (K&R) callees are left as-is.
     {
         use crate::decompile::passes::c_pass::types::TopLevelDecl;
-        let mut arity_counts: HashMap<String, usize> = HashMap::new();
+        let mut arity_facts: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+        let mut variadic_vetoes = HashSet::new();
         for decl in tu.decls.iter() {
             match decl {
                 TopLevelDecl::FuncDef(f) if !f.is_variadic => {
-                    arity_counts.insert(f.name.clone(), f.params.len());
+                    arity_facts
+                        .entry(f.name.clone())
+                        .or_default()
+                        .insert(f.params.len());
                 }
                 TopLevelDecl::FuncDecl(d) if !d.is_variadic && !d.unspecified_params => {
-                    arity_counts.entry(d.name.clone()).or_insert(d.params.len());
+                    arity_facts
+                        .entry(d.name.clone())
+                        .or_default()
+                        .insert(d.params.len());
+                }
+                TopLevelDecl::FuncDef(f) => {
+                    variadic_vetoes.insert(f.name.clone());
+                }
+                TopLevelDecl::FuncDecl(d) if d.is_variadic => {
+                    variadic_vetoes.insert(d.name.clone());
                 }
                 _ => {}
             }
         }
         // Seed the curated arity for header-suppressed non-variadic libc functions, whose fixed arity never reaches arity_counts, so an over-recovered call cannot clash with the header prototype.
-        let known_variadic: HashSet<Symbol> = db
-            .rel_iter::<(Symbol, usize)>("known_varargs_function")
-            .map(|(n, _)| *n)
-            .collect();
-        for (name, arity, _ret, _params) in
-            db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
-        {
-            let sanitized = sanitize_c_symbol_name(name);
-            if known_variadic.contains(name) || is_known_variadic_fn(&sanitized) {
+        for (name, (_ret, params, variadic)) in known_loader_signatures_from_db(db) {
+            if variadic || is_known_variadic_fn(&name) {
+                variadic_vetoes.insert(name);
                 continue;
             }
-            arity_counts.entry(sanitized).or_insert(*arity);
+            arity_facts.entry(name).or_default().insert(params.len());
         }
+        let arity_counts: HashMap<String, usize> = arity_facts
+            .into_iter()
+            .filter_map(|(name, counts)| {
+                (counts.len() == 1 && !variadic_vetoes.contains(&name))
+                    .then(|| (name, *counts.iter().next().unwrap()))
+            })
+            .collect();
         for decl in tu.decls.iter_mut() {
             if let TopLevelDecl::FuncDef(f) = decl {
                 f.body = normalize_call_arity_stmt(&f.body, &arity_counts);
@@ -1904,7 +1956,7 @@ pub fn build_translation_unit_from_stmt_map_with_types(
         }
     }
 
-    // Compilability: insert explicit casts at int<->pointer assignment/argument/return mismatches, after arity normalization so padded arguments are coerced too.
+    // Compilability: insert explicit casts at int<->pointer assignment/argument/return mismatches after surplus-argument normalization.
     {
         use crate::decompile::passes::c_pass::types::TopLevelDecl;
         let mut callee_params: CalleeParams = HashMap::new();
@@ -2095,13 +2147,18 @@ pub fn build_translation_unit_from_stmt_map_with_types(
     tu
 }
 
+fn callee_name_through_casts(e: &CExpr) -> Option<&str> {
+    match e {
+        CExpr::Var(name) => Some(name.as_str()),
+        CExpr::Cast(_, inner) | CExpr::Paren(inner) => callee_name_through_casts(inner),
+        _ => None,
+    }
+}
+
 // The innermost Call(Var(name), ...) of a possibly cast-wrapped call expression, returning the callee name, or None when it is not such a call.
 fn call_name_through_casts(e: &CExpr) -> Option<&str> {
     match e {
-        CExpr::Call(callee, _) => match callee.as_ref() {
-            CExpr::Var(n) => Some(n.as_str()),
-            _ => None,
-        },
+        CExpr::Call(callee, _) => callee_name_through_casts(callee),
         CExpr::Cast(_, inner) | CExpr::Paren(inner) => call_name_through_casts(inner),
         _ => None,
     }
@@ -4116,7 +4173,9 @@ fn repair_arith_stmt(stmt: &CStmt, types: &HashMap<String, CType>) -> CStmt {
     }
 }
 
-// Pad or truncate each call's argument list to the callee's declared fixed arity, padding with 0; counts holds only fixed-arity callees, so variadic and K&R calls are untouched.
+// Truncate surplus arguments to an authoritative fixed arity.  A short call is
+// preserved: declaration recovery is never authority to invent a semantic 0.
+// Variadic and K&R calls are absent from `counts` and remain untouched.
 fn normalize_call_arity_expr(e: &CExpr, counts: &HashMap<String, usize>) -> CExpr {
     match e {
         CExpr::Call(func, args) => {
@@ -4129,10 +4188,6 @@ fn normalize_call_arity_expr(e: &CExpr, counts: &HashMap<String, usize>) -> CExp
                 if let Some(&pc) = counts.get(name) {
                     if nargs.len() > pc {
                         nargs.truncate(pc);
-                    } else {
-                        while nargs.len() < pc {
-                            nargs.push(CExpr::int(0));
-                        }
                     }
                 }
             }
@@ -5221,6 +5276,19 @@ fn convert_callee_expr(expr: &clight::ClightExpr, ctx: &mut ConversionContext) -
     }
 }
 
+fn direct_unprototyped_callee_type(expr: &clight::ClightExpr) -> Option<CType> {
+    let ty = match expr {
+        clight::ClightExpr::Evar(_, ty) | clight::ClightExpr::EvarSymbol(_, ty) => ty,
+        _ => return None,
+    };
+    let cty = convert_clight_type(ty);
+    matches!(
+        &cty,
+        CType::Pointer(inner, _) if matches!(inner.as_ref(), CType::Function(_, _, _, true))
+    )
+    .then_some(cty)
+}
+
 pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> CStmt {
     match stmt {
         clight::ClightStmt::Sskip => CStmt::Empty,
@@ -5249,6 +5317,7 @@ pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> C
 
         clight::ClightStmt::Scall(dst, func, args) => {
             record_local_callee_function_type(func, ctx);
+            let direct_unprototyped_type = direct_unprototyped_callee_type(func);
             let func_expr = convert_callee_expr(func, ctx);
             let func_expr = if let CExpr::Var(ref name) = func_expr {
                 let resolved = ctx.resolve_l_label(name);
@@ -5259,6 +5328,15 @@ pub fn convert_stmt(stmt: &clight::ClightStmt, ctx: &mut ConversionContext) -> C
                 }
             } else {
                 func_expr
+            };
+            // A short or otherwise incoherent exact call carries a true K&R
+            // call-site type.  Materialize that annotation as a cast so a
+            // fixed declaration (including one supplied by a system header)
+            // cannot make the recovered call ill-formed or tempt a later pass
+            // to synthesize missing arguments.
+            let func_expr = match direct_unprototyped_type {
+                Some(ty) => CExpr::Cast(ty, Box::new(func_expr)),
+                None => func_expr,
             };
             let arg_exprs: Vec<CExpr> = args.iter().map(|a| convert_expr(a, ctx)).collect();
             let call_expr = CExpr::Call(Box::new(func_expr), arg_exprs);
@@ -6590,8 +6668,8 @@ fn collect_nonlocal_called_names_in_stmt(
 fn collect_called_names_in_expr(expr: &CExpr, names: &mut HashSet<String>) {
     match expr {
         CExpr::Call(callee, args) => {
-            if let CExpr::Var(name) = callee.as_ref() {
-                names.insert(name.clone());
+            if let Some(name) = callee_name_through_casts(callee) {
+                names.insert(name.to_string());
             }
             collect_called_names_in_expr(callee, names);
             for arg in args {
@@ -6623,15 +6701,22 @@ fn collect_called_names_in_expr(expr: &CExpr, names: &mut HashSet<String>) {
 
 // IL-1: forward-declaration parameter types from a JOIN over call-site evidence; every site must agree on arity and yield classifiable evidence, else the K&R int f() fallback stands.
 
-/// Per-position evidence as a join-semilattice over (class, width): Int|Int takes max width, Int|Float widens to Float(64), Ptr|Ptr unifies to void* except poisoning fn-ptr mismatches.
+/// Per-position evidence as a fail-closed join lattice.  Register classes and
+/// pointer kinds never convert one another: contradictory observations are
+/// `Poison`, which forces an unprototyped declaration.
 #[derive(Debug, Clone, PartialEq)]
 enum ArgEvidence {
     Bottom,
+    /// Integer constant zero.  It may become an integer or a null object/code
+    /// pointer without changing the GP argument class, but it must never join
+    /// floating evidence and move that call position into XMM registers.
+    GpZero,
     Int(u8, Signedness),
     Float(u8),
-    /// Pointer class; `Some(T)` = exact pointer type evidenced, `None` = unknown pointee (emitted `void *`).
-    Ptr(Option<CType>),
-    TopIntPtr,
+    /// Object-pointer class; differing concrete pointees conservatively join
+    /// to `None` (emitted `void *`) without crossing into function pointers.
+    ObjectPtr(Option<CType>),
+    FunctionPtr(Option<CType>),
     Poison,
 }
 
@@ -6642,6 +6727,11 @@ impl ArgEvidence {
         match (self, other) {
             (Poison, _) | (_, Poison) => Poison,
             (Bottom, x) | (x, Bottom) => x,
+            (GpZero, GpZero) => GpZero,
+            (GpZero, value @ Int(_, _)) | (value @ Int(_, _), GpZero) => value,
+            (GpZero, value @ ObjectPtr(_)) | (value @ ObjectPtr(_), GpZero) => value,
+            (GpZero, value @ FunctionPtr(_)) | (value @ FunctionPtr(_), GpZero) => value,
+            (GpZero, Float(_)) | (Float(_), GpZero) => Poison,
             (Int(w1, s1), Int(w2, s2)) => {
                 if w1 == w2 {
                     let s = if s1 == s2 { s1 } else { Signedness::Signed };
@@ -6653,31 +6743,36 @@ impl ArgEvidence {
                 }
             }
             (Float(w1), Float(w2)) => Float(w1.max(w2)),
-            // Documented: int | float widens to double (see type-level docs).
-            (Int(_, _), Float(_)) | (Float(_), Int(_, _)) => Float(64),
-            (Ptr(a), Ptr(b)) => {
+            (ObjectPtr(a), ObjectPtr(b)) => {
                 if a == b {
-                    Ptr(a)
-                } else if ctype_opt_involves_function(&a) || ctype_opt_involves_function(&b) {
-                    // Differing function-pointer types must not unify to void* (not implicit in strict C).
-                    Poison
+                    ObjectPtr(a)
                 } else {
-                    Ptr(None)
+                    ObjectPtr(None)
                 }
             }
-            // Mixed scalar/pointer classes meet at the int/ptr-safe top.
-            (TopIntPtr, _) | (_, TopIntPtr) => TopIntPtr,
-            (Int(_, _), Ptr(_)) | (Ptr(_), Int(_, _)) => TopIntPtr,
-            (Float(_), Ptr(_)) | (Ptr(_), Float(_)) => TopIntPtr,
+            (FunctionPtr(a), FunctionPtr(b)) if a == b => FunctionPtr(a),
+            (FunctionPtr(_), FunctionPtr(_)) => Poison,
+            // GP integer, XMM float, object pointer, and function pointer are
+            // distinct evidence classes.  No join may silently reclassify a
+            // call position or launder an invalid implicit conversion.
+            (Int(_, _), Float(_)) | (Float(_), Int(_, _))
+            | (Int(_, _), ObjectPtr(_)) | (ObjectPtr(_), Int(_, _))
+            | (Int(_, _), FunctionPtr(_)) | (FunctionPtr(_), Int(_, _))
+            | (Float(_), ObjectPtr(_)) | (ObjectPtr(_), Float(_))
+            | (Float(_), FunctionPtr(_)) | (FunctionPtr(_), Float(_))
+            | (ObjectPtr(_), FunctionPtr(_)) | (FunctionPtr(_), ObjectPtr(_)) => Poison,
         }
     }
 
-    /// The C type to emit for a fully-joined position; `None` only for `Poison`, which forces the whole declaration to the K&R fallback.
+    /// The C type to emit for a fully-joined position; poisoned or
+    /// signature-less function-pointer evidence forces the whole declaration
+    /// to the K&R fallback.
     fn to_ctype(&self) -> Option<CType> {
         use crate::decompile::passes::c_pass::types::{FloatSize, IntSize};
         match self {
             // Bottom = no evidence: conservative default (long accepts both ints and pointers untruncated).
             ArgEvidence::Bottom => Some(CType::long()),
+            ArgEvidence::GpZero => Some(CType::int()),
             ArgEvidence::Int(w, s) => {
                 let sz = match *w {
                     0..=8 => IntSize::Char,
@@ -6692,9 +6787,11 @@ impl ArgEvidence {
             } else {
                 FloatSize::Double
             })),
-            ArgEvidence::Ptr(Some(ty)) => Some(ty.clone()),
-            ArgEvidence::Ptr(None) => Some(CType::ptr(CType::Void)),
-            ArgEvidence::TopIntPtr => Some(CType::long()),
+            ArgEvidence::ObjectPtr(Some(ty)) | ArgEvidence::FunctionPtr(Some(ty)) => {
+                Some(ty.clone())
+            }
+            ArgEvidence::ObjectPtr(None) => Some(CType::ptr(CType::Void)),
+            ArgEvidence::FunctionPtr(None) => None,
             ArgEvidence::Poison => None,
         }
     }
@@ -6706,6 +6803,14 @@ fn ctype_involves_function(ty: &CType) -> bool {
         CType::Pointer(inner, _) | CType::Array(inner, _) | CType::Qualified(inner, _) => {
             ctype_involves_function(inner)
         }
+        _ => false,
+    }
+}
+
+fn ctype_is_function_type(ty: &CType) -> bool {
+    match ty {
+        CType::Function(_, _, _, _) => true,
+        CType::Qualified(inner, _) => ctype_is_function_type(inner),
         _ => false,
     }
 }
@@ -6726,10 +6831,6 @@ fn retain_clight_function_object_types(
     }
 }
 
-fn ctype_opt_involves_function(ty: &Option<CType>) -> bool {
-    ty.as_ref().map_or(false, ctype_involves_function)
-}
-
 /// Classify a declared C type as argument evidence.
 fn arg_evidence_of_ctype(ty: &CType) -> ArgEvidence {
     use crate::decompile::passes::c_pass::types::{FloatSize, IntSize};
@@ -6748,13 +6849,56 @@ fn arg_evidence_of_ctype(ty: &CType) -> ArgEvidence {
         CType::Enum(_) => ArgEvidence::Int(32, Signedness::Signed),
         CType::Float(FloatSize::Float) => ArgEvidence::Float(32),
         CType::Float(_) => ArgEvidence::Float(64),
-        CType::Pointer(_, _) => ArgEvidence::Ptr(Some(ty.clone())),
+        CType::Pointer(inner, _) if ctype_is_function_type(inner) => {
+            ArgEvidence::FunctionPtr(Some(ty.clone()))
+        }
+        CType::Pointer(_, _) => ArgEvidence::ObjectPtr(Some(ty.clone())),
         // Arrays and function designators decay to pointers in argument position.
-        CType::Array(inner, _) => ArgEvidence::Ptr(Some(CType::ptr(inner.as_ref().clone()))),
-        CType::Function(_, _, _, _) => ArgEvidence::Ptr(Some(CType::ptr(ty.clone()))),
+        CType::Array(inner, _) => {
+            ArgEvidence::ObjectPtr(Some(CType::ptr(inner.as_ref().clone())))
+        }
+        CType::Function(_, _, _, _) => {
+            ArgEvidence::FunctionPtr(Some(CType::ptr(ty.clone())))
+        }
         CType::Qualified(inner, _) => arg_evidence_of_ctype(inner),
         // void/struct/union/typedef: not a scalar class we can safely type a parameter from.
         _ => ArgEvidence::Poison,
+    }
+}
+
+/// Usual arithmetic conversion for one expression.  This is deliberately
+/// separate from the cross-call-site evidence join: an `int + float`
+/// expression has a real floating result, while observing int at one call and
+/// float at another is a prototype conflict.
+fn arithmetic_arg_evidence(left: ArgEvidence, right: ArgEvidence) -> ArgEvidence {
+    match (left, right) {
+        (ArgEvidence::Bottom, value) | (value, ArgEvidence::Bottom) => value,
+        (ArgEvidence::GpZero, ArgEvidence::GpZero) => ArgEvidence::GpZero,
+        (ArgEvidence::GpZero, value @ ArgEvidence::Int(_, _))
+        | (value @ ArgEvidence::Int(_, _), ArgEvidence::GpZero) => value,
+        (ArgEvidence::GpZero, ArgEvidence::Float(width))
+        | (ArgEvidence::Float(width), ArgEvidence::GpZero) => ArgEvidence::Float(width),
+        (left @ ArgEvidence::Int(_, _), right @ ArgEvidence::Int(_, _))
+        | (left @ ArgEvidence::Float(_), right @ ArgEvidence::Float(_)) => {
+            left.join(right)
+        }
+        (ArgEvidence::Int(_, _), ArgEvidence::Float(width))
+        | (ArgEvidence::Float(width), ArgEvidence::Int(_, _)) => ArgEvidence::Float(width),
+        _ => ArgEvidence::Poison,
+    }
+}
+
+fn integer_binary_arg_evidence(left: ArgEvidence, right: ArgEvidence) -> ArgEvidence {
+    let is_integer = |evidence: &ArgEvidence| {
+        matches!(
+            evidence,
+            ArgEvidence::Bottom | ArgEvidence::GpZero | ArgEvidence::Int(_, _)
+        )
+    };
+    if is_integer(&left) && is_integer(&right) {
+        arithmetic_arg_evidence(left, right)
+    } else {
+        ArgEvidence::Poison
     }
 }
 
@@ -6773,14 +6917,43 @@ impl ArgEvidenceEnv<'_> {
     }
 }
 
+fn address_of_arg_evidence(inner: &CExpr, env: &ArgEvidenceEnv) -> ArgEvidence {
+    match inner {
+        CExpr::Paren(inner) => address_of_arg_evidence(inner, env),
+        CExpr::Var(name) => match env.var_type(name) {
+            Some(ty @ CType::Function(_, _, _, _)) => {
+                ArgEvidence::FunctionPtr(Some(CType::ptr(ty.clone())))
+            }
+            Some(ty) => ArgEvidence::ObjectPtr(Some(CType::ptr(ty.clone()))),
+            None if env.callee_ret.contains_key(name) => ArgEvidence::FunctionPtr(None),
+            None => ArgEvidence::Poison,
+        },
+        // `&*p` retains the pointer value and, critically, its object-vs-code
+        // pointer class.  Treating every non-variable lvalue as `void *` would
+        // silently turn `&*fp` into an object pointer.
+        CExpr::Unary(UnaryOp::Deref, pointer) => match arg_evidence_of_expr(pointer, env) {
+            evidence @ (ArgEvidence::ObjectPtr(_) | ArgEvidence::FunctionPtr(_)) => evidence,
+            _ => ArgEvidence::Poison,
+        },
+        // Member/index lvalue types are not carried by this late C AST.  Their
+        // address might be an object pointer or a function designator, so the
+        // only sound evidence is a veto.
+        _ => ArgEvidence::Poison,
+    }
+}
+
 /// Classify one call-site argument expression; returns `Poison` when the declared type cannot be determined.
 fn arg_evidence_of_expr(expr: &CExpr, env: &ArgEvidenceEnv) -> ArgEvidence {
     use crate::decompile::passes::c_pass::types::UnaryOp;
     match expr {
         CExpr::Cast(ty, _) => arg_evidence_of_ctype(ty),
-        CExpr::StringLit(_) => ArgEvidence::Ptr(Some(CType::ptr(CType::char_signed()))),
-        // A literal 0 is a valid int, float, and null pointer constant.
-        CExpr::IntLit(l) if l.value == 0 => ArgEvidence::Bottom,
+        CExpr::StringLit(_) => {
+            ArgEvidence::ObjectPtr(Some(CType::ptr(CType::char_signed())))
+        }
+        // A literal zero is a GP-class value and a null pointer constant.  It
+        // is not lattice bottom: a fixed float prototype would change the
+        // original call's register class during recompilation.
+        CExpr::IntLit(l) if l.value == 0 => ArgEvidence::GpZero,
         CExpr::IntLit(l) => {
             use crate::decompile::passes::c_pass::types::IntLiteralSuffix as S;
             let (suffix_wide, unsigned) = match l.suffix {
@@ -6809,76 +6982,111 @@ fn arg_evidence_of_expr(expr: &CExpr, env: &ArgEvidenceEnv) -> ArgEvidence {
             .map(arg_evidence_of_ctype)
             .unwrap_or(ArgEvidence::Poison),
         CExpr::Paren(inner) => arg_evidence_of_expr(inner, env),
-        CExpr::Unary(UnaryOp::AddrOf, _) => ArgEvidence::Ptr(None),
+        CExpr::Unary(UnaryOp::AddrOf, inner) => address_of_arg_evidence(inner, env),
         CExpr::Unary(UnaryOp::Deref, inner) => match arg_evidence_of_expr(inner, env) {
-            ArgEvidence::Ptr(Some(CType::Pointer(p, _))) => arg_evidence_of_ctype(&p),
+            ArgEvidence::ObjectPtr(Some(CType::Pointer(p, _)))
+            | ArgEvidence::FunctionPtr(Some(CType::Pointer(p, _))) => {
+                arg_evidence_of_ctype(&p)
+            }
             _ => ArgEvidence::Poison,
         },
         CExpr::Unary(UnaryOp::Not, _) => ArgEvidence::Int(32, Signedness::Signed),
-        CExpr::Unary(UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot, inner) => {
+        CExpr::Unary(UnaryOp::Neg | UnaryOp::Plus, inner) => {
             match arg_evidence_of_expr(inner, env) {
-                ev @ (ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom) => ev,
+                ev @ (ArgEvidence::Int(_,_)
+                | ArgEvidence::Float(_)
+                | ArgEvidence::Bottom
+                | ArgEvidence::GpZero) => ev,
                 _ => ArgEvidence::Poison,
             }
         }
+        CExpr::Unary(UnaryOp::BitNot, inner) => match arg_evidence_of_expr(inner, env) {
+            ArgEvidence::GpZero => ArgEvidence::Int(32, Signedness::Signed),
+            ev @ (ArgEvidence::Int(_, _) | ArgEvidence::Bottom) => ev,
+            _ => ArgEvidence::Poison,
+        },
         CExpr::Unary(_, _) => ArgEvidence::Poison,
         CExpr::Binary(op, l, r) => {
             use crate::decompile::passes::c_pass::types::BinaryOp as B;
             match op {
                 // Comparisons and logical connectives have type int.
                 B::Eq | B::Ne | B::Lt | B::Le | B::Gt | B::Ge | B::And | B::Or => {
-                    ArgEvidence::Int(32, Signedness::Signed)
+                    let left = arg_evidence_of_expr(l, env);
+                    let right = arg_evidence_of_expr(r, env);
+                    if matches!(left, ArgEvidence::Poison)
+                        || matches!(right, ArgEvidence::Poison)
+                    {
+                        ArgEvidence::Poison
+                    } else {
+                        ArgEvidence::Int(32, Signedness::Signed)
+                    }
                 }
-                B::Shl | B::Shr => match arg_evidence_of_expr(l, env) {
-                    ev @ (ArgEvidence::Int(_, _) | ArgEvidence::Bottom) => ev,
-                    _ => ArgEvidence::Poison,
-                },
+                B::Shl | B::Shr => {
+                    let left = arg_evidence_of_expr(l, env);
+                    let right = arg_evidence_of_expr(r, env);
+                    if matches!(
+                        right,
+                        ArgEvidence::Bottom | ArgEvidence::GpZero | ArgEvidence::Int(_, _)
+                    ) {
+                        match left {
+                            ev @ (ArgEvidence::Int(_, _) | ArgEvidence::Bottom) => ev,
+                            ArgEvidence::GpZero => {
+                                ArgEvidence::Int(32, Signedness::Signed)
+                            }
+                            _ => ArgEvidence::Poison,
+                        }
+                    } else {
+                        ArgEvidence::Poison
+                    }
+                }
                 B::Add | B::Sub => {
                     let le = arg_evidence_of_expr(l, env);
                     let re = arg_evidence_of_expr(r, env);
                     match (le, re) {
                         // ptr - ptr is ptrdiff_t; ptr +/- int keeps the pointer type.
-                        (ArgEvidence::Ptr(_), ArgEvidence::Ptr(_)) if matches!(op, B::Sub) => {
+                        (ArgEvidence::ObjectPtr(_), ArgEvidence::ObjectPtr(_))
+                            if matches!(op, B::Sub) => {
                             ArgEvidence::Int(64, Signedness::Signed)
                         }
-                        (p @ ArgEvidence::Ptr(_), ArgEvidence::Int(_, _) | ArgEvidence::Bottom)
-                        | (ArgEvidence::Int(_, _) | ArgEvidence::Bottom, p @ ArgEvidence::Ptr(_)) => {
+                        (p @ ArgEvidence::ObjectPtr(_), ArgEvidence::Int(_, _) | ArgEvidence::Bottom | ArgEvidence::GpZero)
+                        | (ArgEvidence::Int(_, _) | ArgEvidence::Bottom | ArgEvidence::GpZero, p @ ArgEvidence::ObjectPtr(_)) => {
                             p
                         }
                         (
                             le @ (ArgEvidence::Int(_, _)
                             | ArgEvidence::Float(_)
-                            | ArgEvidence::Bottom),
+                            | ArgEvidence::Bottom
+                            | ArgEvidence::GpZero),
                             re @ (ArgEvidence::Int(_, _)
                             | ArgEvidence::Float(_)
-                            | ArgEvidence::Bottom),
-                        ) => le.join(re),
+                            | ArgEvidence::Bottom
+                            | ArgEvidence::GpZero),
+                        ) => arithmetic_arg_evidence(le, re),
                         _ => ArgEvidence::Poison,
                     }
                 }
-                B::Mul | B::Div | B::Mod | B::BitAnd | B::BitOr | B::BitXor => {
+                B::Mul | B::Div => {
                     let le = arg_evidence_of_expr(l, env);
                     let re = arg_evidence_of_expr(r, env);
                     match (&le, &re) {
                         (
-                            ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom,
-                            ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom,
-                        ) => le.join(re),
+                            ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom | ArgEvidence::GpZero,
+                            ArgEvidence::Int(_, _) | ArgEvidence::Float(_) | ArgEvidence::Bottom | ArgEvidence::GpZero,
+                        ) => arithmetic_arg_evidence(le, re),
                         _ => ArgEvidence::Poison,
                     }
                 }
+                B::Mod | B::BitAnd | B::BitOr | B::BitXor => integer_binary_arg_evidence(
+                    arg_evidence_of_expr(l, env),
+                    arg_evidence_of_expr(r, env),
+                ),
                 _ => ArgEvidence::Poison,
             }
         }
         CExpr::Ternary(_, t, e) => {
             let te = arg_evidence_of_expr(t, env);
             let ee = arg_evidence_of_expr(e, env);
-            match (&te, &ee) {
-                // int/ptr-mixed ternary is not valid C; poison so the callee keeps the K&R decl rather than laundering it through TopIntPtr.
-                (ArgEvidence::Ptr(_), ArgEvidence::Int(_, _))
-                | (ArgEvidence::Int(_, _), ArgEvidence::Ptr(_)) => ArgEvidence::Poison,
-                _ => te.join(ee),
-            }
+            te.join(ee)
         }
         CExpr::Call(callee, _) => match callee.as_ref() {
             CExpr::Var(name) => env
@@ -6994,36 +7202,725 @@ fn collect_call_arg_evidence_in_expr(
     }
 }
 
+/// Infer only the arity cohort that is safe to share across call sites.
+///
+/// Every site must have one dense, unambiguous vector and every non-empty
+/// position must be anchored by an explicit register setup or a uniquely
+/// owned entry-SP store somewhere in the cohort.  A forwarded-only thunk may
+/// therefore reuse an anchored site's vector, while two forwarded-live-in-only
+/// sites cannot establish a prototype.  Two agreeing empty sites are the one
+/// anchor-free case: they establish the useful fixed `(void)` prototype.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct ExactLoaderIdentity {
+    address: Address,
+    kind: LoaderSymbolKind,
+}
+
+impl ExactLoaderIdentity {
+    fn from_row(
+        address: Address,
+        kind: LoaderSymbolKind,
+        _provider: Symbol,
+        _original: Symbol,
+    ) -> Self {
+        Self {
+            address,
+            kind,
+        }
+    }
+}
+
+fn exact_import_pointer_call_addresses(db: &DecompileDB) -> HashSet<Address> {
+    db.rel_iter::<(Node, Address, LoaderSymbolKind, Symbol, Symbol)>("call_loader_identity")
+        .filter_map(|(_, address, kind, _, _)| {
+            (*kind == LoaderSymbolKind::ImportPointer).then_some(*address)
+        })
+        .collect()
+}
+
+fn exact_import_pointer_call_names(db: &DecompileDB) -> HashSet<String> {
+    db.rel_iter::<(Node, Address, LoaderSymbolKind, Symbol, Symbol)>("call_loader_identity")
+        .filter_map(|(_, _, kind, provider, original)| {
+            (*kind == LoaderSymbolKind::ImportPointer).then_some([
+                sanitize_c_symbol_name(provider),
+                sanitize_c_symbol_name(original),
+            ])
+        })
+        .flatten()
+        .collect()
+}
+
+fn is_shadowed_same_address_function(
+    identity: &ExactLoaderIdentity,
+    exact_import_pointer_addresses: &HashSet<Address>,
+) -> bool {
+    identity.kind == LoaderSymbolKind::Function
+        && exact_import_pointer_addresses.contains(&identity.address)
+}
+
+fn project_exact_identity_values<T: Clone>(
+    identity_names: &BTreeMap<ExactLoaderIdentity, BTreeSet<String>>,
+    values: &BTreeMap<ExactLoaderIdentity, T>,
+) -> HashMap<String, T> {
+    let mut owners: BTreeMap<String, BTreeSet<ExactLoaderIdentity>> = BTreeMap::new();
+    for (identity, names) in identity_names {
+        for name in names {
+            owners
+                .entry(name.clone())
+                .or_default()
+                .insert(identity.clone());
+        }
+    }
+
+    let mut projected = HashMap::new();
+    for (name, identities) in owners {
+        if identities.len() != 1 {
+            continue;
+        }
+        let identity = identities.iter().next().unwrap();
+        if let Some(value) = values.get(identity) {
+            projected.insert(name, value.clone());
+        }
+    }
+    projected
+}
+
+fn insert_identity_names(
+    names: &mut BTreeMap<ExactLoaderIdentity, BTreeSet<String>>,
+    identity: &ExactLoaderIdentity,
+    provider: Symbol,
+    original: Symbol,
+) {
+    let entry = names.entry(identity.clone()).or_default();
+    entry.insert(sanitize_c_symbol_name(provider));
+    entry.insert(sanitize_c_symbol_name(original));
+}
+
+/// Find emitted spellings that are not uniquely owned by their loader
+/// identity even though the loader relation itself has only one owner.  The C
+/// AST is keyed by sanitized spelling, so a plain symbol at another address
+/// makes that spelling ambiguous just as surely as a second loader identity
+/// would.  Keep aliases at the same address: they still denote the same exact
+/// loader object, and the symbol relations do not carry a finer kind tag.
+fn loader_name_collisions_with_unowned_symbols(
+    db: &DecompileDB,
+    identity_names: &BTreeMap<ExactLoaderIdentity, BTreeSet<String>>,
+) -> HashSet<String> {
+    let mut loader_addresses: BTreeMap<String, BTreeSet<Address>> = BTreeMap::new();
+    for (identity, names) in identity_names {
+        for name in names {
+            loader_addresses
+                .entry(name.clone())
+                .or_default()
+                .insert(identity.address);
+        }
+    }
+
+    let mut collisions = HashSet::new();
+    let mut observe = |address: Address, symbol: Symbol| {
+        let name = sanitize_c_symbol_name(symbol);
+        if loader_addresses
+            .get(&name)
+            .is_some_and(|addresses| !addresses.contains(&address))
+        {
+            collisions.insert(name);
+        }
+    };
+    for &(ident, symbol) in db.rel_iter::<(Ident, Symbol)>("ident_to_symbol") {
+        observe(ident as Address, symbol);
+    }
+    for &(address, symbol, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
+        observe(address, symbol);
+    }
+    collisions
+}
+
+fn infer_shared_fixed_arities(
+    call_sites: &[(Node, ExactLoaderIdentity)],
+    provenance: &[(Node, usize, RTLReg, CallArgProvenance)],
+    known_variadic: &HashSet<ExactLoaderIdentity>,
+    veto_sites: &HashSet<Node>,
+) -> BTreeMap<ExactLoaderIdentity, usize> {
+    let mut sites_by_callee: BTreeMap<ExactLoaderIdentity, BTreeSet<Node>> = BTreeMap::new();
+    let mut identities_by_site: BTreeMap<Node, BTreeSet<ExactLoaderIdentity>> = BTreeMap::new();
+    for (node, identity) in call_sites {
+        sites_by_callee
+            .entry(identity.clone())
+            .or_default()
+            .insert(*node);
+        identities_by_site
+            .entry(*node)
+            .or_default()
+            .insert(identity.clone());
+    }
+    let ambiguous_sites: HashSet<Node> = identities_by_site
+        .into_iter()
+        .filter_map(|(node, identities)| (identities.len() != 1).then_some(node))
+        .collect();
+    let mut provenance_by_site: HashMap<
+        Node,
+        Vec<(usize, RTLReg, CallArgProvenance)>,
+    > = HashMap::new();
+    for &(node, position, reg, source) in provenance {
+        provenance_by_site
+            .entry(node)
+            .or_default()
+            .push((position, reg, source));
+    }
+
+    let mut inferred = BTreeMap::new();
+    for (callee, sites) in sites_by_callee {
+        if sites.len() < 2 || known_variadic.contains(&callee) {
+            continue;
+        }
+
+        let mut common_arity: Option<usize> = None;
+        let mut anchored_positions = BTreeSet::new();
+        let mut coherent = true;
+        for site in sites {
+            if veto_sites.contains(&site) || ambiguous_sites.contains(&site) {
+                coherent = false;
+                break;
+            }
+            let rows = provenance_by_site
+                .get(&site)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let Some(args) =
+                crate::decompile::passes::rtl_optimize_pass::coherent_call_vector(
+                    rows.iter().copied(),
+                )
+            else {
+                coherent = false;
+                break;
+            };
+            match common_arity {
+                Some(arity) if arity != args.len() => {
+                    coherent = false;
+                    break;
+                }
+                None => common_arity = Some(args.len()),
+                Some(_) => {}
+            }
+            anchored_positions.extend(
+                rows.iter()
+                    .filter(|(_, _, source)| source.is_anchor())
+                    .map(|(position, _, _)| *position),
+            );
+        }
+
+        let Some(arity) = common_arity else { continue };
+        if coherent
+            && (arity == 0 || (0..arity).all(|position| anchored_positions.contains(&position)))
+        {
+            inferred.insert(callee, arity);
+        }
+    }
+    inferred
+}
+
+/// Deterministic authoritative signatures keyed by every exact loader
+/// spelling C emission may retain.  A connected identity component is omitted
+/// wholesale when its signature or variadic facts conflict.
+pub(crate) fn known_loader_signatures_from_db(
+    db: &DecompileDB,
+) -> HashMap<String, (XType, Arc<Vec<XType>>, bool)> {
+    let exact_import_pointer_addresses = exact_import_pointer_call_addresses(db);
+    let mut identity_names: BTreeMap<ExactLoaderIdentity, BTreeSet<String>> = BTreeMap::new();
+    for &(address, kind, provider, original) in db.rel_iter::<(
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("loader_symbol_identity") {
+        let identity = ExactLoaderIdentity::from_row(address, kind, provider, original);
+        if is_shadowed_same_address_function(&identity, &exact_import_pointer_addresses) {
+            continue;
+        }
+        insert_identity_names(&mut identity_names, &identity, provider, original);
+    }
+    let mut exact_rows: BTreeMap<
+        ExactLoaderIdentity,
+        BTreeSet<(XType, Arc<Vec<XType>>, bool)>,
+    > = BTreeMap::new();
+    let mut exact_vetoes = HashSet::new();
+    for (address, kind, provider, original, arity, ret, params, variadic) in db
+        .rel_iter::<(
+            Address,
+            LoaderSymbolKind,
+            Symbol,
+            Symbol,
+            usize,
+            XType,
+            Arc<Vec<XType>>,
+            bool,
+        )>("known_loader_signature")
+    {
+        let identity = ExactLoaderIdentity::from_row(*address, *kind, *provider, *original);
+        if is_shadowed_same_address_function(&identity, &exact_import_pointer_addresses) {
+            continue;
+        }
+        insert_identity_names(&mut identity_names, &identity, *provider, *original);
+        if *arity != params.len() {
+            exact_vetoes.insert(identity);
+            continue;
+        }
+        exact_rows
+            .entry(identity)
+            .or_default()
+            .insert((*ret, params.clone(), *variadic));
+    }
+    for &(address, kind, provider, original) in db.rel_iter::<(
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("loader_signature_conflict") {
+        let identity = ExactLoaderIdentity::from_row(address, kind, provider, original);
+        if is_shadowed_same_address_function(&identity, &exact_import_pointer_addresses) {
+            continue;
+        }
+        insert_identity_names(&mut identity_names, &identity, provider, original);
+        exact_vetoes.insert(identity);
+    }
+    let mut exact_variadic = HashSet::new();
+    for &(address, kind, provider, original) in db.rel_iter::<(
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("known_loader_variadic") {
+        let identity = ExactLoaderIdentity::from_row(address, kind, provider, original);
+        if is_shadowed_same_address_function(&identity, &exact_import_pointer_addresses) {
+            continue;
+        }
+        insert_identity_names(&mut identity_names, &identity, provider, original);
+        exact_variadic.insert(identity);
+    }
+    let exact_values: BTreeMap<ExactLoaderIdentity, (XType, Arc<Vec<XType>>, bool)> =
+        exact_rows
+            .into_iter()
+            .filter_map(|(identity, rows)| {
+                if rows.len() != 1 || exact_vetoes.contains(&identity) {
+                    return None;
+                }
+                let value = rows.into_iter().next().unwrap();
+                if exact_variadic.contains(&identity) != value.2 {
+                    return None;
+                }
+                Some((identity, value))
+            })
+            .collect();
+    let mut out = project_exact_identity_values(&identity_names, &exact_values);
+    let name_collisions = loader_name_collisions_with_unowned_symbols(db, &identity_names);
+    out.retain(|name, _| !name_collisions.contains(name));
+
+    // Curated signatures not owned by a loader identity remain available by
+    // their exact raw symbol.  Sanitizer collisions and signature/varargs
+    // conflicts are vetoes, never deterministic picks.
+    let loader_names: HashSet<String> = identity_names
+        .values()
+        .flat_map(|names| names.iter().cloned())
+        .collect();
+    let mut variadic_counts: BTreeMap<Symbol, BTreeSet<usize>> = BTreeMap::new();
+    for &(name, fixed_count) in db.rel_iter::<(Symbol, usize)>("known_varargs_function") {
+        variadic_counts.entry(name).or_default().insert(fixed_count);
+    }
+    let mut raw_signature_rows: BTreeMap<
+        Symbol,
+        BTreeSet<(usize, XType, Arc<Vec<XType>>)>,
+    > = BTreeMap::new();
+    for (name, arity, ret, params) in
+        db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
+    {
+        raw_signature_rows
+            .entry(*name)
+            .or_default()
+            .insert((*arity, *ret, params.clone()));
+    }
+    let mut raw_owners: BTreeMap<String, BTreeSet<Symbol>> = BTreeMap::new();
+    let mut ordinary_rows: BTreeMap<
+        String,
+        BTreeSet<(XType, Arc<Vec<XType>>, bool)>,
+    > = BTreeMap::new();
+    for (name, facts) in raw_signature_rows {
+        let sanitized = sanitize_c_symbol_name(name);
+        if loader_names.contains(&sanitized) {
+            continue;
+        }
+        raw_owners.entry(sanitized.clone()).or_default().insert(name);
+        if facts.len() != 1 {
+            continue;
+        }
+        let (arity, ret, params) = facts.into_iter().next().unwrap();
+        if arity != params.len() {
+            continue;
+        }
+        let counts = variadic_counts.get(name);
+        if counts.map_or(false, |counts| counts.len() != 1) {
+            continue;
+        }
+        let variadic = match counts.and_then(|counts| counts.iter().next().copied()) {
+            Some(fixed_count) if fixed_count == params.len() => true,
+            Some(_) => continue,
+            None => false,
+        };
+        ordinary_rows
+            .entry(sanitized)
+            .or_default()
+            .insert((ret, params, variadic));
+    }
+    for (name, rows) in ordinary_rows {
+        if raw_owners.get(&name).map_or(0, |owners| owners.len()) == 1
+            && rows.len() == 1
+        {
+            out.insert(name, rows.into_iter().next().unwrap());
+        }
+    }
+    out
+}
+
+/// Authoritative prototypes usable for data globals invoked as functions.
+/// Only loader-classified import-pointer objects qualify; a plain OBJECT whose
+/// spelling happens to match a curated function must use call-site evidence.
+pub(crate) fn known_import_pointer_signatures_from_db(
+    db: &DecompileDB,
+) -> HashMap<String, (XType, Arc<Vec<XType>>, bool)> {
+    let exact_import_pointer_addresses = exact_import_pointer_call_addresses(db);
+    let mut identity_names: BTreeMap<ExactLoaderIdentity, BTreeSet<String>> = BTreeMap::new();
+    for &(address, kind, provider, original) in db.rel_iter::<(
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("loader_symbol_identity") {
+        let identity = ExactLoaderIdentity::from_row(address, kind, provider, original);
+        if is_shadowed_same_address_function(&identity, &exact_import_pointer_addresses) {
+            continue;
+        }
+        insert_identity_names(&mut identity_names, &identity, provider, original);
+    }
+    let import_identities: BTreeMap<ExactLoaderIdentity, ()> = identity_names
+        .keys()
+        .filter(|identity| identity.kind == LoaderSymbolKind::ImportPointer)
+        .cloned()
+        .map(|identity| (identity, ()))
+        .collect();
+    let allowed_names: HashSet<String> =
+        project_exact_identity_values(&identity_names, &import_identities)
+            .into_keys()
+            .collect();
+    let mut signatures = known_loader_signatures_from_db(db);
+    signatures.retain(|name, _| allowed_names.contains(name));
+    signatures
+}
+
+/// Relation-backed entry point shared by direct external declarations and the
+/// data-global/function-pointer declaration solver.
+fn infer_shared_fixed_arities_from_db_filtered(
+    db: &DecompileDB,
+    required_kind: Option<LoaderSymbolKind>,
+) -> HashMap<String, usize> {
+    let exact_import_pointer_addresses = exact_import_pointer_call_addresses(db);
+    let mut identity_names: BTreeMap<ExactLoaderIdentity, BTreeSet<String>> = BTreeMap::new();
+    for &(address, kind, provider, original) in db.rel_iter::<(
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("loader_symbol_identity") {
+        let identity = ExactLoaderIdentity::from_row(address, kind, provider, original);
+        if is_shadowed_same_address_function(&identity, &exact_import_pointer_addresses) {
+            continue;
+        }
+        insert_identity_names(&mut identity_names, &identity, provider, original);
+    }
+    let mut call_sites = Vec::new();
+    for &(node, address, kind, provider, original) in db.rel_iter::<(
+        Node,
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("call_loader_identity_candidate") {
+        let identity = ExactLoaderIdentity::from_row(address, kind, provider, original);
+        if is_shadowed_same_address_function(&identity, &exact_import_pointer_addresses) {
+            continue;
+        }
+        insert_identity_names(&mut identity_names, &identity, provider, original);
+        call_sites.push((node, identity));
+    }
+    // Hand-authored DBs and older serialized stages may contain only the
+    // resolved relation.  Union it without changing exact identity semantics.
+    for &(node, address, kind, provider, original) in db.rel_iter::<(
+        Node,
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("call_loader_identity") {
+        let identity = ExactLoaderIdentity::from_row(address, kind, provider, original);
+        if is_shadowed_same_address_function(&identity, &exact_import_pointer_addresses) {
+            continue;
+        }
+        insert_identity_names(&mut identity_names, &identity, provider, original);
+        call_sites.push((node, identity));
+    }
+    call_sites.sort();
+    call_sites.dedup();
+
+    let mut veto_sites: HashSet<Node> = db
+        .rel_iter::<(Node,)>("call_forwarding_unresolved")
+        .map(|(node,)| *node)
+        .collect();
+    veto_sites.extend(
+        db.rel_iter::<(Node,)>("call_loader_identity_ambiguous")
+            .map(|(node,)| *node),
+    );
+    if !db.abi().uses_shared_arg_slots() {
+        // SysV float arguments live in an independent compact XMM sequence.
+        // Until that sequence carries the same per-position provenance as GP
+        // arguments, do not mistake a float-bearing callee for a shared
+        // zero/fewer-argument prototype.  Its per-site RTL evidence is kept
+        // and C emission remains safely unprototyped.
+        veto_sites.extend(
+            db.rel_iter::<(Node, usize)>("call_has_float_arg_evidence")
+                .map(|(node, _)| *node),
+        );
+    }
+    let provenance: Vec<(Node, usize, RTLReg, CallArgProvenance)> = db
+        .rel_iter::<(Node, usize, RTLReg, CallArgProvenance)>("call_arg_provenance")
+        .copied()
+        .collect();
+    let provenance_keys: HashSet<(Node, usize, RTLReg)> = provenance
+        .iter()
+        .map(|&(node, position, reg, _)| (node, position, reg))
+        .collect();
+    for &(node, position, reg) in
+        db.rel_iter::<(Node, usize, RTLReg)>("call_arg_mapping")
+    {
+        if !provenance_keys.contains(&(node, position, reg)) {
+            veto_sites.insert(node);
+        }
+    }
+    let mut provenance_rows_by_site: HashMap<
+        Node,
+        Vec<(usize, RTLReg, CallArgProvenance)>,
+    > = HashMap::new();
+    for &(node, position, reg, source) in &provenance {
+        provenance_rows_by_site
+            .entry(node)
+            .or_default()
+            .push((position, reg, source));
+    }
+    let mut candidate_vectors_by_site: BTreeMap<
+        Node,
+        BTreeSet<Arc<Vec<RTLReg>>>,
+    > = BTreeMap::new();
+    for (node, args) in
+        db.rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
+    {
+        candidate_vectors_by_site
+            .entry(*node)
+            .or_default()
+            .insert(args.clone());
+    }
+    let exact_call_nodes: BTreeSet<Node> = call_sites.iter().map(|(node, _)| *node).collect();
+    for node in exact_call_nodes {
+        let rows = provenance_rows_by_site
+            .get(&node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let coherent = crate::decompile::passes::rtl_optimize_pass::coherent_call_vector(
+            rows.iter().copied(),
+        );
+        let candidate = candidate_vectors_by_site.get(&node).and_then(|vectors| {
+            (vectors.len() == 1).then(|| vectors.iter().next().unwrap())
+        });
+        if coherent.is_none() || coherent.as_ref() != candidate {
+            veto_sites.insert(node);
+        }
+    }
+    let mut known_variadic = HashSet::new();
+    for &(address, kind, provider, original) in db.rel_iter::<(
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("known_loader_variadic") {
+        known_variadic.insert(ExactLoaderIdentity::from_row(
+            address, kind, provider, original,
+        ));
+    }
+    // Signature conflicts share the same fixed-arity veto path.  Calling the
+    // set `known_variadic` here means "never infer fixed", not that the final C
+    // declaration is necessarily variadic.
+    for &(address, kind, provider, original) in db.rel_iter::<(
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("loader_signature_conflict") {
+        known_variadic.insert(ExactLoaderIdentity::from_row(
+            address, kind, provider, original,
+        ));
+    }
+    let mut exact_signature_facts: BTreeMap<
+        ExactLoaderIdentity,
+        BTreeSet<(usize, XType, Arc<Vec<XType>>, bool)>,
+    > = BTreeMap::new();
+    for (address, kind, provider, original, arity, ret, params, variadic) in db.rel_iter::<(
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+        usize,
+        XType,
+        Arc<Vec<XType>>,
+        bool,
+    )>("known_loader_signature") {
+        let identity = ExactLoaderIdentity::from_row(
+            *address, *kind, *provider, *original,
+        );
+        if *arity != params.len() {
+            known_variadic.insert(identity);
+            continue;
+        }
+        exact_signature_facts
+            .entry(identity)
+            .or_default()
+            .insert((*arity, *ret, params.clone(), *variadic));
+    }
+    for (identity, facts) in exact_signature_facts {
+        if facts.len() != 1
+            || facts
+                .iter()
+                .any(|(_, _, _, variadic)| *variadic)
+        {
+            known_variadic.insert(identity);
+        }
+    }
+    let mut exact = infer_shared_fixed_arities(
+        &call_sites,
+        &provenance,
+        &known_variadic,
+        &veto_sites,
+    );
+    if let Some(required_kind) = required_kind {
+        exact.retain(|identity, _| identity.kind == required_kind);
+    }
+    let mut projected = project_exact_identity_values(&identity_names, &exact);
+    let name_collisions = loader_name_collisions_with_unowned_symbols(db, &identity_names);
+    projected.retain(|name, _| !name_collisions.contains(name));
+    projected
+}
+
+pub(crate) fn infer_shared_fixed_arities_from_db(
+    db: &DecompileDB,
+) -> HashMap<String, usize> {
+    infer_shared_fixed_arities_from_db_filtered(db, None)
+}
+
+/// Shared fixed arities usable for a global object called through memory.
+/// Function-entry cohorts and ordinary data symbols are deliberately outside
+/// this projection, even when their emitted spellings coincide.
+pub(crate) fn infer_shared_import_pointer_fixed_arities_from_db(
+    db: &DecompileDB,
+) -> HashMap<String, usize> {
+    infer_shared_fixed_arities_from_db_filtered(
+        db,
+        Some(LoaderSymbolKind::ImportPointer),
+    )
+}
+
 /// Join per-site evidence into a parameter type vector per callee; a callee gets a typed prototype only when arity agrees across all sites and no position joins to Poison.
 fn join_call_site_evidence(
     sites_by_callee: &HashMap<String, Vec<Vec<ArgEvidence>>>,
 ) -> HashMap<String, Vec<CType>> {
     let mut joined: HashMap<String, Vec<CType>> = HashMap::new();
     for (name, sites) in sites_by_callee {
-        let Some(first) = sites.first() else { continue };
-        let arity = first.len();
-        if sites.iter().any(|s| s.len() != arity) {
-            continue; // arity disagreement: variadic-or-noise, keep K&R
+        if let Some(param_types) = join_one_callee_evidence(sites) {
+            joined.insert(name.clone(), param_types);
         }
-        let mut acc: Vec<ArgEvidence> = vec![ArgEvidence::Bottom; arity];
-        for site in sites {
-            for (slot, ev) in acc.iter_mut().zip(site.iter()) {
-                *slot = std::mem::replace(slot, ArgEvidence::Bottom).join(ev.clone());
+    }
+    joined
+}
+
+fn join_one_callee_evidence(sites: &[Vec<ArgEvidence>]) -> Option<Vec<CType>> {
+    let arity = sites.first()?.len();
+    if sites.iter().any(|site| site.len() != arity) {
+        return None;
+    }
+    let mut acc = vec![ArgEvidence::Bottom; arity];
+    for site in sites {
+        for (slot, evidence) in acc.iter_mut().zip(site) {
+            *slot = std::mem::replace(slot, ArgEvidence::Bottom).join(evidence.clone());
+        }
+    }
+    acc.iter().map(ArgEvidence::to_ctype).collect()
+}
+
+/// Loader aliases of one callable object share one evidence join.  Conversely,
+/// a spelling owned by multiple address+kind identities is omitted rather
+/// than allowing each display name to select a different prototype.
+fn join_call_site_evidence_by_loader_identity(
+    db: &DecompileDB,
+    raw: &HashMap<String, Vec<Vec<ArgEvidence>>>,
+) -> HashMap<String, Vec<CType>> {
+    let mut identity_names: BTreeMap<ExactLoaderIdentity, BTreeSet<String>> = BTreeMap::new();
+    for &(address, kind, provider, original) in db.rel_iter::<(
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("loader_symbol_identity") {
+        let identity = ExactLoaderIdentity::from_row(address, kind, provider, original);
+        insert_identity_names(&mut identity_names, &identity, provider, original);
+    }
+    let mut owners: BTreeMap<String, BTreeSet<ExactLoaderIdentity>> = BTreeMap::new();
+    for (identity, names) in &identity_names {
+        for name in names {
+            owners
+                .entry(name.clone())
+                .or_default()
+                .insert(identity.clone());
+        }
+    }
+    let name_collisions = loader_name_collisions_with_unowned_symbols(db, &identity_names);
+
+    let mut ordinary = HashMap::new();
+    let mut exact: BTreeMap<ExactLoaderIdentity, Vec<Vec<ArgEvidence>>> = BTreeMap::new();
+    for (name, sites) in raw {
+        if name_collisions.contains(name) {
+            continue;
+        }
+        match owners.get(name) {
+            None => {
+                ordinary.insert(name.clone(), sites.clone());
             }
+            Some(identities) if identities.len() == 1 => {
+                exact
+                    .entry(identities.iter().next().unwrap().clone())
+                    .or_default()
+                    .extend(sites.iter().cloned());
+            }
+            Some(_) => {}
         }
-        let mut param_types = Vec::with_capacity(arity);
-        let mut ok = true;
-        for ev in &acc {
-            match ev.to_ctype() {
-                Some(t) => param_types.push(t),
-                None => {
-                    ok = false;
-                    break;
+    }
+
+    let mut joined = join_call_site_evidence(&ordinary);
+    for (identity, sites) in exact {
+        let Some(types) = join_one_callee_evidence(&sites) else {
+            continue;
+        };
+        if let Some(names) = identity_names.get(&identity) {
+            for name in names {
+                if !name_collisions.contains(name)
+                    && owners.get(name).map_or(0, |identities| identities.len()) == 1
+                {
+                    joined.insert(name.clone(), types.clone());
                 }
             }
-        }
-        if ok {
-            joined.insert(name.clone(), param_types);
         }
     }
     joined
@@ -7427,6 +8324,20 @@ mod callee_identity_tests {
         )
     }
 
+    fn unprototyped_function_pointer_type() -> ClightType {
+        ClightType::Tpointer(
+            Arc::new(ClightType::Tfunction(
+                Arc::new(vec![]),
+                Arc::new(ClightType::Tvoid),
+                CallConv {
+                    unproto: true,
+                    ..CallConv::default()
+                },
+            )),
+            ClightAttr::default(),
+        )
+    }
+
     #[test]
     fn unmapped_nonlocal_evar_callee_stays_direct() {
         let function_address: Address = 0x401000;
@@ -7490,6 +8401,48 @@ mod callee_identity_tests {
         let mut called = HashSet::new();
         collect_nonlocal_called_names_in_stmt(&converted, &HashSet::new(), &mut called);
         assert_eq!(called, HashSet::from(["FUN_402346".to_string()]));
+    }
+
+    #[test]
+    fn direct_unprototyped_call_materializes_a_call_site_cast() {
+        let function_address: Address = 0x401000;
+        let clight_type = unprototyped_function_pointer_type();
+        let expected_type = convert_clight_type(&clight_type);
+        let mut context = ConversionContext::new(HashMap::new());
+        context.enter_function(function_address, None);
+
+        let converted = convert_stmt(
+            &ClightStmt::Scall(
+                None,
+                ClightExpr::EvarSymbol("short_exact".to_string(), clight_type),
+                vec![ClightExpr::EconstLong(
+                    7,
+                    ClightType::Tlong(
+                        ClightSignedness::Signed,
+                        ClightAttr::default(),
+                    ),
+                )],
+            ),
+            &mut context,
+        );
+
+        assert_eq!(
+            converted,
+            CStmt::Expr(CExpr::Call(
+                Box::new(CExpr::Cast(
+                    expected_type,
+                    Box::new(CExpr::Var("short_exact".to_string())),
+                )),
+                vec![CExpr::IntLit(IntLiteral {
+                    value: 7,
+                    suffix: IntLiteralSuffix::L,
+                    base: IntLiteralBase::Decimal,
+                })],
+            ))
+        );
+        let mut called = HashSet::new();
+        collect_nonlocal_called_names_in_stmt(&converted, &HashSet::new(), &mut called);
+        assert_eq!(called, HashSet::from(["short_exact".to_string()]));
     }
 
     #[test]
@@ -7644,7 +8597,10 @@ mod callee_identity_tests {
 #[cfg(test)]
 mod arg_evidence_tests {
     use super::*;
-    use crate::decompile::passes::c_pass::types::{FloatSize, IntSize};
+    use crate::decompile::passes::c_pass::types::{IntSize, TopLevelDecl};
+    use rand::rngs::SmallRng;
+    use rand::seq::SliceRandom;
+    use rand::SeedableRng;
 
     fn i32_() -> ArgEvidence {
         ArgEvidence::Int(32, Signedness::Signed)
@@ -7659,10 +8615,18 @@ mod arg_evidence_tests {
         ArgEvidence::Float(64)
     }
     fn ptr_char() -> ArgEvidence {
-        ArgEvidence::Ptr(Some(CType::ptr(CType::char_signed())))
+        ArgEvidence::ObjectPtr(Some(CType::ptr(CType::char_signed())))
     }
     fn ptr_int() -> ArgEvidence {
-        ArgEvidence::Ptr(Some(CType::ptr(CType::int())))
+        ArgEvidence::ObjectPtr(Some(CType::ptr(CType::int())))
+    }
+    fn fn_ptr(params: Vec<CType>) -> ArgEvidence {
+        ArgEvidence::FunctionPtr(Some(CType::ptr(CType::Function(
+            Box::new(CType::Void),
+            params,
+            false,
+            false,
+        ))))
     }
 
     #[test]
@@ -7678,50 +8642,160 @@ mod arg_evidence_tests {
     }
 
     #[test]
-    fn join_int_ptr_is_compilable_top() {
-        // int | ptr -> conservative top emitted as long (cast-inserter-safe).
-        assert_eq!(i64_().join(ptr_char()), ArgEvidence::TopIntPtr);
-        assert_eq!(ArgEvidence::TopIntPtr.to_ctype(), Some(CType::long()));
-        // float | ptr must never produce a float param; inserter cannot coerce float<->ptr, so it lands at the int/ptr top.
-        assert_eq!(f64_().join(ptr_char()), ArgEvidence::TopIntPtr);
+    fn class_conflicts_poison_without_changing_register_class() {
+        for (left, right) in [
+            (i64_(), ptr_char()),
+            (f64_(), ptr_char()),
+            (i64_(), f64_()),
+            (ArgEvidence::GpZero, f64_()),
+            (fn_ptr(vec![]), ptr_char()),
+        ] {
+            assert_eq!(left.clone().join(right.clone()), ArgEvidence::Poison);
+            assert_eq!(right.join(left), ArgEvidence::Poison);
+        }
+        let function_type = CType::Function(Box::new(CType::Void), Vec::new(), false, false);
+        assert!(matches!(
+            arg_evidence_of_ctype(&CType::ptr(CType::ptr(function_type))),
+            ArgEvidence::ObjectPtr(_)
+        ));
     }
 
     #[test]
-    fn join_float_int_documented_choice() {
-        // float | int -> double (documented in the ArgEvidence docs).
-        assert_eq!(i64_().join(ArgEvidence::Float(32)), ArgEvidence::Float(64));
+    fn arithmetic_conversion_is_separate_from_evidence_join() {
         assert_eq!(
-            f64_().join(i32_()).to_ctype(),
-            Some(CType::Float(FloatSize::Double))
+            arithmetic_arg_evidence(i32_(), ArgEvidence::Float(32)),
+            ArgEvidence::Float(32)
         );
+        assert_eq!(i32_().join(ArgEvidence::Float(32)), ArgEvidence::Poison);
+    }
+
+    #[test]
+    fn code_pointer_address_expressions_preserve_pointer_kind() {
+        let function = CType::Function(
+            Box::new(CType::int()),
+            vec![CType::long()],
+            false,
+            false,
+        );
+        let function_pointer = CType::ptr(function.clone());
+        let local_types = HashMap::from([("fp".to_string(), function_pointer.clone())]);
+        let global_types = HashMap::from([("callback".to_string(), function.clone())]);
+        let callee_ret = HashMap::from([("callback".to_string(), CType::int())]);
+        let env = ArgEvidenceEnv {
+            local_types,
+            global_types: &global_types,
+            callee_ret: &callee_ret,
+        };
+
+        let address_of_deref = CExpr::Unary(
+            UnaryOp::AddrOf,
+            Box::new(CExpr::Unary(
+                UnaryOp::Deref,
+                Box::new(CExpr::Var("fp".to_string())),
+            )),
+        );
+        let address_of_callback = CExpr::Unary(
+            UnaryOp::AddrOf,
+            Box::new(CExpr::Var("callback".to_string())),
+        );
+        let address_of_pointer_object = CExpr::Unary(
+            UnaryOp::AddrOf,
+            Box::new(CExpr::Var("fp".to_string())),
+        );
+
+        let expected = ArgEvidence::FunctionPtr(Some(function_pointer.clone()));
+        assert_eq!(arg_evidence_of_expr(&address_of_deref, &env), expected);
+        assert_eq!(arg_evidence_of_expr(&address_of_callback, &env), expected);
+        assert!(matches!(
+            arg_evidence_of_expr(&address_of_pointer_object, &env),
+            ArgEvidence::ObjectPtr(_)
+        ));
+        assert_eq!(
+            address_of_arg_evidence(
+                &CExpr::Member(Box::new(CExpr::Var("unknown".to_string())), "cb".to_string()),
+                &env,
+            ),
+            ArgEvidence::Poison
+        );
+    }
+
+    #[test]
+    fn floating_operands_poison_integer_only_operators() {
+        let local_types = HashMap::new();
+        let global_types = HashMap::new();
+        let callee_ret = HashMap::new();
+        let env = ArgEvidenceEnv {
+            local_types,
+            global_types: &global_types,
+            callee_ret: &callee_ret,
+        };
+        let floating = || {
+            CExpr::FloatLit(FloatLiteral {
+                value: 1.5,
+                suffix: FloatLiteralSuffix::None,
+            })
+        };
+        for op in [
+            BinaryOp::Mod,
+            BinaryOp::BitAnd,
+            BinaryOp::BitOr,
+            BinaryOp::BitXor,
+            BinaryOp::Shl,
+            BinaryOp::Shr,
+        ] {
+            let expression = CExpr::Binary(
+                op,
+                Box::new(floating()),
+                Box::new(CExpr::int(1)),
+            );
+            assert_eq!(
+                arg_evidence_of_expr(&expression, &env),
+                ArgEvidence::Poison,
+                "left float accepted by {op:?}"
+            );
+        }
+        for op in [BinaryOp::Shl, BinaryOp::Shr, BinaryOp::Mod] {
+            let expression = CExpr::Binary(
+                op,
+                Box::new(CExpr::int(1)),
+                Box::new(floating()),
+            );
+            assert_eq!(
+                arg_evidence_of_expr(&expression, &env),
+                ArgEvidence::Poison,
+                "right float accepted by {op:?}"
+            );
+        }
     }
 
     #[test]
     fn join_pointers() {
         // identical pointer types stay exact; differing ones unify to void*.
         assert_eq!(ptr_char().join(ptr_char()), ptr_char());
-        assert_eq!(ptr_char().join(ptr_int()), ArgEvidence::Ptr(None));
         assert_eq!(
-            ArgEvidence::Ptr(None).to_ctype(),
+            ptr_char().join(ptr_int()),
+            ArgEvidence::ObjectPtr(None)
+        );
+        assert_eq!(
+            ArgEvidence::ObjectPtr(None).to_ctype(),
             Some(CType::ptr(CType::Void))
         );
-        // differing function-pointer types poison (no implicit conversion).
-        let fp = ArgEvidence::Ptr(Some(CType::ptr(CType::Function(
-            Box::new(CType::Void),
-            vec![],
-            false,
-            false,
-        ))));
+        let fp = fn_ptr(vec![]);
         assert_eq!(fp.clone().join(ptr_char()), ArgEvidence::Poison);
         assert_eq!(fp.clone().join(fp.clone()), fp);
+        assert_eq!(fn_ptr(vec![]).join(fn_ptr(vec![CType::long()])), ArgEvidence::Poison);
     }
 
     #[test]
     fn join_bottom_and_poison() {
-        // literal 0 (Bottom) constrains nothing; Poison absorbs everything.
+        // True bottom constrains nothing; GP zero can become an integer/null
+        // pointer but cannot migrate to the floating register class.
         assert_eq!(ArgEvidence::Bottom.join(ptr_char()), ptr_char());
         assert_eq!(ArgEvidence::Bottom.join(i32_()), i32_());
         assert_eq!(ArgEvidence::Bottom.to_ctype(), Some(CType::long()));
+        assert_eq!(ArgEvidence::GpZero.clone().join(ptr_char()), ptr_char());
+        assert_eq!(ArgEvidence::GpZero.clone().join(i32_()), i32_());
+        assert_eq!(ArgEvidence::GpZero.join(f64_()), ArgEvidence::Poison);
         assert_eq!(ArgEvidence::Poison.join(i64_()), ArgEvidence::Poison);
         assert_eq!(ArgEvidence::Poison.to_ctype(), None);
     }
@@ -7730,6 +8804,7 @@ mod arg_evidence_tests {
     fn join_is_commutative_associative_idempotent() {
         let samples = [
             ArgEvidence::Bottom,
+            ArgEvidence::GpZero,
             i32_(),
             i64_(),
             u32_(),
@@ -7737,8 +8812,10 @@ mod arg_evidence_tests {
             f64_(),
             ptr_char(),
             ptr_int(),
-            ArgEvidence::Ptr(None),
-            ArgEvidence::TopIntPtr,
+            ArgEvidence::ObjectPtr(None),
+            fn_ptr(vec![]),
+            fn_ptr(vec![CType::long()]),
+            ArgEvidence::FunctionPtr(None),
             ArgEvidence::Poison,
         ];
         for a in &samples {
@@ -7755,6 +8832,22 @@ mod arg_evidence_tests {
                     let ab_c = a.clone().join(b.clone()).join(c.clone());
                     let a_bc = a.clone().join(b.clone().join(c.clone()));
                     assert_eq!(ab_c, a_bc, "associativity {:?} {:?} {:?}", a, b, c);
+
+                    let expected = a.clone().join(b.clone()).join(c.clone());
+                    for permutation in [
+                        [a, b, c],
+                        [a, c, b],
+                        [b, a, c],
+                        [b, c, a],
+                        [c, a, b],
+                        [c, b, a],
+                    ] {
+                        let actual = permutation
+                            .into_iter()
+                            .cloned()
+                            .fold(ArgEvidence::Bottom, ArgEvidence::join);
+                        assert_eq!(actual, expected, "permutation {:?}", permutation);
+                    }
                 }
             }
         }
@@ -7782,6 +8875,772 @@ mod arg_evidence_tests {
             Some(&vec![]),
             "consistent zero-arity -> (void)"
         );
+    }
+
+    #[test]
+    fn call_evidence_joins_aliases_and_vetoes_identity_collisions() {
+        let mut db = DecompileDB::default();
+        db.rel_push(
+            "loader_symbol_identity",
+            (
+                0x9000u64,
+                LoaderSymbolKind::Function,
+                "alias_provider" as Symbol,
+                "alias_raw" as Symbol,
+            ),
+        );
+        let conflicting_aliases = HashMap::from([
+            ("alias_provider".to_string(), vec![vec![i32_()]]),
+            ("alias_raw".to_string(), vec![vec![f64_()]]),
+        ]);
+        let joined = join_call_site_evidence_by_loader_identity(&db, &conflicting_aliases);
+        assert!(!joined.contains_key("alias_provider"));
+        assert!(!joined.contains_key("alias_raw"));
+
+        db.rel_push(
+            "loader_symbol_identity",
+            (
+                0xa000u64,
+                LoaderSymbolKind::ImportPointer,
+                "alias_provider" as Symbol,
+                "second_raw" as Symbol,
+            ),
+        );
+        let collided = HashMap::from([("alias_provider".to_string(), vec![vec![i32_()]])]);
+        assert!(join_call_site_evidence_by_loader_identity(&db, &collided).is_empty());
+    }
+
+    fn call_rows(
+        node: Node,
+        arity: usize,
+        provenance: CallArgProvenance,
+    ) -> Vec<(Node, usize, RTLReg, CallArgProvenance)> {
+        (0..arity)
+            .map(|position| (node, position, 0x1000 + node + position as u64, provenance))
+            .collect()
+    }
+
+    fn identity(address: Address, name: &str) -> ExactLoaderIdentity {
+        let _ = name;
+        ExactLoaderIdentity {
+            address,
+            kind: LoaderSymbolKind::Function,
+        }
+    }
+
+    #[test]
+    fn shared_zero_argument_sites_establish_void() {
+        let callee = identity(0x1000, "zero");
+        let sites = vec![(1, callee.clone()), (2, callee.clone())];
+        let inferred =
+            infer_shared_fixed_arities(&sites, &[], &HashSet::new(), &HashSet::new());
+        assert_eq!(inferred.get(&callee), Some(&0));
+    }
+
+    #[test]
+    fn anchored_site_can_corroborate_forwarding_thunk() {
+        let callee = identity(0x2000, "thunked");
+        let sites = vec![(1, callee.clone()), (2, callee.clone())];
+        let mut rows = call_rows(1, 2, CallArgProvenance::ForwardedEntry);
+        rows.extend(call_rows(2, 2, CallArgProvenance::ExplicitRegister));
+        assert_eq!(
+            infer_shared_fixed_arities(&sites, &rows, &HashSet::new(), &HashSet::new())
+                .get(&callee),
+            Some(&2)
+        );
+
+        let forwarded_only: Vec<_> = call_rows(1, 2, CallArgProvenance::ForwardedEntry)
+            .into_iter()
+            .chain(call_rows(2, 2, CallArgProvenance::ForwardedEntry))
+            .collect();
+        assert!(infer_shared_fixed_arities(
+            &sites,
+            &forwarded_only,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+            .get(&callee)
+            .is_none());
+    }
+
+    #[test]
+    fn shared_arities_zero_through_eight_require_real_positions() {
+        for arity in 0..=8 {
+            let name = format!("arity_{arity}");
+            let callee = identity(0x3000 + arity as u64, &name);
+            let sites = vec![(10, callee.clone()), (20, callee.clone())];
+            let mut rows = Vec::new();
+            for node in [10, 20] {
+                rows.extend((0..arity).map(|position| {
+                    let source = if position < 4 {
+                        CallArgProvenance::ExplicitRegister
+                    } else {
+                        CallArgProvenance::EntrySpStore
+                    };
+                    (node, position, node + position as u64, source)
+                }));
+            }
+            assert_eq!(
+                infer_shared_fixed_arities(
+                    &sites,
+                    &rows,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                )
+                .get(&callee),
+                Some(&arity),
+                "arity {arity}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_high_registers_and_ambiguous_stack_stores_fail_closed() {
+        let callee = identity(0x4000, "stale");
+        let sites = vec![(1, callee.clone()), (2, callee)];
+        let stale = vec![
+            (1, 2, 12, CallArgProvenance::ForwardedEntry),
+            (1, 3, 13, CallArgProvenance::ForwardedEntry),
+            (2, 2, 22, CallArgProvenance::ForwardedEntry),
+            (2, 3, 23, CallArgProvenance::ForwardedEntry),
+        ];
+        assert!(infer_shared_fixed_arities(
+            &sites,
+            &stale,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .is_empty());
+
+        let mut ambiguous = call_rows(1, 5, CallArgProvenance::ExplicitRegister);
+        ambiguous.push((1, 4, 0xdead, CallArgProvenance::EntrySpStore));
+        ambiguous.extend(call_rows(2, 5, CallArgProvenance::ExplicitRegister));
+        assert!(infer_shared_fixed_arities(
+            &sites,
+            &ambiguous,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn variadic_and_conflicting_cohorts_remain_unspecified_order_independently() {
+        let conflict = identity(0x5000, "conflict");
+        let mut sites = vec![(1, conflict.clone()), (2, conflict.clone())];
+        let mut rows = call_rows(1, 1, CallArgProvenance::ExplicitRegister);
+        rows.extend(call_rows(2, 2, CallArgProvenance::ExplicitRegister));
+        let expected =
+            infer_shared_fixed_arities(&sites, &rows, &HashSet::new(), &HashSet::new());
+        assert!(!expected.contains_key(&conflict));
+
+        let mut rng = SmallRng::seed_from_u64(0x5eed_c011_ec7);
+        for _ in 0..128 {
+            sites.shuffle(&mut rng);
+            rows.shuffle(&mut rng);
+            assert_eq!(
+                infer_shared_fixed_arities(
+                    &sites,
+                    &rows,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                ),
+                expected
+            );
+        }
+
+        let varfun = identity(0x6000, "varfun");
+        let variadic_sites = vec![(3, varfun.clone()), (4, varfun.clone())];
+        let variadic_rows: Vec<_> = call_rows(3, 1, CallArgProvenance::ExplicitRegister)
+            .into_iter()
+            .chain(call_rows(4, 1, CallArgProvenance::ExplicitRegister))
+            .collect();
+        assert!(infer_shared_fixed_arities(
+            &variadic_sites,
+            &variadic_rows,
+            &HashSet::from([varfun]),
+            &HashSet::new(),
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn veto_and_identity_ambiguity_are_never_dropped_from_the_cohort() {
+        let first = identity(0x7000, "same_display");
+        let second = identity(0x8000, "same_display");
+        let sites = vec![
+            (1, first.clone()),
+            (2, first.clone()),
+            (2, second.clone()),
+            (3, second.clone()),
+        ];
+        let rows: Vec<_> = [1u64, 2, 3]
+            .into_iter()
+            .flat_map(|node| call_rows(node, 1, CallArgProvenance::ExplicitRegister))
+            .collect();
+        let inferred = infer_shared_fixed_arities(
+            &sites,
+            &rows,
+            &HashSet::new(),
+            &HashSet::from([2u64]),
+        );
+        assert!(inferred.is_empty());
+    }
+
+    #[test]
+    fn fixed_arity_normalization_never_pads_a_short_call() {
+        let call = CExpr::Call(
+            Box::new(CExpr::Var("fixed".to_string())),
+            vec![CExpr::int(11)],
+        );
+        let normalized = normalize_call_arity_expr(
+            &call,
+            &HashMap::from([("fixed".to_string(), 3usize)]),
+        );
+        assert_eq!(normalized, call);
+    }
+
+    #[test]
+    fn shared_arity_follows_exact_loader_identity_and_rejects_conflict() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        db.rel_push(
+            "loader_symbol_identity",
+            (
+                0x5000u64,
+                LoaderSymbolKind::ImportPointer,
+                "coff_ext_target" as Symbol,
+                "__imp_target" as Symbol,
+            ),
+        );
+        for node in [1u64, 2] {
+            db.rel_push(
+                "call_loader_identity_candidate",
+                (
+                    node,
+                    0x5000u64,
+                    LoaderSymbolKind::ImportPointer,
+                    "coff_ext_target" as Symbol,
+                    "__imp_target" as Symbol,
+                ),
+            );
+            db.rel_push(
+                "call_arg_provenance",
+                (
+                    node,
+                    0usize,
+                    0x100 + node,
+                    CallArgProvenance::ExplicitRegister,
+                ),
+            );
+            db.rel_push(
+                "call_args_collected_candidate",
+                (node, Arc::new(vec![0x100 + node])),
+            );
+        }
+
+        let inferred = infer_shared_fixed_arities_from_db(&db);
+        assert_eq!(inferred.get("coff_ext_target"), Some(&1));
+        assert_eq!(inferred.get("__imp_target"), Some(&1));
+        let import_only = infer_shared_import_pointer_fixed_arities_from_db(&db);
+        assert_eq!(import_only.get("coff_ext_target"), Some(&1));
+        assert_eq!(import_only.get("__imp_target"), Some(&1));
+
+        for node in [3u64, 4] {
+            db.rel_push(
+                "call_loader_identity_candidate",
+                (
+                    node,
+                    0x5000u64,
+                    LoaderSymbolKind::ImportPointer,
+                    "coff_ext_target" as Symbol,
+                    "__imp_target" as Symbol,
+                ),
+            );
+            for position in 0..2usize {
+                db.rel_push(
+                    "call_arg_provenance",
+                    (
+                        node,
+                        position,
+                        0x200 + node + position as u64,
+                        CallArgProvenance::ExplicitRegister,
+                    ),
+                );
+            }
+            db.rel_push(
+                "call_args_collected_candidate",
+                (
+                    node,
+                    Arc::new(vec![0x200 + node, 0x200 + node + 1]),
+                ),
+            );
+        }
+        let conflicting = infer_shared_fixed_arities_from_db(&db);
+        assert!(!conflicting.contains_key("coff_ext_target"));
+        assert!(!conflicting.contains_key("__imp_target"));
+    }
+
+    #[test]
+    fn unresolved_forwarding_sites_are_not_reclassified_as_void() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        db.rel_push(
+            "loader_symbol_identity",
+            (
+                0x6000u64,
+                LoaderSymbolKind::Function,
+                "forwarded_only" as Symbol,
+                "forwarded_only" as Symbol,
+            ),
+        );
+        for node in [10u64, 20] {
+            db.rel_push(
+                "call_loader_identity_candidate",
+                (
+                    node,
+                    0x6000u64,
+                    LoaderSymbolKind::Function,
+                    "forwarded_only" as Symbol,
+                    "forwarded_only" as Symbol,
+                ),
+            );
+        }
+        assert!(!infer_shared_fixed_arities_from_db(&db)
+            .contains_key("forwarded_only"));
+        for node in [10u64, 20] {
+            db.rel_push(
+                "call_args_collected_candidate",
+                (node, Arc::new(Vec::<RTLReg>::new())),
+            );
+        }
+        assert_eq!(
+            infer_shared_fixed_arities_from_db(&db).get("forwarded_only"),
+            Some(&0)
+        );
+
+        db.rel_push("call_forwarding_unresolved", (10u64,));
+        assert!(!infer_shared_fixed_arities_from_db(&db)
+            .contains_key("forwarded_only"));
+    }
+
+    #[test]
+    fn address_kind_and_sanitizer_collisions_veto_projection() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        for (address, kind, provider, original) in [
+            (
+                0x7000u64,
+                LoaderSymbolKind::Function,
+                "same.name" as Symbol,
+                "first" as Symbol,
+            ),
+            (
+                0x7000u64,
+                LoaderSymbolKind::ImportPointer,
+                "same_name" as Symbol,
+                "second" as Symbol,
+            ),
+            (
+                0x8000u64,
+                LoaderSymbolKind::Function,
+                "same_name" as Symbol,
+                "third" as Symbol,
+            ),
+        ] {
+            db.rel_push(
+                "loader_symbol_identity",
+                (address, kind, provider, original),
+            );
+            db.rel_push(
+                "known_loader_signature",
+                (
+                    address,
+                    kind,
+                    provider,
+                    original,
+                    1usize,
+                    XType::Xint,
+                    Arc::new(vec![XType::Xany64]),
+                    false,
+                ),
+            );
+            for node in [address + 1, address + 2] {
+                db.rel_push(
+                    "call_loader_identity_candidate",
+                    (node, address, kind, provider, original),
+                );
+                db.rel_push(
+                    "call_arg_provenance",
+                    (
+                        node,
+                        0usize,
+                        node + 0x100,
+                        CallArgProvenance::ExplicitRegister,
+                    ),
+                );
+                db.rel_push(
+                    "call_args_collected_candidate",
+                    (node, Arc::new(vec![node + 0x100])),
+                );
+            }
+        }
+
+        assert!(!infer_shared_fixed_arities_from_db(&db).contains_key("same_name"));
+        assert!(!known_loader_signatures_from_db(&db).contains_key("same_name"));
+    }
+
+    #[test]
+    fn ordinary_symbol_sanitizer_collisions_veto_all_loader_projections() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        for (address, kind, provider, first_node) in [
+            (
+                0xb000u64,
+                LoaderSymbolKind::Function,
+                "punctuated.name" as Symbol,
+                101u64,
+            ),
+            (
+                0xd000u64,
+                LoaderSymbolKind::ImportPointer,
+                "coff.ptr" as Symbol,
+                201u64,
+            ),
+        ] {
+            db.rel_push(
+                "loader_symbol_identity",
+                (address, kind, provider, provider),
+            );
+            db.rel_push(
+                "known_loader_signature",
+                (
+                    address,
+                    kind,
+                    provider,
+                    provider,
+                    1usize,
+                    XType::Xint,
+                    Arc::new(vec![XType::Xany64]),
+                    false,
+                ),
+            );
+            for node in [first_node, first_node + 1] {
+                db.rel_push(
+                    "call_loader_identity_candidate",
+                    (node, address, kind, provider, provider),
+                );
+                db.rel_push(
+                    "call_arg_provenance",
+                    (
+                        node,
+                        0usize,
+                        node + 0x1000,
+                        CallArgProvenance::ExplicitRegister,
+                    ),
+                );
+                db.rel_push(
+                    "call_args_collected_candidate",
+                    (node, Arc::new(vec![node + 0x1000])),
+                );
+            }
+        }
+
+        // Neither ordinary relation carries loader kind.  A foreign address
+        // with the same emitted spelling is therefore an ambiguity, not an
+        // alias of the callable identity.
+        db.rel_push(
+            "ident_to_symbol",
+            (0xc000usize as Ident, "punctuated_name" as Symbol),
+        );
+        db.rel_push(
+            "symbols",
+            (0xe000u64, "coff_ptr" as Symbol, "Beg" as Symbol),
+        );
+
+        let signatures = known_loader_signatures_from_db(&db);
+        let arities = infer_shared_fixed_arities_from_db(&db);
+        for name in ["punctuated_name", "coff_ptr"] {
+            assert!(!signatures.contains_key(name), "signature leaked for {name}");
+            assert!(!arities.contains_key(name), "arity leaked for {name}");
+            let raw = HashMap::from([(name.to_string(), vec![vec![i32_()]])]);
+            assert!(
+                join_call_site_evidence_by_loader_identity(&db, &raw).is_empty(),
+                "argument evidence leaked for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_of_one_address_and_kind_share_the_exact_identity() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        for (provider, original) in [
+            ("alias_a" as Symbol, "raw_a" as Symbol),
+            ("alias_b" as Symbol, "raw_b" as Symbol),
+        ] {
+            db.rel_push(
+                "loader_symbol_identity",
+                (
+                    0x9000u64,
+                    LoaderSymbolKind::Function,
+                    provider,
+                    original,
+                ),
+            );
+        }
+        for (node, provider, original) in [
+            (1u64, "alias_a" as Symbol, "raw_a" as Symbol),
+            (2u64, "alias_b" as Symbol, "raw_b" as Symbol),
+        ] {
+            db.rel_push(
+                "call_loader_identity_candidate",
+                (
+                    node,
+                    0x9000u64,
+                    LoaderSymbolKind::Function,
+                    provider,
+                    original,
+                ),
+            );
+            db.rel_push(
+                "call_arg_provenance",
+                (
+                    node,
+                    0usize,
+                    0xa000 + node,
+                    CallArgProvenance::ExplicitRegister,
+                ),
+            );
+            db.rel_push(
+                "call_args_collected_candidate",
+                (node, Arc::new(vec![0xa000 + node])),
+            );
+        }
+
+        let inferred = infer_shared_fixed_arities_from_db(&db);
+        for name in ["alias_a", "raw_a", "alias_b", "raw_b"] {
+            assert_eq!(inferred.get(name), Some(&1));
+        }
+        assert!(infer_shared_import_pointer_fixed_arities_from_db(&db).is_empty());
+    }
+
+    #[test]
+    fn exact_known_signature_projection_vetoes_stale_fixed_conflicts() {
+        let mut valid = DecompileDB::default();
+        valid.rel_push(
+            "loader_symbol_identity",
+            (
+                0xa000u64,
+                LoaderSymbolKind::ImportPointer,
+                "coff_ext_printf" as Symbol,
+                "__imp_printf" as Symbol,
+            ),
+        );
+        valid.rel_push(
+            "known_loader_signature",
+            (
+                0xa000u64,
+                LoaderSymbolKind::ImportPointer,
+                "coff_ext_printf" as Symbol,
+                "__imp_printf" as Symbol,
+                1usize,
+                XType::Xint,
+                Arc::new(vec![XType::Xcharptr]),
+                true,
+            ),
+        );
+        valid.rel_push(
+            "known_loader_variadic",
+            (
+                0xa000u64,
+                LoaderSymbolKind::ImportPointer,
+                "coff_ext_printf" as Symbol,
+                "__imp_printf" as Symbol,
+            ),
+        );
+        let projected = known_loader_signatures_from_db(&valid);
+        assert_eq!(
+            projected.get("coff_ext_printf"),
+            Some(&(
+                XType::Xint,
+                Arc::new(vec![XType::Xcharptr]),
+                true,
+            ))
+        );
+
+        valid.rel_push(
+            "loader_signature_conflict",
+            (
+                0xa000u64,
+                LoaderSymbolKind::ImportPointer,
+                "coff_ext_printf" as Symbol,
+                "__imp_printf" as Symbol,
+            ),
+        );
+        assert!(!known_loader_signatures_from_db(&valid).contains_key("coff_ext_printf"));
+
+        let mut stale = DecompileDB::default();
+        stale.rel_push(
+            "loader_symbol_identity",
+            (
+                0xb000u64,
+                LoaderSymbolKind::Function,
+                "stale" as Symbol,
+                "stale" as Symbol,
+            ),
+        );
+        stale.rel_push(
+            "known_loader_signature",
+            (
+                0xb000u64,
+                LoaderSymbolKind::Function,
+                "stale" as Symbol,
+                "stale" as Symbol,
+                1usize,
+                XType::Xint,
+                Arc::new(vec![XType::Xany64]),
+                false,
+            ),
+        );
+        stale.rel_push(
+            "known_loader_variadic",
+            (
+                0xb000u64,
+                LoaderSymbolKind::Function,
+                "stale" as Symbol,
+                "stale" as Symbol,
+            ),
+        );
+        assert!(!known_loader_signatures_from_db(&stale).contains_key("stale"));
+
+        let mut plain_object = DecompileDB::default();
+        plain_object.rel_push(
+            "known_extern_signature",
+            (
+                "memcpy" as Symbol,
+                3usize,
+                XType::Xptr,
+                Arc::new(vec![XType::Xptr, XType::Xptr, XType::Xany64]),
+            ),
+        );
+        assert!(known_loader_signatures_from_db(&plain_object).contains_key("memcpy"));
+        assert!(known_import_pointer_signatures_from_db(&plain_object).is_empty());
+    }
+
+    #[test]
+    fn exact_import_pointer_call_shadows_same_address_stale_function_projection() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        let address = 0xc000u64;
+        let node = 0xc010u64;
+        let provider = "coff_ext_callback" as Symbol;
+        let original = "__imp_callback" as Symbol;
+        for kind in [
+            LoaderSymbolKind::ImportPointer,
+            LoaderSymbolKind::Function,
+        ] {
+            db.rel_push(
+                "loader_symbol_identity",
+                (address, kind, provider, original),
+            );
+        }
+        db.rel_push(
+            "call_loader_identity",
+            (
+                node,
+                address,
+                LoaderSymbolKind::ImportPointer,
+                provider,
+                original,
+            ),
+        );
+        db.rel_push(
+            "known_loader_signature",
+            (
+                address,
+                LoaderSymbolKind::ImportPointer,
+                provider,
+                original,
+                1usize,
+                XType::Xvoid,
+                Arc::new(vec![XType::Xany64]),
+                false,
+            ),
+        );
+        db.rel_push(
+            "known_loader_signature",
+            (
+                address,
+                LoaderSymbolKind::Function,
+                provider,
+                original,
+                0usize,
+                XType::Xint,
+                Arc::new(Vec::<XType>::new()),
+                false,
+            ),
+        );
+
+        let all = known_loader_signatures_from_db(&db);
+        let imports = known_import_pointer_signatures_from_db(&db);
+        let expected = (
+            XType::Xvoid,
+            Arc::new(vec![XType::Xany64]),
+            false,
+        );
+        for name in [provider, original] {
+            let name = sanitize_c_symbol_name(name);
+            assert_eq!(all.get(&name), Some(&expected));
+            assert_eq!(imports.get(&name), Some(&expected));
+        }
+
+        // Even if stale metadata also publishes a direct extern signature, C
+        // emission must retain the IAT object declaration and must not add a
+        // same-name function declaration beside it.
+        db.rel_push(
+            "resolved_extern_signature",
+            (
+                original,
+                1usize,
+                XType::Xvoid,
+                Arc::new(vec![XType::Xany64]),
+            ),
+        );
+        let global = GlobalData {
+            id: address as Ident,
+            name: original.to_string(),
+            is_string: false,
+            content: Vec::new(),
+            is_pointer: true,
+            scalar_value: None,
+            scalar_writable: false,
+            pointer_init: Vec::new(),
+        };
+        let tu = build_translation_unit_from_stmt_map_with_types(
+            &db,
+            &[],
+            &[global],
+            &HashMap::from([(address as Ident, original.to_string())]),
+            &HashMap::new(),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(tu.decls.iter().any(|decl| {
+            matches!(
+                decl,
+                TopLevelDecl::VarDecl(var) if var.name == sanitize_c_symbol_name(original)
+            )
+        }));
+        assert!(!tu.decls.iter().any(|decl| {
+            matches!(
+                decl,
+                TopLevelDecl::FuncDecl(func) if func.name == sanitize_c_symbol_name(original)
+            )
+        }));
     }
 }
 

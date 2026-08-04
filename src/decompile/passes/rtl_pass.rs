@@ -276,6 +276,29 @@ fn win64_home_rmw_source_width(name: &str) -> Option<usize> {
         .flatten()
 }
 
+fn stack_write_intervals_overlap(
+    first_start: i64,
+    first_width: i64,
+    second_start: i64,
+    second_width: i64,
+) -> bool {
+    if first_width <= 0 || second_width <= 0 {
+        return false;
+    }
+    let first_start = first_start as i128;
+    let second_start = second_start as i128;
+    first_start < second_start + second_width as i128
+        && second_start < first_start + first_width as i128
+}
+
+fn resolved_signature_call_conv(param_count: usize, variadic: bool) -> CallConv {
+    CallConv {
+        varargs: variadic.then_some(param_count as i64),
+        unproto: false,
+        structured_ret: false,
+    }
+}
+
 // Operand decoding collapses subregister spellings into one Mreg family. That
 // is useful for value flow, but unsafe for frame analysis: every E*-based
 // memory operand has 32-bit address-size semantics. In particular, a proven
@@ -309,6 +332,10 @@ ascent_par! {
     relation is_external_function(Address);
     relation known_extern_signature(Symbol, usize, XType, Arc<Vec<XType>>);
     relation known_varargs_function(Symbol, usize);
+    relation loader_symbol_identity(Address, LoaderSymbolKind, Symbol, Symbol);
+    relation known_loader_signature(Address, LoaderSymbolKind, Symbol, Symbol, usize, XType, Arc<Vec<XType>>, bool);
+    relation known_loader_variadic(Address, LoaderSymbolKind, Symbol, Symbol);
+    relation loader_signature_conflict(Address, LoaderSymbolKind, Symbol, Symbol);
 
     relation known_func_param_is_ptr(Symbol, usize);
     relation known_func_returns_long(Symbol);
@@ -363,6 +390,10 @@ ascent_par! {
     relation is_char_ptr(RTLReg);
     relation known_extern_signature(Symbol, usize, XType, Arc<Vec<XType>>);
     relation known_varargs_function(Symbol, usize);
+    relation loader_symbol_identity(Address, LoaderSymbolKind, Symbol, Symbol);
+    relation known_loader_signature(Address, LoaderSymbolKind, Symbol, Symbol, usize, XType, Arc<Vec<XType>>, bool);
+    relation known_loader_variadic(Address, LoaderSymbolKind, Symbol, Symbol);
+    relation loader_signature_conflict(Address, LoaderSymbolKind, Symbol, Symbol);
 
     relation ltl_inst(Node, LTLInst);
     relation ltl_succ(Node, Node);
@@ -606,13 +637,23 @@ ascent_par! {
 
     call_args_collected_candidate(call_addr, args) <--
         ltl_inst(call_addr, ?LTLInst::Lcall(_)),
-        agg args = build_call_args(pos, reg) in call_arg_mapping(call_addr, pos, reg);
+        agg args = build_dense_call_args(pos, reg) in call_arg_mapping(call_addr, pos, reg);
 
-    // Memory-indirect call detection: op_indirect on a CALL means callee is loaded from memory (register-direct CALLs use op_register).
+    // Memory-indirect transfer detection.  PE import thunks commonly use a
+    // RIP-relative JMP through the IAT; although asm_pass may attach a display
+    // symbol to that tailcall, the decoded operand still denotes an
+    // ImportPointer load and must not be reinterpreted as a direct Function
+    // address.
     call_through_memory(*addr, base_str, idx_str, *scale, *disp) <--
         instruction(addr, _, _, "CALL", dst, _, _, _, _, _),
         op_indirect(dst, _, base_str, idx_str, scale, disp, _),
         if *base_str != "NONE";
+    call_through_memory(*addr, base_str, idx_str, *scale, *disp) <--
+        instruction(addr, _, _, mnemonic, dst, _, _, _, _, _),
+        if matches!(*mnemonic, "JMP" | "JMPQ"),
+        op_indirect(dst, _, base_str, idx_str, scale, disp, _),
+        if *base_str != "NONE",
+        ltl_inst(addr, ?LTLInst::Ltailcall(_));
 
 
     // osel_cond_pos: a cmov condition operand that is the register the cmov writes, where clang's reuse makes the value at the compare differ from the cmov-site shadow; non-reuse cmovs are unmarked.
@@ -793,7 +834,7 @@ ascent_par! {
 
     call_args_collected_candidate(call_addr, args) <--
         ltl_inst(call_addr, ?LTLInst::Ltailcall(_)),
-        agg args = build_call_args(pos, reg) in call_arg_mapping(call_addr, pos, reg);
+        agg args = build_dense_call_args(pos, reg) in call_arg_mapping(call_addr, pos, reg);
 
     call_args_collected_candidate(call_addr, Arc::new(vec![])) <--
         ltl_inst(call_addr, ?LTLInst::Lcall(_)),
@@ -849,9 +890,22 @@ ascent_par! {
         if name == name_sym;
 
     global_var_ref(ident) <--
-        ltl_inst(_, ?LTLInst::Ltailcall(Either::Right(Either::Right(name_sym)))),
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(Either::Right(Either::Right(name_sym)))),
+        !call_through_memory(call_addr, _, _, _, _),
         ident_to_symbol(ident, name),
         if name == name_sym;
+
+    // A RIP-memory tailcall references the slot object, not the provider text
+    // attached to Ltailcall.  Publish that exact global so declaration solving
+    // can type `__imp_*` as a function-pointer object downstream.
+    global_var_ref(ident) <--
+        call_through_memory(call_addr, base_str, idx_str, _, _),
+        if is_rip(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        rip_target_addr(call_addr, target),
+        loader_symbol_identity(target, kind, _, _),
+        if matches!(kind, LoaderSymbolKind::ImportPointer),
+        let ident = *target as Ident;
 
     // Track memory chunk type used when loading from each global (for rodata constant inlining)
     global_load_chunk(*ident, chunk.clone()) <--
@@ -3659,12 +3713,80 @@ ascent_par! {
         reg_rtl(addr, *src_reg, src_rtl),
         let inst = RTLInst::Istore(*chunk, addressing.clone(), Arc::new(vec![]), *src_rtl);
 
+    // A sparse or conflicting positional relation deliberately emits no
+    // semantic candidate.  Preserve the machine call itself with an empty
+    // vector so later diagnostics/emitters can fail closed without deleting
+    // the instruction from RTL.
+    #[local] relation call_args_materialization_incoherent(Node);
+    call_args_materialization_incoherent(addr) <--
+        ltl_inst(addr, ?LTLInst::Lcall(_)),
+        !call_args_collected_candidate(addr, _);
+    call_args_materialization_incoherent(addr) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(_)),
+        !call_args_collected_candidate(addr, _);
+    call_args_materialization_incoherent(addr) <--
+        call_args_collected_candidate(addr, first),
+        call_args_collected_candidate(addr, second),
+        if first != second;
+    #[local] relation call_signature_short(Node);
+    call_signature_short(addr) <--
+        call_args_collected_candidate(addr, args),
+        call_resolved_signature(addr, _, param_count, _, _, _),
+        if args.len() < *param_count;
+
+    #[local] relation call_args_for_signature_incoherent(Node);
+    call_args_for_signature_incoherent(addr) <-- call_args_materialization_incoherent(addr);
+    call_args_for_signature_incoherent(addr) <-- call_signature_short(addr);
+
+    #[local] relation materialized_call_args(Node, Args);
+    materialized_call_args(addr, args) <--
+        call_args_collected_candidate(addr, args),
+        !call_args_materialization_incoherent(addr);
+    materialized_call_args(addr, Arc::new(vec![])) <--
+        ltl_inst(addr, ?LTLInst::Lcall(_)),
+        call_args_materialization_incoherent(addr);
+    materialized_call_args(addr, Arc::new(vec![])) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(_)),
+        call_args_materialization_incoherent(addr);
+
+    #[local] relation resolved_rtl_call_signature(Node, XType, Arc<Vec<XType>>, CallConv);
+    resolved_rtl_call_signature(addr, *ret_type, known_params.clone(), call_conv) <--
+        call_resolved_signature(addr, _, param_count, ret_type, known_params, variadic),
+        !call_args_for_signature_incoherent(addr),
+        let call_conv = resolved_signature_call_conv(*param_count, *variadic);
+    resolved_rtl_call_signature(addr, *ret_type, Arc::new(vec![]), call_conv) <--
+        call_resolved_signature(addr, _, _, ret_type, _, _),
+        call_args_for_signature_incoherent(addr),
+        let call_conv = CallConv { unproto: true, ..CallConv::default() };
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Left(_target_addr) = target,
+        materialized_call_args(addr, args),
+        call_return_reg(addr, final_ret),
+        next(addr, next_addr),
+        resolved_rtl_call_signature(addr, ret_type, known_params, call_conv),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: *call_conv },
+        let inst = RTLInst::Icall(Some(sig), Either::Right(target.clone()), args.clone(), Some(*final_ret), *next_addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(callee)),
+        if let Either::Right(target) = callee,
+        if let Either::Left(_target_addr) = target,
+        materialized_call_args(addr, args),
+        !call_return_reg(addr, _),
+        next(addr, next_addr),
+        resolved_rtl_call_signature(addr, _, known_params, call_conv),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: XType::Xvoid, sig_cc: *call_conv },
+        let inst = RTLInst::Icall(Some(sig), Either::Right(target.clone()), args.clone(), None, *next_addr);
+
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
         if let Either::Left(mreg) = callee,
         !call_through_memory(addr, _, _, _, _),
         reg_rtl(addr, *mreg, callee_rtl),
-        call_args_collected_candidate(addr, args),
+        materialized_call_args(addr, args),
         call_return_reg(addr, _ret_rtl),
         reg_rtl(addr, Mreg::AX, final_ret),
         next(addr, next_addr),
@@ -3676,7 +3798,7 @@ ascent_par! {
         if let Either::Left(mreg) = callee,
         !call_through_memory(addr, _, _, _, _),
         reg_rtl(addr, *mreg, callee_rtl),
-        call_args_collected_candidate(addr, args),
+        materialized_call_args(addr, args),
         !call_return_reg(addr, _),
         next(addr, next_addr),
         let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
@@ -3688,7 +3810,7 @@ ascent_par! {
         if let Either::Left(mreg) = callee,
         !call_through_memory(addr, _, _, _, _),
         !reg_rtl(addr, *mreg, _),
-        call_args_collected_candidate(addr, args),
+        materialized_call_args(addr, args),
         call_return_reg(addr, _ret_rtl),
         reg_rtl(addr, Mreg::AX, final_ret),
         next(addr, next_addr),
@@ -3701,7 +3823,7 @@ ascent_par! {
         if let Either::Left(mreg) = callee,
         !call_through_memory(addr, _, _, _, _),
         !reg_rtl(addr, *mreg, _),
-        call_args_collected_candidate(addr, args),
+        materialized_call_args(addr, args),
         !call_return_reg(addr, _),
         next(addr, next_addr),
         let fresh_callee = fresh_xtl_reg(*addr, *mreg),
@@ -3712,10 +3834,33 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lcall(Either::Left(_))),
         call_through_memory(addr, _, _, _, _),
-        call_args_collected_candidate(addr, args),
+        materialized_call_args(addr, args),
+        call_return_reg(addr, final_ret),
+        next(addr, next_addr),
+        resolved_rtl_call_signature(addr, ret_type, known_params, call_conv),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT")),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: *call_conv },
+        let inst = RTLInst::Icall(Some(sig), Either::Left(temp), args.clone(), Some(*final_ret), *next_addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(_))),
+        call_through_memory(addr, _, _, _, _),
+        materialized_call_args(addr, args),
+        !call_return_reg(addr, _),
+        next(addr, next_addr),
+        resolved_rtl_call_signature(addr, _, known_params, call_conv),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT")),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: XType::Xvoid, sig_cc: *call_conv },
+        let inst = RTLInst::Icall(Some(sig), Either::Left(temp), args.clone(), None, *next_addr);
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(_))),
+        call_through_memory(addr, _, _, _, _),
+        materialized_call_args(addr, args),
         call_return_reg(addr, _ret_rtl),
         reg_rtl(addr, Mreg::AX, final_ret),
         next(addr, next_addr),
+        !call_resolved_signature(addr, _, _, _, _, _),
         let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT")),
         let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
         let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(temp), args.clone(), Some(*final_ret), *next_addr);
@@ -3723,9 +3868,10 @@ ascent_par! {
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lcall(Either::Left(_))),
         call_through_memory(addr, _, _, _, _),
-        call_args_collected_candidate(addr, args),
+        materialized_call_args(addr, args),
         !call_return_reg(addr, _),
         next(addr, next_addr),
+        !call_resolved_signature(addr, _, _, _, _, _),
         let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT")),
         let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
         let inst = RTLInst::Icall(Some(inferred_sig), Either::Left(temp), args.clone(), None, *next_addr);
@@ -3737,6 +3883,7 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lcall(Either::Left(_))),
         call_through_memory(addr, base_str, idx_str, _scale, disp),
         if *idx_str == "NONE" || idx_str.is_empty(),
+        if !is_rip(base_str),
         let base_mreg = Mreg::x86(*base_str),
         reg_rtl(addr, base_mreg, base_rtl),
         let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT"));
@@ -3746,6 +3893,54 @@ ascent_par! {
         call_through_memory(addr, base_str, idx_str, scale, disp),
         if *idx_str != "NONE" && !idx_str.is_empty(),
         if *scale <= 1,
+        let base_mreg = Mreg::x86(*base_str),
+        let idx_mreg = Mreg::x86(*idx_str),
+        reg_rtl(addr, base_mreg, base_rtl),
+        reg_rtl(addr, idx_mreg, idx_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT"));
+
+    // Tailcall counterparts.  A RIP-relative IAT slot has no base RTL
+    // register, so retain it as an exact Aglobal load keyed by the slot
+    // address.  This is the object whose loader kind is ImportPointer.
+    call_through_memory_load(
+        *addr,
+        temp,
+        MemoryChunk::MInt64,
+        Addressing::Aglobal(*target as Ident, 0),
+        Arc::new(vec![]),
+    ) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(_)),
+        call_through_memory(addr, base_str, idx_str, _, _),
+        if is_rip(base_str),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        rip_target_addr(addr, target),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT"));
+
+    call_through_memory_load(*addr, temp, MemoryChunk::MInt64, Addressing::Aindexed(*disp), Arc::new(vec![*base_rtl])) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(_)),
+        call_through_memory(addr, base_str, idx_str, _scale, disp),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if !is_rip(base_str),
+        let base_mreg = Mreg::x86(*base_str),
+        reg_rtl(addr, base_mreg, base_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT"));
+
+    call_through_memory_load(*addr, temp, MemoryChunk::MInt64, Addressing::Aindexed2(*disp), Arc::new(vec![*base_rtl, *idx_rtl])) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(_)),
+        call_through_memory(addr, base_str, idx_str, scale, disp),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *scale <= 1,
+        let base_mreg = Mreg::x86(*base_str),
+        let idx_mreg = Mreg::x86(*idx_str),
+        reg_rtl(addr, base_mreg, base_rtl),
+        reg_rtl(addr, idx_mreg, idx_rtl),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT"));
+
+    call_through_memory_load(*addr, temp, MemoryChunk::MInt64, Addressing::Aindexed2scaled(*scale, *disp), Arc::new(vec![*base_rtl, *idx_rtl])) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(_)),
+        call_through_memory(addr, base_str, idx_str, scale, disp),
+        if *idx_str != "NONE" && !idx_str.is_empty(),
+        if *scale > 1,
         let base_mreg = Mreg::x86(*base_str),
         let idx_mreg = Mreg::x86(*idx_str),
         reg_rtl(addr, base_mreg, base_rtl),
@@ -3767,21 +3962,23 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
         if let Either::Right(target) = callee,
         if let Either::Left(target_addr) = target,
-        call_args_collected_candidate(addr, args),
+        materialized_call_args(addr, args),
         call_return_reg(addr, _ret_rtl),
         reg_rtl(addr, Mreg::AX, final_ret),
         next(addr, next_addr),
         emit_function_signature_candidate(target_addr, sig),
+        !call_resolved_signature(addr, _, _, _, _, _),
         let inst = RTLInst::Icall(Some(sig.clone()), Either::Right(target.clone()), args.clone(), Some(*final_ret), *next_addr);
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
         if let Either::Right(target) = callee,
         if let Either::Left(target_addr) = target,
-        call_args_collected_candidate(addr, args),
+        materialized_call_args(addr, args),
         !call_return_reg(addr, _),
         next(addr, next_addr),
         emit_function_signature_candidate(target_addr, sig),
+        !call_resolved_signature(addr, _, _, _, _, _),
         let inst = RTLInst::Icall(Some(sig.clone()), Either::Right(target.clone()), args.clone(), None, *next_addr);
 
 
@@ -3886,144 +4083,110 @@ ascent_par! {
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
-        if let Either::Left(mreg) = callee,
-        reg_rtl(addr, *mreg, callee_rtl),
-        call_args_collected_candidate(addr, args),
-        let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
-        let inst = RTLInst::Itailcall(Some(default_sig), Either::Left(*callee_rtl), args.clone());
-
-    rtl_inst_candidate(addr, inst) <--
-        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
-        if let Either::Left(mreg) = callee,
-        reg_rtl(addr, *mreg, callee_rtl),
-        !call_args_collected_candidate(addr, _),
-        let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
-        let inst = RTLInst::Itailcall(Some(default_sig), Either::Left(*callee_rtl), Arc::new(vec![]));
-
-    // Fallback: indirect Ltailcall with missing reg_rtl (mirrors Lcall fallback above).
-    rtl_inst_candidate(addr, inst) <--
-        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
-        if let Either::Left(mreg) = callee,
-        !reg_rtl(addr, *mreg, _),
-        call_args_collected_candidate(addr, args),
-        let fresh_callee = fresh_xtl_reg(*addr, *mreg),
-        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
-        let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Left(fresh_callee), args.clone());
-
-    rtl_inst_candidate(addr, inst) <--
-        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
-        if let Either::Left(mreg) = callee,
-        !reg_rtl(addr, *mreg, _),
-        !call_args_collected_candidate(addr, _),
-        let fresh_callee = fresh_xtl_reg(*addr, *mreg),
-        let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
-        let inst = RTLInst::Itailcall(Some(default_sig), Either::Left(fresh_callee), Arc::new(vec![]));
-
-    rtl_inst_candidate(addr, inst) <--
-        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        !call_through_memory(addr, _, _, _, _),
         if let Either::Right(target) = callee,
-        if let Either::Left(target_addr) = target,
-        call_args_collected_candidate(addr, args),
-        emit_function_signature_candidate(target_addr, sig),
-        let inst = RTLInst::Itailcall(Some(sig.clone()), Either::Right(target.clone()), args.clone());
-
-    rtl_inst_candidate(addr, inst) <--
-        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
-        if let Either::Right(target) = callee,
-        if let Either::Left(target_addr) = target,
-        !call_args_collected_candidate(addr, _),
-        emit_function_signature_candidate(target_addr, sig),
-        let inst = RTLInst::Itailcall(Some(sig.clone()), Either::Right(target.clone()), Arc::new(vec![]));
-
-    // The extern signature table applies to a by-name target ONLY when the binary does not define that name; the twin rule below covers the gated symbol via inference.
-    rtl_inst_candidate(addr, inst) <--
-        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
-        if let Either::Right(target) = callee,
-        if let Either::Right(symbol) = target,
-        call_args_collected_candidate(addr, args),
-        !emit_function(_, symbol, _),
-        known_extern_signature(symbol, _, ret_type, known_params),
-        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: CallConv::default() },
+        if let Either::Left(_target_addr) = target,
+        materialized_call_args(addr, args),
+        resolved_rtl_call_signature(addr, ret_type, known_params, call_conv),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: *call_conv },
         let inst = RTLInst::Itailcall(Some(sig), Either::Right(target.clone()), args.clone());
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
-        if let Either::Right(target) = callee,
-        if let Either::Right(symbol) = target,
-        call_args_collected_candidate(addr, args),
-        !known_extern_signature(symbol, _, _, _),
-        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
-        let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Right(target.clone()), args.clone());
-
-    // Hole-closer twin of the rule above: a locally-defined symbol that ALSO has a table entry (so `!known_extern_signature` is false) still gets a signature, inferred from the binary's own call-site args rather than the corpus table.
-    rtl_inst_candidate(addr, inst) <--
-        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
-        if let Either::Right(target) = callee,
-        if let Either::Right(symbol) = target,
-        call_args_collected_candidate(addr, args),
-        emit_function(_, symbol, _),
-        known_extern_signature(symbol, _, _, _),
-        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
-        let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Right(target.clone()), args.clone());
-
-    rtl_inst_candidate(addr, inst) <--
-        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
-        if let Either::Right(target) = callee,
-        if let Either::Right(symbol) = target,
-        !call_args_collected_candidate(addr, _),
-        !emit_function(_, symbol, _),
-        known_extern_signature(symbol, _, ret_type, _known_params),
-        let sig = Signature { sig_args: Arc::new(vec![]), sig_res: *ret_type, sig_cc: CallConv::default() },
-        let inst = RTLInst::Itailcall(Some(sig), Either::Right(target.clone()), Arc::new(vec![]));
-
-    rtl_inst_candidate(addr, inst) <--
-        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
-        if let Either::Right(target) = callee,
-        if let Either::Right(symbol) = target,
-        !call_args_collected_candidate(addr, _),
-        !known_extern_signature(symbol, _, _, _),
+        !call_through_memory(addr, _, _, _, _),
+        if let Either::Left(mreg) = callee,
+        reg_rtl(addr, *mreg, callee_rtl),
+        materialized_call_args(addr, args),
         let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
-        let inst = RTLInst::Itailcall(Some(default_sig), Either::Right(target.clone()), Arc::new(vec![]));
+        let inst = RTLInst::Itailcall(Some(default_sig), Either::Left(*callee_rtl), args.clone());
 
-    // Hole-closer twin: locally-defined symbol that also has a table entry -> default sig (matching the no-args fallback above) instead of the corpus table.
+    // Fallback: indirect Ltailcall with missing reg_rtl (mirrors Lcall fallback above).
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
-        if let Either::Right(target) = callee,
-        if let Either::Right(symbol) = target,
-        !call_args_collected_candidate(addr, _),
-        emit_function(_, symbol, _),
-        known_extern_signature(symbol, _, _, _),
-        let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
-        let inst = RTLInst::Itailcall(Some(default_sig), Either::Right(target.clone()), Arc::new(vec![]));
+        !call_through_memory(addr, _, _, _, _),
+        if let Either::Left(mreg) = callee,
+        !reg_rtl(addr, *mreg, _),
+        materialized_call_args(addr, args),
+        let fresh_callee = fresh_xtl_reg(*addr, *mreg),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Left(fresh_callee), args.clone());
+
+    // A raw memory JMP always remains indirect in RTL, even when asm_pass
+    // resolved the IAT slot to a provider spelling.  Exact address+kind facts
+    // still provide the signature; they never change the callee object kind.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(_)),
+        call_through_memory(addr, _, _, _, _),
+        materialized_call_args(addr, args),
+        resolved_rtl_call_signature(addr, ret_type, known_params, call_conv),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT")),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: *call_conv },
+        let inst = RTLInst::Itailcall(Some(sig), Either::Left(temp), args.clone());
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(_)),
+        call_through_memory(addr, _, _, _, _),
+        materialized_call_args(addr, args),
+        !call_resolved_signature(addr, _, _, _, _, _),
+        let temp = fresh_xtl_reg(*addr, Mreg::x86("RCALL_TGT")),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Left(temp), args.clone());
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        !call_through_memory(addr, _, _, _, _),
         if let Either::Right(target) = callee,
         if let Either::Left(target_addr) = target,
-        call_args_collected_candidate(addr, args),
-        !emit_function_signature_candidate(target_addr, _),
+        materialized_call_args(addr, args),
+        emit_function_signature_candidate(target_addr, sig),
+        !call_resolved_signature(addr, _, _, _, _, _),
+        let inst = RTLInst::Itailcall(Some(sig.clone()), Either::Right(target.clone()), args.clone());
+
+    // A by-name target may consume an authoritative signature only after the
+    // call has resolved through the exact loader-identity reducer.  Legacy
+    // names are handled there only when no loader candidate exists.
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        !call_through_memory(addr, _, _, _, _),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        materialized_call_args(addr, args),
+        resolved_rtl_call_signature(addr, ret_type, known_params, call_conv),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: *call_conv },
+        let inst = RTLInst::Itailcall(Some(sig), Either::Right(target.clone()), args.clone());
+
+    rtl_inst_candidate(addr, inst) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        !call_through_memory(addr, _, _, _, _),
+        if let Either::Right(target) = callee,
+        if let Either::Right(symbol) = target,
+        materialized_call_args(addr, args),
+        !call_resolved_signature(addr, _, _, _, _, _),
         let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
         let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Right(target.clone()), args.clone());
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Ltailcall(callee)),
+        !call_through_memory(addr, _, _, _, _),
         if let Either::Right(target) = callee,
         if let Either::Left(target_addr) = target,
-        !call_args_collected_candidate(addr, _),
+        materialized_call_args(addr, args),
         !emit_function_signature_candidate(target_addr, _),
-        let default_sig = Signature { sig_args: Arc::new(vec![]), sig_res: XType::Xint, sig_cc: CallConv::default() },
-        let inst = RTLInst::Itailcall(Some(default_sig), Either::Right(target.clone()), Arc::new(vec![]));
+        !call_resolved_signature(addr, _, _, _, _, _),
+        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
+        let inst = RTLInst::Itailcall(Some(inferred_sig), Either::Right(target.clone()), args.clone());
 
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
         if let Either::Right(target) = callee,
         if let Either::Left(target_addr) = target,
-        call_args_collected_candidate(addr, args),
+        materialized_call_args(addr, args),
         call_return_reg(addr, _ret_rtl),
         reg_rtl(addr, Mreg::AX, final_ret),
         next(addr, next_addr),
         !emit_function_signature_candidate(target_addr, _),
+        !call_resolved_signature(addr, _, _, _, _, _),
         let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
         let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), Some(*final_ret), *next_addr);
 
@@ -4031,10 +4194,11 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
         if let Either::Right(target) = callee,
         if let Either::Left(target_addr) = target,
-        call_args_collected_candidate(addr, args),
+        materialized_call_args(addr, args),
         !call_return_reg(addr, _),
         next(addr, next_addr),
         !emit_function_signature_candidate(target_addr, _),
+        !call_resolved_signature(addr, _, _, _, _, _),
         let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
         let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), None, *next_addr);
 
@@ -4042,38 +4206,22 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
         if let Either::Right(target) = callee,
         if let Either::Right(symbol) = target,
-        call_args_collected_candidate(addr, args),
-        call_return_reg(addr, _ret_rtl),
-        reg_rtl(addr, Mreg::AX, final_ret),
+        materialized_call_args(addr, args),
+        call_return_reg(addr, final_ret),
         next(addr, next_addr),
-        !emit_function(_, symbol, _),
-        known_extern_signature(symbol, _, ret_type, known_params),
-        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: CallConv::default() },
+        resolved_rtl_call_signature(addr, ret_type, known_params, call_conv),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: *call_conv },
         let inst = RTLInst::Icall(Some(sig), Either::Right(target.clone()), args.clone(), Some(*final_ret), *next_addr);
 
     rtl_inst_candidate(addr, inst) <--
         ltl_inst(addr, ?LTLInst::Lcall(callee)),
         if let Either::Right(target) = callee,
         if let Either::Right(symbol) = target,
-        call_args_collected_candidate(addr, args),
+        materialized_call_args(addr, args),
         call_return_reg(addr, _ret_rtl),
         reg_rtl(addr, Mreg::AX, final_ret),
         next(addr, next_addr),
-        !known_extern_signature(symbol, _, _, _),
-        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
-        let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), Some(*final_ret), *next_addr);
-
-    // Hole-closer twin: locally-defined symbol that also has a table entry -> inferred sig.
-    rtl_inst_candidate(addr, inst) <--
-        ltl_inst(addr, ?LTLInst::Lcall(callee)),
-        if let Either::Right(target) = callee,
-        if let Either::Right(symbol) = target,
-        call_args_collected_candidate(addr, args),
-        call_return_reg(addr, _ret_rtl),
-        reg_rtl(addr, Mreg::AX, final_ret),
-        next(addr, next_addr),
-        emit_function(_, symbol, _),
-        known_extern_signature(symbol, _, _, _),
+        !call_resolved_signature(addr, _, _, _, _, _),
         let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, true),
         let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), Some(*final_ret), *next_addr);
 
@@ -4082,11 +4230,10 @@ ascent_par! {
         if let Either::Right(target) = callee,
         if let Either::Right(symbol) = target,
         !call_return_reg(addr, _),
-        call_args_collected_candidate(addr, args),
+        materialized_call_args(addr, args),
         next(addr, next_addr),
-        !emit_function(_, symbol, _),
-        known_extern_signature(symbol, _, _, known_params),
-        let sig = Signature { sig_args: known_params.clone(), sig_res: XType::Xvoid, sig_cc: CallConv::default() },
+        resolved_rtl_call_signature(addr, _, known_params, call_conv),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: XType::Xvoid, sig_cc: *call_conv },
         let inst = RTLInst::Icall(Some(sig), Either::Right(target.clone()), args.clone(), None, *next_addr);
 
     rtl_inst_candidate(addr, inst) <--
@@ -4094,22 +4241,9 @@ ascent_par! {
         if let Either::Right(target) = callee,
         if let Either::Right(symbol) = target,
         !call_return_reg(addr, _),
-        call_args_collected_candidate(addr, args),
+        materialized_call_args(addr, args),
         next(addr, next_addr),
-        !known_extern_signature(symbol, _, _, _),
-        let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
-        let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), None, *next_addr);
-
-    // Hole-closer twin: locally-defined symbol that also has a table entry -> inferred sig.
-    rtl_inst_candidate(addr, inst) <--
-        ltl_inst(addr, ?LTLInst::Lcall(callee)),
-        if let Either::Right(target) = callee,
-        if let Either::Right(symbol) = target,
-        !call_return_reg(addr, _),
-        call_args_collected_candidate(addr, args),
-        next(addr, next_addr),
-        emit_function(_, symbol, _),
-        known_extern_signature(symbol, _, _, _),
+        !call_resolved_signature(addr, _, _, _, _, _),
         let inferred_sig = crate::decompile::passes::rtl_pass::infer_signature_from_args(&args, false),
         let inst = RTLInst::Icall(Some(inferred_sig), Either::Right(target.clone()), args.clone(), None, *next_addr);
 
@@ -4357,7 +4491,8 @@ ascent_par! {
     local_addr_call(call_addr) <--
         ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(_))));
     local_addr_call(call_addr) <--
-        ltl_inst(call_addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(_))));
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(_)))),
+        !call_through_memory(call_addr, _, _, _, _);
     func_produces_retval(func_start) <--
         instr_in_function(call_addr, func_start),
         ax_retval_def_base(call_addr),
@@ -4766,8 +4901,7 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lcall(Either::Right(Either::Left(callee)))),
         func_returns_float(callee);
     x0_value_write(addr) <--
-        external_call_site(addr, _, name),
-        known_extern_signature(name, _, ret, _),
+        call_resolved_signature(addr, _, _, ret, _, _),
         if matches!(ret, XType::Xfloat | XType::Xsingle);
     // 3.8 R1: a FUSED float op writing X0 is a genuine X0 VALUE write; it has no Lop/Lload, so func_returns_float stayed false and DCE collapsed the body to return 0.
     x0_value_write(addr) <--
@@ -5409,6 +5543,8 @@ ascent_par! {
     #[local] relation reg_of_interest(Mreg);
     reg_of_interest(r) <-- is_arg_reg(r);
     reg_of_interest(r) <-- is_xmm_arg_reg(r);
+    reg_of_interest(r) <-- ltl_inst(_, ?LTLInst::Lcall(Either::Left(r)));
+    reg_of_interest(r) <-- ltl_inst(_, ?LTLInst::Ltailcall(Either::Left(r)));
     reg_of_interest(Mreg::AX);
     reg_of_interest(Mreg::X0);
 
@@ -6053,6 +6189,7 @@ ascent_par! {
 
     external_call_site(call_site, target, *name) <--
         ltl_inst(call_site, ?LTLInst::Lcall(Either::Right(Either::Left(target)))),
+        if *target <= Address::MAX - ENDBR64_LEN,
         let offset_target = target + ENDBR64_LEN,
         plt_function(offset_target, name);
 
@@ -6064,15 +6201,19 @@ ascent_par! {
 
     external_call_site(call_site, target, *name) <--
         ltl_inst(call_site, ?LTLInst::Ltailcall(Either::Right(Either::Left(target)))),
+        !call_through_memory(call_site, _, _, _, _),
         plt_function(target, name);
 
     external_call_site(call_site, target, *name) <--
         ltl_inst(call_site, ?LTLInst::Ltailcall(Either::Right(Either::Left(target)))),
+        !call_through_memory(call_site, _, _, _, _),
+        if *target <= Address::MAX - ENDBR64_LEN,
         let offset_target = target + ENDBR64_LEN,
         plt_function(offset_target, name);
 
     external_call_site(call_site, target, *name) <--
         ltl_inst(call_site, ?LTLInst::Ltailcall(Either::Right(Either::Left(target)))),
+        !call_through_memory(call_site, _, _, _, _),
         if *target >= ENDBR64_LEN,
         let offset_target = target - ENDBR64_LEN,
         plt_function(offset_target, name);
@@ -6095,8 +6236,94 @@ ascent_par! {
         ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(target)))),
         emit_function(target, name, _);
 
+    call_site(call_addr, *name) <--
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(target)))),
+        !call_through_memory(call_addr, _, _, _, _),
+        emit_function(target, name, _);
+
+    call_site(call_addr, *name) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Right(name))));
+
+    call_site(call_addr, *name) <--
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(Either::Right(Either::Right(name)))),
+        !call_through_memory(call_addr, _, _, _, _);
+
+    // Resolve the callee object before any cross-site or signature join.  A
+    // direct address can only name a function entry; a symbolic call may name
+    // either a function or an import-pointer identity.  Provider/original
+    // spelling matches are merely candidates and a multi-identity match is an
+    // explicit ambiguity, never a component to merge by name.
+    relation call_loader_identity_candidate(Node, Address, LoaderSymbolKind, Symbol, Symbol);
+    call_loader_identity_candidate(call_addr, *target, *kind, *provider, *original) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(target)))),
+        loader_symbol_identity(target, kind, provider, original),
+        if matches!(kind, LoaderSymbolKind::Function);
+    call_loader_identity_candidate(call_addr, *target, *kind, *provider, *original) <--
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(target)))),
+        !call_through_memory(call_addr, _, _, _, _),
+        loader_symbol_identity(target, kind, provider, original),
+        if matches!(kind, LoaderSymbolKind::Function);
+    call_loader_identity_candidate(call_addr, adjusted, *kind, *provider, *original) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(target)))),
+        if *target <= Address::MAX - ENDBR64_LEN,
+        let adjusted = *target + ENDBR64_LEN,
+        loader_symbol_identity(adjusted, kind, provider, original),
+        if matches!(kind, LoaderSymbolKind::Function);
+    call_loader_identity_candidate(call_addr, adjusted, *kind, *provider, *original) <--
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(target)))),
+        !call_through_memory(call_addr, _, _, _, _),
+        if *target <= Address::MAX - ENDBR64_LEN,
+        let adjusted = *target + ENDBR64_LEN,
+        loader_symbol_identity(adjusted, kind, provider, original),
+        if matches!(kind, LoaderSymbolKind::Function);
+    call_loader_identity_candidate(call_addr, adjusted, *kind, *provider, *original) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(target)))),
+        if *target >= ENDBR64_LEN,
+        let adjusted = *target - ENDBR64_LEN,
+        loader_symbol_identity(adjusted, kind, provider, original),
+        if matches!(kind, LoaderSymbolKind::Function);
+    call_loader_identity_candidate(call_addr, adjusted, *kind, *provider, *original) <--
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(target)))),
+        !call_through_memory(call_addr, _, _, _, _),
+        if *target >= ENDBR64_LEN,
+        let adjusted = *target - ENDBR64_LEN,
+        loader_symbol_identity(adjusted, kind, provider, original),
+        if matches!(kind, LoaderSymbolKind::Function);
+    call_loader_identity_candidate(call_addr, *address, *kind, *provider, *original) <--
+        ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Right(name)))),
+        loader_symbol_identity(address, kind, provider, original),
+        if matches!(kind, LoaderSymbolKind::Function),
+        if *provider == *name || *original == *name;
+    call_loader_identity_candidate(call_addr, *address, *kind, *provider, *original) <--
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(Either::Right(Either::Right(name)))),
+        !call_through_memory(call_addr, _, _, _, _),
+        loader_symbol_identity(address, kind, provider, original),
+        if matches!(kind, LoaderSymbolKind::Function),
+        if *provider == *name || *original == *name;
+    call_loader_identity_candidate(call_addr, *address, *kind, *provider, *original) <--
+        call_through_memory(call_addr, _, _, _, _),
+        rip_target_addr(call_addr, address),
+        loader_symbol_identity(address, kind, provider, original),
+        if matches!(kind, LoaderSymbolKind::ImportPointer);
+
+    relation call_loader_identity_ambiguous(Node);
+    call_loader_identity_ambiguous(call_addr) <--
+        call_loader_identity_candidate(call_addr, first_address, first_kind, _, _),
+        call_loader_identity_candidate(call_addr, second_address, second_kind, _, _),
+        if (*first_address, *first_kind) != (*second_address, *second_kind);
+
+    relation call_loader_identity(Node, Address, LoaderSymbolKind, Symbol, Symbol);
+    call_loader_identity(call_addr, address, kind, provider, original) <--
+        call_loader_identity_candidate(call_addr, address, kind, provider, original),
+        !call_loader_identity_ambiguous(call_addr);
+
+    // Only publish semantic per-position facts from a materialized dense
+    // vector.  Sparse raw evidence remains auditable in call_arg_mapping but
+    // cannot inflate a shared callee through max-position arithmetic.
     call_arg(node, pos, reg) <--
-        call_arg_mapping(node, pos, reg);
+        call_arg_mapping(node, pos, reg),
+        call_args_collected_candidate(node, args),
+        if args.get(*pos) == Some(reg);
 
 
     ident_to_symbol(id, *name) <-- base_ident_to_symbol(id, name);
@@ -6107,48 +6334,146 @@ ascent_par! {
 
     relation resolved_extern_signature(Symbol, usize, XType, Arc<Vec<XType>>);
 
+    #[local] relation legacy_signature_fact_conflict(Symbol);
+    legacy_signature_fact_conflict(name) <--
+        known_extern_signature(name, arity, _, params),
+        if *arity != params.len();
+    legacy_signature_fact_conflict(name) <--
+        known_extern_signature(name, first_arity, first_ret, first_params),
+        known_extern_signature(name, second_arity, second_ret, second_params),
+        if *first_arity != *second_arity
+            || *first_ret != *second_ret
+            || first_params.as_ref() != second_params.as_ref();
+    legacy_signature_fact_conflict(name) <--
+        known_varargs_function(name, first_count),
+        known_varargs_function(name, second_count),
+        if *first_count != *second_count;
+    legacy_signature_fact_conflict(name) <--
+        known_extern_signature(name, arity, _, _),
+        known_varargs_function(name, fixed_count),
+        if *arity != *fixed_count;
+
     resolved_extern_signature(*name, *count, *ret, params.clone()) <--
         plt_function(_, name),
-        known_extern_signature(name, count, ret, params);
+        known_extern_signature(name, count, ret, params),
+        !legacy_signature_fact_conflict(name);
 
-    call_has_known_signature(call_site, *name, *param_count, *ret_type) <--
+    #[local] relation loader_signature_fact_conflict(Address, LoaderSymbolKind);
+    loader_signature_fact_conflict(address, kind) <--
+        loader_signature_conflict(address, kind, _, _);
+    loader_signature_fact_conflict(address, kind) <--
+        known_loader_signature(address, kind, _, _, arity, _, params, _),
+        if *arity != params.len();
+    loader_signature_fact_conflict(address, kind) <--
+        known_loader_signature(
+            address,
+            kind,
+            _,
+            _,
+            first_arity,
+            first_ret,
+            first_params,
+            first_variadic,
+        ),
+        known_loader_signature(
+            address,
+            kind,
+            _,
+            _,
+            second_arity,
+            second_ret,
+            second_params,
+            second_variadic,
+        ),
+        if *first_arity != *second_arity
+            || *first_ret != *second_ret
+            || first_params.as_ref() != second_params.as_ref()
+            || *first_variadic != *second_variadic;
+    loader_signature_fact_conflict(address, kind) <--
+        known_loader_signature(address, kind, _, _, _, _, _, variadic),
+        known_loader_variadic(address, kind, _, _),
+        if !*variadic;
+    loader_signature_fact_conflict(address, kind) <--
+        known_loader_signature(address, kind, _, _, _, _, _, variadic),
+        if *variadic,
+        !known_loader_variadic(address, kind, _, _);
+
+    #[local] relation exact_loader_signature(Address, LoaderSymbolKind, usize, XType, Arc<Vec<XType>>, bool);
+    exact_loader_signature(address, kind, arity, ret, params, variadic) <--
+        known_loader_signature(address, kind, _, _, arity, ret, params, variadic),
+        !loader_signature_fact_conflict(address, kind);
+
+    relation call_resolved_signature(Node, Symbol, usize, XType, Arc<Vec<XType>>, bool);
+    call_resolved_signature(call_site, *provider, *param_count, *ret_type, params.clone(), *variadic) <--
+        call_loader_identity(call_site, address, kind, provider, _),
+        exact_loader_signature(address, kind, param_count, ret_type, params, variadic);
+
+    // Legacy objects without loader identities retain exact symbol lookup.
+    // Once any loader candidate exists, even an ambiguous one, falling back
+    // to the display spelling would silently undo the collision veto.
+    call_resolved_signature(call_site, *name, *param_count, *ret_type, params.clone(), true) <--
         external_call_site(call_site, _, name),
-        known_extern_signature(name, param_count, ret_type, _);
+        !call_loader_identity_candidate(call_site, _, _, _, _),
+        known_extern_signature(name, param_count, ret_type, params),
+        known_varargs_function(name, _),
+        !legacy_signature_fact_conflict(name);
+    call_resolved_signature(call_site, *name, *param_count, *ret_type, params.clone(), false) <--
+        external_call_site(call_site, _, name),
+        !call_loader_identity_candidate(call_site, _, _, _, _),
+        known_extern_signature(name, param_count, ret_type, params),
+        !known_varargs_function(name, _),
+        !legacy_signature_fact_conflict(name);
 
-    // Also match symbol-based calls (Right(Right(name))) against known signatures
-    call_has_known_signature(call_site, *name, *param_count, *ret_type) <--
+    // Also match symbol-based calls against known signatures only when the
+    // symbol has no loader-owned identity candidate.
+    call_resolved_signature(call_site, *name, *param_count, *ret_type, params.clone(), true) <--
         ltl_inst(call_site, ?LTLInst::Lcall(Either::Right(Either::Right(name)))),
         !emit_function(_, name, _),
-        known_extern_signature(name, param_count, ret_type, _);
-
-    call_has_known_signature(call_site, *name, *param_count, *ret_type) <--
+        !call_loader_identity_candidate(call_site, _, _, _, _),
+        known_extern_signature(name, param_count, ret_type, params),
+        known_varargs_function(name, _),
+        !legacy_signature_fact_conflict(name);
+    call_resolved_signature(call_site, *name, *param_count, *ret_type, params.clone(), false) <--
+        ltl_inst(call_site, ?LTLInst::Lcall(Either::Right(Either::Right(name)))),
+        !emit_function(_, name, _),
+        !call_loader_identity_candidate(call_site, _, _, _, _),
+        known_extern_signature(name, param_count, ret_type, params),
+        !known_varargs_function(name, _),
+        !legacy_signature_fact_conflict(name);
+    call_resolved_signature(call_site, *name, *param_count, *ret_type, params.clone(), true) <--
         ltl_inst(call_site, ?LTLInst::Ltailcall(Either::Right(Either::Right(name)))),
         !emit_function(_, name, _),
-        known_extern_signature(name, param_count, ret_type, _);
+        !call_loader_identity_candidate(call_site, _, _, _, _),
+        known_extern_signature(name, param_count, ret_type, params),
+        known_varargs_function(name, _),
+        !legacy_signature_fact_conflict(name);
+    call_resolved_signature(call_site, *name, *param_count, *ret_type, params.clone(), false) <--
+        ltl_inst(call_site, ?LTLInst::Ltailcall(Either::Right(Either::Right(name)))),
+        !emit_function(_, name, _),
+        !call_loader_identity_candidate(call_site, _, _, _, _),
+        known_extern_signature(name, param_count, ret_type, params),
+        !known_varargs_function(name, _),
+        !legacy_signature_fact_conflict(name);
 
-    // Count of GP-class params in a known signature: float args consume no integer position, so gating forwarded-param evidence on this count stops a pure-float callee fabricating a phantom int param.
-    #[local] relation known_sig_gp_param_count(Symbol, usize);
-    known_sig_gp_param_count(*name, gp) <--
-        known_extern_signature(name, _, _, params),
-        let gp = params.iter().filter(|t| !matches!(**t, XType::Xfloat | XType::Xsingle)).count();
+    call_has_known_signature(call_site, name, count, ret) <--
+        call_resolved_signature(call_site, name, count, ret, _, _);
 
-    #[local] relation known_sig_gp_position(Symbol, usize);
-    known_sig_gp_position(name, pos) <--
-        known_sig_gp_param_count(name, gp),
+    relation call_known_sig_gp_position(Node, usize);
+    call_known_sig_gp_position(*call_site, pos) <--
+        call_resolved_signature(call_site, _, _, _, params, _),
         !abi_shared_arg_slots(true),
+        let gp_count = params
+            .iter()
+            .filter(|t| !matches!(**t, XType::Xfloat | XType::Xsingle))
+            .count(),
         abi_int_arg_position(_, pos),
-        if *pos < *gp;
-    known_sig_gp_position(*name, pos) <--
-        known_extern_signature(name, _, _, params),
+        if *pos < gp_count;
+    call_known_sig_gp_position(*call_site, pos) <--
+        call_resolved_signature(call_site, _, _, _, params, _),
         abi_shared_arg_slots(true),
         abi_int_arg_position(_, pos),
         if *pos < params.len(),
         if !matches!(params[*pos], XType::Xfloat | XType::Xsingle);
-
-    relation call_known_sig_gp_position(Node, usize);
-    call_known_sig_gp_position(*call_site, *pos) <--
-        call_has_known_signature(call_site, name, _, _),
-        known_sig_gp_position(name, pos);
 
     relation unknown_extern(Symbol);
 
@@ -6158,6 +6483,7 @@ ascent_par! {
 
     relation function_entry_dist(Address, Node, i64);
     relation call_arg_mapping(Node, usize, RTLReg);
+    relation call_arg_provenance(Node, usize, RTLReg, CallArgProvenance);
     relation call_arg_position_allowed(Node, usize);
 
     relation call_target_func(Node, Address);
@@ -6166,7 +6492,8 @@ ascent_par! {
         ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(target))));
 
     call_target_func(call_addr, *target) <--
-        ltl_inst(call_addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(target))));
+        ltl_inst(call_addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(target)))),
+        !call_through_memory(call_addr, _, _, _, _);
 
     relation func_param_position_type(Address, usize, XType);
 
@@ -6443,19 +6770,37 @@ ascent_par! {
     // For internal functions matching known externs, use known sig to avoid false variadic params.
     relation func_has_known_extern_sig(Address);
 
-    // Only suppress inferred sigs for variadic functions; non-variadic may be custom implementations.
+    // Only suppress inferred sigs for a safely bound variadic declaration;
+    // non-variadic bodies may be custom implementations.  An exact conflict
+    // also suppresses a fixed candidate rather than selecting one side.
+    func_has_known_extern_sig(func_start) <--
+        loader_signature_fact_conflict(func_start, kind),
+        if matches!(kind, LoaderSymbolKind::Function);
+    func_has_known_extern_sig(func_start) <--
+        exact_loader_signature(func_start, kind, _, _, _, variadic),
+        if matches!(kind, LoaderSymbolKind::Function),
+        if *variadic;
     func_has_known_extern_sig(func_start) <--
         emit_function(func_start, name, _),
-        known_varargs_function(name, _);
+        known_varargs_function(name, _),
+        !body_has_loader_function_identity(func_start),
+        !legacy_signature_fact_conflict(name);
 
     relation emit_function_signature_candidate(Address, Signature);
 
     // When a known varargs extern signature exists, prefer it over inferred signature.
     emit_function_signature_candidate(func_start, sig) <--
+        exact_loader_signature(func_start, kind, param_count, ret_type, known_params, variadic),
+        if matches!(kind, LoaderSymbolKind::Function),
+        if *variadic,
+        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: resolved_signature_call_conv(*param_count, true) };
+    emit_function_signature_candidate(func_start, sig) <--
         emit_function(func_start, name, _),
         known_varargs_function(name, _),
-        known_extern_signature(name, _, ret_type, known_params),
-        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: CallConv::default() };
+        known_extern_signature(name, param_count, ret_type, known_params),
+        !body_has_loader_function_identity(func_start),
+        !legacy_signature_fact_conflict(name),
+        let sig = Signature { sig_args: known_params.clone(), sig_res: *ret_type, sig_cc: resolved_signature_call_conv(*param_count, true) };
 
     emit_function_signature_candidate(func_start, sig) <--
         emit_function(func_start, _, _),
@@ -6487,33 +6832,30 @@ ascent_par! {
 
 
     call_arg_position_allowed(call_addr, pos) <--
-        call_has_arg_at_position(call_addr, pos),
+        call_has_arg_evidence(call_addr, pos),
         !call_has_known_signature(call_addr, _, _, _);
 
     call_arg_position_allowed(call_addr, pos) <--
-        call_has_arg_at_position(call_addr, pos),
-        call_has_known_signature(call_addr, name, _, _),
-        known_varargs_function(name, _);
+        call_has_arg_evidence(call_addr, pos),
+        call_resolved_signature(call_addr, _, _, _, _, true);
 
     call_arg_position_allowed(call_addr, pos) <--
-        call_has_arg_at_position(call_addr, pos),
-        call_has_known_signature(call_addr, name, sig_arg_count, _),
-        !known_varargs_function(name, _),
+        call_has_arg_evidence(call_addr, pos),
+        call_resolved_signature(call_addr, _, sig_arg_count, _, _, false),
         !abi_shared_arg_slots(true),
         if pos < sig_arg_count;
 
     call_arg_position_allowed(call_addr, pos) <--
-        call_has_arg_at_position(call_addr, pos),
-        call_has_known_signature(call_addr, name, _, _),
-        !known_varargs_function(name, _),
-        known_extern_signature(name, _, _, arg_types),
+        call_has_arg_evidence(call_addr, pos),
+        call_resolved_signature(call_addr, _, _, _, arg_types, false),
         abi_shared_arg_slots(true),
         abi_first_stack_arg_position(first_stack),
         if *pos < arg_types.len(),
         if *pos >= *first_stack || !matches!(arg_types[*pos], XType::Xfloat | XType::Xsingle);
 
-    call_arg_mapping(*call_addr, pos, rtl_reg) <--
+    call_arg_provenance(*call_addr, pos, rtl_reg, CallArgProvenance::ExplicitRegister) <--
         call_arg_setup_detected(defaddr, dst_reg, call_addr),
+        arg_setup_candidate_anchor(defaddr, dst_reg, call_addr),
         is_def(defaddr, def_id),
         reg_xtl(defaddr, dst_reg, def_id),
         xtl_canonical(def_id, rtl_reg),
@@ -6521,8 +6863,29 @@ ascent_par! {
         call_arg_position_allowed(call_addr, pos),
         instr_in_function(defaddr, _func_start);
 
-    call_arg_mapping(*call_addr, pos, rtl_reg) <--
+    call_arg_provenance(*call_addr, pos, rtl_reg, CallArgProvenance::CorroboratedRegister) <--
+        call_arg_setup_detected(defaddr, dst_reg, call_addr),
+        arg_setup_candidate_real(defaddr, dst_reg, call_addr),
+        !arg_setup_candidate_anchor(defaddr, *dst_reg, *call_addr),
+        is_def(defaddr, def_id),
+        reg_xtl(defaddr, dst_reg, def_id),
+        xtl_canonical(def_id, rtl_reg),
+        abi_int_arg_position(dst_reg, pos),
+        call_arg_position_allowed(call_addr, pos),
+        instr_in_function(defaddr, _func_start);
+
+    call_arg_provenance(*call_addr, pos, rtl_reg, CallArgProvenance::ForwardedEntry) <--
+        call_arg_setup_detected(defaddr, dst_reg, call_addr),
+        forwarded_param_candidate(defaddr, dst_reg, call_addr),
+        reg_xtl(defaddr, dst_reg, incoming),
+        xtl_canonical(incoming, rtl_reg),
+        abi_int_arg_position(dst_reg, pos),
+        call_arg_position_allowed(call_addr, pos),
+        instr_in_function(defaddr, _func_start);
+
+    call_arg_provenance(*call_addr, pos, rtl_reg, CallArgProvenance::ExplicitRegister) <--
         tailcall_arg_setup_detected(defaddr, dst_reg, call_addr),
+        arg_setup_candidate_anchor(defaddr, dst_reg, call_addr),
         is_def(defaddr, def_id),
         reg_xtl(defaddr, dst_reg, def_id),
         xtl_canonical(def_id, rtl_reg),
@@ -6530,119 +6893,312 @@ ascent_par! {
         call_arg_position_allowed(call_addr, pos),
         instr_in_function(defaddr, _func_start);
 
-    // If a higher explicit setup proves the call's arity, every lower ABI
-    // position exists.  Bind a lower register that still holds this function's
-    // incoming parameter directly to that parameter instead of letting the
-    // positional aggregator synthesize an uninitialized placeholder.  This is
-    // the common VS2013 tail-wrapper shape `f(p0, 0)` where only RDX is written
-    // immediately before the COFF import jump.
-    call_arg_mapping(*call_addr, pos, canonical) <--
-        call_has_arg_at_position(call_addr, pos),
+    call_arg_provenance(*call_addr, pos, rtl_reg, CallArgProvenance::CorroboratedRegister) <--
+        tailcall_arg_setup_detected(defaddr, dst_reg, call_addr),
+        arg_setup_candidate_real(defaddr, dst_reg, call_addr),
+        !arg_setup_candidate_anchor(defaddr, *dst_reg, *call_addr),
+        is_def(defaddr, def_id),
+        reg_xtl(defaddr, dst_reg, def_id),
+        xtl_canonical(def_id, rtl_reg),
+        abi_int_arg_position(dst_reg, pos),
         call_arg_position_allowed(call_addr, pos),
-        abi_int_arg_position(mreg, pos),
-        instr_in_function(call_addr, func_start),
-        arg_reg_param_live_at(func_start, call_addr, mreg),
-        reg_xtl(func_start, mreg, incoming),
-        xtl_canonical(incoming, canonical);
+        instr_in_function(defaddr, _func_start);
+
+    call_arg_provenance(*call_addr, pos, rtl_reg, CallArgProvenance::ForwardedEntry) <--
+        tailcall_arg_setup_detected(defaddr, dst_reg, call_addr),
+        forwarded_param_candidate(defaddr, dst_reg, call_addr),
+        reg_xtl(defaddr, dst_reg, incoming),
+        xtl_canonical(incoming, rtl_reg),
+        abi_int_arg_position(dst_reg, pos),
+        call_arg_position_allowed(call_addr, pos),
+        instr_in_function(defaddr, _func_start);
+
+    call_arg_mapping(call_addr, pos, reg) <--
+        call_arg_provenance(call_addr, pos, reg, _);
+
+    // A shared thunk/PLT node may be attributed to more than one function.
+    // Stack ownership must be singular before an entry-SP coordinate is used;
+    // selecting an arbitrary owner would turn a caller local into an argument.
+    #[local] relation ambiguous_instr_owner(Node);
+    ambiguous_instr_owner(node) <--
+        instr_in_function(node, first),
+        instr_in_function(node, second),
+        if first != second;
+
+    #[local] relation unique_instr_owner(Node, Address);
+    unique_instr_owner(node, func) <--
+        instr_in_function(node, func),
+        !ambiguous_instr_owner(node);
 
     // R3: outgoing STACK arguments anchored in the ENTRY frame so they reconcile against the call's RSP; an approximation that may under-recover an arg stored in an earlier block but never fabricates one for a local.
-    #[local] relation og_arg_store(Address, i64, RTLReg, Address);
-    og_arg_store(*st_addr, abs_slot, *src_rtl, *func) <--
-        ltl_inst(st_addr, ?LTLInst::Lstore(_, Addressing::Aindexed(ofs), args, src)),
+    #[local] relation og_arg_store(Address, i64, i64, RTLReg, Address);
+    og_arg_store(*st_addr, abs_slot, width, *src_rtl, *func) <--
+        ltl_inst(st_addr, ?LTLInst::Lstore(chunk, Addressing::Aindexed(ofs), args, src)),
         !win64_home_spill_candidate(st_addr, _, _, _),
         if args.len() == 1 && args[0] == Mreg::SP,
         if *ofs >= 0,
-        instr_in_function(st_addr, func),
+        unique_instr_owner(st_addr, func),
         direct_stack_operand(st_addr, Mreg::SP, ofs, _),
         !stack_var(func, st_addr, *ofs, _),
         sp_entry_ofs(func, st_addr, sp_st),
         let abs_slot = *ofs + sp_st.0,
-        reg_rtl(st_addr, *src, src_rtl);
+        let width = chunk_size_bits(chunk) as i64 / 8,
+        reg_rtl(st_addr, *src, src_raw),
+        xtl_canonical(src_raw, src_rtl);
 
-    // Simple [rsp+disp] = reg stores lift through Lsetstack, so recover their entry-anchored slot; these shapes are WEAK and need callee-body corroboration, while the Lstore and PUSH shapes stay strong.
-    #[local] relation og_arg_store_weak(Address, i64, RTLReg);
+    // Simple [rsp+disp] = reg stores lift through Lsetstack.  They remain
+    // tagged so competing lowerings at one slot can be rejected as a unit.
+    #[local] relation og_arg_store_weak(Address, i64, i64, RTLReg);
 
-    og_arg_store(*st_addr, abs_slot, *src_rtl, *func),
-    og_arg_store_weak(*st_addr, abs_slot, *src_rtl) <--
-        ltl_inst(st_addr, ?LTLInst::Lsetstack(src, _, ofs, _)),
+    og_arg_store(*st_addr, abs_slot, width, *src_rtl, *func),
+    og_arg_store_weak(*st_addr, abs_slot, width, *src_rtl) <--
+        ltl_inst(st_addr, ?LTLInst::Lsetstack(src, _, ofs, typ)),
         !win64_home_spill_candidate(st_addr, _, _, _),
         pmov(st_addr, dst_sym, _),
         op_indirect(dst_sym, _, base_str, idx_str, _, disp, _),
         if *base_str == "RSP",
         if *idx_str == "NONE" || idx_str.is_empty(),
         if *disp == *ofs,
-        instr_in_function(st_addr, func),
+        unique_instr_owner(st_addr, func),
         sp_entry_ofs(func, st_addr, sp_st),
         let abs_slot = *disp + sp_st.0,
-        reg_rtl(st_addr, *src, src_rtl);
+        let width = chunk_size_bits(&typ_to_chunk(*typ)) as i64 / 8,
+        reg_rtl(st_addr, *src, src_raw),
+        xtl_canonical(src_raw, src_rtl);
 
     // Immediate stack stores have no LTL instruction, and mach_imm_stack_init's slot omits absorbed callee-save pushes, so re-anchor the raw displacement with this pass's CFG-derived SP state.
-    og_arg_store(*st_addr, abs_slot, *src_rtl, *func),
-    og_arg_store_weak(*st_addr, abs_slot, *src_rtl) <--
-        mach_imm_stack_init(st_addr, stack_ofs, _, _),
+    og_arg_store(*st_addr, abs_slot, width, *src_rtl, *func),
+    og_arg_store_weak(*st_addr, abs_slot, width, *src_rtl) <--
+        mach_imm_stack_init(st_addr, stack_ofs, _, typ),
         pmov(st_addr, dst_sym, _),
         op_indirect(dst_sym, _, base_str, idx_str, _, disp, _),
         if *base_str == "RSP",
         if *idx_str == "NONE" || idx_str.is_empty(),
-        instr_in_function(st_addr, func),
+        unique_instr_owner(st_addr, func),
         sp_entry_ofs(func, st_addr, sp_st),
         let abs_slot = *disp + sp_st.0,
+        let width = chunk_size_bits(&typ_to_chunk(*typ)) as i64 / 8,
         stack_var(func, st_addr, stack_ofs, src_rtl);
 
-    // The store to abs_slot reaches addr within the block with no intervening re-store, the same kill-on-redef chain as block_last_def; the trailing flag carries weak/strong provenance.
-    #[local] relation og_store_reaches(Address, i64, RTLReg, bool);
-    og_store_reaches(*next_addr, *abs_slot, *src_rtl, true) <--
-        og_arg_store_weak(st_addr, abs_slot, src_rtl),
-        next(st_addr, next_addr),
-        code_in_block(st_addr, blk),
-        code_in_block(next_addr, blk);
-    og_store_reaches(*next_addr, *abs_slot, *src_rtl, false) <--
-        og_arg_store(st_addr, abs_slot, src_rtl, _),
-        !og_arg_store_weak(st_addr, *abs_slot, *src_rtl),
-        next(st_addr, next_addr),
-        code_in_block(st_addr, blk),
-        code_in_block(next_addr, blk);
-    og_store_reaches(*next_addr, *abs_slot, *src_rtl, *weak) <--
-        og_store_reaches(curr_addr, abs_slot, src_rtl, weak),
-        !og_arg_store(curr_addr, *abs_slot, _, _),
-        next(curr_addr, next_addr),
-        code_in_block(curr_addr, blk),
-        code_in_block(next_addr, blk);
+    // Decoder-owned memory effects are the kill authority for an outgoing
+    // stack value.  LTL classifies only the stores it can lower; an otherwise
+    // unsupported RMW or memory-writing instruction must still kill an older
+    // accepted argument store.  Keep the operand key until completeness is
+    // proved so one known operand cannot hide another unknown write.
+    // Start from the decoder's complete write set, not the subset that happened
+    // to receive an LTL stack lowering.  A write through an arbitrary pointer
+    // can alias an outgoing slot unless its address is proved otherwise; in the
+    // absence of such a proof it is deliberately classified as unknown below.
+    #[local] relation og_potential_stack_write_operand(Node, Address, Symbol);
+    og_potential_stack_write_operand(*addr, *func, *operand) <--
+        decoded_memory_write_operand(addr, operand),
+        unique_instr_owner(addr, func);
 
-    // At a call, map the structurally reaching store using the ABI's first stack position, shadow-space base, and slot width, emitting ungated position fill and an arity-gated value mapping.
+    #[local] relation og_decoded_stack_write_operand_range(
+        Node,
+        Address,
+        Symbol,
+        i64,
+        i64,
+    );
+    og_decoded_stack_write_operand_range(
+        *addr,
+        *func,
+        *operand,
+        range_start,
+        width,
+    ) <--
+        og_potential_stack_write_operand(addr, func, operand),
+        op_indirect(operand, _, base_str, idx_str, _, disp, mem_size),
+        if *idx_str == "NONE" || idx_str.is_empty(),
+        if *mem_size > 0,
+        if is_valid_stack_operand_base_name(base_str),
+        let base = Mreg::x86(*base_str),
+        sp_based_mem_at(addr, func, proven_base, base_ofs),
+        if *proven_base == base,
+        let range_start = *base_ofs + *disp,
+        let width = *mem_size as i64;
+
+    #[local] relation og_complete_stack_write_operand(Node, Address, Symbol);
+    og_complete_stack_write_operand(addr, func, operand) <--
+        og_decoded_stack_write_operand_range(addr, func, operand, _, _);
+    #[local] relation og_unknown_stack_write(Node, Address);
+    og_unknown_stack_write(addr, func) <--
+        og_potential_stack_write_operand(addr, func, operand),
+        !og_complete_stack_write_operand(addr, *func, *operand);
+
+    // Every outgoing write must travel to the call through one uniquely owned
+    // sequential chain.  Restricting the proof to a single basic block makes
+    // it a must-reaching fact: no unexamined predecessor or branch can bypass
+    // one member of a multi-push/store setup.
+    #[local] relation ambiguous_og_next_source(Node);
+    ambiguous_og_next_source(node) <--
+        next(node, first),
+        next(node, second),
+        if first != second;
+    #[local] relation ambiguous_og_next_target(Node);
+    ambiguous_og_next_target(node) <--
+        next(first, node),
+        next(second, node),
+        if first != second;
+    #[local] relation ambiguous_og_block(Node);
+    ambiguous_og_block(node) <--
+        code_in_block(node, first),
+        code_in_block(node, second),
+        if first != second;
+    #[local] relation og_linear_next(Node, Node, Address);
+    og_linear_next(curr, next_addr, func) <--
+        next(curr, next_addr),
+        !is_call_instruction(curr),
+        !ambiguous_og_next_source(curr),
+        !ambiguous_og_next_target(next_addr),
+        !ambiguous_og_block(curr),
+        !ambiguous_og_block(next_addr),
+        code_in_block(curr, blk),
+        code_in_block(next_addr, blk),
+        unique_instr_owner(curr, func),
+        unique_instr_owner(next_addr, func);
+
+    #[local] relation og_linear_reaches(Node, Node, Address);
+    og_linear_reaches(first, second, func) <--
+        og_linear_next(first, second, func);
+    og_linear_reaches(first, third, func) <--
+        og_linear_reaches(first, second, func),
+        og_linear_next(second, third, func);
+
+    // Even if a later overlapping write would kill the earlier value, the
+    // pair is not a uniquely owned sequence of ABI slots.  Veto the complete
+    // outgoing-stack cohort at that call instead of interpreting a partial
+    // overwrite as one or two arguments.
+    #[local] relation og_setup_overlap_veto(Node, Address);
+    og_setup_overlap_veto(call_addr, func) <--
+        og_arg_store(first_addr, first_start, first_width, _, func),
+        og_arg_store(second_addr, second_start, second_width, _, func),
+        if first_addr != second_addr,
+        if stack_write_intervals_overlap(
+            *first_start,
+            *first_width,
+            *second_start,
+            *second_width,
+        ),
+        og_linear_reaches(first_addr, second_addr, func),
+        og_linear_reaches(second_addr, call_addr, func);
+    og_setup_overlap_veto(call_addr, func) <--
+        og_arg_store(store_addr, tracked_start, tracked_width, _, func),
+        og_decoded_stack_write_operand_range(
+            write_addr,
+            func,
+            _,
+            write_start,
+            write_width,
+        ),
+        if store_addr != write_addr,
+        if stack_write_intervals_overlap(
+            *tracked_start,
+            *tracked_width,
+            *write_start,
+            *write_width,
+        ),
+        og_linear_reaches(store_addr, write_addr, func),
+        og_linear_reaches(write_addr, call_addr, func);
+    og_setup_overlap_veto(call_addr, func) <--
+        og_arg_store(store_addr, _, _, _, func),
+        og_unknown_stack_write(write_addr, func),
+        if store_addr != write_addr,
+        og_linear_reaches(store_addr, write_addr, func),
+        og_linear_reaches(write_addr, call_addr, func);
+
+    #[local] relation og_tracked_interval(i64, i64, Address);
+    og_tracked_interval(start, width, func) <--
+        og_arg_store(_, start, width, _, func);
+    #[local] relation og_store_overwrites(Node, i64, i64, Address);
+    og_store_overwrites(node, tracked_start, tracked_width, func) <--
+        og_tracked_interval(tracked_start, tracked_width, func),
+        og_arg_store(node, other_start, other_width, _, func),
+        if stack_write_intervals_overlap(
+            *tracked_start,
+            *tracked_width,
+            *other_start,
+            *other_width,
+        );
+    og_store_overwrites(node, tracked_start, tracked_width, func) <--
+        og_tracked_interval(tracked_start, tracked_width, func),
+        og_decoded_stack_write_operand_range(
+            node,
+            func,
+            _,
+            other_start,
+            other_width,
+        ),
+        if stack_write_intervals_overlap(
+            *tracked_start,
+            *tracked_width,
+            *other_start,
+            *other_width,
+        );
+    og_store_overwrites(node, tracked_start, tracked_width, func) <--
+        og_tracked_interval(tracked_start, tracked_width, func),
+        og_unknown_stack_write(node, func);
+
+    #[local] relation og_store_reaches(Address, i64, i64, RTLReg, bool, Address);
+    og_store_reaches(*next_addr, *abs_slot, *width, *src_rtl, true, *func) <--
+        og_arg_store(st_addr, abs_slot, width, src_rtl, func),
+        og_arg_store_weak(st_addr, abs_slot, width, src_rtl),
+        og_linear_next(st_addr, next_addr, func);
+    og_store_reaches(*next_addr, *abs_slot, *width, *src_rtl, false, *func) <--
+        og_arg_store(st_addr, abs_slot, width, src_rtl, func),
+        !og_arg_store_weak(st_addr, *abs_slot, *width, *src_rtl),
+        og_linear_next(st_addr, next_addr, func);
+    og_store_reaches(*next_addr, *abs_slot, *width, *src_rtl, *weak, *func) <--
+        og_store_reaches(curr_addr, abs_slot, width, src_rtl, weak, func),
+        !og_store_overwrites(curr_addr, *abs_slot, *width, *func),
+        og_linear_next(curr_addr, next_addr, func);
+
+    // A slot with more than one reaching value has no uniquely owned semantic
+    // argument.  This also makes the result independent of relation order.
+    #[local] relation og_store_reach_conflict(Node, i64, i64, Address);
+    og_store_reach_conflict(call_addr, abs_slot, width, func) <--
+        og_store_reaches(call_addr, abs_slot, width, first, _, func),
+        og_store_reaches(call_addr, abs_slot, width, second, _, func),
+        if first != second;
+
+    #[local] relation og_store_reach_overlap(Node, i64, i64, Address);
+    og_store_reach_overlap(call_addr, first_start, first_width, func) <--
+        og_store_reaches(call_addr, first_start, first_width, first_value, _, func),
+        og_store_reaches(call_addr, second_start, second_width, second_value, _, func),
+        if (*first_start, *first_width, *first_value)
+            != (*second_start, *second_width, *second_value),
+        if stack_write_intervals_overlap(
+            *first_start,
+            *first_width,
+            *second_start,
+            *second_width,
+        );
+
+    // At a call, map a uniquely reaching entry-SP-normalized store using the
+    // ABI shadow-space base and slot width.  Strong and lifted Lsetstack forms
+    // are equally admissible once ownership, coordinate, and value are unique.
     #[local] relation call_outgoing_stack_arg(Node, usize, RTLReg);
     call_outgoing_stack_arg(*call_addr, pos, *src_rtl) <--
         is_call_instruction(call_addr),
-        og_store_reaches(call_addr, abs_slot, src_rtl, ?false),
-        instr_in_function(call_addr, func),
+        unique_instr_owner(call_addr, func),
+        !og_setup_overlap_veto(call_addr, *func),
+        og_store_reaches(call_addr, abs_slot, width, src_rtl, _, func),
+        !og_store_reach_conflict(call_addr, *abs_slot, *width, *func),
+        !og_store_reach_overlap(call_addr, *abs_slot, *width, *func),
         sp_entry_ofs(func, call_addr, sp_call),
         let k = *abs_slot - sp_call.0,
         abi_outgoing_stack_base(stack_base),
         abi_first_stack_arg_position(first_pos),
         abi_stack_slot_size(slot_size),
+        if *width > 0 && *width <= *slot_size,
         if k >= *stack_base && (k - *stack_base) % *slot_size == 0,
         let pos = *first_pos + ((k - *stack_base) / *slot_size) as usize;
-
-    // A weak store materializes an argument only where the callee's body proves it reads a stack parameter at that ordinal; with no callee body the slot stays a local, the conservative reading.
-    call_outgoing_stack_arg(*call_addr, pos, *src_rtl) <--
-        is_call_instruction(call_addr),
-        og_store_reaches(call_addr, abs_slot, src_rtl, ?true),
-        instr_in_function(call_addr, func),
-        sp_entry_ofs(func, call_addr, sp_call),
-        let k = *abs_slot - sp_call.0,
-        abi_outgoing_stack_base(stack_base),
-        abi_first_stack_arg_position(first_pos),
-        abi_stack_slot_size(slot_size),
-        if k >= *stack_base && (k - *stack_base) % *slot_size == 0,
-        let pos = *first_pos + ((k - *stack_base) / *slot_size) as usize,
-        call_target_func(call_addr, callee),
-        emit_function_stack_param_count(callee, stack_params),
-        if pos < *first_pos + *stack_params;
 
     call_has_arg_evidence(call_addr, pos) <--
         call_outgoing_stack_arg(call_addr, pos, _);
 
-    call_arg_mapping(*call_addr, *pos, *src_rtl) <--
+    call_arg_provenance(*call_addr, *pos, *src_rtl, CallArgProvenance::EntrySpStore) <--
         call_outgoing_stack_arg(call_addr, pos, src_rtl),
         call_arg_position_allowed(call_addr, pos);
 
@@ -6663,51 +7219,121 @@ ascent_par! {
     push_arg_def(*push_addr, *mreg, *def_addr) <--
         push_arg_reg(push_addr, mreg),
         !block_last_def(push_addr, _, mreg),
-        instr_in_function(push_addr, func),
+        unique_instr_owner(push_addr, func),
         code_in_block(push_addr, blk),
         reaching_def_in(func, blk, mreg, defs),
         for def_addr in defs.iter();
 
-    og_arg_store(*push_addr, abs_slot, *src_rtl, *func) <--
+    og_arg_store(*push_addr, abs_slot, *slot_size, *src_rtl, *func) <--
         push_arg_def(push_addr, mreg, def_addr),
         asm_effective_def(def_addr, *mreg),
-        reg_rtl(def_addr, *mreg, src_rtl),
-        instr_in_function(push_addr, func),
+        reg_rtl(def_addr, *mreg, src_raw),
+        xtl_canonical(src_raw, src_rtl),
+        unique_instr_owner(push_addr, func),
         sp_entry_ofs(func, push_addr, sp_push),
         abi_stack_slot_size(slot_size),
         let abs_slot = sp_push.0 - *slot_size;
 
-    // R3c: an outgoing stack arg marshaled as push $imm, synthesized as a fresh const reg spliced onto every CFG edge into the call so the constant dominates it.
+    // R3c: an outgoing stack arg marshaled as push $imm, synthesized as a
+    // fresh constant register on one ordered chain before the call.
     #[local] relation push_arg_imm(Address, i64);
     push_arg_imm(*addr, *imm) <--
         instruction(addr, _, _, "PUSH", operand, _, _, _, _, _),
         op_immediate(operand, imm, _);
+
+    #[local] relation ambiguous_push_imm(Address);
+    ambiguous_push_imm(addr) <--
+        push_arg_imm(addr, first),
+        push_arg_imm(addr, second),
+        if first != second;
 
     // The call this immediate push set up an arg for is its own block's terminator; uses a DIRECT Lcall check, since is_call_instruction depends on emit_function and would form an unstratifiable cycle.
     #[local] relation is_direct_call_insn(Node);
     is_direct_call_insn(addr) <-- ltl_inst(addr, ?LTLInst::Lcall(_));
     is_direct_call_insn(addr) <-- ltl_inst(addr, ?LTLInst::Ltailcall(_));
 
+    // Keep immediate-push ordering on immutable asm/LTL inputs.  Reusing the
+    // outgoing-store workspace here would feed the synthetic RTL nodes back
+    // into instr_in_function/ownership, placing the first/last negations in
+    // the same recursive SCC and making the program unstratifiable.
+    #[local] relation imm_push_linear_next(Node, Node, Address);
+    imm_push_linear_next(curr, next_addr, block) <--
+        next(curr, next_addr),
+        !is_direct_call_insn(curr),
+        !ambiguous_og_next_source(curr),
+        !ambiguous_og_next_target(next_addr),
+        !ambiguous_og_block(curr),
+        !ambiguous_og_block(next_addr),
+        code_in_block(curr, block),
+        code_in_block(next_addr, block);
+    #[local] relation imm_push_linear_reaches(Node, Node, Address);
+    imm_push_linear_reaches(first, second, block) <--
+        imm_push_linear_next(first, second, block);
+    imm_push_linear_reaches(first, third, block) <--
+        imm_push_linear_reaches(first, second, block),
+        imm_push_linear_next(second, third, block);
+
     #[local] relation imm_push_call(Address, i64, Node);
     imm_push_call(*push_addr, *imm, *call_addr) <--
         push_arg_imm(push_addr, imm),
-        code_in_block(push_addr, blk),
-        code_in_block(call_addr, blk),
+        !ambiguous_push_imm(push_addr),
+        code_in_block(push_addr, block),
+        code_in_block(call_addr, block),
         is_direct_call_insn(call_addr),
-        if push_addr < call_addr;
+        imm_push_linear_reaches(push_addr, call_addr, block);
 
-    og_arg_store(*push_addr, abs_slot, fresh_reg, *func) <--
+    #[local] relation ambiguous_imm_push_owner(Address);
+    ambiguous_imm_push_owner(addr) <--
+        real_addr_in_func(addr, first),
+        real_addr_in_func(addr, second),
+        if first != second;
+    #[local] relation imm_push_owner(Address, Address);
+    imm_push_owner(addr, func) <--
+        real_addr_in_func(addr, func),
+        !ambiguous_imm_push_owner(addr);
+
+    // Multiple immediate pushes for one call must execute as one synthetic
+    // definition chain.  Splicing every constant independently immediately
+    // before the call would create alternative predecessors, so each path
+    // would define only one of the recovered arguments.  Derive adjacency
+    // from the authenticated instruction chain, never from address order.
+    #[local] relation imm_push_precedes(Address, Address, Node);
+    imm_push_precedes(first, second, call_addr) <--
+        imm_push_call(first, _, call_addr),
+        imm_push_call(second, _, call_addr),
+        code_in_block(first, block),
+        code_in_block(second, block),
+        imm_push_linear_reaches(first, second, block);
+
+    #[local] relation imm_push_has_prior(Address, Node);
+    imm_push_has_prior(second, call_addr) <--
+        imm_push_precedes(_, second, call_addr);
+    #[local] relation imm_push_has_later(Address, Node);
+    imm_push_has_later(first, call_addr) <--
+        imm_push_precedes(first, _, call_addr);
+    #[local] relation imm_push_between(Address, Address, Node);
+    imm_push_between(first, third, call_addr) <--
+        imm_push_precedes(first, second, call_addr),
+        imm_push_precedes(second, third, call_addr);
+    #[local] relation imm_push_next(Address, Address, Node);
+    imm_push_next(first, second, call_addr) <--
+        imm_push_precedes(first, second, call_addr),
+        !imm_push_between(first, second, call_addr);
+
+    og_arg_store(*push_addr, abs_slot, *slot_size, fresh_reg, *func) <--
         imm_push_call(push_addr, _imm, _call),
-        instr_in_function(push_addr, func),
+        imm_push_owner(push_addr, func),
         sp_entry_ofs(func, push_addr, sp_push),
         abi_stack_slot_size(slot_size),
         let abs_slot = sp_push.0 - *slot_size,
         let fresh_reg = fresh_xtl_reg(*push_addr, Mreg::AX);
 
-    // Define the constant at a synthetic node and splice it before the call (dominates it).
+    // Define each constant at a synthetic node.  The edges below order all of
+    // those nodes before the call, so every recovered immediate dominates its
+    // use even for a multi-push setup.
     rtl_inst_candidate(synth, inst), instr_in_function(synth, *func) <--
         imm_push_call(push_addr, imm, _call),
-        instr_in_function(push_addr, func),
+        imm_push_owner(push_addr, func),
         let synth = *push_addr | (1u64 << 62),
         let fresh_reg = fresh_xtl_reg(*push_addr, Mreg::AX),
         let inst = RTLInst::Iop(Operation::Olongconst(*imm), Arc::new(vec![]), fresh_reg);
@@ -6717,23 +7343,35 @@ ascent_par! {
         rtl_next(pred, call_addr);
     rtl_succ_candidate(*pred, synth), instr_in_function(synth, *func) <--
         imm_push_call(push_addr, _imm, call_addr),
+        !imm_push_has_prior(push_addr, *call_addr),
         rtl_next(pred, call_addr),
-        instr_in_function(push_addr, func),
+        imm_push_owner(push_addr, func),
         let synth = *push_addr | (1u64 << 62);
+    rtl_succ_candidate(first_synth, second_synth) <--
+        imm_push_next(first, second, _call_addr),
+        let first_synth = *first | (1u64 << 62),
+        let second_synth = *second | (1u64 << 62);
     rtl_succ_candidate(synth, *call_addr) <--
         imm_push_call(push_addr, _imm, call_addr),
+        !imm_push_has_later(push_addr, *call_addr),
         let synth = *push_addr | (1u64 << 62);
 
 
     relation arg_setup_candidate(Node, Mreg, Node);
     relation call_clobbers_arg_reg(Node, Mreg, Node);
     relation is_call_instruction(Node);
+    #[local] relation indirect_call_target_reg(Node, Mreg);
 
     is_call_instruction(addr) <-- ltl_inst(addr, ?LTLInst::Lcall(_));
     is_call_instruction(addr) <-- ltl_inst(addr, ?LTLInst::Ltailcall(_));
     is_call_instruction(addr) <--
         ltl_inst(addr, ?LTLInst::Lbranch(Either::Right(target))),
         emit_function(_, _, target);
+
+    indirect_call_target_reg(addr, *reg) <--
+        ltl_inst(addr, ?LTLInst::Lcall(Either::Left(reg)));
+    indirect_call_target_reg(addr, *reg) <--
+        ltl_inst(addr, ?LTLInst::Ltailcall(Either::Left(reg)));
 
     lattice call_backward_reach(Node, Node, ascent::Dual<i64>);
 
@@ -6760,34 +7398,113 @@ ascent_par! {
     arg_setup_candidate_real(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lop(_, _, dst_reg)),
         is_arg_reg(dst_reg),
-        def_reaches_call(call_addr, defaddr, dst_reg);
+        def_reaches_call(call_addr, defaddr, dst_reg),
+        !indirect_call_target_reg(*call_addr, *dst_reg);
 
     arg_setup_candidate_real(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lgetstack(_slot, _ofs, _typ, dst_reg)),
         is_arg_reg(dst_reg),
-        def_reaches_call(call_addr, defaddr, dst_reg);
+        def_reaches_call(call_addr, defaddr, dst_reg),
+        !indirect_call_target_reg(*call_addr, *dst_reg);
 
     arg_setup_candidate_real(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lload(_, _, _, dst_reg)),
         is_arg_reg(dst_reg),
-        def_reaches_call(call_addr, defaddr, dst_reg);
+        def_reaches_call(call_addr, defaddr, dst_reg),
+        !indirect_call_target_reg(*call_addr, *dst_reg);
 
-    // c19: veto crediting an arg position a body-analysed callee provably does not take, since every call site of a 0-param callee carries the same leftover regs and cross-site agreement is not evidence.
+    // A reaching ABI-register definition is a concrete call-setup anchor only
+    // in the final setup region of the call's block.  A later write to an
+    // unrelated register is a structural barrier: e.g. `mov rcx,[x]; mov
+    // rbx,[rcx+18]; call zero_arg` leaves RCX live but did not prepare it as an
+    // argument.  ABI/XMM definitions, outgoing stores, and SP epilogues can be
+    // freely interleaved in a real setup region.
+    #[local] relation call_setup_def(Node, Mreg);
+    call_setup_def(addr, *dst) <-- ltl_inst(addr, ?LTLInst::Lop(_, _, dst));
+    call_setup_def(addr, *dst) <-- ltl_inst(addr, ?LTLInst::Lload(_, _, _, dst));
+    call_setup_def(addr, *dst) <-- ltl_inst(addr, ?LTLInst::Lgetstack(_, _, _, dst));
+
+    #[local] relation call_setup_allowed_def(Node);
+    call_setup_allowed_def(addr) <-- call_setup_def(addr, reg), is_arg_reg(reg);
+    call_setup_allowed_def(addr) <-- call_setup_def(addr, reg), is_xmm_arg_reg(reg);
+    call_setup_allowed_def(addr) <-- call_setup_def(addr, Mreg::SP);
+
+    #[local] relation call_setup_barrier(Node);
+    call_setup_barrier(addr) <-- call_setup_def(addr, _), !call_setup_allowed_def(addr);
+    call_setup_barrier(addr) <-- is_call_instruction(addr);
+
+    // Loading a register-indirect callee is part of the call setup even when
+    // that register is not an ABI argument register.  Do not let the target
+    // load invalidate otherwise adjacent argument definitions.
+    #[local] relation indirect_call_target_def(Node, Node);
+    indirect_call_target_def(defaddr, call_addr) <--
+        indirect_call_target_reg(call_addr, target_reg),
+        call_setup_def(defaddr, target_reg),
+        def_reaches_call(call_addr, defaddr, target_reg);
+
+    #[local] relation call_setup_barrier_between(Node, Node);
+    call_setup_barrier_between(defaddr, call_addr) <--
+        call_backward_reach(call_addr, defaddr, def_steps),
+        call_backward_reach(call_addr, barrier, barrier_steps),
+        if barrier_steps.0 > 0 && barrier_steps.0 < def_steps.0,
+        code_in_block(defaddr, block),
+        code_in_block(barrier, block),
+        code_in_block(call_addr, block),
+        call_setup_barrier(barrier),
+        !indirect_call_target_def(barrier, call_addr);
+
+    relation arg_setup_candidate_anchor(Node, Mreg, Node);
+    arg_setup_candidate_anchor(defaddr, mreg, call_addr) <--
+        arg_setup_candidate_real(defaddr, mreg, call_addr),
+        call_backward_reach(call_addr, defaddr, _),
+        code_in_block(defaddr, block),
+        code_in_block(call_addr, block),
+        !call_setup_barrier_between(defaddr, call_addr);
+
+    #[local] relation body_callee_is_variadic(Address);
+    body_callee_is_variadic(callee) <-- func_has_variadic_xmm_prologue(callee);
+    #[local] relation body_has_loader_function_identity(Address);
+    body_has_loader_function_identity(callee) <--
+        loader_symbol_identity(callee, kind, _, _),
+        if matches!(kind, LoaderSymbolKind::Function);
+    body_callee_is_variadic(callee) <--
+        known_loader_variadic(callee, kind, _, _),
+        if matches!(kind, LoaderSymbolKind::Function);
+    body_callee_is_variadic(callee) <--
+        known_loader_signature(callee, kind, _, _, _, _, _, variadic),
+        if matches!(kind, LoaderSymbolKind::Function),
+        if *variadic;
+    // A contradictory exact declaration is not proof of variadicity, but it
+    // must protect the body and all of its calls from fixed-arity reduction.
+    body_callee_is_variadic(callee) <--
+        loader_signature_fact_conflict(callee, kind),
+        if matches!(kind, LoaderSymbolKind::Function);
+    body_callee_is_variadic(callee) <--
+        emit_function(callee, name, _),
+        known_varargs_function(name, _),
+        !body_has_loader_function_identity(callee);
+
+    // c19: veto crediting an arg position a body-analysed fixed callee
+    // provably does not take, since every call site of a 0-param callee carries
+    // the same leftover regs and cross-site agreement is not evidence.
     #[local] relation callee_takes_no_arg_at(Node, Mreg);
     callee_takes_no_arg_at(call_addr, mreg) <--
-        arg_setup_candidate_real(_, mreg, call_addr),
+        is_arg_reg(mreg),
         call_target_func(call_addr, callee),
         func_stacksz(callee, _, _, _),
+        !body_callee_is_variadic(callee),
         !func_param_validated(callee, mreg);
 
     arg_setup_candidate(defaddr, mreg, call_addr) <--
-        arg_setup_candidate_real(defaddr, mreg, call_addr),
+        arg_setup_candidate_anchor(defaddr, mreg, call_addr),
         !callee_takes_no_arg_at(call_addr, mreg);
 
     // Fix 1: an ABI arg register that is a validated parameter and is not redefined before a resolved call still holds the incoming value, so forward it as a call arg.
     relation call_has_resolved_callee(Node);
     call_has_resolved_callee(call_addr) <-- call_target_func(call_addr, _);
     call_has_resolved_callee(call_addr) <-- call_has_known_signature(call_addr, _, _, _);
+    call_has_resolved_callee(call_addr) <-- call_site(call_addr, _);
+    call_has_resolved_callee(call_addr) <-- call_loader_identity(call_addr, _, _, _, _);
 
     // arg_reg_param_live_at gates the forward on MUST-liveness, or every resolved call receives a copy of every register including long-dead ones; fabrication is prevented downstream.
     #[local] relation forwarded_param_candidate(Node, Mreg, Node);
@@ -6796,41 +7513,82 @@ ascent_par! {
         is_call_instruction(call_addr),
         instr_in_function(call_addr, func_start),
         call_has_resolved_callee(call_addr),
+        !indirect_call_target_reg(*call_addr, *mreg),
         arg_reg_param_live_at(func_start, call_addr, mreg);
 
-    // Corroboration gate: a forwarded still-live param materializes only when the callee validates the position or a second call site agrees, preventing arity fabricated from leftover state.
+    // Corroboration gate: a forwarded still-live param materializes only when
+    // the callee validates the position or another site has a concrete setup.
+    // Two forwarded live-ins are the same absence of evidence and cannot
+    // corroborate one another.
+    // Corroboration may promote only a genuine forwarded entry value.  A real
+    // definition that failed the final-setup/barrier proof stays rejected;
+    // otherwise a different anchor at the same site could re-admit stale RCX,
+    // RDX, or their XMM analogues merely by sharing a call.
+    #[local] relation register_arg_candidate(Node, Mreg);
+    register_arg_candidate(call_addr, mreg) <--
+        forwarded_param_candidate(_, mreg, call_addr);
+
     #[local] relation forwarding_corroborated(Node, Mreg);
 
-    // Callee-side, internal: the callee's own body validates the register as one of its params.
+    // Callee-side, internal.  SysV has independent compact GP positions, so
+    // its validated register is sufficient.  Win64 shares source-language
+    // ordinals across GP/XMM: require positive GP evidence at this exact slot,
+    // not the lower-slot GP fallback synthesized from a higher parameter.
     forwarding_corroborated(call_addr, mreg) <--
-        forwarded_param_candidate(_, mreg, call_addr),
+        register_arg_candidate(call_addr, mreg),
+        !abi_shared_arg_slots(true),
         call_target_func(call_addr, callee),
         func_param_validated(callee, mreg);
+    forwarding_corroborated(call_addr, mreg) <--
+        register_arg_candidate(call_addr, mreg),
+        abi_shared_arg_slots(true),
+        abi_int_arg_position(mreg, pos),
+        call_target_func(call_addr, callee),
+        func_gp_param_evidence(callee, pos);
 
     // Callee-side known signature: the GP-class param count covers the GP position, since pure-float params occupy XMM and must not corroborate a forwarded GP register.
     forwarding_corroborated(call_addr, mreg) <--
-        forwarded_param_candidate(_, mreg, call_addr),
+        register_arg_candidate(call_addr, mreg),
         call_known_sig_gp_position(call_addr, pos),
         abi_int_arg_position(mreg, pos);
 
-    // Cross-site agreement: another distinct call site of the same callee also carries this position.
+    // Same-site prefix shape is deliberately not corroboration.  In Win64 a
+    // source-language slot has one exact register class (RCX/RDX/R8/R9 or
+    // XMM0..3), and neither a higher slot nor a stack write proves the lower
+    // slot or its class.  SysV likewise needs independent evidence for every
+    // compact GP/XMM position.  Exact callee facts and exact-register
+    // cross-site anchors below remain valid corroborators.
+
+    // Cross-site agreement requires an explicit caller-side definition at the
+    // other site.  Forwarded-only sites are intentionally absent here.
     #[local] relation callee_arg_reg_site(Address, Mreg, Node);
     callee_arg_reg_site(callee, mreg, call_addr) <--
         call_target_func(call_addr, callee),
-        arg_setup_candidate_real(_, mreg, call_addr);
-    callee_arg_reg_site(callee, mreg, call_addr) <--
-        call_target_func(call_addr, callee),
-        forwarded_param_candidate(_, mreg, call_addr);
+        arg_setup_candidate_anchor(_, mreg, call_addr);
 
     forwarding_corroborated(call_addr, mreg) <--
-        forwarded_param_candidate(_, mreg, call_addr),
+        register_arg_candidate(call_addr, mreg),
         call_target_func(call_addr, callee),
         callee_arg_reg_site(callee, mreg, other_site),
         if *other_site != *call_addr;
 
+    // External/shared corroboration uses the exact loader object.  Provider
+    // names are display data and may collide across address, kind, or loader
+    // spelling.
+    #[local] relation callee_loader_arg_reg_site(Address, LoaderSymbolKind, Mreg, Node);
+    callee_loader_arg_reg_site(address, kind, mreg, call_addr) <--
+        call_loader_identity(call_addr, address, kind, _, _),
+        arg_setup_candidate_anchor(_, mreg, call_addr);
+    forwarding_corroborated(call_addr, mreg) <--
+        register_arg_candidate(call_addr, mreg),
+        call_loader_identity(call_addr, address, kind, _, _),
+        callee_loader_arg_reg_site(address, kind, mreg, other_site),
+        if *other_site != *call_addr;
+
     arg_setup_candidate(func_start, mreg, call_addr) <--
         forwarded_param_candidate(func_start, mreg, call_addr),
-        forwarding_corroborated(call_addr, mreg);
+        forwarding_corroborated(call_addr, mreg),
+        !callee_takes_no_arg_at(call_addr, mreg);
 
     // Float analog of the pass-through forward: an incoming XMM param still live at a resolved call is forwarded as that call's float argument, under the same corroboration discipline as the integer forward.
     #[local] relation float_forwarded_param_candidate(Node, Mreg, Node);
@@ -6839,26 +7597,27 @@ ascent_par! {
         is_call_instruction(call_addr),
         instr_in_function(call_addr, func_start),
         call_has_resolved_callee(call_addr),
+        !indirect_call_target_reg(*call_addr, *mreg),
         arg_reg_param_live_at(func_start, call_addr, mreg);
+
+    #[local] relation float_register_arg_candidate(Node, Mreg);
+    float_register_arg_candidate(call_addr, mreg) <--
+        float_forwarded_param_candidate(_, mreg, call_addr);
 
     #[local] relation float_forwarding_corroborated(Node, Mreg);
     float_forwarding_corroborated(call_addr, mreg) <--
-        float_forwarded_param_candidate(_, mreg, call_addr),
+        float_register_arg_candidate(call_addr, mreg),
         call_target_func(call_addr, callee),
         func_float_param_validated(callee, mreg, _);
     float_forwarding_corroborated(call_addr, mreg) <--
-        float_forwarded_param_candidate(_, mreg, call_addr),
-        call_has_known_signature(call_addr, name, _, _),
-        !known_varargs_function(name, _),
-        known_extern_signature(name, _, _, arg_types),
+        float_register_arg_candidate(call_addr, mreg),
+        call_resolved_signature(call_addr, _, _, _, arg_types, false),
         abi_float_arg_position(mreg, pos),
         !abi_shared_arg_slots(true),
         if arg_types.iter().filter(|t| matches!(t, XType::Xfloat | XType::Xsingle)).count() > *pos;
     float_forwarding_corroborated(call_addr, mreg) <--
-        float_forwarded_param_candidate(_, mreg, call_addr),
-        call_has_known_signature(call_addr, name, _, _),
-        !known_varargs_function(name, _),
-        known_extern_signature(name, _, _, arg_types),
+        float_register_arg_candidate(call_addr, mreg),
+        call_resolved_signature(call_addr, _, _, _, arg_types, false),
         abi_float_arg_position(mreg, pos),
         abi_shared_arg_slots(true),
         if *pos < arg_types.len(),
@@ -6866,19 +7625,54 @@ ascent_par! {
     #[local] relation callee_float_arg_reg_site(Address, Mreg, Node);
     callee_float_arg_reg_site(callee, mreg, call_addr) <--
         call_target_func(call_addr, callee),
-        float_arg_setup_candidate(_, mreg, call_addr);
-    callee_float_arg_reg_site(callee, mreg, call_addr) <--
-        call_target_func(call_addr, callee),
-        float_forwarded_param_candidate(_, mreg, call_addr);
+        float_arg_setup_candidate_anchor(_, mreg, call_addr);
     float_forwarding_corroborated(call_addr, mreg) <--
-        float_forwarded_param_candidate(_, mreg, call_addr),
+        float_register_arg_candidate(call_addr, mreg),
         call_target_func(call_addr, callee),
         callee_float_arg_reg_site(callee, mreg, other_site),
         if *other_site != *call_addr;
+    #[local] relation callee_loader_float_arg_reg_site(Address, LoaderSymbolKind, Mreg, Node);
+    callee_loader_float_arg_reg_site(address, kind, mreg, call_addr) <--
+        call_loader_identity(call_addr, address, kind, _, _),
+        float_arg_setup_candidate_anchor(_, mreg, call_addr);
+    float_forwarding_corroborated(call_addr, mreg) <--
+        float_register_arg_candidate(call_addr, mreg),
+        call_loader_identity(call_addr, address, kind, _, _),
+        callee_loader_float_arg_reg_site(address, kind, mreg, other_site),
+        if *other_site != *call_addr;
+
+    #[local] relation callee_takes_no_float_arg_at(Node, Mreg);
+    callee_takes_no_float_arg_at(call_addr, mreg) <--
+        abi_shared_arg_slots(true),
+        is_xmm_arg_reg(mreg),
+        abi_float_arg_position(mreg, pos),
+        call_target_func(call_addr, callee),
+        func_stacksz(callee, _, _, _),
+        !body_callee_is_variadic(callee),
+        !func_has_param_at_position(callee, pos);
+    callee_takes_no_float_arg_at(call_addr, mreg) <--
+        !abi_shared_arg_slots(true),
+        is_xmm_arg_reg(mreg),
+        call_target_func(call_addr, callee),
+        func_stacksz(callee, _, _, _),
+        !body_callee_is_variadic(callee),
+        !func_float_param_validated(callee, mreg, _);
 
     float_arg_setup_candidate(func_start, mreg, call_addr) <--
         float_forwarded_param_candidate(func_start, mreg, call_addr),
-        float_forwarding_corroborated(call_addr, mreg);
+        float_forwarding_corroborated(call_addr, mreg),
+        !callee_takes_no_float_arg_at(call_addr, mreg);
+
+    // Preserve the distinction between a genuine empty/short site and every
+    // still-live entry register that failed its own corroboration check.  One
+    // valid forwarded position must not hide a stale higher position.
+    relation call_forwarding_unresolved(Node);
+    call_forwarding_unresolved(call_addr) <--
+        forwarded_param_candidate(_, mreg, call_addr),
+        !forwarding_corroborated(call_addr, mreg);
+    call_forwarding_unresolved(call_addr) <--
+        float_forwarded_param_candidate(_, mreg, call_addr),
+        !float_forwarding_corroborated(call_addr, mreg);
 
     // The old order-based between-call clobber suppression is removed: arg_setup_candidate now comes from def_reaches_call, which already excludes any def clobbered before the call.
 
@@ -6943,7 +7737,9 @@ ascent_par! {
         emit_function(_, _, target),
         !call_clobbers_arg_reg(defaddr, mreg, call_addr);
 
-    // Call arg positions use max-evidence approach instead of requiring consecutive regs
+    // Every position is direct evidence.  A high ABI register does not imply
+    // the missing prefix; only the dense-vector collector may form a semantic
+    // argument list, and it fails closed on a hole.
     relation call_has_arg_evidence(Node, usize);
 
     call_has_arg_evidence(call_addr, pos) <--
@@ -6953,39 +7749,39 @@ ascent_par! {
         tailcall_arg_setup_detected(_, mreg, call_addr),
         abi_int_arg_position(mreg, pos);
 
-    relation call_max_arg_position(Node, usize);
-
-    call_max_arg_position(call_addr, max_pos) <--
-        call_has_arg_evidence(call_addr, _),
-        agg max_pos = ascent::aggregators::max(pos) in call_has_arg_evidence(call_addr, pos);
-
-    relation call_has_arg_at_position(Node, usize);
-
-    // ABI position-fill: arguments occupy contiguous ordinal slots including stack positions, with the positive recursion downstream of the aggregate.
-    call_has_arg_at_position(call_addr, *max_pos) <--
-        call_max_arg_position(call_addr, max_pos);
-    call_has_arg_at_position(call_addr, p_lower) <--
-        call_has_arg_at_position(call_addr, p),
-        if *p >= 1,
-        let p_lower = *p - 1;
-
     // Float arg setup detection at call sites (XMM0-XMM7, independent from integer args)
     relation float_arg_setup_candidate(Node, Mreg, Node);
+    relation float_arg_setup_candidate_real(Node, Mreg, Node);
 
-    float_arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
+    float_arg_setup_candidate_real(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lop(_, _, dst_reg)),
         is_xmm_arg_reg(dst_reg),
-        def_reaches_call(call_addr, defaddr, dst_reg);
+        def_reaches_call(call_addr, defaddr, dst_reg),
+        !indirect_call_target_reg(*call_addr, *dst_reg);
 
-    float_arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
+    float_arg_setup_candidate_real(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lgetstack(_slot, _ofs, _typ, dst_reg)),
         is_xmm_arg_reg(dst_reg),
-        def_reaches_call(call_addr, defaddr, dst_reg);
+        def_reaches_call(call_addr, defaddr, dst_reg),
+        !indirect_call_target_reg(*call_addr, *dst_reg);
 
-    float_arg_setup_candidate(*defaddr, *dst_reg, *call_addr) <--
+    float_arg_setup_candidate_real(*defaddr, *dst_reg, *call_addr) <--
         ltl_inst(defaddr, ?LTLInst::Lload(_, _, _, dst_reg)),
         is_xmm_arg_reg(dst_reg),
-        def_reaches_call(call_addr, defaddr, dst_reg);
+        def_reaches_call(call_addr, defaddr, dst_reg),
+        !indirect_call_target_reg(*call_addr, *dst_reg);
+
+    relation float_arg_setup_candidate_anchor(Node, Mreg, Node);
+    float_arg_setup_candidate_anchor(defaddr, mreg, call_addr) <--
+        float_arg_setup_candidate_real(defaddr, mreg, call_addr),
+        call_backward_reach(call_addr, defaddr, _),
+        code_in_block(defaddr, block),
+        code_in_block(call_addr, block),
+        !call_setup_barrier_between(defaddr, call_addr);
+
+    float_arg_setup_candidate(defaddr, mreg, call_addr) <--
+        float_arg_setup_candidate_anchor(defaddr, mreg, call_addr),
+        !callee_takes_no_float_arg_at(call_addr, mreg);
 
     relation call_float_arg_setup_detected(Node, Mreg, Node);
 
@@ -7005,26 +7801,13 @@ ascent_par! {
         call_float_arg_setup_detected(_, mreg, call_addr),
         abi_float_arg_position(mreg, pos);
 
-    relation call_float_arg_max_position(Node, usize);
-
-    call_float_arg_max_position(call_addr, max_pos) <--
-        call_has_float_arg_evidence(call_addr, _),
-        agg max_pos = ascent::aggregators::max(pos) in call_has_float_arg_evidence(call_addr, pos);
-
     relation call_has_float_arg_at_position(Node, usize);
 
-    // SysV XMM registers form their own compact sequence, so evidence for Xk fills X0..Xk; Windows shares slots with GP arguments, so only direct evidence is valid there.
+    // Every float position also requires its own caller-side evidence.  ABI
+    // compactness is a layout rule, not evidence that a missing lower XMM slot
+    // carries a semantic argument.
     call_has_float_arg_at_position(call_addr, pos) <--
-        call_has_float_arg_evidence(call_addr, pos),
-        abi_shared_arg_slots(true);
-    call_has_float_arg_at_position(call_addr, *max_pos) <--
-        call_float_arg_max_position(call_addr, max_pos),
-        !abi_shared_arg_slots(true);
-    call_has_float_arg_at_position(call_addr, lower) <--
-        call_has_float_arg_at_position(call_addr, pos),
-        !abi_shared_arg_slots(true),
-        if *pos > 0,
-        let lower = *pos - 1;
+        call_has_float_arg_evidence(call_addr, pos);
 
     // Gate XMM/float-arg positions by the callee signature, mirroring the integer path; its remaining job is class filtering for stray same-function XMM defs that reach the call without being args.
     relation call_float_arg_position_allowed(Node, usize);
@@ -7046,24 +7829,19 @@ ascent_par! {
     // Known varargs function (printf-family with %f, etc.): allow any float position.
     call_float_arg_position_allowed(call_addr, pos) <--
         call_has_float_arg_at_position(call_addr, pos),
-        call_has_known_signature(call_addr, name, _, _),
-        known_varargs_function(name, _);
+        call_resolved_signature(call_addr, _, _, _, _, true);
 
     // Known non-varargs signature: allow float position k only if the signature declares more than k float-valued (Xfloat/Xsingle) parameters. Pointer args (e.g. char*) travel in integer regs and do not count toward XMM positions.
     call_float_arg_position_allowed(call_addr, pos) <--
         call_has_float_arg_at_position(call_addr, pos),
-        call_has_known_signature(call_addr, name, _, _),
-        !known_varargs_function(name, _),
-        known_extern_signature(name, _, _, arg_types),
+        call_resolved_signature(call_addr, _, _, _, arg_types, false),
         !abi_shared_arg_slots(true),
         if arg_types.iter().filter(|t| matches!(t, XType::Xfloat | XType::Xsingle)).count() > *pos;
 
     // Windows x64 uses the source-language ordinal directly for XMM0..3.
     call_float_arg_position_allowed(call_addr, pos) <--
         call_has_float_arg_at_position(call_addr, pos),
-        call_has_known_signature(call_addr, name, _, _),
-        !known_varargs_function(name, _),
-        known_extern_signature(name, _, _, arg_types),
+        call_resolved_signature(call_addr, _, _, _, arg_types, false),
         abi_shared_arg_slots(true),
         if *pos < arg_types.len(),
         if matches!(arg_types[*pos], XType::Xfloat | XType::Xsingle);
@@ -7072,28 +7850,56 @@ ascent_par! {
 
     call_float_arg_mapping(*call_addr, pos, rtl_reg) <--
         call_float_arg_setup_detected(defaddr, dst_reg, call_addr),
+        float_arg_setup_candidate_real(defaddr, dst_reg, call_addr),
         is_def(defaddr, def_id),
         reg_xtl(defaddr, dst_reg, def_id),
         xtl_canonical(def_id, rtl_reg),
         abi_float_arg_position(dst_reg, pos),
         call_float_arg_position_allowed(call_addr, pos);
 
-    // Windows has one ordinal argument sequence, so feed the selected XMM value into the ordinary positional mapping instead of an independent SysV float vector.
-    call_arg_mapping(call_addr, pos, reg) <--
+    call_float_arg_mapping(*call_addr, pos, rtl_reg) <--
+        call_float_arg_setup_detected(defaddr, dst_reg, call_addr),
+        float_forwarded_param_candidate(defaddr, dst_reg, call_addr),
+        reg_xtl(defaddr, dst_reg, incoming),
+        xtl_canonical(incoming, rtl_reg),
+        abi_float_arg_position(dst_reg, pos),
+        call_float_arg_position_allowed(call_addr, pos);
+
+    // Windows has one ordinal argument sequence, so feed the selected XMM
+    // value and its caller-side provenance into the ordinary positional map.
+    call_arg_provenance(call_addr, pos, reg, CallArgProvenance::ExplicitRegister) <--
         abi_shared_arg_slots(true),
-        call_float_arg_mapping(call_addr, pos, reg);
+        call_float_arg_mapping(call_addr, pos, reg),
+        call_float_arg_setup_detected(defaddr, mreg, call_addr),
+        float_arg_setup_candidate_anchor(defaddr, mreg, call_addr),
+        abi_float_arg_position(mreg, pos);
+
+    call_arg_provenance(call_addr, pos, reg, CallArgProvenance::CorroboratedRegister) <--
+        abi_shared_arg_slots(true),
+        call_float_arg_mapping(call_addr, pos, reg),
+        call_float_arg_setup_detected(defaddr, mreg, call_addr),
+        float_arg_setup_candidate_real(defaddr, mreg, call_addr),
+        !float_arg_setup_candidate_anchor(defaddr, *mreg, *call_addr),
+        abi_float_arg_position(mreg, pos);
+
+    call_arg_provenance(call_addr, pos, reg, CallArgProvenance::ForwardedEntry) <--
+        abi_shared_arg_slots(true),
+        call_float_arg_mapping(call_addr, pos, reg),
+        call_float_arg_setup_detected(defaddr, mreg, call_addr),
+        float_forwarded_param_candidate(defaddr, mreg, call_addr),
+        abi_float_arg_position(mreg, pos);
 
     relation call_float_args_collected(Node, Args);
 
     call_float_args_collected(call_addr, args) <--
         !abi_shared_arg_slots(true),
         ltl_inst(call_addr, ?LTLInst::Lcall(_)),
-        agg args = build_call_args(pos, reg) in call_float_arg_mapping(call_addr, pos, reg);
+        agg args = build_dense_call_args(pos, reg) in call_float_arg_mapping(call_addr, pos, reg);
 
     call_float_args_collected(call_addr, args) <--
         !abi_shared_arg_slots(true),
         ltl_inst(call_addr, ?LTLInst::Ltailcall(_)),
-        agg args = build_call_args(pos, reg) in call_float_arg_mapping(call_addr, pos, reg);
+        agg args = build_dense_call_args(pos, reg) in call_float_arg_mapping(call_addr, pos, reg);
 
     call_float_args_collected(call_addr, Arc::new(vec![])) <--
         !abi_shared_arg_slots(true),
@@ -10487,13 +11293,12 @@ ascent_par! {
     callee_ptr_param_at(call_node, *arg_idx) <--
         call_site(call_node, func_name),
         call_arg(call_node, arg_idx, _),
+        !call_loader_identity_candidate(call_node, _, _, _, _),
         known_func_param_is_ptr(func_name, arg_idx);
 
     callee_ptr_param_at(call_node, *arg_idx) <--
-        call_site(call_node, func_name),
         call_arg(call_node, arg_idx, _),
-        !emit_function(_, func_name, _),
-        known_extern_signature(func_name, _, _, params),
+        call_resolved_signature(call_node, _, _, _, params, _),
         if *arg_idx < params.len(),
         if matches!(params[*arg_idx], XType::Xptr | XType::Xcharptr);
 
@@ -10501,16 +11306,9 @@ ascent_par! {
     callee_ptr_param_at(call_node, *arg_idx) <--
         ltl_inst(call_node, ?LTLInst::Lcall(Either::Right(Either::Right(name)))),
         !emit_function(_, name, _),
+        !call_loader_identity_candidate(call_node, _, _, _, _),
         call_arg(call_node, arg_idx, _),
         known_func_param_is_ptr(name, arg_idx);
-
-    callee_ptr_param_at(call_node, *arg_idx) <--
-        ltl_inst(call_node, ?LTLInst::Lcall(Either::Right(Either::Right(name)))),
-        !emit_function(_, name, _),
-        call_arg(call_node, arg_idx, _),
-        known_extern_signature(name, _, _, params),
-        if *arg_idx < params.len(),
-        if matches!(params[*arg_idx], XType::Xptr | XType::Xcharptr);
 
     // The param's incoming value (same canonical xtl reg via the entry copy) is passed as a pointer-typed call argument somewhere in the body.
     param_type_evidence_pointer(func_start, mreg) <--
@@ -10674,6 +11472,7 @@ ascent_par! {
             | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
     call_returns_ptr_value(call_addr) <--
         external_call_site(call_addr, _, name),
+        !call_loader_identity_candidate(call_addr, _, _, _, _),
         known_func_returns_ptr(name);
 
     relation stack_slot_stored_ptr(Address, i64);
@@ -10762,7 +11561,8 @@ ascent_par! {
     func_tailcalls_local(func_start, target) <--
         emit_function(func_start, _, _),
         instr_in_function(addr, func_start),
-        ltl_inst(addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(target))));
+        ltl_inst(addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(target)))),
+        !call_through_memory(addr, _, _, _, _);
 
     // (A) Body: synthesize a return reg for a tail-call-only function whose target returns a value, so clight_pass lowers it as ret = target(); return ret; recursing up the tail-call chain.
     emit_function_return(func_start, ret_rtl) <--
@@ -10787,11 +11587,11 @@ ascent_par! {
 
     called_address(target) <--
         ltl_inst(_caller, ?LTLInst::Lcall(Either::Right(Either::Left(target)))),
-        instr_in_function(target, _);
+        instruction(target, _, _, _, _, _, _, _, _, _);
 
     called_address(target2) <--
         ltl_inst(_caller2, ?LTLInst::Ltailcall(Either::Right(Either::Left(target2)))),
-        instr_in_function(target2, _);
+        instruction(target2, _, _, _, _, _, _, _, _, _);
 
     emit_function(func_entry, *sym_name, func_entry) <--
         called_address(func_entry),
@@ -10812,7 +11612,6 @@ ascent_par! {
         symbols(addr, sym_name, _),
         instr_in_function(addr, addr),
         !func_stacksz(addr, _, _, _),
-        !called_address(addr),
         !plt_entry(addr, _),
         !plt_block(addr, _);
 
@@ -10885,6 +11684,7 @@ ascent_par! {
         call_site(node, func_name),
         call_return_reg(node, ret_reg),
         !emit_function(_, func_name, _),
+        !call_loader_identity_candidate(node, _, _, _, _),
         known_func_returns_ptr(func_name);
     must_be_ptr(rtl_reg) <--
         ltl_inst(node, ?LTLInst::Lop(Operation::Oindirectsymbol(_), _, dst_mreg)),
@@ -10894,24 +11694,29 @@ ascent_par! {
     arg_constrained_as_ptr(node, arg_reg) <--
         call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
+        !call_loader_identity_candidate(node, _, _, _, _),
         known_func_param_is_ptr(func_name, arg_idx);
+
+    arg_constrained_as_ptr(node, arg_reg) <--
+        call_arg(node, arg_idx, arg_reg),
+        call_resolved_signature(node, _, _, _, params, _),
+        if *arg_idx < params.len(),
+        if matches!(params[*arg_idx],
+            XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr
+            | XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
 
     is_ptr(reg) <-- arg_constrained_as_ptr(_, reg);
 
     is_char_ptr(arg_reg) <--
-        call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
-        !emit_function(_, func_name, _),
-        known_extern_signature(func_name, _, _, params),
+        call_resolved_signature(node, _, _, _, params, _),
         if *arg_idx < params.len(),
         if matches!(params[*arg_idx], XType::Xcharptr);
 
     // ABI 64-bit width floor (c16): an argument passed to an extern parameter known to be 64-bit is itself 64-bit; Xany64 is excluded as too ambiguous and would over-widen narrow args.
     is_long(arg_reg) <--
-        call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
-        !emit_function(_, func_name, _),
-        known_extern_signature(func_name, _, _, params),
+        call_resolved_signature(node, _, _, _, params, _),
         if *arg_idx < params.len(),
         if matches!(params[*arg_idx], XType::Xlong | XType::Xlongunsigned);
 
@@ -10919,6 +11724,7 @@ ascent_par! {
         call_site(node, func_name),
         call_return_reg(node, ret_reg),
         !emit_function(_, func_name, _),
+        !call_loader_identity_candidate(node, _, _, _, _),
         known_func_returns_ptr(func_name);
 
     // (A) A by-NAME pointer-returning extern call result is a pointer: the call_site-gated rules cover only by-address PLT calls, so a by-name malloc/realloc result never got is_ptr and its return truncated.
@@ -10927,10 +11733,8 @@ ascent_par! {
         reg_rtl(call_addr, Mreg::AX, ret_rtl);
 
     is_char_ptr(ret_reg) <--
-        call_site(node, func_name),
         call_return_reg(node, ret_reg),
-        !emit_function(_, func_name, _),
-        known_extern_signature(func_name, _, ret_type, _),
+        call_resolved_signature(node, _, _, ret_type, _, _),
         if matches!(ret_type, XType::Xcharptr);
 
     // (A) By-NAME char-pointer extern call result refines is_ptr to char*, keyed on the signature directly via reg_rtl(call_addr, AX); Xcharptr outranks the bare Xptr above.
@@ -10945,13 +11749,12 @@ ascent_par! {
         call_site(node, func_name),
         call_return_reg(node, ret_reg),
         !emit_function(_, func_name, _),
+        !call_loader_identity_candidate(node, _, _, _, _),
         known_func_returns_long(func_name);
 
     is_long(ret_reg) <--
-        call_site(node, func_name),
         call_return_reg(node, ret_reg),
-        !emit_function(_, func_name, _),
-        known_extern_signature(func_name, _, ret_type, _),
+        call_resolved_signature(node, _, _, ret_type, _, _),
         if matches!(ret_type, XType::Xlong | XType::Xlongunsigned);
 
     is_ptr(b) <--
@@ -11546,6 +12349,36 @@ pub fn build_call_args<'a>(
         args[pos] = reg;
     }
     std::iter::once(Arc::new(args))
+}
+
+/// Materialize a call vector only when every ordinal from zero is present and
+/// every position has one value.  Sparse/ambiguous positional evidence stays
+/// in the provenance relations for diagnostics, but is not converted into a
+/// semantic argument list and is never padded with DEFAULT_VAR.
+pub fn build_dense_call_args<'a>(
+    inp: impl Iterator<Item = (&'a usize, &'a RTLReg)>,
+) -> impl Iterator<Item = Args> {
+    let mut by_position: std::collections::BTreeMap<usize, RTLReg> =
+        std::collections::BTreeMap::new();
+    let mut ambiguous = false;
+    for (&position, &reg) in inp {
+        match by_position.get(&position) {
+            Some(existing) if *existing != reg => ambiguous = true,
+            Some(_) => {}
+            None => {
+                by_position.insert(position, reg);
+            }
+        }
+    }
+
+    let dense = !ambiguous
+        && by_position
+            .keys()
+            .copied()
+            .eq(0..by_position.len());
+    dense
+        .then(|| Arc::new(by_position.into_values().collect::<Vec<_>>()))
+        .into_iter()
 }
 
 /// Build an Addrmode for a CMP/Iload operand with optional base, index, and scale; falls back to base-only when the index register is absent.
@@ -16710,6 +17543,26 @@ mod encoding_tests {
     }
 
     #[test]
+    fn outgoing_stack_write_overlap_uses_full_widths() {
+        assert!(stack_write_intervals_overlap(0, 8, 4, 8));
+        assert!(stack_write_intervals_overlap(8, 4, 8, 4));
+        assert!(!stack_write_intervals_overlap(0, 8, 8, 8));
+        assert!(!stack_write_intervals_overlap(16, 0, 16, 8));
+        assert!(stack_write_intervals_overlap(
+            i64::MAX - 3,
+            8,
+            i64::MAX,
+            1,
+        ));
+    }
+
+    #[test]
+    fn resolved_variadic_signature_records_fixed_prefix() {
+        assert_eq!(resolved_signature_call_conv(2, true).varargs, Some(2));
+        assert_eq!(resolved_signature_call_conv(2, false).varargs, None);
+    }
+
+    #[test]
     fn home_div_operation_preserves_signedness_result_and_width() {
         for (signed, remainder, width, expected) in [
             (true, false, 4, Operation::Odiv),
@@ -16865,6 +17718,746 @@ mod encoding_tests {
             .expect("spawn RTL program test")
             .join()
             .expect("RTL program test panicked");
+    }
+
+    #[test]
+    fn immediate_push_constants_form_one_must_execute_chain() {
+        on_rtl_program_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let function: Address = 0x1000;
+            let block: Address = 0x1000;
+            let predecessor: Node = 0x1008;
+            let first_push: Address = 0x1010;
+            let second_push: Address = 0x1020;
+            let call: Node = 0x1030;
+            let first_synth = first_push | (1u64 << 62);
+            let second_synth = second_push | (1u64 << 62);
+
+            prog.block_in_function.push((block, function));
+            prog.push_arg_imm.push((first_push, 11));
+            prog.push_arg_imm.push((second_push, 22));
+            prog.ltl_inst.push((
+                call,
+                LTLInst::Lcall(Either::Right(Either::Left(0x2000))),
+            ));
+            for node in [first_push, second_push, call] {
+                prog.instr_in_function.push((node, function));
+                prog.code_in_block.push((node, block));
+            }
+            prog.next.push((first_push, second_push));
+            prog.next.push((second_push, call));
+            // LTL has already elided both PUSH nodes, so the retained CFG has
+            // one edge which the synthetic constant chain must replace.
+            prog.rtl_next.push((predecessor, call));
+
+            prog.run();
+
+            let edges = prog
+                .rtl_succ_candidate
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            assert!(!edges.contains(&(predecessor, call)));
+            assert!(edges.contains(&(predecessor, first_synth)));
+            assert!(edges.contains(&(first_synth, second_synth)));
+            assert!(edges.contains(&(second_synth, call)));
+            assert!(!edges.contains(&(predecessor, second_synth)));
+            assert!(!edges.contains(&(first_synth, call)));
+
+            let constants = prog
+                .rtl_inst_candidate
+                .iter()
+                .filter_map(|(node, inst)| match inst {
+                    RTLInst::Iop(Operation::Olongconst(value), args, _)
+                        if args.is_empty() =>
+                    {
+                        Some((*node, *value))
+                    }
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            assert!(constants.contains(&(first_synth, 11)));
+            assert!(constants.contains(&(second_synth, 22)));
+        });
+    }
+
+    #[test]
+    fn overlapping_outgoing_writes_veto_the_complete_setup() {
+        on_rtl_program_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let function: Address = 0x3000;
+            let first_store: Address = 0x3010;
+            let second_store: Address = 0x3020;
+            let call: Node = 0x3030;
+
+            prog.og_arg_store
+                .push((first_store, 0, 8, 0x41, function));
+            prog.og_arg_store
+                .push((second_store, 4, 8, 0x42, function));
+            prog.og_linear_reaches
+                .push((first_store, second_store, function));
+            prog.og_linear_reaches
+                .push((second_store, call, function));
+
+            prog.run();
+
+            assert!(prog
+                .og_setup_overlap_veto
+                .iter()
+                .any(|&(site, owner)| site == call && owner == function));
+        });
+    }
+
+    #[test]
+    fn decoded_rmw_after_accepted_store_kills_outgoing_setup() {
+        on_rtl_program_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let function: Address = 0x4000;
+            let store: Node = 0x4010;
+            let rmw: Node = 0x4020;
+            let call: Node = 0x4030;
+            let block: Address = function;
+            let store_operand: Symbol = "accepted_outgoing_store_operand";
+            let rmw_operand: Symbol = "outgoing_rmw_operand";
+
+            // Derive the first accepted outgoing store from the normal
+            // decoder/LTL/SP/value-flow inputs rather than seeding og_arg_store.
+            prog.instruction.push((
+                store,
+                5usize,
+                "",
+                "MOV",
+                store_operand,
+                "accepted_outgoing_store_src",
+                "",
+                "",
+                0usize,
+                0usize,
+            ));
+            prog.op_indirect
+                .push((store_operand, "NONE", "RSP", "NONE", 1, 32, 8));
+            prog.decoded_memory_write_operand
+                .push((store, store_operand));
+            prog.ltl_inst.push((
+                store,
+                LTLInst::Lstore(
+                    MemoryChunk::MInt64,
+                    Addressing::Aindexed(32),
+                    Arc::new(vec![Mreg::SP]),
+                    Mreg::AX,
+                ),
+            ));
+            prog.reg_xtl.push((store, Mreg::AX, 0x51));
+
+            prog.block_in_function.push((block, function));
+            for node in [store, rmw, call] {
+                prog.instr_in_function.push((node, function));
+                prog.code_in_block.push((node, block));
+            }
+            prog.next.push((store, rmw));
+            prog.next.push((rmw, call));
+            prog.rsp_frame_offset_at.push((function, store, 0));
+            prog.rsp_frame_offset_at.push((function, rmw, 0));
+
+            // The later instruction is intentionally not an og_arg_store.  Its
+            // immutable decoded read+write operand is the only evidence that
+            // the unsupported RMW modifies bytes 36..40 of the accepted slot.
+            prog.instruction.push((
+                rmw,
+                4usize,
+                "",
+                "ADD",
+                rmw_operand,
+                "",
+                "",
+                "",
+                0usize,
+                0usize,
+            ));
+            prog.decoded_memory_read_operand.push((rmw, rmw_operand));
+            prog.decoded_memory_write_operand.push((rmw, rmw_operand));
+            prog.op_indirect
+                .push((rmw_operand, "NONE", "RSP", "NONE", 1, 36, 4));
+
+            prog.run();
+
+            assert!(prog
+                .og_arg_store
+                .iter()
+                .any(|&(node, start, width, value, owner)| {
+                    (node, start, width, value, owner) ==
+                        (store, 32, 8, 0x51, function)
+                }));
+            assert!(prog
+                .og_decoded_stack_write_operand_range
+                .iter()
+                .any(|&(node, owner, _, start, width)| {
+                    (node, owner, start, width) == (rmw, function, 36, 4)
+                }));
+            assert!(prog
+                .og_setup_overlap_veto
+                .iter()
+                .any(|&(site, owner)| (site, owner) == (call, function)));
+            assert!(!prog.og_store_reaches.iter().any(
+                |&(site, start, width, value, _, owner)| {
+                    (site, start, width, value, owner) == (call, 32, 8, 0x51, function)
+                }
+            ));
+        });
+    }
+
+    #[test]
+    fn unknown_indexed_stack_write_vetoes_outgoing_setup() {
+        on_rtl_program_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let function: Address = 0x5000;
+            let store: Node = 0x5010;
+            let unknown_write: Node = 0x5020;
+            let call: Node = 0x5030;
+            let operand: Symbol = "indexed_outgoing_write";
+
+            prog.og_arg_store.push((store, 32, 8, 0x61, function));
+            prog.og_linear_next
+                .push((store, unknown_write, function));
+            prog.og_linear_next
+                .push((unknown_write, call, function));
+            prog.instr_in_function.push((unknown_write, function));
+            prog.decoded_memory_write_operand
+                .push((unknown_write, operand));
+            prog.op_indirect
+                .push((operand, "NONE", "RSP", "RAX", 1, 32, 8));
+            prog.sp_based_mem_at
+                .push((unknown_write, function, Mreg::SP, 0));
+
+            prog.run();
+
+            assert!(prog
+                .og_unknown_stack_write
+                .iter()
+                .any(|&(node, owner)| (node, owner) == (unknown_write, function)));
+            assert!(prog
+                .og_setup_overlap_veto
+                .iter()
+                .any(|&(site, owner)| (site, owner) == (call, function)));
+        });
+    }
+
+    #[test]
+    fn unclassified_decoded_write_vetoes_outgoing_setup() {
+        on_rtl_program_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let function: Address = 0x5800;
+            let store: Node = 0x5810;
+            let unknown_write: Node = 0x5820;
+            let call: Node = 0x5830;
+            let operand: Symbol = "unclassified_outgoing_write";
+
+            prog.og_arg_store.push((store, 32, 8, 0x71, function));
+            prog.og_linear_next
+                .push((store, unknown_write, function));
+            prog.og_linear_next
+                .push((unknown_write, call, function));
+            prog.instr_in_function.push((unknown_write, function));
+            prog.decoded_memory_write_operand
+                .push((unknown_write, operand));
+            // There is no proved SP coordinate for this arbitrary-base write.
+            // Must-reaching therefore cannot establish that the old outgoing
+            // value survives, even though no LTL store classified the opcode.
+            prog.op_indirect
+                .push((operand, "NONE", "RAX", "NONE", 1, 0, 8));
+
+            prog.run();
+
+            assert!(prog
+                .og_unknown_stack_write
+                .iter()
+                .any(|&(node, owner)| (node, owner) == (unknown_write, function)));
+            assert!(prog
+                .og_setup_overlap_veto
+                .iter()
+                .any(|&(site, owner)| (site, owner) == (call, function)));
+            assert!(!prog.og_store_reaches.iter().any(
+                |&(site, start, width, value, _, owner)| {
+                    (site, start, width, value, owner) ==
+                        (call, 32, 8, 0x71, function)
+                }
+            ));
+        });
+    }
+
+    #[test]
+    fn win64_same_site_anchors_do_not_resurrect_stale_registers() {
+        on_rtl_program_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let function: Address = 0x6000;
+            let gp_call: Node = 0x6030;
+            let stale_rcx: Node = 0x6010;
+            let fresh_rdx: Node = 0x6020;
+            let xmm_call: Node = 0x6070;
+            let stale_xmm0: Node = 0x6050;
+            let fresh_xmm1: Node = 0x6060;
+            let stack_call: Node = 0x6090;
+            let callee_call: Node = 0x60b0;
+            let callee: Address = 0x6100;
+
+            prog.abi_shared_arg_slots.push((true,));
+            prog.abi_int_arg_position.push((Mreg::CX, 0));
+            prog.abi_int_arg_position.push((Mreg::DX, 1));
+            prog.abi_float_arg_position.push((Mreg::X0, 0));
+            prog.abi_float_arg_position.push((Mreg::X1, 1));
+
+            // RCX and XMM0 reached their calls, but a structural barrier had
+            // already rejected each as final setup.  A fresh higher-slot
+            // anchor at the same call must not re-admit either definition.
+            prog.arg_setup_candidate_real
+                .push((stale_rcx, Mreg::CX, gp_call));
+            prog.call_setup_barrier_between
+                .push((stale_rcx, gp_call));
+            prog.arg_setup_candidate_anchor
+                .push((fresh_rdx, Mreg::DX, gp_call));
+            prog.float_arg_setup_candidate_real
+                .push((stale_xmm0, Mreg::X0, xmm_call));
+            prog.call_setup_barrier_between
+                .push((stale_xmm0, xmm_call));
+            prog.float_arg_setup_candidate_anchor
+                .push((fresh_xmm1, Mreg::X1, xmm_call));
+
+            // An outgoing stack argument is a different storage/class witness,
+            // not evidence for a forwarded Win64 register slot.
+            prog.forwarded_param_candidate
+                .push((function, Mreg::CX, stack_call));
+            prog.call_outgoing_stack_arg
+                .push((stack_call, 4, 0x701));
+
+            // The callee's positive RDX evidence fills its lower source slot
+            // in the declaration ladder, but that synthetic Win64 GP fallback
+            // is not exact RCX-class corroboration for this caller.
+            prog.forwarded_param_candidate
+                .push((function, Mreg::CX, callee_call));
+            prog.call_target_func.push((callee_call, callee));
+            prog.func_gp_param_evidence.push((callee, 1));
+
+            prog.run();
+
+            assert!(!prog
+                .arg_setup_candidate
+                .iter()
+                .any(|&(definition, reg, site)| {
+                    (definition, reg, site) == (stale_rcx, Mreg::CX, gp_call)
+                }));
+            assert!(prog
+                .arg_setup_candidate
+                .iter()
+                .any(|&(definition, reg, site)| {
+                    (definition, reg, site) == (fresh_rdx, Mreg::DX, gp_call)
+                }));
+            assert!(!prog
+                .float_arg_setup_candidate
+                .iter()
+                .any(|&(definition, reg, site)| {
+                    (definition, reg, site) == (stale_xmm0, Mreg::X0, xmm_call)
+                }));
+            assert!(prog
+                .float_arg_setup_candidate
+                .iter()
+                .any(|&(definition, reg, site)| {
+                    (definition, reg, site) == (fresh_xmm1, Mreg::X1, xmm_call)
+                }));
+            assert!(!prog
+                .forwarding_corroborated
+                .iter()
+                .any(|&(site, reg)| (site, reg) == (stack_call, Mreg::CX)));
+            assert!(prog
+                .func_param_validated
+                .iter()
+                .any(|&(owner, reg)| (owner, reg) == (callee, Mreg::CX)));
+            assert!(!prog
+                .forwarding_corroborated
+                .iter()
+                .any(|&(site, reg)| (site, reg) == (callee_call, Mreg::CX)));
+            assert!(prog
+                .call_forwarding_unresolved
+                .iter()
+                .any(|&(site,)| site == stack_call));
+            assert!(prog
+                .call_forwarding_unresolved
+                .iter()
+                .any(|&(site,)| site == callee_call));
+        });
+    }
+
+    #[test]
+    fn rip_iat_tailcall_stays_import_pointer_through_optimizer_and_c() {
+        on_rtl_program_stack(|| {
+            use crate::decompile::passes::c_pass::convert::from_relations::{
+                convert_stmt, ConversionContext,
+            };
+            use crate::decompile::passes::c_pass::types::{CExpr, CStmt, UnaryOp};
+            use crate::decompile::passes::clight_pass::ClightPass;
+            use crate::decompile::passes::cminor_pass::CminorPass;
+            use crate::decompile::passes::cshminor_pass::CshminorPass;
+            use crate::decompile::passes::rtl_optimize_pass::RTLOptimizePass;
+
+            let mut prog = RTLPassProgram::default();
+            let function: Address = 0x7000;
+            let tail: Node = 0x7010;
+            let iat: Address = 0x9000;
+            let colliding_function: Address = iat;
+            let operand: Symbol = "rip_iat_operand";
+            let provider: Symbol = "imported_callback";
+            let original: Symbol = "__imp_imported_callback";
+            let argument: RTLReg = 0xa001;
+
+            prog.instruction.push((
+                tail, 6usize, "", "JMP", operand, "", "", "", 0usize, 0usize,
+            ));
+            prog.op_indirect
+                .push((operand, "NONE", "RIP", "NONE", 1, 0x20, 8));
+            // asm_pass attaches the provider spelling, but the immutable raw
+            // operand and relocation still identify an ImportPointer object.
+            prog.ltl_inst.push((
+                tail,
+                LTLInst::Ltailcall(Either::Right(Either::Right(provider))),
+            ));
+            prog.rip_target_addr.push((tail, iat));
+            prog.loader_symbol_identity.push((
+                iat,
+                LoaderSymbolKind::ImportPointer,
+                provider,
+                original,
+            ));
+            // A stale same-address Function identity must not compete with the
+            // exact IAT object merely because asm_pass used its provider as
+            // display text on the Ltailcall.
+            prog.loader_symbol_identity.push((
+                colliding_function,
+                LoaderSymbolKind::Function,
+                provider,
+                original,
+            ));
+            prog.ident_to_symbol
+                .push((colliding_function as Ident, provider));
+            prog.ident_to_symbol.push((iat as Ident, original));
+            prog.known_loader_signature.push((
+                iat,
+                LoaderSymbolKind::ImportPointer,
+                provider,
+                original,
+                1usize,
+                XType::Xvoid,
+                Arc::new(vec![XType::Xany64]),
+                false,
+            ));
+            prog.known_loader_signature.push((
+                colliding_function,
+                LoaderSymbolKind::Function,
+                provider,
+                original,
+                0usize,
+                XType::Xint,
+                Arc::new(Vec::new()),
+                false,
+            ));
+            prog.call_arg_mapping.push((tail, 0usize, argument));
+            prog.instr_in_function.push((tail, function));
+
+            prog.run();
+
+            assert!(!prog
+                .call_loader_identity_ambiguous
+                .iter()
+                .any(|&(site,)| site == tail));
+            assert!(!prog.call_loader_identity_candidate.iter().any(
+                |&(site, _, kind, _, _)| {
+                    site == tail && kind == LoaderSymbolKind::Function
+                }
+            ));
+            assert!(prog.global_var_ref.iter().any(|&(ident,)| ident == iat as Ident));
+            assert!(prog.call_loader_identity.iter().any(
+                |&(site, address, kind, seen_provider, seen_original)| {
+                    (site, address, kind, seen_provider, seen_original)
+                        == (
+                            tail,
+                            iat,
+                            LoaderSymbolKind::ImportPointer,
+                            provider,
+                            original,
+                        )
+                }
+            ));
+            let rtl_tailcalls: Vec<RTLInst> = prog
+                .rtl_inst_candidate
+                .iter()
+                .filter_map(|(node, inst)| (*node == tail).then_some(inst.clone()))
+                .collect();
+            assert_eq!(rtl_tailcalls.len(), 1);
+            assert!(matches!(
+                &rtl_tailcalls[0],
+                RTLInst::Itailcall(
+                    Some(Signature { sig_args, sig_res: XType::Xvoid, .. }),
+                    Either::Left(_),
+                    args,
+                ) if sig_args.as_ref() == &[XType::Xany64] && args.as_ref() == &[argument]
+            ));
+            assert!(prog.call_through_memory_load.iter().any(
+                |(site, _, chunk, addressing, args)| {
+                    *site == tail
+                        && *chunk == MemoryChunk::MInt64
+                        && *addressing == Addressing::Aglobal(iat as Ident, 0)
+                        && args.is_empty()
+                }
+            ));
+
+            // Carry the exact RTL artifacts through the real optimizer and the
+            // normal Cminor/Csharpminor/Clight adapters.  The structurer's
+            // candidate selection is identity for this single terminal node.
+            let mut db = DecompileDB::default();
+            db.target_abi = Some(crate::abi::AbiConfig::win64());
+            db.rel_push("emit_function", (function, "iat_thunk" as Symbol, tail));
+            db.rel_push("instr_in_function", (tail, function));
+            for row in &prog.global_var_ref {
+                db.rel_push("global_var_ref", *row);
+            }
+            for row in &prog.ident_to_symbol {
+                db.rel_push("ident_to_symbol", *row);
+            }
+            db.rel_push(
+                "rtl_inst_candidate",
+                (tail, rtl_tailcalls[0].clone()),
+            );
+            for row in &prog.call_through_memory_load {
+                db.rel_push("call_through_memory_load", row.clone());
+            }
+            db.rel_push("call_arg_mapping", (tail, 0usize, argument));
+            db.rel_push(
+                "call_arg_provenance",
+                (
+                    tail,
+                    0usize,
+                    argument,
+                    CallArgProvenance::ExplicitRegister,
+                ),
+            );
+            db.rel_push(
+                "call_args_collected_candidate",
+                (tail, Arc::new(vec![argument])),
+            );
+            db.rel_push(
+                "loader_symbol_identity",
+                (
+                    iat,
+                    LoaderSymbolKind::ImportPointer,
+                    provider,
+                    original,
+                ),
+            );
+            db.rel_push(
+                "loader_symbol_identity",
+                (
+                    colliding_function,
+                    LoaderSymbolKind::Function,
+                    provider,
+                    original,
+                ),
+            );
+            db.rel_push(
+                "call_loader_identity",
+                (
+                    tail,
+                    iat,
+                    LoaderSymbolKind::ImportPointer,
+                    provider,
+                    original,
+                ),
+            );
+            db.rel_push(
+                "known_loader_signature",
+                (
+                    iat,
+                    LoaderSymbolKind::ImportPointer,
+                    provider,
+                    original,
+                    1usize,
+                    XType::Xvoid,
+                    Arc::new(vec![XType::Xany64]),
+                    false,
+                ),
+            );
+            db.rel_push(
+                "known_loader_signature",
+                (
+                    colliding_function,
+                    LoaderSymbolKind::Function,
+                    provider,
+                    original,
+                    0usize,
+                    XType::Xint,
+                    Arc::new(Vec::<XType>::new()),
+                    false,
+                ),
+            );
+
+            let import_signatures = crate::decompile::passes::c_pass::convert::from_relations::known_import_pointer_signatures_from_db(&db);
+            assert_eq!(
+                import_signatures.get(original),
+                Some(&(
+                    XType::Xvoid,
+                    Arc::new(vec![XType::Xany64]),
+                    false,
+                )),
+                "same-address stale Function identity suppressed the exact IAT prototype"
+            );
+
+            RTLOptimizePass.run(&mut db);
+            assert!(db.rel_iter::<(Node, RTLInst)>("rtl_inst").any(
+                |(node, inst)| *node == tail
+                    && matches!(inst, RTLInst::Itailcall(_, Either::Left(_), _))
+            ));
+            CminorPass.run(&mut db);
+            CshminorPass.run(&mut db);
+            let csharp: Vec<(Node, CsharpminorStmt)> = db
+                .rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt_candidate")
+                .filter(|(node, _)| *node == tail)
+                .cloned()
+                .collect();
+            assert_eq!(csharp.len(), 1);
+            assert!(matches!(
+                &csharp[0].1,
+                CsharpminorStmt::Stailcall(_, Either::Left(CsharpminorExpr::Eload(_, _)), args)
+                    if args.len() == 1
+            ));
+            db.rel_set(
+                "csharp_stmt",
+                csharp.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+            );
+            ClightPass.run(&mut db);
+            let clight_stmt = db
+                .rel_iter::<(Node, ClightStmt)>("clight_stmt")
+                .find_map(|(node, stmt)| (*node == tail).then_some(stmt.clone()))
+                .expect("indirect tailcall reaches Clight");
+            let mut context = ConversionContext::new(HashMap::from([(
+                iat as Ident,
+                original.to_string(),
+            )]));
+            let c_stmt = convert_stmt(&clight_stmt, &mut context);
+
+            fn first_call(stmt: &CStmt) -> Option<(&CExpr, &[CExpr])> {
+                match stmt {
+                    CStmt::Expr(CExpr::Call(callee, args)) => Some((callee, args)),
+                    CStmt::Expr(CExpr::Assign(_, _, rhs)) => match rhs.as_ref() {
+                        CExpr::Call(callee, args) => Some((callee, args)),
+                        _ => None,
+                    },
+                    CStmt::Sequence(stmts) => stmts.iter().find_map(first_call),
+                    CStmt::Block(items) => items.iter().find_map(|item| match item {
+                        crate::decompile::passes::c_pass::types::CBlockItem::Stmt(stmt) => {
+                            first_call(stmt)
+                        }
+                        _ => None,
+                    }),
+                    _ => None,
+                }
+            }
+            fn is_direct_name(expr: &CExpr) -> bool {
+                match expr {
+                    CExpr::Var(_) => true,
+                    CExpr::Cast(_, inner) | CExpr::Paren(inner) => is_direct_name(inner),
+                    _ => false,
+                }
+            }
+            fn contains_indirect_deref(expr: &CExpr) -> bool {
+                match expr {
+                    CExpr::Unary(UnaryOp::Deref, _) => true,
+                    CExpr::Cast(_, inner) | CExpr::Paren(inner) => {
+                        contains_indirect_deref(inner)
+                    }
+                    _ => false,
+                }
+            }
+            let (callee, args) = first_call(&c_stmt).expect("C tailcall expression");
+            assert_eq!(args.len(), 1);
+            assert!(
+                contains_indirect_deref(callee),
+                "IAT tailcall lost its explicit slot dereference: {callee:?}"
+            );
+            assert!(
+                !is_direct_name(callee),
+                "IAT address/provider escaped as a direct Function callee: {callee:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn rip_iat_address_spelling_cannot_become_a_function_target() {
+        on_rtl_program_stack(|| {
+            let mut prog = RTLPassProgram::default();
+            let function: Address = 0x7200;
+            let tail: Node = 0x7210;
+            let iat: Address = 0x9200;
+            let operand: Symbol = "rip_iat_address_operand";
+            let provider: Symbol = "address_spelled_import";
+            let original: Symbol = "__imp_address_spelled_import";
+
+            prog.instruction.push((
+                tail, 6usize, "", "JMP", operand, "", "", "", 0usize, 0usize,
+            ));
+            prog.op_indirect
+                .push((operand, "NONE", "RIP", "NONE", 1, 0x20, 8));
+            // Even a stale LTL spelling that carries the IAT address itself is
+            // subordinate to the immutable decoded memory operand.
+            prog.ltl_inst.push((
+                tail,
+                LTLInst::Ltailcall(Either::Right(Either::Left(iat))),
+            ));
+            prog.rip_target_addr.push((tail, iat));
+            prog.instr_in_function.push((tail, function));
+            prog.loader_symbol_identity.push((
+                iat,
+                LoaderSymbolKind::ImportPointer,
+                provider,
+                original,
+            ));
+            // This malformed/stale Function row demonstrates that the direct
+            // address spelling cannot bypass the memory-object kind reducer.
+            prog.loader_symbol_identity.push((
+                iat,
+                LoaderSymbolKind::Function,
+                provider,
+                provider,
+            ));
+            prog.known_loader_signature.push((
+                iat,
+                LoaderSymbolKind::ImportPointer,
+                provider,
+                original,
+                0usize,
+                XType::Xvoid,
+                Arc::new(vec![]),
+                false,
+            ));
+
+            prog.run();
+
+            assert!(!prog
+                .call_target_func
+                .iter()
+                .any(|&(site, _)| site == tail));
+            assert!(!prog.call_loader_identity_candidate.iter().any(
+                |&(site, _, kind, _, _)| {
+                    site == tail && kind == LoaderSymbolKind::Function
+                }
+            ));
+            assert!(prog.call_loader_identity.iter().any(
+                |&(site, address, kind, _, _)| {
+                    (site, address, kind)
+                        == (tail, iat, LoaderSymbolKind::ImportPointer)
+                }
+            ));
+            assert!(prog.rtl_inst_candidate.iter().any(|(site, inst)| {
+                *site == tail
+                    && matches!(inst, RTLInst::Itailcall(_, Either::Left(_), args) if args.is_empty())
+            }));
+        });
     }
 
     #[test]

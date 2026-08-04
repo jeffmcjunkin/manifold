@@ -98,6 +98,8 @@ pub fn load_symbols(
 ) {
     let mut symbols_vec: Vec<(u64, usize, &'static str, &'static str,
                                &'static str, usize, &'static str, usize, &'static str)> = Vec::new();
+    let mut loader_symbol_identities: Vec<(Address, LoaderSymbolKind, Symbol, Symbol)> =
+        Vec::new();
     // Exactly one deterministic display/provider name per address.  File and
     // section bookkeeping symbols must never shadow a real function at offset
     // zero (common in COFF objects).
@@ -130,6 +132,17 @@ pub fn load_symbols(
         } else {
             sym.kind()
         };
+        let has_callable_loader_object = coff_function_size.is_some()
+            || matches!(sym.section(), object::SymbolSection::Section(_));
+        if effective_kind == SymbolKind::Text && has_callable_loader_object {
+            let original_name: &'static str = leak_str(name_raw.to_string());
+            loader_symbol_identities.push((
+                addr,
+                LoaderSymbolKind::Function,
+                name,
+                original_name,
+            ));
+        }
 
         if size == 0 && effective_kind == SymbolKind::Text {
             if let Some(inferred) = coff_function_size {
@@ -195,6 +208,15 @@ pub fn load_symbols(
     }
 
     db.rel_set("symbol_table", symbols_vec.into_iter().collect::<ascent::boxcar::Vec<_>>());
+    // Keep the loader spelling separate from the provider/display spelling.
+    // Prototype lookup consumes this identity later, so sanitization and COFF
+    // synthetic names cannot sever an authoritative declaration.
+    db.rel_set(
+        "loader_symbol_identity",
+        loader_symbol_identities
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
     db.rel_set(
         "symbols",
         best_sym
@@ -556,6 +578,15 @@ fn load_plt(db: &mut DecompileDB, obj: &object::File) {
                                 .wrapping_add(mem.disp() as u64);
                             if let Some(&name) = got_to_name.get(&got_addr) {
                                 db.rel_push("plt_block", (entry_addr, name));
+                                db.rel_push(
+                                    "loader_symbol_identity",
+                                    (
+                                        entry_addr,
+                                        LoaderSymbolKind::Function,
+                                        name,
+                                        name,
+                                    ),
+                                );
                                 let jmp_addr = insn.address();
                                 db.rel_push("plt_entry", (jmp_addr, name));
                                 db.rel_push("plt_entry", (jmp_addr + 1, name));
@@ -585,6 +616,15 @@ fn load_plt(db: &mut DecompileDB, obj: &object::File) {
                                 if idx < rela_plt_names.len() && !rela_plt_names[idx].is_empty() {
                                     let name = rela_plt_names[idx];
                                     db.rel_push("plt_block", (entry_addr, name));
+                                    db.rel_push(
+                                        "loader_symbol_identity",
+                                        (
+                                            entry_addr,
+                                            LoaderSymbolKind::Function,
+                                            name,
+                                            name,
+                                        ),
+                                    );
                                     db.rel_push("plt_entry", (entry_addr, name));
                                     // Register the stub as a named symbol so CALL imm operands resolve to named-call form.
                                     db.rel_push("symbols", (entry_addr, name, "Beg"));

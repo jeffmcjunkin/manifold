@@ -551,7 +551,9 @@ pub fn convert_param_type_from_param(
             crate::x86::types::XType::Xintptr => CType::ptr(CType::int()),
             crate::x86::types::XType::Xfloatptr => CType::ptr(CType::double()),
             crate::x86::types::XType::Xsingleptr => CType::ptr(CType::float()),
-            crate::x86::types::XType::Xfuncptr => CType::ptr(CType::Function(Box::new(CType::Void), Vec::new(), false, false)),
+            crate::x86::types::XType::Xfuncptr => {
+                CType::ptr(CType::func_unprototyped(CType::Void))
+            }
             crate::x86::types::XType::Xfloat => CType::double(),
             crate::x86::types::XType::Xsingle => CType::float(),
             crate::x86::types::XType::Xbool => CType::Bool,
@@ -595,7 +597,7 @@ pub fn xtype_string_to_ctype(type_str: &str) -> CType {
         "ptr_int" => CType::Pointer(Box::new(CType::int()), crate::decompile::passes::c_pass::types::TypeQualifiers::none()),
         "ptr_double" => CType::Pointer(Box::new(CType::double()), crate::decompile::passes::c_pass::types::TypeQualifiers::none()),
         "ptr_float" => CType::Pointer(Box::new(CType::float()), crate::decompile::passes::c_pass::types::TypeQualifiers::none()),
-        "ptr_func" => CType::Pointer(Box::new(CType::Function(Box::new(CType::Void), Vec::new(), false, false)), crate::decompile::passes::c_pass::types::TypeQualifiers::none()),
+        "ptr_func" => CType::ptr(CType::func_unprototyped(CType::Void)),
         "void" => CType::Void,
         _ => CType::Int(IntSize::Long, Signedness::Signed),
     }

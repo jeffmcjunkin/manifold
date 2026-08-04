@@ -20,6 +20,7 @@ use object::{
 use serde::Serialize;
 
 use crate::decompile::elevator::DecompileDB;
+use crate::x86::types::LoaderSymbolKind;
 
 /// Kept below 4 GiB because a COFF section header stores its virtual address in
 /// 32 bits.  All synthetic addresses remain within the signed REL32 window.
@@ -149,10 +150,16 @@ impl CoffImage {
     pub fn load_synthetic_symbols(&self, db: &mut DecompileDB) {
         for ext in &self.address_map.externs {
             let name: &'static str = Box::leak(ext.provider_name.clone().into_boxed_str());
+            let original_name: &'static str =
+                Box::leak(ext.original_name.clone().into_boxed_str());
             let addr = ext.synthetic_address;
             db.rel_push("symbols", (addr, name, "Beg"));
             match ext.kind {
                 CoffExternalKind::Function => {
+                    db.rel_push(
+                        "loader_symbol_identity",
+                        (addr, LoaderSymbolKind::Function, name, original_name),
+                    );
                     // plt_block marks a named callable target as external, so
                     // function inference never emits a body for the synthetic
                     // address even though direct_call retains the exact edge.
@@ -164,6 +171,15 @@ impl CoffImage {
                     );
                 }
                 CoffExternalKind::ImportPointer => {
+                    db.rel_push(
+                        "loader_symbol_identity",
+                        (
+                            addr,
+                            LoaderSymbolKind::ImportPointer,
+                            name,
+                            original_name,
+                        ),
+                    );
                     db.rel_push("pointer_to_external_symbol", (addr, name));
                     db.rel_push(
                         "symbol_table",
@@ -1474,6 +1490,20 @@ mod tests {
         assert!(pointer_names.contains("coff_ext_slotcall"));
         assert!(!pointer_names.contains("coff_ext_directfn"));
         assert!(!pointer_names.contains("coff_ext_dataload"));
+        let identities: BTreeMap<&str, LoaderSymbolKind> = db
+            .rel_iter::<(Address, LoaderSymbolKind, Symbol, Symbol)>(
+                "loader_symbol_identity",
+            )
+            .map(|(_, kind, provider, _)| (*provider, *kind))
+            .collect();
+        assert_eq!(
+            identities.get("coff_ext_slotjmp"),
+            Some(&LoaderSymbolKind::ImportPointer)
+        );
+        assert_eq!(
+            identities.get("coff_ext_directfn"),
+            Some(&LoaderSymbolKind::Function)
+        );
     }
 
     #[test]

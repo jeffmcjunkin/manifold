@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::decompile::elevator::DecompileDB;
@@ -39,10 +39,6 @@ pub(crate) fn count_items_sig<'a, T: 'a>(inp: impl Iterator<Item = (&'a T,)>) ->
     std::iter::once(inp.count())
 }
 
-pub(crate) fn max_usize<'a>(inp: impl Iterator<Item = (&'a usize,)>) -> impl Iterator<Item = usize> {
-    inp.map(|(&v,)| v).max().into_iter()
-}
-
 // Declarative helpers consumed by reconcile_signatures below.
 ascent_par! {
     #![measure_rule_times]
@@ -55,13 +51,20 @@ ascent_par! {
     relation func_has_param_evidence(Address, usize);
     relation call_target_func(Node, Address);
     relation call_arg(Node, usize, RTLReg);
-    relation call_has_arg_evidence(Node, usize);
+    relation call_arg_provenance(Node, usize, RTLReg, CallArgProvenance);
+    relation call_forwarding_unresolved(Node);
     relation call_args_collected_candidate(Node, Args);
     relation call_float_args_collected(Node, Args);
+    relation call_has_float_arg_evidence(Node, usize);
     relation emit_function_param_count_candidate(Address, usize);
     relation emit_function_float_param_count(Address, usize);
     relation emit_function_stack_param_count(Address, usize);
     relation known_varargs_function(Symbol, usize);
+    relation loader_symbol_identity(Address, LoaderSymbolKind, Symbol, Symbol);
+    relation known_loader_signature(Address, LoaderSymbolKind, Symbol, Symbol, usize, XType, Arc<Vec<XType>>, bool);
+    relation known_loader_variadic(Address, LoaderSymbolKind, Symbol, Symbol);
+    relation loader_signature_conflict(Address, LoaderSymbolKind, Symbol, Symbol);
+    relation call_resolved_signature(Node, Symbol, usize, XType, Arc<Vec<XType>>, bool);
     // Functions inferred variadic by their XMM register save area prologue (test %al,%al; je; movaps xmm0..7 to stack).
     relation func_has_variadic_xmm_prologue(Address);
     relation emit_function_has_return_candidate(Address);
@@ -69,22 +72,89 @@ ascent_par! {
     relation emit_function_return_type_xtype_candidate(Address, XType);
     relation call_returns_value(Address, Mreg);
     relation abi_int_arg_position(Mreg, usize);
+    relation abi_shared_arg_slots(bool);
 
-    // Calls that have precise per-position arg_mapping.
-    #[local] relation call_precise(Node);
-    call_precise(n) <-- call_arg(n, _, _);
+    #[local] relation call_arg_conflict(Node);
+    call_arg_conflict(n) <--
+        call_arg(n, position, first),
+        call_arg(n, position, second),
+        if first != second;
 
-    // Per-call integer-position evidence; precise mapping wins.
+    #[local] relation call_args_candidate_conflict(Node);
+    call_args_candidate_conflict(n) <--
+        call_args_collected_candidate(n, first),
+        call_args_collected_candidate(n, second),
+        if first != second;
+
+    #[local] relation call_target_conflict(Node);
+    call_target_conflict(n) <--
+        call_target_func(n, first),
+        call_target_func(n, second),
+        if first != second;
+
+    #[local] relation call_arg_position_count(Node, usize);
+    call_arg_position_count(n, count) <--
+        call_arg(n, _, _),
+        agg count = count_items_sig(position) in call_arg(n, position, _);
+
+    // Per-call integer-position evidence comes only from a materialized dense
+    // vector.  Falling back to a lone high ABI position here would recreate
+    // missing prefix parameters.  Conflicting semantic rows veto the complete
+    // site rather than allowing their common positions to leak through.
     #[local] relation call_int_pos(Node, usize);
-    call_int_pos(n, p) <-- call_arg(n, p, _);
-    // Fall back to call_has_arg_evidence only when no precise mapping exists for this call.
     call_int_pos(n, p) <--
-        call_has_arg_evidence(n, p),
-        !call_precise(n);
+        call_arg(n, p, _),
+        !call_arg_conflict(n),
+        !call_args_candidate_conflict(n);
 
     // A call site is informative if it has any arg evidence for its target.
     #[local] relation call_has_any_arg(Node);
     call_has_any_arg(n) <-- call_int_pos(n, _);
+
+    // A sparse or conflicting positional set is represented by an empty
+    // semantic vector downstream, but it is not evidence for arity zero.
+    // Keep it out of the call-site mode entirely; genuine zero-argument sites
+    // have neither provenance nor a semantic position.
+    #[local] relation call_vector_incoherent(Node);
+    call_vector_incoherent(n) <--
+        call_arg_provenance(n, _, _, _),
+        !call_arg(n, _, _);
+    call_vector_incoherent(n) <-- call_arg_conflict(n);
+    call_vector_incoherent(n) <-- call_args_candidate_conflict(n);
+    call_vector_incoherent(n) <-- call_target_conflict(n);
+    call_vector_incoherent(n) <--
+        call_target_func(n, _),
+        !call_args_collected_candidate(n, _);
+    call_vector_incoherent(n) <--
+        call_arg(n, _, _),
+        !call_args_collected_candidate(n, _);
+    call_vector_incoherent(n) <--
+        call_args_collected_candidate(n, args),
+        if !args.is_empty(),
+        !call_arg(n, _, _);
+    call_vector_incoherent(n) <--
+        call_args_collected_candidate(n, args),
+        if args
+            .iter()
+            .any(|reg| *reg == crate::util::DEFAULT_VAR as RTLReg);
+    call_vector_incoherent(n) <--
+        call_arg(n, position, reg),
+        call_args_collected_candidate(n, args),
+        if args.get(*position) != Some(reg);
+    call_vector_incoherent(n) <--
+        call_args_collected_candidate(n, args),
+        call_arg_position_count(n, count),
+        if args.len() != *count;
+    call_vector_incoherent(n) <-- call_forwarding_unresolved(n);
+    call_vector_incoherent(n) <--
+        call_args_collected_candidate(n, args),
+        call_resolved_signature(n, _, fixed_prefix, _, _, _),
+        if args.len() < *fixed_prefix;
+    call_vector_incoherent(n) <--
+        call_has_float_arg_evidence(n, _),
+        !abi_shared_arg_slots(true),
+        !call_float_arg_count(n, _);
+    call_vector_incoherent(n) <-- call_float_arg_count_conflict(n);
 
     // Per-(func, pos) call-site support counts.
     #[local] relation call_pos_evidence(Address, Node, usize);
@@ -97,7 +167,7 @@ ascent_par! {
         call_target_func(n, target),
         call_has_any_arg(n);
 
-    // Number of informative call sites per function
+    // Number of informative call sites per function (diagnostic only).
     relation informative_call_count(Address, usize);
     informative_call_count(f, c) <--
         informative_call(f, _),
@@ -131,10 +201,11 @@ ascent_par! {
     // (b) call-site ratio confirms (only with at least one informative call); suppressed for pure-float-param functions, where the definition is authoritative that it reads no int arg reg so caller-side int-reg evidence is leftover state, not a parameter.
     int_pos_confirmed(f, p) <--
         call_pos_support(f, p, c),
-        informative_call_count(f, total),
+        total_call_sites(f, total),
         abi_int_arg_position(_, p),
         if *total > 0,
         if (*c as f64) / (*total as f64) >= CALL_SITE_CONFIRM_THRESHOLD,
+        !call_site_consensus_veto(f),
         !func_pure_float_params(f);
 
     // Reconciled int count: max confirmed position + 1. Emits only when some confirmation exists.
@@ -155,15 +226,55 @@ ascent_par! {
         call_args_collected_candidate(n, args),
         let len = args.len();
     #[local] relation call_int_arg_count(Node, usize);
-    call_int_arg_count(n, m) <--
-        call_int_arg_count_raw(n, _),
-        agg m = max_usize(l) in call_int_arg_count_raw(n, l);
+    call_int_arg_count(n, count) <--
+        call_int_arg_count_raw(n, count),
+        !call_args_candidate_conflict(n);
 
+    #[local] relation call_float_arg_count_raw(Node, usize);
+    call_float_arg_count_raw(n, fc) <--
+        call_float_args_collected(n, args),
+        let fc = args.len();
+    #[local] relation call_float_arg_count_conflict(Node);
+    call_float_arg_count_conflict(n) <--
+        call_float_arg_count_raw(n, first),
+        call_float_arg_count_raw(n, second),
+        if first != second;
+    #[local] relation call_float_args_candidate_conflict(Node);
+    call_float_args_candidate_conflict(n) <--
+        call_float_args_collected(n, first),
+        call_float_args_collected(n, second),
+        if first != second;
+    #[local] relation call_float_evidence_count(Node, usize);
+    call_float_evidence_count(n, count) <--
+        call_has_float_arg_evidence(n, _),
+        agg count = count_items_sig(position) in call_has_float_arg_evidence(n, position);
     #[local] relation call_float_arg_count(Node, usize);
     call_float_arg_count(n, fc) <--
+        call_float_arg_count_raw(n, fc),
+        if *fc > 0,
+        !call_float_arg_count_conflict(n),
+        !call_float_args_candidate_conflict(n);
+
+    call_vector_incoherent(n) <-- call_float_args_candidate_conflict(n);
+    call_vector_incoherent(n) <--
         call_float_args_collected(n, args),
-        let fc = args.len(),
-        if fc > 0;
+        if args
+            .iter()
+            .any(|reg| *reg == crate::util::DEFAULT_VAR as RTLReg);
+    call_vector_incoherent(n) <--
+        !abi_shared_arg_slots(true),
+        call_float_arg_count_raw(n, count),
+        call_float_evidence_count(n, evidence_count),
+        if *count != *evidence_count;
+    call_vector_incoherent(n) <--
+        !abi_shared_arg_slots(true),
+        call_float_arg_count(n, _),
+        !call_has_float_arg_evidence(n, _);
+    call_vector_incoherent(n) <--
+        !abi_shared_arg_slots(true),
+        call_has_float_arg_evidence(n, position),
+        call_float_arg_count_raw(n, count),
+        if *position >= *count;
 
     #[local] relation call_total_arg_count(Node, usize);
     call_total_arg_count(n, ic) <--
@@ -181,16 +292,19 @@ ascent_par! {
     #[local] relation call_site_count_sample(Address, Node, usize);
     call_site_count_sample(target, n, c) <--
         call_target_func(n, target),
-        call_total_arg_count(n, c);
+        call_total_arg_count(n, c),
+        !call_vector_incoherent(n);
     call_site_count_sample(target, n, 0) <--
         call_target_func(n, target),
-        !call_total_arg_count(n, _);
+        !call_total_arg_count(n, _),
+        !call_vector_incoherent(n);
 
-    // Total call sites per function (every call_target_func entry).
+    // Total call sites per function.  Incoherent and empty/short sites stay in
+    // this denominator even though only coherent vectors produce samples.
     relation total_call_sites(Address, usize);
     total_call_sites(f, c) <--
-        call_site_count_sample(f, _, _),
-        agg c = count_items_sig(n) in call_site_count_sample(f, n, _);
+        call_target_func(_, f),
+        agg c = count_items_sig(n) in call_target_func(n, f);
 
     // Majority mode: arg-count with highest frequency, ties broken by larger value.
     relation call_site_mode(Address, usize);
@@ -203,6 +317,18 @@ ascent_par! {
         call_site_count_sample(f, _, _),
         agg freq = mode_freq_usize(c) in call_site_count_sample(f, _, c);
 
+    // Any incoherent site or disagreement in coherent site lengths is a veto
+    // for call-site-derived fixed arity.  In particular a short site is not
+    // silently dropped in favor of the longer mode.
+    relation call_site_consensus_veto(Address);
+    call_site_consensus_veto(target) <--
+        call_target_func(n, target),
+        call_vector_incoherent(n);
+    call_site_consensus_veto(target) <--
+        call_site_count_sample(target, first_node, first_count),
+        call_site_count_sample(target, second_node, second_count),
+        if first_node != second_node && first_count != second_count;
+
     // has_call_sites: any call_target_func entry for f.
     relation has_call_sites(Address);
     has_call_sites(f) <-- call_target_func(_, f);
@@ -213,11 +339,59 @@ ascent_par! {
         call_target_func(n, f),
         call_returns_value(n, _);
 
-    // Varargs: emit_function listed in known_varargs_function, OR functions whose prologue spills all 8 XMM arg regs (SysV variadic register save area; see func_has_variadic_xmm_prologue in rtl_pass.rs).
+    #[local] relation function_loader_identity(Address);
+    function_loader_identity(addr) <--
+        loader_symbol_identity(addr, kind, _, _),
+        if matches!(kind, LoaderSymbolKind::Function);
+
+    #[local] relation function_loader_signature_conflict(Address);
+    function_loader_signature_conflict(addr) <--
+        loader_signature_conflict(addr, kind, _, _),
+        if matches!(kind, LoaderSymbolKind::Function);
+    function_loader_signature_conflict(addr) <--
+        known_loader_signature(addr, kind, _, _, arity, _, params, _),
+        if matches!(kind, LoaderSymbolKind::Function),
+        if *arity != params.len();
+    function_loader_signature_conflict(addr) <--
+        known_loader_signature(addr, first_kind, _, _, first_arity, first_ret, first_params, first_variadic),
+        known_loader_signature(addr, second_kind, _, _, second_arity, second_ret, second_params, second_variadic),
+        if matches!(first_kind, LoaderSymbolKind::Function),
+        if matches!(second_kind, LoaderSymbolKind::Function),
+        if *first_arity != *second_arity
+            || *first_ret != *second_ret
+            || first_params.as_ref() != second_params.as_ref()
+            || *first_variadic != *second_variadic;
+    function_loader_signature_conflict(addr) <--
+        known_loader_signature(addr, kind, _, _, _, _, _, variadic),
+        known_loader_variadic(addr, variadic_kind, _, _),
+        if matches!(kind, LoaderSymbolKind::Function),
+        if matches!(variadic_kind, LoaderSymbolKind::Function),
+        if !*variadic;
+    function_loader_signature_conflict(addr) <--
+        known_loader_signature(addr, kind, _, _, _, _, _, variadic),
+        if matches!(kind, LoaderSymbolKind::Function),
+        if *variadic,
+        !known_loader_variadic(addr, kind, _, _);
+
+    // Conflicting loader declarations may not contribute caller consensus,
+    // even when the body itself still supplies independent parameter evidence.
+    call_site_consensus_veto(addr) <-- function_loader_signature_conflict(addr);
+
+    // Varargs come from the exact loader identity when one exists.  The
+    // legacy name relation remains only for objects outside that identity
+    // domain; a sanitized/provider collision can therefore never mark a body.
     relation is_varargs_fn(Address);
     is_varargs_fn(addr) <--
+        known_loader_variadic(addr, kind, _, _),
+        if matches!(kind, LoaderSymbolKind::Function);
+    is_varargs_fn(addr) <--
+        known_loader_signature(addr, kind, _, _, _, _, _, variadic),
+        if matches!(kind, LoaderSymbolKind::Function),
+        if *variadic;
+    is_varargs_fn(addr) <--
         emit_function(addr, name, _),
-        known_varargs_function(name, _);
+        known_varargs_function(name, _),
+        !function_loader_identity(addr);
     is_varargs_fn(addr) <--
         func_has_variadic_xmm_prologue(addr);
 
@@ -305,16 +479,18 @@ impl IRPass for SignatureReconciliationPass {
             "emit_function", "emit_function_param_candidate", "emit_function_param_count_candidate",
             "emit_function_param_type_candidate", "emit_function_has_return_candidate", "emit_function_void_candidate",
             "emit_function_return_type_xtype_candidate", "emit_function_signature_candidate",
-            "call_target_func", "call_args_collected_candidate", "call_float_args_collected", "call_returns_value",
-            "known_extern_signature", "call_site", "reg_rtl", "reg_def_used",
+            "call_target_func", "call_args_collected_candidate", "call_float_args_collected", "call_has_float_arg_evidence", "call_returns_value",
+            "known_extern_signature", "known_varargs_function", "call_site", "reg_rtl",
+            "loader_symbol_identity", "known_loader_signature", "known_loader_variadic", "loader_signature_conflict",
+            "call_loader_identity_candidate", "call_resolved_signature",
             "func_param_position_type", "reg_xtl",
-            "emit_var_type_candidate", "call_arg",
-            "func_has_param_evidence", "call_has_arg_evidence",
+            "emit_var_type_candidate", "call_arg", "call_arg_provenance", "call_forwarding_unresolved",
+            "func_has_param_evidence",
             "emit_function_float_param_count", "emit_function_stack_param_count",
             "func_has_variadic_xmm_prologue",
             "rtl_inst",
             "known_func_param_is_ptr",
-            "abi_int_arg_position",
+            "abi_int_arg_position", "abi_shared_arg_slots",
             "arg_reg_param_live_at",
             "instr_in_function",
         ]
@@ -389,6 +565,10 @@ fn reconcile_signatures(db: &mut DecompileDB) {
         .rel_iter::<(Address, usize)>("total_call_sites")
         .map(|&(a, c)| (a, c))
         .collect();
+    let call_site_consensus_veto_set: HashSet<Address> = db
+        .rel_iter::<(Address,)>("call_site_consensus_veto")
+        .map(|&(a,)| a)
+        .collect();
     let has_call_sites_set: HashSet<Address> = db
         .rel_iter::<(Address,)>("has_call_sites")
         .map(|&(a,)| a)
@@ -422,15 +602,132 @@ fn reconcile_signatures(db: &mut DecompileDB) {
             .collect()
     };
 
-    let extern_sigs: HashMap<Symbol, (usize, XType, Arc<Vec<XType>>)> = db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
-        .map(|&(name, count, ref ret, ref params)| (name, (count, ret.clone(), params.clone())))
+    let extern_sigs: HashMap<Symbol, (usize, XType, Arc<Vec<XType>>)> = {
+        let mut groups: BTreeMap<Symbol, BTreeSet<(usize, XType, Arc<Vec<XType>>)>> =
+            BTreeMap::new();
+        for &(name, count, ret, ref params) in db.rel_iter::<(
+            Symbol,
+            usize,
+            XType,
+            Arc<Vec<XType>>,
+        )>("known_extern_signature") {
+            groups
+                .entry(name)
+                .or_default()
+                .insert((count, ret, params.clone()));
+        }
+        groups
+            .into_iter()
+            .filter_map(|(name, facts)| {
+                if facts.len() != 1 {
+                    return None;
+                }
+                let fact = facts.into_iter().next().unwrap();
+                (fact.0 == fact.2.len()).then_some((name, fact))
+            })
+            .collect()
+    };
+    let known_vararg_fixed_counts: HashMap<Symbol, usize> = {
+        let mut groups: BTreeMap<Symbol, BTreeSet<usize>> = BTreeMap::new();
+        for &(name, count) in db.rel_iter::<(Symbol, usize)>("known_varargs_function") {
+            groups.entry(name).or_default().insert(count);
+        }
+        groups
+            .into_iter()
+            .filter_map(|(name, counts)| {
+                (counts.len() == 1).then(|| (name, *counts.iter().next().unwrap()))
+            })
+            .collect()
+    };
+
+    let loader_function_addresses: HashSet<Address> = db
+        .rel_iter::<(Address, LoaderSymbolKind, Symbol, Symbol)>(
+            "loader_symbol_identity",
+        )
+        .filter_map(|&(address, kind, _, _)| {
+            (kind == LoaderSymbolKind::Function).then_some(address)
+        })
+        .collect();
+    let exact_variadic_addresses: HashSet<Address> = db
+        .rel_iter::<(Address, LoaderSymbolKind, Symbol, Symbol)>(
+            "known_loader_variadic",
+        )
+        .filter_map(|&(address, kind, _, _)| {
+            (kind == LoaderSymbolKind::Function).then_some(address)
+        })
+        .collect();
+    let mut exact_signature_vetoes: HashSet<Address> = db
+        .rel_iter::<(Address, LoaderSymbolKind, Symbol, Symbol)>(
+            "loader_signature_conflict",
+        )
+        .filter_map(|&(address, kind, _, _)| {
+            (kind == LoaderSymbolKind::Function).then_some(address)
+        })
+        .collect();
+    let mut exact_signature_rows: BTreeMap<
+        Address,
+        BTreeSet<(usize, XType, Arc<Vec<XType>>, bool)>,
+    > = BTreeMap::new();
+    for (address, kind, _, _, arity, ret, params, variadic) in db.rel_iter::<(
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+        usize,
+        XType,
+        Arc<Vec<XType>>,
+        bool,
+    )>("known_loader_signature") {
+        if *kind != LoaderSymbolKind::Function {
+            continue;
+        }
+        if *arity != params.len() {
+            exact_signature_vetoes.insert(*address);
+            continue;
+        }
+        exact_signature_rows.entry(*address).or_default().insert((
+            *arity,
+            *ret,
+            params.clone(),
+            *variadic,
+        ));
+    }
+    for (&address, rows) in &exact_signature_rows {
+        if rows.len() != 1
+            || rows
+                .iter()
+                .any(|(_, _, _, variadic)| {
+                    *variadic != exact_variadic_addresses.contains(&address)
+                })
+        {
+            exact_signature_vetoes.insert(address);
+        }
+    }
+    let exact_loader_vararg_sigs: HashMap<
+        Address,
+        (usize, XType, Arc<Vec<XType>>),
+    > = exact_signature_rows
+        .into_iter()
+        .filter_map(|(address, rows)| {
+            if rows.len() != 1 || exact_signature_vetoes.contains(&address) {
+                return None;
+            }
+            let (arity, ret, params, variadic) = rows.into_iter().next().unwrap();
+            (variadic && exact_variadic_addresses.contains(&address))
+                .then_some((address, (arity, ret, params)))
+        })
         .collect();
 
-    let mut def_param_counts: HashMap<Address, usize> = HashMap::new();
+    let mut def_param_count_groups: BTreeMap<Address, BTreeSet<usize>> = BTreeMap::new();
     for &(addr, count) in db.rel_iter::<(Address, usize)>("emit_function_param_count_candidate") {
-        let entry = def_param_counts.entry(addr).or_insert(0);
-        *entry = (*entry).max(count);
+        def_param_count_groups.entry(addr).or_default().insert(count);
     }
+    let def_param_counts: HashMap<Address, usize> = def_param_count_groups
+        .into_iter()
+        .filter_map(|(addr, counts)| {
+            (counts.len() == 1).then(|| (addr, *counts.iter().next().unwrap()))
+        })
+        .collect();
 
     // Multiple param-type candidates per (addr, reg) are possible; reduce with (refine-priority, ty) for determinism under parallel Ascent.
     let def_param_types: HashMap<Address, HashMap<RTLReg, XType>> = {
@@ -519,9 +816,18 @@ fn reconcile_signatures(db: &mut DecompileDB) {
     }
 
     // call_targets is consumed by patch_db and the call-site arg-type lookup below.
-    let call_targets: HashMap<Node, Address> = db.rel_iter::<(Node, Address)>("call_target_func")
-        .map(|&(call_node, target)| (call_node, target))
-        .collect();
+    let call_targets: HashMap<Node, Address> = {
+        let mut groups: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+        for &(call_node, target) in db.rel_iter::<(Node, Address)>("call_target_func") {
+            groups.entry(call_node).or_default().insert(target);
+        }
+        groups
+            .into_iter()
+            .filter_map(|(node, targets)| {
+                (targets.len() == 1).then(|| (node, *targets.iter().next().unwrap()))
+            })
+            .collect()
+    };
 
     let emit_var_types: HashMap<RTLReg, Vec<XType>> = {
         let mut map: HashMap<RTLReg, Vec<XType>> = HashMap::new();
@@ -567,15 +873,20 @@ fn reconcile_signatures(db: &mut DecompileDB) {
 
     // Position-level int-arg evidence lives in the Ascent program above.
 
-    let float_param_counts: HashMap<Address, usize> = db
-        .rel_iter::<(Address, usize)>("emit_function_float_param_count")
-        .map(|&(addr, count)| (addr, count))
-        .collect();
-
-    let stack_param_counts: HashMap<Address, usize> = db
-        .rel_iter::<(Address, usize)>("emit_function_stack_param_count")
-        .map(|&(addr, count)| (addr, count))
-        .collect();
+    let unique_counts = |relation: &'static str| -> HashMap<Address, usize> {
+        let mut groups: BTreeMap<Address, BTreeSet<usize>> = BTreeMap::new();
+        for &(addr, count) in db.rel_iter::<(Address, usize)>(relation) {
+            groups.entry(addr).or_default().insert(count);
+        }
+        groups
+            .into_iter()
+            .filter_map(|(addr, counts)| {
+                (counts.len() == 1).then(|| (addr, *counts.iter().next().unwrap()))
+            })
+            .collect()
+    };
+    let float_param_counts = unique_counts("emit_function_float_param_count");
+    let stack_param_counts = unique_counts("emit_function_stack_param_count");
 
     let known_internal_sigs: HashMap<&str, (usize, XType, Vec<XType>)> = [
         ("main", (2, XType::Xint, vec![XType::Xint, XType::Xcharptrptr])),
@@ -673,38 +984,56 @@ fn reconcile_signatures(db: &mut DecompileDB) {
             }
         }
 
-        // POINTER-PARAM-AS-SCALAR, forwarded form: a param handed to a callee that takes a pointer at that position is a pointer; marks only the pointerness axis.
-        let mut callee_ptr_pos: HashMap<Symbol, HashSet<usize>> = HashMap::new();
+        // POINTER-PARAM-AS-SCALAR, forwarded form: a param handed to a callee
+        // that takes a pointer at that position is a pointer.  Key the proof
+        // by the already-resolved call node so loader aliases/collisions can
+        // never merge here by display name.
+        let mut known_ptr_positions: HashMap<Symbol, HashSet<usize>> = HashMap::new();
         for &(name, idx) in db.rel_iter::<(Symbol, usize)>("known_func_param_is_ptr") {
-            callee_ptr_pos.entry(name).or_default().insert(idx);
+            known_ptr_positions.entry(name).or_default().insert(idx);
         }
-        for &(name, _cnt, _ret, ref params) in
-            db.rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
-        {
+        let mut call_ptr_positions: HashMap<Node, HashSet<usize>> = HashMap::new();
+        for &(node, _name, _count, _ret, ref params, _variadic) in db.rel_iter::<(
+            Node,
+            Symbol,
+            usize,
+            XType,
+            Arc<Vec<XType>>,
+            bool,
+        )>("call_resolved_signature") {
             for (i, t) in params.iter().enumerate() {
                 if matches!(t, XType::Xptr | XType::Xcharptr | XType::Xcharptrptr
-                    | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr | XType::XstructPtr(_)) {
-                    callee_ptr_pos.entry(name).or_default().insert(i);
+                    | XType::Xintptr | XType::Xfloatptr | XType::Xsingleptr
+                    | XType::Xfuncptr | XType::XstructPtr(_)) {
+                    call_ptr_positions.entry(node).or_default().insert(i);
                 }
             }
         }
-        if !callee_ptr_pos.is_empty() {
-            for &(_node, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
-                let (callee, args) = match inst {
-                    RTLInst::Icall(_, callee, args, _, _) => (callee, args),
-                    RTLInst::Itailcall(_, callee, args) => (callee, args),
+        let loader_candidate_calls: HashSet<Node> = db
+            .rel_iter::<(Node, Address, LoaderSymbolKind, Symbol, Symbol)>(
+                "call_loader_identity_candidate",
+            )
+            .map(|&(node, _, _, _, _)| node)
+            .collect();
+        for &(node, name) in db.rel_iter::<(Node, Symbol)>("call_site") {
+            if loader_candidate_calls.contains(&node) {
+                continue;
+            }
+            if let Some(positions) = known_ptr_positions.get(name) {
+                call_ptr_positions
+                    .entry(node)
+                    .or_default()
+                    .extend(positions.iter().copied());
+            }
+        }
+        if !call_ptr_positions.is_empty() {
+            for &(node, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+                let args = match inst {
+                    RTLInst::Icall(_, _, args, _, _) => args,
+                    RTLInst::Itailcall(_, _, args) => args,
                     _ => continue,
                 };
-                // Resolve the callee name (symbol form only; indirect calls have no known sig).
-                let name: Option<Symbol> = match callee {
-                    either::Either::Right(either::Either::Right(sym)) => Some(*sym),
-                    either::Either::Right(either::Either::Left(addr)) => {
-                        functions.get(addr).copied()
-                    }
-                    _ => None,
-                };
-                let Some(name) = name else { continue };
-                let Some(ptr_positions) = callee_ptr_pos.get(name) else { continue };
+                let Some(ptr_positions) = call_ptr_positions.get(&node) else { continue };
                 for (pos, &arg_reg) in args.iter().enumerate() {
                     if !ptr_positions.contains(&pos) {
                         continue;
@@ -727,11 +1056,18 @@ fn reconcile_signatures(db: &mut DecompileDB) {
     let mut prototypes: Vec<FunctionPrototype> = Vec::new();
 
     for (&func_addr, &func_name) in &functions {
+        // A conflicting exact loader declaration is not an invitation to
+        // infer a replacement fixed prototype from the body.  Preserve the
+        // conflict as an unspecified signature all the way to C emission.
+        if exact_signature_vetoes.contains(&func_addr) {
+            continue;
+        }
         // Varargs detection: declarative via SignatureReconciliationProgram.
         let is_va = is_varargs_fn_set.contains(&func_addr);
         if is_va {
-            if let Some((param_count, ret_type, param_types)) = extern_sigs.get(func_name) {
-                // Variadic internal function: force known param count to avoid materializing register dumps.
+            if let Some((param_count, ret_type, param_types)) =
+                exact_loader_vararg_sigs.get(&func_addr)
+            {
                 prototypes.push(FunctionPrototype {
                     address: func_addr,
                     name: func_name,
@@ -742,6 +1078,28 @@ fn reconcile_signatures(db: &mut DecompileDB) {
                     is_varargs: true,
                 });
                 continue;
+            }
+            if !loader_function_addresses.contains(&func_addr) {
+                if let Some((param_count, ret_type, param_types)) = extern_sigs.get(func_name) {
+                // A curated fixed-prefix count is authoritative only when the
+                // variadic relation has one matching value.  Conflicting or
+                // malformed name facts still protect the tail, but cannot
+                // select a fixed prefix.
+                    if known_vararg_fixed_counts.get(func_name) == Some(param_count)
+                        && *param_count == param_types.len()
+                    {
+                        prototypes.push(FunctionPrototype {
+                            address: func_addr,
+                            name: func_name,
+                            param_count: *param_count,
+                            param_types: (**param_types).clone(),
+                            return_type: *ret_type,
+                            confidence: SignatureConfidence::KnownExtern,
+                            is_varargs: true,
+                        });
+                        continue;
+                    }
+                }
             }
             // Varargs known but no extern sig: fall through, remember is_va so call sites keep extra args.
         }
@@ -804,7 +1162,9 @@ fn reconcile_signatures(db: &mut DecompileDB) {
             // Variadic: call sites carry extra variadic args that must not inflate the fixed-param count.
             position_based_count
         } else if call_site_mode > position_based_count
-            && consensus_ratio >= 0.6 && total_sites >= 2
+            && consensus_ratio >= 0.6
+            && total_sites >= 2
+            && !call_site_consensus_veto_set.contains(&func_addr)
         {
             // Call sites strongly agree on more params; trust them
             call_site_mode
@@ -1104,6 +1464,174 @@ fn reconcile_signatures(db: &mut DecompileDB) {
     patch_db(db, &prototypes, &inherited_tailcalls);
 }
 
+#[cfg(test)]
+mod consensus_veto_tests {
+    use super::*;
+
+    fn on_signature_program_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("signature-program-test".to_string())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(test)
+            .expect("spawn signature program test")
+            .join()
+            .expect("signature program test panicked");
+    }
+
+    #[test]
+    fn short_and_incoherent_sites_remain_consensus_vetoes() {
+        on_signature_program_stack(|| {
+            let mut db = DecompileDB::default();
+        let target = 0x1000u64;
+        db.rel_push("call_target_func", (1u64, target));
+        db.rel_push("call_target_func", (2u64, target));
+        db.rel_push(
+            "call_args_collected_candidate",
+            (1u64, Arc::new(vec![0x10u64, 0x11u64])),
+        );
+        db.rel_push(
+            "call_args_collected_candidate",
+            (2u64, Arc::new(Vec::<RTLReg>::new())),
+        );
+        for (position, value) in [(0usize, 0x10u64), (1usize, 0x11u64)] {
+            db.rel_push("call_arg", (1u64, position, value));
+            db.rel_push(
+                "call_arg_provenance",
+                (
+                    1u64,
+                    position,
+                    value,
+                    CallArgProvenance::ExplicitRegister,
+                ),
+            );
+        }
+
+        run_pass!(&mut db, SignatureReconciliationProgram);
+
+        assert!(db
+            .rel_iter::<(Address,)>("call_site_consensus_veto")
+            .any(|&(address,)| address == target));
+        assert!(db
+            .rel_iter::<(Address, usize)>("total_call_sites")
+            .any(|&(address, count)| address == target && count == 2));
+
+        let mut exact_short = DecompileDB::default();
+        exact_short.rel_push("call_target_func", (9u64, target));
+        exact_short.rel_push(
+            "call_args_collected_candidate",
+            (9u64, Arc::new(vec![0x90u64])),
+        );
+        exact_short.rel_push("call_arg", (9u64, 0usize, 0x90u64));
+        exact_short.rel_push(
+            "call_resolved_signature",
+            (
+                9u64,
+                "exact_target" as Symbol,
+                2usize,
+                XType::Xint,
+                Arc::new(vec![XType::Xlong, XType::Xlong]),
+                false,
+            ),
+        );
+        run_pass!(&mut exact_short, SignatureReconciliationProgram);
+        assert!(exact_short
+            .rel_iter::<(Address,)>("call_site_consensus_veto")
+            .any(|&(address,)| address == target));
+
+        let mut incoherent = DecompileDB::default();
+        incoherent.rel_push("call_target_func", (3u64, target));
+        incoherent.rel_push("call_target_func", (4u64, target));
+        incoherent.rel_push(
+            "call_arg_provenance",
+            (
+                3u64,
+                1usize,
+                0x31u64,
+                CallArgProvenance::ForwardedEntry,
+            ),
+        );
+        run_pass!(&mut incoherent, SignatureReconciliationProgram);
+        assert!(incoherent
+            .rel_iter::<(Address,)>("call_site_consensus_veto")
+            .any(|&(address,)| address == target));
+        assert!(incoherent
+            .rel_iter::<(Address, usize)>("total_call_sites")
+            .any(|&(address, count)| address == target && count == 2));
+
+        let mut conflicting = DecompileDB::default();
+        conflicting.rel_push("call_target_func", (5u64, target));
+        conflicting.rel_push("call_target_func", (6u64, target));
+        conflicting.rel_push(
+            "call_args_collected_candidate",
+            (5u64, Arc::new(vec![0x50u64])),
+        );
+        conflicting.rel_push(
+            "call_args_collected_candidate",
+            (5u64, Arc::new(vec![0x51u64])),
+        );
+        run_pass!(&mut conflicting, SignatureReconciliationProgram);
+        assert!(conflicting
+            .rel_iter::<(Address,)>("call_site_consensus_veto")
+            .any(|&(address,)| address == target));
+
+        let mut ambiguous_target = DecompileDB::default();
+        ambiguous_target.rel_push("call_target_func", (7u64, target));
+        ambiguous_target.rel_push("call_target_func", (7u64, target + 0x10));
+        ambiguous_target.rel_push(
+            "call_args_collected_candidate",
+            (7u64, Arc::new(Vec::<RTLReg>::new())),
+        );
+        run_pass!(&mut ambiguous_target, SignatureReconciliationProgram);
+        for address in [target, target + 0x10] {
+            assert!(ambiguous_target
+                .rel_iter::<(Address,)>("call_site_consensus_veto")
+                .any(|&(candidate,)| candidate == address));
+        }
+
+        let mut stale_candidate_tail = DecompileDB::default();
+        stale_candidate_tail.rel_push("call_target_func", (8u64, target));
+        stale_candidate_tail.rel_push(
+            "call_args_collected_candidate",
+            (8u64, Arc::new(vec![0x80u64, 0x81u64])),
+        );
+        stale_candidate_tail.rel_push("call_arg", (8u64, 0usize, 0x80u64));
+        stale_candidate_tail.rel_push(
+            "call_arg_provenance",
+            (
+                8u64,
+                0usize,
+                0x80u64,
+                CallArgProvenance::ExplicitRegister,
+            ),
+        );
+        run_pass!(&mut stale_candidate_tail, SignatureReconciliationProgram);
+        assert!(stale_candidate_tail
+            .rel_iter::<(Address,)>("call_site_consensus_veto")
+            .any(|&(address,)| address == target));
+
+        let mut conflicting_float = DecompileDB::default();
+        conflicting_float.rel_push("call_target_func", (9u64, target));
+        conflicting_float.rel_push(
+            "call_args_collected_candidate",
+            (9u64, Arc::new(Vec::<RTLReg>::new())),
+        );
+        conflicting_float.rel_push(
+            "call_float_args_collected",
+            (9u64, Arc::new(vec![0x90u64])),
+        );
+        conflicting_float.rel_push(
+            "call_float_args_collected",
+            (9u64, Arc::new(vec![0x91u64])),
+        );
+        conflicting_float.rel_push("call_has_float_arg_evidence", (9u64, 0usize));
+        run_pass!(&mut conflicting_float, SignatureReconciliationProgram);
+            assert!(conflicting_float
+                .rel_iter::<(Address,)>("call_site_consensus_veto")
+                .any(|&(address,)| address == target));
+        });
+    }
+}
+
 // A same-object COFF thunk can consist only of a relocation-backed tail branch,
 // so its own body may contain no type-bearing operation at all. Inherit an
 // internal tail target's complete Win64 register signature only when every
@@ -1335,9 +1863,19 @@ fn patch_db(
         .map(|p| (p.address, p))
         .collect();
 
-    let call_targets: HashMap<Node, Address> = db.rel_iter::<(Node, Address)>("call_target_func")
-        .map(|&(call_node, target)| (call_node, target))
-        .collect();
+    let call_targets: HashMap<Node, Address> = {
+        let mut facts: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+        for &(call_node, target) in db.rel_iter::<(Node, Address)>("call_target_func") {
+            facts.entry(call_node).or_default().insert(target);
+        }
+        facts
+            .into_iter()
+            .filter_map(|(call_node, targets)| {
+                (targets.len() == 1)
+                    .then(|| (call_node, *targets.iter().next().unwrap()))
+            })
+            .collect()
+    };
 
     let rtl_to_mreg: HashMap<(Address, RTLReg), Mreg> = db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl")
         .map(|&(node, ref mreg, rtl_reg)| ((node, rtl_reg), *mreg))
@@ -1559,7 +2097,11 @@ fn patch_db(
             let sig = Signature {
                 sig_args: Arc::new(proto.param_types.clone()),
                 sig_res: proto.return_type.clone(),
-                sig_cc: CallConv::default(),
+                sig_cc: CallConv {
+                    varargs: proto.is_varargs.then_some(proto.param_count as i64),
+                    unproto: false,
+                    structured_ret: false,
+                },
             };
             new_sigs.push((proto.address, sig));
         }
@@ -1630,7 +2172,6 @@ fn patch_db(
         db.rel_set("emit_function_void", new_void.into_iter().collect::<ascent::boxcar::Vec<_>>());
     }
 
-    // reg->rtl and def-at-use maps, shared by the (dead) call_args_collected reconciliation and the Icall/Itailcall argument-arity reconciliation in the rtl_inst patch below.
     // Reduce only unambiguous final signatures.  The normal reconciliation
     // path emits one row per function; if an older candidate relation still
     // contains conflicting rows, declining to rewrite that call is safer than
@@ -1657,31 +2198,6 @@ fn patch_db(
     let variadic_targets: HashSet<Address> = db
         .rel_iter::<(Address,)>("is_varargs_fn")
         .map(|(address,)| *address)
-        .collect();
-    let reg_rtl_map: HashMap<(Node, Mreg), RTLReg> = db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl")
-        .map(|&(addr, ref mreg, rtl)| ((addr, *mreg), rtl))
-        .collect();
-    let mut reg_def_at_use: HashMap<(Mreg, Address), Address> = HashMap::new();
-    for &(def_addr, ref mreg, use_addr) in db.rel_iter::<(Address, Mreg, Address)>("reg_def_used") {
-        reg_def_at_use.insert((*mreg, use_addr), def_addr);
-    }
-    let mut call_owners: HashMap<Node, Address> = HashMap::new();
-    let mut ambiguous_call_owners = HashSet::new();
-    for (node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
-        match call_owners.get(node) {
-            Some(existing) if existing != function => {
-                ambiguous_call_owners.insert(*node);
-            }
-            Some(_) => {}
-            None => {
-                call_owners.insert(*node, *function);
-            }
-        }
-    }
-    call_owners.retain(|node, _| !ambiguous_call_owners.contains(node));
-    let incoming_live: HashSet<(Address, Node, Mreg)> = db
-        .rel_iter::<(Address, Node, Mreg)>("arg_reg_param_live_at")
-        .copied()
         .collect();
 
     {
@@ -1733,40 +2249,14 @@ fn patch_db(
                 continue;
             }
 
-            let mut widened = args.as_ref().clone();
-            for i in args.len()..param_count {
-                let xtype = signature.sig_args.get(i).unwrap_or(&XType::Xany64);
-                let Some(mreg) = register_for_position(i, xtype) else {
-                    break;
-                };
-
-                if let Some(&function) = call_owners.get(&call_node) {
-                    if incoming_live.contains(&(function, call_node, mreg)) {
-                        widened.push(fresh_xtl_reg(function, mreg));
-                        continue;
-                    }
-                }
-                if let Some(&rtl) = reg_rtl_map.get(&(call_node, mreg)) {
-                    widened.push(rtl);
-                    continue;
-                }
-
-                if let Some(&def_addr) = reg_def_at_use.get(&(mreg, call_node)) {
-                    if let Some(&rtl) = reg_rtl_map.get(&(def_addr, mreg)) {
-                        widened.push(rtl);
-                        continue;
-                    }
-                }
-
-                let synthetic = fresh_xtl_reg(call_node, mreg);
-                widened.push(synthetic);
-            }
-            new_call_args.push((call_node, Arc::new(widened)));
-            patched_calls.insert(call_node);
+            // A fixed prototype is not authority to manufacture values at a
+            // short site.  Preserve that site's recovered evidence verbatim;
+            // only surplus fixed arguments can be safely removed.
+            new_call_args.push((call_node, args.clone()));
         }
 
         if !patched_calls.is_empty() {
-            log::info!("SignatureReconciliation: widened args at {} call sites", patched_calls.len());
+            log::info!("SignatureReconciliation: trimmed args at {} call sites", patched_calls.len());
             db.rel_set("call_args_collected", new_call_args.into_iter().collect::<ascent::boxcar::Vec<_>>());
         }
     }
@@ -1777,66 +2267,12 @@ fn patch_db(
         let mut patched_insts: usize = 0;
 
         // Reconcile a call's argument list to the callee's reconciled arity, since cminor builds Scall directly from Icall.args and clang checks it against the already-reconciled declaration.
-        let reconcile_args = |call_node: Node,
-                              args: &Args,
-                              previous_signature: Option<&Signature>,
-                              param_types: &[XType]|
-         -> Args {
+        let reconcile_args = |args: &Args, param_types: &[XType]| -> Args {
             let param_count = param_types.len();
-            let mut reconciled = Vec::with_capacity(param_count);
-            for i in 0..param_count {
-                if let Some(mreg) = register_for_position(i, &param_types[i]) {
-                    if let Some(&function) = call_owners.get(&call_node) {
-                        if incoming_live.contains(&(function, call_node, mreg)) {
-                            reconciled.push(fresh_xtl_reg(function, mreg));
-                            continue;
-                        }
-                    }
-                    let previous_mreg = previous_signature
-                        .and_then(|signature| signature.sig_args.get(i))
-                        .and_then(|xtype| register_for_position(i, xtype));
-                    if let Some(&existing) = args.get(i) {
-                        let fabricated = existing == fresh_xtl_reg(call_node, mreg)
-                            || previous_mreg.is_some_and(|previous| {
-                                existing == fresh_xtl_reg(call_node, previous)
-                            });
-                        if !fabricated
-                            && (previous_mreg == Some(mreg)
-                                || rtl_to_mreg.get(&(call_node, existing)) == Some(&mreg))
-                        {
-                            reconciled.push(existing);
-                            continue;
-                        }
-                    }
-                    if let Some(&rtl) = reg_rtl_map.get(&(call_node, mreg)) {
-                        reconciled.push(rtl);
-                        continue;
-                    }
-                    if let Some(&def_addr) = reg_def_at_use.get(&(mreg, call_node)) {
-                        if let Some(&rtl) = reg_rtl_map.get(&(def_addr, mreg)) {
-                            reconciled.push(rtl);
-                            continue;
-                        }
-                    }
-                    let positional = args.get(i).copied().filter(|arg| {
-                        rtl_to_mreg.get(&(call_node, *arg)) == Some(&mreg)
-                    });
-                    reconciled.push(
-                        positional.unwrap_or_else(|| fresh_xtl_reg(call_node, mreg)),
-                    );
-                } else {
-                    // Existing stack arguments already carry their positional
-                    // load/store value.  Synthesize only when the collected
-                    // list is genuinely short.
-                    reconciled.push(args.get(i).copied().unwrap_or_else(|| {
-                        crate::decompile::passes::rtl_pass::fresh_stack_param_reg(
-                            call_node,
-                            i - first_stack_position,
-                        )
-                    }));
-                }
+            if args.len() <= param_count {
+                return args.clone();
             }
-            Arc::new(reconciled)
+            Arc::new(args.iter().take(param_count).copied().collect())
         };
 
         for &(node, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
@@ -1856,28 +2292,49 @@ fn patch_db(
                         let new_args = if is_varargs {
                             args.clone()
                         } else {
-                            reconcile_args(
-                                node,
-                                args,
-                                sig_opt.as_ref(),
-                                final_signature.sig_args.as_slice(),
-                            )
+                            reconcile_args(args, final_signature.sig_args.as_slice())
                         };
                         // Type the variadic tail at its natural 64-bit width; an untyped tail slot defaults to int and truncates a pointer vararg.
-                        let mut sig_args = final_signature.sig_args.as_ref().clone();
+                        let short_site = new_args.len() < final_signature.sig_args.len();
+                        let mut sig_args = if short_site {
+                            // Keep the site's prior signature shape when the
+                            // semantic vector is short.  If none exists, type
+                            // only the values that actually exist.
+                            sig_opt
+                                .as_ref()
+                                .filter(|signature| signature.sig_args.len() == new_args.len())
+                                .map(|signature| signature.sig_args.as_ref().clone())
+                                .unwrap_or_else(|| vec![XType::Xany64; new_args.len()])
+                        } else {
+                            final_signature.sig_args.as_ref().clone()
+                        };
                         if is_varargs {
                             while sig_args.len() < new_args.len() {
                                 sig_args.push(XType::Xany64);
                             }
                         }
+                        let fixed_count = final_signature.sig_args.len();
                         let new_sig = Signature {
                             sig_args: Arc::new(sig_args),
                             sig_res: final_signature.sig_res,
-                            sig_cc: sig_opt.as_ref().map(|s| s.sig_cc.clone()).unwrap_or_default(),
+                            sig_cc: if short_site {
+                                CallConv {
+                                    varargs: None,
+                                    unproto: true,
+                                    structured_ret: final_signature.sig_cc.structured_ret,
+                                }
+                            } else {
+                                CallConv {
+                                    varargs: is_varargs.then_some(fixed_count as i64),
+                                    unproto: false,
+                                    structured_ret: final_signature.sig_cc.structured_ret,
+                                }
+                            },
                         };
                         let sig_changed = sig_opt.as_ref()
                             .map(|s| s.sig_res != new_sig.sig_res
-                                  || s.sig_args.as_slice() != new_sig.sig_args.as_slice())
+                                  || s.sig_args.as_slice() != new_sig.sig_args.as_slice()
+                                  || s.sig_cc != new_sig.sig_cc)
                             .unwrap_or(true);
                         let args_changed = new_args.as_slice() != args.as_slice();
                         if sig_changed || args_changed {
@@ -1910,28 +2367,46 @@ fn patch_db(
                         let new_args = if is_varargs {
                             args.clone()
                         } else {
-                            reconcile_args(
-                                node,
-                                args,
-                                sig_opt.as_ref(),
-                                final_signature.sig_args.as_slice(),
-                            )
+                            reconcile_args(args, final_signature.sig_args.as_slice())
                         };
                         // Type the variadic tail at its natural 64-bit width; an untyped tail slot defaults to int and truncates a pointer vararg.
-                        let mut sig_args = final_signature.sig_args.as_ref().clone();
+                        let short_site = new_args.len() < final_signature.sig_args.len();
+                        let mut sig_args = if short_site {
+                            sig_opt
+                                .as_ref()
+                                .filter(|signature| signature.sig_args.len() == new_args.len())
+                                .map(|signature| signature.sig_args.as_ref().clone())
+                                .unwrap_or_else(|| vec![XType::Xany64; new_args.len()])
+                        } else {
+                            final_signature.sig_args.as_ref().clone()
+                        };
                         if is_varargs {
                             while sig_args.len() < new_args.len() {
                                 sig_args.push(XType::Xany64);
                             }
                         }
+                        let fixed_count = final_signature.sig_args.len();
                         let new_sig = Signature {
                             sig_args: Arc::new(sig_args),
                             sig_res: final_signature.sig_res,
-                            sig_cc: sig_opt.as_ref().map(|s| s.sig_cc.clone()).unwrap_or_default(),
+                            sig_cc: if short_site {
+                                CallConv {
+                                    varargs: None,
+                                    unproto: true,
+                                    structured_ret: final_signature.sig_cc.structured_ret,
+                                }
+                            } else {
+                                CallConv {
+                                    varargs: is_varargs.then_some(fixed_count as i64),
+                                    unproto: false,
+                                    structured_ret: final_signature.sig_cc.structured_ret,
+                                }
+                            },
                         };
                         let sig_changed = sig_opt.as_ref()
                             .map(|s| s.sig_res != new_sig.sig_res
-                                  || s.sig_args.as_slice() != new_sig.sig_args.as_slice())
+                                  || s.sig_args.as_slice() != new_sig.sig_args.as_slice()
+                                  || s.sig_cc != new_sig.sig_cc)
                             .unwrap_or(true);
                         let args_changed = new_args.as_slice() != args.as_slice();
                         if sig_changed || args_changed {

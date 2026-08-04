@@ -319,7 +319,10 @@ pub fn clight_type_from_xtype(xtype: &XType) -> ClightType {
         XType::Xfuncptr => pointer_to(ClightType::Tfunction(
             Arc::new(Vec::new()),
             Arc::new(ClightType::Tvoid),
-            CallConv::default(),
+            CallConv {
+                unproto: true,
+                ..CallConv::default()
+            },
         )),
         XType::Xcharptr => pointer_to(ClightType::Tint(
             ClightIntSize::I8,
@@ -364,6 +367,22 @@ pub fn default_function_signature() -> Signature {
 
 pub fn resolve_signature(sig_opt: &Option<Signature>) -> Signature {
     sig_opt.clone().unwrap_or_else(default_function_signature)
+}
+
+#[cfg(test)]
+mod function_pointer_type_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_function_pointer_has_unspecified_parameters() {
+        let ty = clight_type_from_xtype(&XType::Xfuncptr);
+        assert!(matches!(
+            ty,
+            ClightType::Tpointer(inner, _)
+                if matches!(inner.as_ref(), ClightType::Tfunction(args, _, cc)
+                    if args.is_empty() && cc.unproto && cc.varargs.is_none())
+        ));
+    }
 }
 
 pub fn clight_cast_supported(from: &ClightType, to: &ClightType) -> bool {

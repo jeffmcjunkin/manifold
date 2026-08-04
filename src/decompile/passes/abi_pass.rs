@@ -1,10 +1,11 @@
 // ABI pass: populates register conventions, known function signatures, and noreturn functions into DecompileDB.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
-use crate::x86::types::{Symbol, XType};
+use crate::x86::types::{Address, LoaderSymbolKind, Symbol, XType};
 
 pub struct AbiPass;
 
@@ -19,6 +20,7 @@ impl IRPass for AbiPass {
         populate_hardcoded_signatures(db);
         populate_known_global_types(db);
         populate_known_func_param_pointee_size(db);
+        bind_loader_symbol_identities(db);
     }
 
     fn outputs(&self) -> &'static [&'static str] {
@@ -34,7 +36,318 @@ impl IRPass for AbiPass {
             "known_func_returns_long",
             "known_extern_signature", "known_global_type",
             "known_varargs_function", "known_func_param_pointee_size",
+            "known_loader_signature", "known_loader_variadic",
+            "loader_signature_conflict",
         ]
+    }
+
+    fn extra_reads(&self) -> &'static [&'static str] {
+        &["loader_symbol_identity"]
+    }
+}
+
+/// Spellings implied by the COFF symbol decoration grammar, in preference
+/// order.  These are format identities, not guesses based on a function-name
+/// prefix: import-pointer decoration, one C external-name underscore, and a
+/// numeric stdcall byte-count suffix are the only transformations accepted.
+fn coff_identity_candidates(
+    original: &str,
+    is_coff_family: bool,
+    has_legacy_x86_decoration: bool,
+) -> Vec<String> {
+    fn push_unique(out: &mut Vec<String>, value: &str) {
+        if !value.is_empty() && !out.iter().any(|existing| existing == value) {
+            out.push(value.to_string());
+        }
+    }
+
+    fn without_stdcall_suffix(value: &str) -> Option<&str> {
+        let (base, bytes) = value.rsplit_once('@')?;
+        (!base.is_empty() && !bytes.is_empty() && bytes.bytes().all(|b| b.is_ascii_digit()))
+            .then_some(base)
+    }
+
+    let mut out = Vec::new();
+    push_unique(&mut out, original);
+
+    if !is_coff_family {
+        return out;
+    }
+
+    // Both spellings occur in Microsoft/LLVM COFF symbol tables.  The first
+    // leaves any ordinary C leading underscore for the next grammar step.
+    for prefix in ["__imp_", "_imp__"] {
+        if let Some(base) = original.strip_prefix(prefix) {
+            push_unique(&mut out, base);
+        }
+    }
+
+    if !has_legacy_x86_decoration {
+        return out;
+    }
+
+    // Legacy i386 COFF additionally decorates stdcall byte counts and ordinary
+    // C externals.  A bounded loop is enough because each successful step
+    // shortens a name.
+    let mut cursor = 0usize;
+    while cursor < out.len() {
+        let value = out[cursor].clone();
+        if let Some(base) = without_stdcall_suffix(&value) {
+            push_unique(&mut out, base);
+        }
+        if value.starts_with('_') && !value.starts_with("__") {
+            push_unique(&mut out, &value[1..]);
+        }
+        cursor += 1;
+    }
+    out
+}
+
+/// Resolve curated ABI facts independently for every exact loader identity.
+/// Provider-name aliases are only a compatibility projection and are emitted
+/// when that provider denotes exactly one `(address, kind)` object.
+/// All arity-sensitive consumers use `known_loader_signature` directly.
+fn bind_loader_symbol_identities(db: &mut DecompileDB) {
+    let (is_coff_family, has_legacy_x86_decoration) = db
+        .target_abi
+        .as_ref()
+        .map(|abi| {
+            (
+                matches!(
+                    abi.format,
+                    crate::abi::BinaryFormat::Coff | crate::abi::BinaryFormat::Pe
+                ),
+                abi.arch == crate::abi::Arch::X86_32,
+            )
+        })
+        .unwrap_or((false, false));
+    let mut identity_names: BTreeMap<
+        (Address, LoaderSymbolKind),
+        BTreeSet<(Symbol, Symbol)>,
+    > = BTreeMap::new();
+    for &(address, kind, provider, original) in db.rel_iter::<(
+        Address,
+        LoaderSymbolKind,
+        Symbol,
+        Symbol,
+    )>("loader_symbol_identity") {
+        identity_names
+            .entry((address, kind))
+            .or_default()
+            .insert((provider, original));
+    }
+    if identity_names.is_empty() {
+        return;
+    }
+
+    let signatures: Vec<(Symbol, usize, XType, Arc<Vec<XType>>)> = db
+        .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>("known_extern_signature")
+        .cloned()
+        .collect();
+    let signatures_by_name: HashMap<&str, Vec<(usize, XType, Arc<Vec<XType>>)>> = {
+        let mut out: HashMap<&str, Vec<(usize, XType, Arc<Vec<XType>>)>> = HashMap::new();
+        for (name, arity, ret, params) in &signatures {
+            out.entry(*name)
+                .or_default()
+                .push((*arity, *ret, params.clone()));
+        }
+        out
+    };
+
+    let varargs_by_name: HashMap<Symbol, BTreeSet<usize>> = {
+        let mut out: HashMap<Symbol, BTreeSet<usize>> = HashMap::new();
+        for &(name, count) in db.rel_iter::<(Symbol, usize)>("known_varargs_function") {
+            out.entry(name).or_default().insert(count);
+        }
+        out
+    };
+    let ptr_params: Vec<(Symbol, usize)> = db
+        .rel_iter::<(Symbol, usize)>("known_func_param_is_ptr")
+        .cloned()
+        .collect();
+    let pointee_sizes: Vec<(Symbol, usize, usize)> = db
+        .rel_iter::<(Symbol, usize, usize)>("known_func_param_pointee_size")
+        .cloned()
+        .collect();
+    let returns_ptr: HashSet<Symbol> = db
+        .rel_iter::<(Symbol,)>("known_func_returns_ptr")
+        .map(|(name,)| *name)
+        .collect();
+    let returns_long: HashSet<Symbol> = db
+        .rel_iter::<(Symbol,)>("known_func_returns_long")
+        .map(|(name,)| *name)
+        .collect();
+    let noreturn: HashSet<Symbol> = db
+        .rel_iter::<(Symbol,)>("is_known_noreturn_function")
+        .map(|(name,)| *name)
+        .collect();
+
+    #[derive(Clone)]
+    struct IdentityBinding {
+        address: Address,
+        kind: LoaderSymbolKind,
+        names: BTreeSet<(Symbol, Symbol)>,
+        signature: Option<(usize, XType, Arc<Vec<XType>>, bool)>,
+        vararg_count: Option<usize>,
+        variadic: bool,
+        signature_conflict: bool,
+        pointer_positions: BTreeSet<usize>,
+        pointee_sizes: BTreeSet<(usize, usize)>,
+        returns_ptr: bool,
+        returns_long: bool,
+        noreturn: bool,
+    }
+
+    let mut bindings = Vec::new();
+    for ((address, kind), names) in identity_names {
+        let candidates: BTreeSet<String> = names
+            .iter()
+            .flat_map(|(_, original)| {
+                coff_identity_candidates(
+                    original,
+                    is_coff_family,
+                    has_legacy_x86_decoration,
+                )
+            })
+            .collect();
+        let mut matched_signatures: BTreeSet<(usize, XType, Arc<Vec<XType>>)> = BTreeSet::new();
+        for candidate in &candidates {
+            if let Some(rows) = signatures_by_name.get(candidate.as_str()) {
+                matched_signatures.extend(rows.iter().cloned());
+            }
+        }
+        let candidate_names: HashSet<&str> = candidates.iter().map(String::as_str).collect();
+        let vararg_counts: BTreeSet<usize> = candidates
+            .iter()
+            .filter_map(|candidate| varargs_by_name.get(candidate.as_str()))
+            .flat_map(|counts| counts.iter().copied())
+            .collect();
+        let vararg_count = (vararg_counts.len() == 1)
+            .then(|| *vararg_counts.iter().next().unwrap());
+        let has_signature_fact = !matched_signatures.is_empty();
+        let signature = if matched_signatures.len() == 1 && vararg_counts.len() <= 1 {
+            let (arity, ret, params) = matched_signatures.into_iter().next().unwrap();
+            (arity == params.len()
+                && vararg_count.map_or(true, |fixed_count| fixed_count == arity))
+                .then_some((arity, ret, params, vararg_count.is_some()))
+        } else {
+            None
+        };
+        let signature_conflict = (has_signature_fact && signature.is_none())
+            || vararg_counts.len() > 1;
+        let pointer_positions = ptr_params
+            .iter()
+            .filter_map(|(name, position)| {
+                candidate_names.contains(name).then_some(*position)
+            })
+            .collect();
+        let pointee_sizes = pointee_sizes
+            .iter()
+            .filter_map(|(name, position, size)| {
+                candidate_names
+                    .contains(name)
+                    .then_some((*position, *size))
+            })
+            .collect();
+
+        bindings.push(IdentityBinding {
+            address,
+            kind,
+            names,
+            signature,
+            vararg_count,
+            variadic: !vararg_counts.is_empty(),
+            signature_conflict,
+            pointer_positions,
+            pointee_sizes,
+            returns_ptr: returns_ptr
+                .iter()
+                .any(|name| candidate_names.contains(name)),
+            returns_long: returns_long
+                .iter()
+                .any(|name| candidate_names.contains(name)),
+            noreturn: noreturn.iter().any(|name| candidate_names.contains(name)),
+        });
+    }
+
+    for binding in &bindings {
+        for &(provider, original) in &binding.names {
+            if binding.variadic {
+                db.rel_push(
+                    "known_loader_variadic",
+                    (binding.address, binding.kind, provider, original),
+                );
+            }
+            if binding.signature_conflict {
+                db.rel_push(
+                    "loader_signature_conflict",
+                    (binding.address, binding.kind, provider, original),
+                );
+            }
+            if let Some((arity, ret, params, variadic)) = &binding.signature {
+                db.rel_push(
+                    "known_loader_signature",
+                    (
+                        binding.address,
+                        binding.kind,
+                        provider,
+                        original,
+                        *arity,
+                        *ret,
+                        params.clone(),
+                        *variadic,
+                    ),
+                );
+            }
+        }
+    }
+
+    // A spelling collision is not an identity relation.  Keep compatibility
+    // name facts only for the singleton projection; exact consumers above can
+    // still use both colliding objects by address and kind.
+    let mut by_provider: BTreeMap<Symbol, BTreeSet<usize>> = BTreeMap::new();
+    for (index, binding) in bindings.iter().enumerate() {
+        for &(provider, _) in &binding.names {
+            by_provider.entry(provider).or_default().insert(index);
+        }
+    }
+    for (provider, provider_bindings) in by_provider {
+        if provider_bindings.len() != 1 {
+            continue;
+        }
+        let binding = &bindings[*provider_bindings.iter().next().unwrap()];
+        if let Some((arity, ret, params, _)) = &binding.signature {
+            db.rel_push(
+                "known_extern_signature",
+                (provider, *arity, *ret, params.clone()),
+            );
+        }
+        if let Some(fixed_count) = binding.vararg_count {
+            db.rel_push("known_varargs_function", (provider, fixed_count));
+        }
+        for &position in &binding.pointer_positions {
+            db.rel_push("known_func_param_is_ptr", (provider, position));
+        }
+        let mut sizes_by_position: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        for &(position, size) in &binding.pointee_sizes {
+            sizes_by_position.entry(position).or_default().insert(size);
+        }
+        for (position, sizes) in sizes_by_position {
+            if sizes.len() == 1 {
+                db.rel_push(
+                    "known_func_param_pointee_size",
+                    (provider, position, *sizes.iter().next().unwrap()),
+                );
+            }
+        }
+        if binding.returns_ptr && !binding.returns_long {
+            db.rel_push("known_func_returns_ptr", (provider,));
+        } else if binding.returns_long && !binding.returns_ptr {
+            db.rel_push("known_func_returns_long", (provider,));
+        }
+        if binding.noreturn {
+            db.rel_push("is_known_noreturn_function", (provider,));
+        }
     }
 }
 
@@ -590,5 +903,171 @@ fn populate_known_global_types(db: &mut DecompileDB) {
 
     for &(name, ref xtype) in known_globals {
         db.rel_push("known_global_type", (name, xtype.clone()));
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn coff_decoration_candidates_are_format_bounded() {
+        let candidates = coff_identity_candidates("__imp__memcpy@24", true, true);
+        assert!(candidates.iter().any(|name| name == "memcpy"));
+        assert!(!candidates.iter().any(|name| name == "cpy"));
+
+        let x64 = coff_identity_candidates("__imp__memcpy@24", true, false);
+        assert!(!x64.iter().any(|name| name == "memcpy"));
+
+        let ordinary = coff_identity_candidates("domain_specific_prefix_memcpy", true, false);
+        assert_eq!(ordinary, vec!["domain_specific_prefix_memcpy"]);
+
+        let non_coff = coff_identity_candidates("__imp_memcpy", false, false);
+        assert_eq!(non_coff, vec!["__imp_memcpy"]);
+    }
+
+    #[test]
+    fn original_import_identity_binds_provider_prototype() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        db.rel_push(
+            "loader_symbol_identity",
+            (
+                0x1000u64,
+                LoaderSymbolKind::ImportPointer,
+                "coff_ext_memcpy" as Symbol,
+                "__imp_memcpy" as Symbol,
+            ),
+        );
+        db.rel_push(
+            "known_extern_signature",
+            (
+                "memcpy" as Symbol,
+                3usize,
+                XType::Xptr,
+                Arc::new(vec![XType::Xptr, XType::Xptr, XType::Xany64]),
+            ),
+        );
+
+        bind_loader_symbol_identities(&mut db);
+
+        assert!(db
+            .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>(
+                "known_extern_signature"
+            )
+            .any(|(name, arity, _, _)| *name == "coff_ext_memcpy" && *arity == 3));
+        assert!(db
+            .rel_iter::<(
+                Address,
+                LoaderSymbolKind,
+                Symbol,
+                Symbol,
+                usize,
+                XType,
+                Arc<Vec<XType>>,
+                bool,
+            )>("known_loader_signature")
+            .any(|(address, kind, _, original, arity, _, _, variadic)| {
+                *address == 0x1000
+                    && *kind == LoaderSymbolKind::ImportPointer
+                    && *original == "__imp_memcpy"
+                    && *arity == 3
+                    && !*variadic
+            }));
+    }
+
+    #[test]
+    fn exact_loader_identity_survives_display_sanitization() {
+        let mut db = DecompileDB::default();
+        db.rel_push(
+            "loader_symbol_identity",
+            (
+                0x2000u64,
+                LoaderSymbolKind::Function,
+                "worker_constprop_0" as Symbol,
+                "worker.constprop.0" as Symbol,
+            ),
+        );
+        db.rel_push(
+            "known_extern_signature",
+            (
+                "worker.constprop.0" as Symbol,
+                1usize,
+                XType::Xint,
+                Arc::new(vec![XType::Xlong]),
+            ),
+        );
+
+        bind_loader_symbol_identities(&mut db);
+
+        assert!(db
+            .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>(
+                "known_extern_signature"
+            )
+            .any(|(name, arity, _, _)| *name == "worker_constprop_0" && *arity == 1));
+    }
+
+    #[test]
+    fn provider_collisions_and_variadic_conflicts_fail_closed() {
+        let mut db = DecompileDB::default();
+        for (address, kind, original) in [
+            (0x3000u64, LoaderSymbolKind::Function, "printf"),
+            (0x4000u64, LoaderSymbolKind::ImportPointer, "puts"),
+        ] {
+            db.rel_push(
+                "loader_symbol_identity",
+                (address, kind, "shared_provider" as Symbol, original as Symbol),
+            );
+        }
+        db.rel_push(
+            "known_extern_signature",
+            (
+                "printf" as Symbol,
+                1usize,
+                XType::Xint,
+                Arc::new(vec![XType::Xcharptr]),
+            ),
+        );
+        db.rel_push("known_varargs_function", ("printf" as Symbol, 1usize));
+        db.rel_push("known_varargs_function", ("printf" as Symbol, 2usize));
+        db.rel_push(
+            "known_extern_signature",
+            (
+                "puts" as Symbol,
+                1usize,
+                XType::Xint,
+                Arc::new(vec![XType::Xcharptr]),
+            ),
+        );
+
+        bind_loader_symbol_identities(&mut db);
+
+        assert!(!db
+            .rel_iter::<(Symbol, usize, XType, Arc<Vec<XType>>)>(
+                "known_extern_signature"
+            )
+            .any(|(name, _, _, _)| *name == "shared_provider"));
+        assert!(!db
+            .rel_iter::<(
+                Address,
+                LoaderSymbolKind,
+                Symbol,
+                Symbol,
+                usize,
+                XType,
+                Arc<Vec<XType>>,
+                bool,
+            )>("known_loader_signature")
+            .any(|(address, _, _, _, _, _, _, _)| *address == 0x3000));
+        assert!(db
+            .rel_iter::<(Address, LoaderSymbolKind, Symbol, Symbol)>(
+                "known_loader_variadic"
+            )
+            .any(|(address, _, _, _)| *address == 0x3000));
+        assert!(db
+            .rel_iter::<(Address, LoaderSymbolKind, Symbol, Symbol)>(
+                "loader_signature_conflict"
+            )
+            .any(|(address, _, _, _)| *address == 0x3000));
     }
 }

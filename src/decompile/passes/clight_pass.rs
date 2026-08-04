@@ -4,7 +4,7 @@ use crate::{declare_io_from, run_pass};
 
 use crate::decompile::passes::cminor_pass::*;
 use crate::decompile::passes::csh_pass::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::mreg::Mreg;
@@ -27,6 +27,7 @@ ascent_par! {
     relation arg_constrained_as_ptr(Node, RTLReg);
     relation base_ident_to_symbol(Ident, Symbol);
     relation block_in_function(Node, Address);
+    relation call_loader_identity(Node, Address, LoaderSymbolKind, Symbol, Symbol);
     relation call_return_reg(Node, RTLReg);
     relation cminor_stmt(Node, CminorStmt);
     relation code_in_block(Address, Address);
@@ -77,6 +78,32 @@ ascent_par! {
     relation valid_loop(Address, Node);
     relation valid_switch_chain(Address, Node, RTLReg);
     relation valid_ternary(Address, Node, RTLReg, CsharpminorExpr, CsharpminorExpr, Node);
+
+    // The ordinary Eload(Oaddrsymbol) lowering intentionally materializes a
+    // global object as Evar.  An exact loader-resolved ImportPointer callee is
+    // different: the symbol names the IAT SLOT, so the call must retain the
+    // load through that slot.  Make that exception node-local and exact-kind
+    // keyed; every unrelated global load keeps the ordinary shortcut.
+    #[local] relation exact_import_pointer_callee_load(Node);
+    exact_import_pointer_callee_load(node) <--
+        csharp_stmt(node, ?CsharpminorStmt::Stailcall(_, Either::Left(expr), _)),
+        call_loader_identity(node, address, kind, _, _),
+        if matches!(kind, LoaderSymbolKind::ImportPointer),
+        if is_exact_import_pointer_global_load(&expr, *address);
+    exact_import_pointer_callee_load(node) <--
+        csharp_stmt(node, ?CsharpminorStmt::Scall(_, _, Either::Left(expr), _)),
+        call_loader_identity(node, address, kind, _, _),
+        if matches!(kind, LoaderSymbolKind::ImportPointer),
+        if is_exact_import_pointer_global_load(&expr, *address);
+
+    #[local] relation preserve_callee_global_load(Node, bool);
+    preserve_callee_global_load(node, true) <-- exact_import_pointer_callee_load(node);
+    preserve_callee_global_load(node, false) <--
+        csharp_stmt(node, ?CsharpminorStmt::Stailcall(_, Either::Left(_), _)),
+        !exact_import_pointer_callee_load(node);
+    preserve_callee_global_load(node, false) <--
+        csharp_stmt(node, ?CsharpminorStmt::Scall(_, _, Either::Left(_), _)),
+        !exact_import_pointer_callee_load(node);
 
     relation clight_dead_var(Address, Ident);
     relation clight_efield_info(Address, Node, i64, i64, Ident, MemoryChunk);
@@ -308,6 +335,7 @@ ascent_par! {
 
     clight_stmt(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Stailcall(sig, Either::Left(expr), args)),
+        preserve_callee_global_load(node, preserve_global_load),
         instr_in_function(node, func_addr),
         emit_function(func_addr, _, _),
         emit_function_return(func_addr, ret_reg),
@@ -318,7 +346,7 @@ ascent_par! {
         let var_types = filter_and_build_multi_var_type_map(all_var_types, &vars_used),
         let dst_ident = Some(ident_from_reg(*ret_reg)),
         let ret_ident = ident_from_reg(*ret_reg),
-        let raw_func_expr = clight_expr_from_csharp_with_multi_types(&expr, &var_types),
+        let raw_func_expr = clight_expr_from_csharp_with_multi_types_policy(&expr, &var_types, *preserve_global_load),
         let crude_sig = resolve_signature(&sig),
         let resolved_sig = refine_indirect_call_signature(&crude_sig, args.as_slice(), all_var_types, &None),
         let func_ty = clight_function_pointer_type(&resolved_sig),
@@ -372,11 +400,12 @@ ascent_par! {
 
     clight_stmt(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Stailcall(sig, Either::Left(expr), args)),
+        preserve_callee_global_load(node, preserve_global_load),
         instr_in_function(node, func_addr),
         emit_function(func_addr, _, _),
         emit_function_void(func_addr),
         all_var_types_global(all_var_types),
-        let raw_func_expr = clight_expr_from_csharp(&expr),
+        let raw_func_expr = clight_expr_from_csharp_policy(&expr, *preserve_global_load),
         let crude_sig = resolve_signature(&sig),
         let resolved_sig = refine_indirect_call_signature(&crude_sig, args.as_slice(), all_var_types, &None),
         let func_ty = clight_function_pointer_type(&resolved_sig),
@@ -453,12 +482,13 @@ ascent_par! {
 
     clight_stmt(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Stailcall(sig, Either::Left(expr), args)),
+        preserve_callee_global_load(node, preserve_global_load),
         instr_in_function(node, func_addr),
         emit_function(func_addr, _, _),
         !emit_function_return(func_addr, _),
         !emit_function_void(func_addr),
         all_var_types_global(all_var_types),
-        let raw_func_expr = clight_expr_from_csharp(&expr),
+        let raw_func_expr = clight_expr_from_csharp_policy(&expr, *preserve_global_load),
         let crude_sig = resolve_signature(&sig),
         let resolved_sig = refine_indirect_call_signature(&crude_sig, args.as_slice(), all_var_types, &None),
         let func_ty = clight_function_pointer_type(&resolved_sig),
@@ -519,6 +549,7 @@ ascent_par! {
 
     clight_stmt(node, stmt) <--
         csharp_stmt(node, ?CsharpminorStmt::Scall(dst, sig, Either::Left(expr), args)),
+        preserve_callee_global_load(node, preserve_global_load),
         all_var_types_global(all_var_types),
         let mut all_exprs = vec![expr.clone()],
         let _ = all_exprs.extend_from_slice(args.as_slice()),
@@ -527,7 +558,7 @@ ascent_par! {
         let crude_sig = resolve_signature(&sig),
         let resolved_sig = refine_indirect_call_signature(&crude_sig, args.as_slice(), all_var_types, dst),
         let dst_ident = if resolved_sig.sig_res == XType::Xvoid { None } else { dst.clone().map(ident_from_reg) },
-        let raw_func_expr = clight_expr_from_csharp_with_multi_types(&expr, &var_types),
+        let raw_func_expr = clight_expr_from_csharp_with_multi_types_policy(&expr, &var_types, *preserve_global_load),
         let func_ty = clight_function_pointer_type(&resolved_sig),
         let func_expr = ClightExpr::Ecast(Box::new(raw_func_expr.clone()), func_ty.clone()),
         let raw_args = clight_exprs_from_csharp_with_multi_types(args.as_slice(), &var_types),
@@ -1058,7 +1089,7 @@ impl IRPass for ClightFieldPass {
             "global_struct_catalog",
             "emit_function",
             "reg_rtl",
-            "call_arg_mapping",
+            "call_arg",
             "call_target_func",
             "reg_to_struct_id",
             "rtl_inst",
@@ -1915,6 +1946,16 @@ pub(crate) fn invert_condition(cond: &Condition) -> Condition {
     }
 }
 
+fn is_exact_import_pointer_global_load(expr: &CsharpminorExpr, address: Address) -> bool {
+    let CsharpminorExpr::Eload(_, addr) = expr else {
+        return false;
+    };
+    let CsharpminorExpr::Econst(Constant::Oaddrsymbol(ident, offset)) = addr.as_ref() else {
+        return false;
+    };
+    *ident == address as Ident && *offset == 0
+}
+
 pub type FieldInfo = HashMap<(i64, i64), (Ident, MemoryChunk)>;
 
 pub(crate) fn generate_field_name(offset: i64) -> Ident {
@@ -1961,6 +2002,7 @@ fn extract_base_expr_for_field(addr: &CsharpminorExpr, _field_offset: i64) -> Op
                 &HashMap::new(),
                 &HashMap::new(),
                 None,
+                false,
             ))
         }
         CsharpminorExpr::Evar(reg) => Some(ClightExpr::Etempvar(
@@ -2665,7 +2707,20 @@ pub fn build_binop_expr(
 }
 
 pub(crate) fn clight_expr_from_csharp(expr: &CsharpminorExpr) -> ClightExpr {
-    clight_expr_from_csharp_inner(expr, &HashMap::new(), &HashMap::new(), None)
+    clight_expr_from_csharp_policy(expr, false)
+}
+
+fn clight_expr_from_csharp_policy(
+    expr: &CsharpminorExpr,
+    preserve_global_load: bool,
+) -> ClightExpr {
+    clight_expr_from_csharp_inner(
+        expr,
+        &HashMap::new(),
+        &HashMap::new(),
+        None,
+        preserve_global_load,
+    )
 }
 
 pub(crate) fn clight_expr_from_csharp_with_types(
@@ -2677,14 +2732,28 @@ pub(crate) fn clight_expr_from_csharp_with_types(
         .iter()
         .map(|(k, v)| (*k, vec![v.clone()]))
         .collect();
-    clight_expr_from_csharp_inner(expr, &HashMap::new(), &multi, None)
+    clight_expr_from_csharp_inner(expr, &HashMap::new(), &multi, None, false)
 }
 
 pub(crate) fn clight_expr_from_csharp_with_multi_types(
     expr: &CsharpminorExpr,
     var_types: &MultiVarTypeMap,
 ) -> ClightExpr {
-    clight_expr_from_csharp_inner(expr, &HashMap::new(), var_types, None)
+    clight_expr_from_csharp_with_multi_types_policy(expr, var_types, false)
+}
+
+fn clight_expr_from_csharp_with_multi_types_policy(
+    expr: &CsharpminorExpr,
+    var_types: &MultiVarTypeMap,
+    preserve_global_load: bool,
+) -> ClightExpr {
+    clight_expr_from_csharp_inner(
+        expr,
+        &HashMap::new(),
+        var_types,
+        None,
+        preserve_global_load,
+    )
 }
 
 fn clight_expr_from_csharp_inner(
@@ -2692,6 +2761,7 @@ fn clight_expr_from_csharp_inner(
     field_info: &FieldInfo,
     var_types: &MultiVarTypeMap,
     type_hint: Option<&ClightType>,
+    preserve_global_load: bool,
 ) -> ClightExpr {
     match expr {
         CsharpminorExpr::Evar(reg) => {
@@ -2755,7 +2825,13 @@ fn clight_expr_from_csharp_inner(
             }
         },
         CsharpminorExpr::Eunop(op, inner) => {
-            let inner_expr = clight_expr_from_csharp_inner(inner, field_info, var_types, None);
+            let inner_expr = clight_expr_from_csharp_inner(
+                inner,
+                field_info,
+                var_types,
+                None,
+                preserve_global_load,
+            );
             match op {
                 CminorUnop::Ocast8unsigned => ClightExpr::Ecast(
                     Box::new(inner_expr),
@@ -2864,10 +2940,20 @@ fn clight_expr_from_csharp_inner(
                 } else {
                     (None, None)
                 };
-            let lhs_expr =
-                clight_expr_from_csharp_inner(lhs, field_info, var_types, lhs_hint.as_ref());
-            let rhs_expr =
-                clight_expr_from_csharp_inner(rhs, field_info, var_types, rhs_hint.as_ref());
+            let lhs_expr = clight_expr_from_csharp_inner(
+                lhs,
+                field_info,
+                var_types,
+                lhs_hint.as_ref(),
+                preserve_global_load,
+            );
+            let rhs_expr = clight_expr_from_csharp_inner(
+                rhs,
+                field_info,
+                var_types,
+                rhs_hint.as_ref(),
+                preserve_global_load,
+            );
             // Downgrade Oaddl/Osubl to Oadd/Osub for pointer operands so build_binop_expr produces pointer result type (ptr+int=ptr in C).
             let effective_op = match op {
                 CminorBinop::Oaddl
@@ -2892,17 +2978,24 @@ fn clight_expr_from_csharp_inner(
                 }
             }
 
-            if let CsharpminorExpr::Econst(Constant::Oaddrsymbol(ident, ofs)) = addr.as_ref() {
-                if *ident != 0 && *ofs == 0 {
-                    let ty = clight_type_from_chunk(chunk);
-                    return ClightExpr::Evar(*ident, ty);
+            if !preserve_global_load {
+                if let CsharpminorExpr::Econst(Constant::Oaddrsymbol(ident, ofs)) = addr.as_ref() {
+                    if *ident != 0 && *ofs == 0 {
+                        let ty = clight_type_from_chunk(chunk);
+                        return ClightExpr::Evar(*ident, ty);
+                    }
                 }
             }
 
             let elem_ty = clight_type_from_chunk(chunk);
             let ptr_hint = pointer_to(elem_ty.clone());
-            let addr_expr =
-                clight_expr_from_csharp_inner(addr, field_info, var_types, Some(&ptr_hint));
+            let addr_expr = clight_expr_from_csharp_inner(
+                addr,
+                field_info,
+                var_types,
+                Some(&ptr_hint),
+                preserve_global_load,
+            );
 
             if matches!(
                 &addr_expr,
@@ -2982,11 +3075,27 @@ fn clight_expr_from_csharp_inner(
             ClightExpr::Ederef(Box::new(ptraddr), ty)
         }
         CsharpminorExpr::Econdition(cond, true_val, false_val) => {
-            let cond_expr = clight_expr_from_csharp_inner(cond, field_info, var_types, None);
-            let true_expr =
-                clight_expr_from_csharp_inner(true_val, field_info, var_types, type_hint);
-            let false_expr =
-                clight_expr_from_csharp_inner(false_val, field_info, var_types, type_hint);
+            let cond_expr = clight_expr_from_csharp_inner(
+                cond,
+                field_info,
+                var_types,
+                None,
+                preserve_global_load,
+            );
+            let true_expr = clight_expr_from_csharp_inner(
+                true_val,
+                field_info,
+                var_types,
+                type_hint,
+                preserve_global_load,
+            );
+            let false_expr = clight_expr_from_csharp_inner(
+                false_val,
+                field_info,
+                var_types,
+                type_hint,
+                preserve_global_load,
+            );
             let ty = type_hint.cloned().unwrap_or_else(default_int_type);
             ClightExpr::Econdition(
                 Box::new(cond_expr),
@@ -4551,23 +4660,21 @@ fn rewrite_clight_stmts_with_struct_fields(db: &mut DecompileDB) {
 
         // Caller side: which (call_node, pos) carries which RTLReg.
         let mut call_args: Vec<(Node, usize, RTLReg)> = db
-            .rel_iter::<(Node, usize, RTLReg)>("call_arg_mapping")
+            .rel_iter::<(Node, usize, RTLReg)>("call_arg")
             .map(|t| (t.0, t.1, t.2))
             .collect();
         call_args.sort();
 
-        let mut call_targets: HashMap<Node, Address> = HashMap::new();
+        let mut call_target_facts: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
         for (n, a) in db.rel_iter::<(Node, Address)>("call_target_func") {
-            // Min-wins for indirect calls that map a call node to multiple targets.
-            call_targets
-                .entry(*n)
-                .and_modify(|cur| {
-                    if *a < *cur {
-                        *cur = *a
-                    }
-                })
-                .or_insert(*a);
+            call_target_facts.entry(*n).or_default().insert(*a);
         }
+        let call_targets: HashMap<Node, Address> = call_target_facts
+            .into_iter()
+            .filter_map(|(node, targets)| {
+                (targets.len() == 1).then(|| (node, *targets.iter().next().unwrap()))
+            })
+            .collect();
 
         // Union-Find over RTLReg, lazily created as we walk the linkages.
         let mut parent: HashMap<RTLReg, RTLReg> = HashMap::new();

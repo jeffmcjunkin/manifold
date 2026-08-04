@@ -45,10 +45,8 @@ ascent_par! {
     relation instr_in_function(Node, Address);
     relation is_ptr(RTLReg);
     relation emit_var_type_candidate(RTLReg, XType);
-    relation call_target_func(Node, Address);
-    relation call_arg_mapping(Node, usize, RTLReg);
-    relation emit_function(Address, Symbol, Node);
-    relation known_extern_signature(Symbol, usize, XType, Arc<Vec<XType>>);
+    relation call_arg(Node, usize, RTLReg);
+    relation call_resolved_signature(Node, Symbol, usize, XType, Arc<Vec<XType>>, bool);
     relation string_data(String, String, usize);
     relation ident_to_symbol(Ident, Symbol);
     relation stack_var(Address, Address, i64, RTLReg);
@@ -203,16 +201,6 @@ ascent_par! {
         let base_reg = args[0],
         is_ptr(&base_reg);
 
-    #[local] relation call_site(Node, Symbol);
-    #[local] relation call_arg(Node, usize, RTLReg);
-
-    call_site(node, *sym) <--
-        call_target_func(node, callee),
-        emit_function(callee, sym, _);
-
-    call_arg(call_node, *pos, *reg) <--
-        call_arg_mapping(call_node, pos, reg);
-
     #[local] relation ptr_has_offset(RTLReg, i64);
     ptr_has_offset(reg, ofs) <-- ptr_deref(reg, ofs, _, _, _);
 
@@ -232,9 +220,8 @@ ascent_par! {
     #[local] relation ptr_rejected_as_struct(RTLReg);
 
     ptr_rejected_as_struct(arg_reg) <--
-        call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
-        known_extern_signature(func_name, _, _, params),
+        call_resolved_signature(node, _, _, _, params, _),
         if *arg_idx < params.len(),
         if matches!(params[*arg_idx],
             XType::Xint | XType::Xintunsigned |
@@ -630,10 +617,8 @@ impl IRPass for StructRecoveryPass {
             "instr_in_function",
             "is_ptr",
             "emit_var_type_candidate",
-            "call_target_func",
-            "call_arg_mapping",
-            "emit_function",
-            "known_extern_signature",
+            "call_arg",
+            "call_resolved_signature",
             "string_data",
             "ident_to_symbol",
             "stack_var",
