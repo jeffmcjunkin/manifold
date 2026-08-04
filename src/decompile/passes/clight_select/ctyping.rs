@@ -953,9 +953,20 @@ fn wt_call(
     env: &dyn WtEnv,
     errs: &mut Vec<WtError>,
 ) {
-    let ftype = match env.callee_type(f) {
-        Some(t) => t,
-        None => wt_expr(f, env, errs),
+    // An explicit function-pointer cast is the call's effective per-call C
+    // contract. It intentionally outranks any declaration attached to the
+    // named function underneath the cast.
+    let explicit_function_cast = matches!(
+        f,
+        ClightExpr::Ecast(_, ty) if matches!(classify_fun(ty), FunCase::F(..))
+    );
+    let ftype = if explicit_function_cast {
+        wt_expr(f, env, errs)
+    } else {
+        match env.callee_type(f) {
+            Some(t) => t,
+            None => wt_expr(f, env, errs),
+        }
     };
     let arg_types: Vec<ClightType> = args.iter().map(|a| wt_expr(a, env, errs)).collect();
     match classify_fun(&ftype) {
@@ -1609,6 +1620,19 @@ mod tests {
             err_fams(&wt_check_stmt(&overridden, &env3)),
             vec!["call-through-non-function"]
         );
+
+        let exact_call_type = tptr(tfn(vec![tlong()], ClightType::Tvoid));
+        let cast_callee = ClightExpr::Ecast(
+            Box::new(ClightExpr::EvarSymbol(
+                "shared_target".into(),
+                exact_call_type.clone(),
+            )),
+            exact_call_type,
+        );
+        env3.callee = Some(tfn(vec![tint(), tint()], tint()));
+        let independent =
+            ClightStmt::Scall(None, cast_callee, vec![ClightExpr::EconstLong(1, tlong())]);
+        assert!(err_fams(&wt_check_stmt(&independent, &env3)).is_empty());
     }
 
     #[test]

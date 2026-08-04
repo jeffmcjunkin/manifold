@@ -1,6 +1,7 @@
 use crate::decompile::elevator::DecompileDB;
 use crate::run_pass;
 
+use crate::decompile::disassembly::operand::NO_OP;
 use crate::decompile::passes::asm_pass::{is_flag_setting, transl_addressing_rev_sized};
 use crate::decompile::passes::cminor_pass::*;
 use crate::decompile::passes::clight_select::query::canonical_function_owners;
@@ -23,6 +24,2927 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 const ENDBR64_LEN: u64 = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct MsvcGsCookieGuardWitness {
+    cookie_load: Node,
+    cookie_xor: Node,
+    call: Node,
+    function: Address,
+    check_xor: Node,
+    ret: Node,
+    argument: RTLReg,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RawStackSlot {
+    base: &'static str,
+    displacement: i64,
+    size: usize,
+}
+
+type RawIndirect = (&'static str, &'static str, &'static str, i64, i64, usize);
+type RawInstruction = (
+    usize,
+    &'static str,
+    &'static str,
+    Symbol,
+    Symbol,
+    Symbol,
+    Symbol,
+    usize,
+    usize,
+);
+
+fn msvc_gs_exact_raw_operand_count(row: &RawInstruction) -> Option<usize> {
+    let operands = [row.3, row.4, row.5, row.6];
+    let mut count = 0;
+    let mut reached_padding = false;
+    for operand in operands {
+        if operand == NO_OP {
+            reached_padding = true;
+        } else if reached_padding {
+            // Decoder-produced operands are contiguous.  A populated operand
+            // after the NO_OP sentinel is a malformed raw row, not arity
+            // evidence that the target/effect proofs may safely consume.
+            return None;
+        } else {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+fn msvc_gs_effective_global_address(ident: usize, offset: i64) -> Option<Address> {
+    let base = Address::try_from(ident).ok()?;
+    if offset >= 0 {
+        base.checked_add(offset as Address)
+    } else {
+        base.checked_sub(offset.unsigned_abs())
+    }
+}
+
+fn msvc_gs_exact_ltl_candidate(candidates: &[LTLInst]) -> Option<LTLInst> {
+    if candidates.len() == 1 {
+        return Some(candidates[0].clone());
+    }
+    let first = candidates.first()?;
+    match first {
+        LTLInst::Lload(
+            first_chunk,
+            Addressing::Aglobal(first_ident, first_offset),
+            first_args,
+            first_dst,
+        ) if first_args.is_empty() => {
+            let effective = msvc_gs_effective_global_address(*first_ident, *first_offset)?;
+            candidates
+                .iter()
+                .all(|candidate| {
+                    matches!(
+                        candidate,
+                        LTLInst::Lload(chunk, Addressing::Aglobal(ident, offset), args, dst)
+                            if chunk == first_chunk
+                                && dst == first_dst
+                                && args.is_empty()
+                                && msvc_gs_effective_global_address(*ident, *offset)
+                                    == Some(effective)
+                    )
+                })
+                .then(|| first.clone())
+        }
+        LTLInst::Lstore(
+            first_chunk,
+            Addressing::Aglobal(first_ident, first_offset),
+            first_args,
+            first_src,
+        ) if first_args.is_empty() => {
+            let effective = msvc_gs_effective_global_address(*first_ident, *first_offset)?;
+            candidates
+                .iter()
+                .all(|candidate| {
+                    matches!(
+                        candidate,
+                        LTLInst::Lstore(chunk, Addressing::Aglobal(ident, offset), args, src)
+                            if chunk == first_chunk
+                                && src == first_src
+                                && args.is_empty()
+                                && msvc_gs_effective_global_address(*ident, *offset)
+                                    == Some(effective)
+                    )
+                })
+                .then(|| first.clone())
+        }
+        _ => None,
+    }
+}
+
+type SymbolTableRow = (
+    Address,
+    usize,
+    Symbol,
+    Symbol,
+    Symbol,
+    usize,
+    Symbol,
+    usize,
+    Symbol,
+);
+
+struct MsvcGsExternalTargetProof<'a> {
+    external_addresses: &'a BTreeSet<Address>,
+    decoded_nodes: &'a BTreeSet<Node>,
+    claimants: &'a BTreeMap<Node, BTreeSet<Address>>,
+    function_spans: &'a [(Address, Address)],
+    symbol_rows_by_name: &'a BTreeMap<Symbol, BTreeSet<SymbolTableRow>>,
+    symbol_rows_by_address: &'a BTreeMap<Address, BTreeSet<SymbolTableRow>>,
+    symbols_by_address: &'a BTreeMap<Address, BTreeSet<Symbol>>,
+    addresses_by_symbol: &'a BTreeMap<Symbol, BTreeSet<Address>>,
+    resolved_by_symbol: &'a BTreeMap<Symbol, BTreeSet<Address>>,
+    call_targets: &'a BTreeMap<Node, BTreeSet<Address>>,
+    operands: &'a BTreeMap<Node, [Symbol; 4]>,
+    operand_counts: &'a BTreeMap<Node, usize>,
+    immediates: &'a BTreeMap<Symbol, BTreeSet<i64>>,
+    register_operands: &'a BTreeSet<Symbol>,
+    indirect_operands: &'a BTreeSet<Symbol>,
+}
+
+impl MsvcGsExternalTargetProof<'_> {
+    fn exact_raw_direct_operand(&self, call: Node) -> Option<i64> {
+        if self.operand_counts.get(&call) != Some(&1) {
+            return None;
+        }
+        let operand = self.operands.get(&call)?[0];
+        if self.register_operands.contains(&operand) || self.indirect_operands.contains(&operand) {
+            return None;
+        }
+        let values = self.immediates.get(&operand)?;
+        (values.len() == 1).then(|| *values.iter().next().unwrap())
+    }
+
+    fn exact_raw_target(&self, call: Node, address: Address) -> bool {
+        self.exact_raw_direct_operand(call)
+            .and_then(|value| Address::try_from(value).ok())
+            == Some(address)
+    }
+
+    fn raw_direct_target_is_local(&self, call: Node) -> bool {
+        self.exact_raw_direct_operand(call)
+            .and_then(|value| Address::try_from(value).ok())
+            .is_some_and(|address| {
+                self.decoded_nodes.contains(&address)
+                    || self.claimants.contains_key(&address)
+                    || self
+                        .function_spans
+                        .iter()
+                        .any(|(start, end)| address >= *start && address < *end)
+            })
+    }
+
+    fn exact_external_address(&self, address: Address, expected_name: Option<Symbol>) -> bool {
+        if !self.external_addresses.contains(&address)
+            || self.decoded_nodes.contains(&address)
+            || self.claimants.contains_key(&address)
+            || self
+                .function_spans
+                .iter()
+                .any(|(start, end)| address >= *start && address < *end)
+        {
+            return false;
+        }
+
+        let address_name = if let Some(names) = self.symbols_by_address.get(&address) {
+            if names.len() != 1 || expected_name.is_some_and(|name| !names.contains(&name)) {
+                return false;
+            }
+            names.iter().next().copied()
+        } else if expected_name.is_some() {
+            return false;
+        } else {
+            None
+        };
+        let required_name = expected_name.or(address_name);
+
+        if let Some(rows) = self.symbol_rows_by_address.get(&address) {
+            if rows.len() != 1
+                || rows
+                    .iter()
+                    .any(|(_, _, symbol_type, _, section_type, _, _, _, name)| {
+                        !matches!(*symbol_type, "FUNC" | "NOTYPE")
+                            || *section_type != "UNDEF"
+                            || required_name.is_some_and(|expected| *name != expected)
+                    })
+            {
+                return false;
+            }
+        }
+
+        if let Some(name) = expected_name {
+            self.addresses_by_symbol
+                .get(&name)
+                .is_some_and(|addresses| addresses.len() == 1 && addresses.contains(&address))
+        } else {
+            self.symbols_by_address.get(&address).map_or(true, |names| {
+                let name = *names.iter().next().unwrap();
+                self.addresses_by_symbol
+                    .get(&name)
+                    .is_some_and(|addresses| addresses.len() == 1 && addresses.contains(&address))
+            })
+        }
+    }
+
+    fn accepts(&self, call: Node, callee: &Either<Mreg, Either<Address, Symbol>>) -> bool {
+        match callee {
+            Either::Left(_) => false,
+            Either::Right(Either::Left(address)) => {
+                self.exact_external_address(*address, None)
+                    && self.exact_raw_target(call, *address)
+                    && self
+                        .call_targets
+                        .get(&call)
+                        .is_some_and(|targets| targets.len() == 1 && targets.contains(address))
+            }
+            Either::Right(Either::Right(name)) => {
+                let Some(rows) = self.symbol_rows_by_name.get(name) else {
+                    return false;
+                };
+                if rows.len() != 1
+                    || !rows.iter().all(
+                        |(_, _, symbol_type, _, section_type, _, _, _, row_name)| {
+                            matches!(*symbol_type, "FUNC" | "NOTYPE")
+                                && *section_type == "UNDEF"
+                                && row_name == name
+                        },
+                    )
+                {
+                    return false;
+                }
+
+                let resolved = self.resolved_by_symbol.get(name);
+                let call_targets = self.call_targets.get(&call);
+                match (resolved, call_targets) {
+                    (None, None) => {
+                        !self.addresses_by_symbol.contains_key(name)
+                            && self.exact_raw_direct_operand(call).is_some()
+                            && !self.raw_direct_target_is_local(call)
+                    }
+                    (Some(addresses), Some(targets))
+                        if addresses.len() == 1 && targets == addresses =>
+                    {
+                        let address = *addresses.iter().next().unwrap();
+                        self.exact_external_address(address, Some(*name))
+                            && self.exact_raw_target(call, address)
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+}
+
+fn unique_next(next: &BTreeMap<Node, BTreeSet<Node>>, node: Node) -> Option<Node> {
+    let successors = next.get(&node)?;
+    (successors.len() == 1).then(|| *successors.iter().next().unwrap())
+}
+
+fn raw_operand_is_register(
+    registers: &BTreeMap<Symbol, BTreeSet<&'static str>>,
+    operand: Symbol,
+    expected: &str,
+) -> bool {
+    registers
+        .get(&operand)
+        .is_some_and(|names| names.len() == 1 && names.contains(expected))
+}
+
+fn unique_raw_register_name(
+    registers: &BTreeMap<Symbol, BTreeSet<&'static str>>,
+    operand: Symbol,
+) -> Option<&'static str> {
+    let names = registers.get(&operand)?;
+    (names.len() == 1).then(|| *names.iter().next().unwrap())
+}
+
+fn exact_raw_binary_operands(
+    operands: &BTreeMap<Node, [Symbol; 4]>,
+    operand_counts: &BTreeMap<Node, usize>,
+    node: Node,
+    destination: Symbol,
+    source: Symbol,
+) -> bool {
+    operand_counts.get(&node) == Some(&2)
+        && operands
+            .get(&node)
+            // `instruction` deliberately keeps ddisasm's source-first
+            // storage convention even though the semantic p* relations expose
+            // destination/source order.
+            .is_some_and(|raw| raw[0] == source && raw[1] == destination)
+}
+
+fn raw_affine_address(
+    indirect: &BTreeMap<Symbol, BTreeSet<RawIndirect>>,
+    operand: Symbol,
+) -> Option<(&'static str, i64)> {
+    let facts = indirect.get(&operand)?;
+    if facts.len() != 1 {
+        return None;
+    }
+    let (segment, base, index, _scale, displacement, _size) = *facts.iter().next().unwrap();
+    (matches!(segment, "" | "NONE" | "SS")
+        && is_x86_64_gp_register_name(base)
+        && (index.is_empty() || index == "NONE"))
+        .then_some((base, displacement))
+}
+
+fn raw_stack_slot(
+    indirect: &BTreeMap<Symbol, BTreeSet<RawIndirect>>,
+    operand: Symbol,
+) -> Option<RawStackSlot> {
+    let facts = indirect.get(&operand)?;
+    if facts.len() != 1 {
+        return None;
+    }
+    let (segment, base, index, _scale, displacement, size) = *facts.iter().next().unwrap();
+    if !matches!(segment, "" | "NONE" | "SS")
+        || !is_x86_64_gp_register_name(base)
+        || !(index.is_empty() || index == "NONE")
+        || size != 8
+    {
+        return None;
+    }
+    Some(RawStackSlot {
+        base,
+        displacement,
+        size,
+    })
+}
+
+fn node_belongs_to_function(
+    canonical_owners: &BTreeMap<Node, Address>,
+    claimants: &BTreeMap<Node, BTreeSet<Address>>,
+    node: Node,
+    function: Address,
+) -> bool {
+    canonical_owners.get(&node) == Some(&function)
+        && claimants
+            .get(&node)
+            .is_some_and(|node_owners| node_owners.len() == 1 && node_owners.contains(&function))
+}
+
+fn unique_frame_offset(
+    frame_offsets: &BTreeMap<(Address, Node), BTreeSet<i64>>,
+    function: Address,
+    node: Node,
+) -> Option<i64> {
+    let offsets = frame_offsets.get(&(function, node))?;
+    (offsets.len() == 1).then(|| *offsets.iter().next().unwrap())
+}
+
+fn node_reaches_in_function(
+    src: Node,
+    dst: Node,
+    function: Address,
+    next: &BTreeMap<Node, BTreeSet<Node>>,
+    canonical_owners: &BTreeMap<Node, Address>,
+    claimants: &BTreeMap<Node, BTreeSet<Address>>,
+) -> bool {
+    let mut pending = vec![src];
+    let mut visited = BTreeSet::new();
+    while let Some(node) = pending.pop() {
+        if !visited.insert(node)
+            || !node_belongs_to_function(canonical_owners, claimants, node, function)
+        {
+            continue;
+        }
+        if node == dst {
+            return true;
+        }
+        if let Some(successors) = next.get(&node) {
+            pending.extend(successors.iter().copied());
+        }
+    }
+    false
+}
+
+/// Walk the decoded instruction CFG while requiring every traversed node to
+/// have one canonical function owner.  `None` means the proof encountered a
+/// shared/noncanonical node and must fail closed.
+fn cfg_reaches_in_function(
+    src: Node,
+    dst: Node,
+    function: Address,
+    cfg: &BTreeMap<Node, BTreeSet<Node>>,
+    canonical_owners: &BTreeMap<Node, Address>,
+    claimants: &BTreeMap<Node, BTreeSet<Address>>,
+    avoid: Option<Node>,
+) -> Option<bool> {
+    let mut pending = vec![src];
+    let mut visited = BTreeSet::new();
+    while let Some(node) = pending.pop() {
+        if Some(node) == avoid || !visited.insert(node) {
+            continue;
+        }
+        if !node_belongs_to_function(canonical_owners, claimants, node, function) {
+            return None;
+        }
+        if node == dst {
+            return Some(true);
+        }
+        if let Some(successors) = cfg.get(&node) {
+            for successor in successors {
+                let claimed_by_function = claimants
+                    .get(successor)
+                    .is_some_and(|owners| owners.contains(&function));
+                if claimed_by_function {
+                    if !node_belongs_to_function(canonical_owners, claimants, *successor, function)
+                    {
+                        return None;
+                    }
+                    pending.push(*successor);
+                }
+            }
+        }
+    }
+    Some(false)
+}
+
+fn node_dominates_in_function(
+    dominator: Node,
+    use_node: Node,
+    function: Address,
+    cfg: &BTreeMap<Node, BTreeSet<Node>>,
+    canonical_owners: &BTreeMap<Node, Address>,
+    claimants: &BTreeMap<Node, BTreeSet<Address>>,
+) -> bool {
+    cfg_reaches_in_function(
+        function,
+        use_node,
+        function,
+        cfg,
+        canonical_owners,
+        claimants,
+        None,
+    ) == Some(true)
+        && cfg_reaches_in_function(
+            function,
+            use_node,
+            function,
+            cfg,
+            canonical_owners,
+            claimants,
+            Some(dominator),
+        ) == Some(false)
+}
+
+fn msvc_gs_ltl_xor_is_absent_or_exact(
+    candidates: Option<&[LTLInst]>,
+    destination: Mreg,
+    source: Mreg,
+) -> bool {
+    let Some(candidates) = candidates else {
+        // SP-source arithmetic has exact raw decoder evidence but no Mach/LTL
+        // lowering at this pre-fixed-point boundary.  Absence is not a
+        // contradiction; any published lowering must still agree exactly.
+        return true;
+    };
+    let Some((first, rest)) = candidates.split_first() else {
+        return false;
+    };
+    matches!(
+        first,
+        LTLInst::Lop(Operation::Oxorl, args, result)
+            if *result == destination && args.as_slice() == [destination, source]
+    ) && rest.iter().all(|candidate| candidate == first)
+}
+
+/// Return the complete decoded function slice from its entry through `ret`.
+/// Every entry-reachable path must converge on that return; missing ownership,
+/// decode ambiguity, an alternate terminal, or unresolved indirect control
+/// flow makes the proof fail closed.
+#[allow(clippy::too_many_arguments)]
+fn authenticated_msvc_gs_cfg_slice(
+    start: Node,
+    ret: Node,
+    function: Address,
+    cfg: &BTreeMap<Node, BTreeSet<Node>>,
+    reverse_cfg: &BTreeMap<Node, BTreeSet<Node>>,
+    canonical_owners: &BTreeMap<Node, Address>,
+    claimants: &BTreeMap<Node, BTreeSet<Address>>,
+    unique_raw_nodes: &BTreeSet<Node>,
+    unique_ltl_nodes: &BTreeSet<Node>,
+    authenticated_raw_only_nodes: &BTreeSet<Node>,
+    mnemonics: &BTreeMap<Node, &'static str>,
+    unresolved_indirect_sources: &BTreeSet<Node>,
+) -> Option<BTreeSet<Node>> {
+    if cfg
+        .get(&ret)
+        .is_some_and(|successors| !successors.is_empty())
+        || !mnemonics
+            .get(&ret)
+            .is_some_and(|mnemonic| matches!(*mnemonic, "RET" | "RETQ" | "RETN"))
+    {
+        return None;
+    }
+    let mut forward = BTreeSet::new();
+    let mut pending = vec![start];
+    while let Some(node) = pending.pop() {
+        if !forward.insert(node) {
+            continue;
+        }
+        if !node_belongs_to_function(canonical_owners, claimants, node, function)
+            || !unique_raw_nodes.contains(&node)
+            || (!unique_ltl_nodes.contains(&node) && !authenticated_raw_only_nodes.contains(&node))
+            || !mnemonics
+                .get(&node)
+                .is_some_and(|mnemonic| !mnemonic.is_empty())
+            || unresolved_indirect_sources.contains(&node)
+        {
+            return None;
+        }
+        if node == ret {
+            continue;
+        }
+        for successor in cfg.get(&node).into_iter().flatten() {
+            if !node_belongs_to_function(canonical_owners, claimants, *successor, function) {
+                return None;
+            }
+            pending.push(*successor);
+        }
+    }
+    if !forward.contains(&ret) {
+        return None;
+    }
+
+    let mut reaches_ret = BTreeSet::new();
+    let mut pending = vec![ret];
+    while let Some(node) = pending.pop() {
+        if !forward.contains(&node) || !reaches_ret.insert(node) {
+            continue;
+        }
+        pending.extend(reverse_cfg.get(&node).into_iter().flatten().copied());
+    }
+    (forward == reaches_ret).then_some(forward)
+}
+
+fn exact_stack_adjustment(
+    adjustments: &BTreeMap<Node, BTreeSet<(&'static str, i64)>>,
+    node: Node,
+) -> Option<i64> {
+    let rows = adjustments.get(&node)?;
+    if rows.len() != 1 {
+        return None;
+    }
+    let (base, delta) = *rows.iter().next().unwrap();
+    (base == "RSP").then_some(delta)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn proved_msvc_gs_frame_allocation(
+    function: Address,
+    cookie_load: Node,
+    frame_offset: i64,
+    next: &BTreeMap<Node, BTreeSet<Node>>,
+    canonical_owners: &BTreeMap<Node, Address>,
+    claimants: &BTreeMap<Node, BTreeSet<Address>>,
+    frame_offsets: &BTreeMap<(Address, Node), BTreeSet<i64>>,
+    adjustments: &BTreeMap<Node, BTreeSet<(&'static str, i64)>>,
+) -> bool {
+    frame_offset < 0
+        && unique_frame_offset(frame_offsets, function, function) == Some(0)
+        && adjustments.iter().any(|(allocation, rows)| {
+            let Some(delta) = (rows.len() == 1)
+                .then(|| *rows.iter().next().unwrap())
+                .filter(|(base, delta)| *base == "RSP" && *delta < 0)
+                .map(|(_, delta)| delta)
+            else {
+                return false;
+            };
+            let Some(after) = unique_next(next, *allocation) else {
+                return false;
+            };
+            let Some(before_offset) = unique_frame_offset(frame_offsets, function, *allocation)
+            else {
+                return false;
+            };
+            node_belongs_to_function(canonical_owners, claimants, *allocation, function)
+                && node_belongs_to_function(canonical_owners, claimants, after, function)
+                && unique_frame_offset(frame_offsets, function, after)
+                    == before_offset.checked_add(delta)
+                && node_reaches_in_function(
+                    function,
+                    *allocation,
+                    function,
+                    next,
+                    canonical_owners,
+                    claimants,
+                )
+                && node_reaches_in_function(
+                    *allocation,
+                    cookie_load,
+                    function,
+                    next,
+                    canonical_owners,
+                    claimants,
+                )
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn proved_frame_pointer_setup_at(
+    use_node: Node,
+    function: Address,
+    canonical_owners: &BTreeMap<Node, Address>,
+    claimants: &BTreeMap<Node, BTreeSet<Address>>,
+    frame_setups: &BTreeMap<(Node, Address), BTreeSet<(Node, i64)>>,
+    stack_base_moves: &BTreeMap<Node, BTreeSet<(Symbol, Symbol)>>,
+) -> Option<(Node, i64)> {
+    if !node_belongs_to_function(canonical_owners, claimants, use_node, function) {
+        return None;
+    }
+    let setups = frame_setups.get(&(use_node, function))?;
+    if setups.len() != 1 {
+        return None;
+    }
+    let (setup, base_offset) = *setups.iter().next().unwrap();
+    if !node_belongs_to_function(canonical_owners, claimants, setup, function) {
+        return None;
+    }
+    let setup_moves = stack_base_moves.get(&setup)?;
+    if setup_moves.len() != 1 || !setup_moves.contains(&("RSP", "RBP")) {
+        return None;
+    }
+    Some((setup, base_offset))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matching_frame_pointer_setup(
+    restore: Node,
+    cookie_load: Node,
+    function: Address,
+    next: &BTreeMap<Node, BTreeSet<Node>>,
+    canonical_owners: &BTreeMap<Node, Address>,
+    claimants: &BTreeMap<Node, BTreeSet<Address>>,
+    frame_setups: &BTreeMap<(Node, Address), BTreeSet<(Node, i64)>>,
+    stack_base_moves: &BTreeMap<Node, BTreeSet<(Symbol, Symbol)>>,
+) -> Option<i64> {
+    let (setup, base_offset) = proved_frame_pointer_setup_at(
+        restore,
+        function,
+        canonical_owners,
+        claimants,
+        frame_setups,
+        stack_base_moves,
+    )?;
+    if !node_reaches_in_function(
+        setup,
+        cookie_load,
+        function,
+        next,
+        canonical_owners,
+        claimants,
+    ) {
+        return None;
+    }
+    Some(base_offset)
+}
+
+struct MsvcGsStackAliasProof<'a> {
+    cfg: &'a BTreeMap<Node, BTreeSet<Node>>,
+    reverse_cfg: &'a BTreeMap<Node, BTreeSet<Node>>,
+    canonical_owners: &'a BTreeMap<Node, Address>,
+    claimants: &'a BTreeMap<Node, BTreeSet<Address>>,
+    decoded_defs: &'a BTreeMap<Node, BTreeSet<Mreg>>,
+    call_nodes: &'a BTreeSet<Node>,
+    caller_saved: &'a BTreeSet<Mreg>,
+    mnemonics: &'a BTreeMap<Node, &'static str>,
+    moves: &'a BTreeMap<Node, BTreeSet<(Symbol, Symbol)>>,
+    adds: &'a BTreeMap<Node, BTreeSet<(Symbol, Symbol)>>,
+    subs: &'a BTreeMap<Node, BTreeSet<(Symbol, Symbol)>>,
+    leas: &'a BTreeMap<Node, BTreeSet<(Symbol, Symbol)>>,
+    registers: &'a BTreeMap<Symbol, BTreeSet<&'static str>>,
+    immediates: &'a BTreeMap<Symbol, BTreeSet<i64>>,
+    indirect: &'a BTreeMap<Symbol, BTreeSet<RawIndirect>>,
+    frame_offsets: &'a BTreeMap<(Address, Node), BTreeSet<i64>>,
+    frame_setups: &'a BTreeMap<(Node, Address), BTreeSet<(Node, i64)>>,
+    stack_base_moves: &'a BTreeMap<Node, BTreeSet<(Symbol, Symbol)>>,
+}
+
+impl MsvcGsStackAliasProof<'_> {
+    fn node_defines_reg(&self, node: Node, reg: Mreg) -> bool {
+        // The spill-to-reload audit admits only a closed set of raw semantic
+        // forms with no unrepresented implicit GP definitions.  Within that
+        // set, every decoded explicit definition is therefore an alias kill;
+        // calls remain a separate all-caller-saved kill.
+        self.decoded_defs
+            .get(&node)
+            .is_some_and(|defs| defs.contains(&reg))
+            || (self.call_nodes.contains(&node) && self.caller_saved.contains(&reg))
+    }
+
+    fn unique_reaching_def_before(
+        &self,
+        use_node: Node,
+        function: Address,
+        reg: Mreg,
+    ) -> Option<Node> {
+        if !node_belongs_to_function(self.canonical_owners, self.claimants, use_node, function) {
+            return None;
+        }
+        let mut pending: Vec<Node> = self
+            .reverse_cfg
+            .get(&use_node)
+            .into_iter()
+            .flatten()
+            .filter(|predecessor| {
+                self.claimants
+                    .get(predecessor)
+                    .is_some_and(|owners| owners.contains(&function))
+            })
+            .copied()
+            .collect();
+        if pending.is_empty() {
+            return None;
+        }
+        let mut visited = BTreeSet::new();
+        let mut reaching_defs = BTreeSet::new();
+        let mut reaches_unknown_entry = false;
+        while let Some(node) = pending.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            if !node_belongs_to_function(self.canonical_owners, self.claimants, node, function) {
+                return None;
+            }
+            if self.node_defines_reg(node, reg) {
+                reaching_defs.insert(node);
+                continue;
+            }
+            if node == function {
+                reaches_unknown_entry = true;
+                continue;
+            }
+            let predecessors: Vec<Node> = self
+                .reverse_cfg
+                .get(&node)
+                .into_iter()
+                .flatten()
+                .filter(|predecessor| {
+                    self.claimants
+                        .get(predecessor)
+                        .is_some_and(|owners| owners.contains(&function))
+                })
+                .copied()
+                .collect();
+            if predecessors.is_empty() {
+                reaches_unknown_entry = true;
+            } else {
+                pending.extend(predecessors);
+            }
+        }
+        if reaches_unknown_entry || reaching_defs.len() != 1 {
+            return None;
+        }
+        let definition = *reaching_defs.iter().next().unwrap();
+        node_dominates_in_function(
+            definition,
+            use_node,
+            function,
+            self.cfg,
+            self.canonical_owners,
+            self.claimants,
+        )
+        .then_some(definition)
+    }
+
+    fn coordinate_before(&self, node: Node, function: Address, base: Symbol) -> Option<i64> {
+        self.coordinate_before_inner(node, function, base, &mut BTreeSet::new())
+    }
+
+    fn coordinate_before_inner(
+        &self,
+        node: Node,
+        function: Address,
+        base: Symbol,
+        visiting: &mut BTreeSet<(Node, Mreg)>,
+    ) -> Option<i64> {
+        if !node_belongs_to_function(self.canonical_owners, self.claimants, node, function) {
+            return None;
+        }
+        if base == "RSP" {
+            return unique_frame_offset(self.frame_offsets, function, node);
+        }
+        if base == "RBP" {
+            return proved_frame_pointer_setup_at(
+                node,
+                function,
+                self.canonical_owners,
+                self.claimants,
+                self.frame_setups,
+                self.stack_base_moves,
+            )
+            .map(|(_, offset)| offset);
+        }
+        if !is_x86_64_gp_register_name(base) {
+            return None;
+        }
+        let reg = Mreg::x86(base);
+        if !visiting.insert((node, reg)) {
+            return None;
+        }
+        let result = self
+            .unique_reaching_def_before(node, function, reg)
+            .and_then(|definition| {
+                self.coordinate_from_definition(definition, function, reg, visiting)
+            });
+        visiting.remove(&(node, reg));
+        result
+    }
+
+    fn coordinate_from_definition(
+        &self,
+        definition: Node,
+        function: Address,
+        reg: Mreg,
+        visiting: &mut BTreeSet<(Node, Mreg)>,
+    ) -> Option<i64> {
+        let mnemonic = *self.mnemonics.get(&definition)?;
+        match mnemonic {
+            "MOV" | "MOVQ" => {
+                let rows = self.moves.get(&definition)?;
+                if rows.len() != 1 {
+                    return None;
+                }
+                let (destination, source) = *rows.iter().next().unwrap();
+                let destination_name = unique_raw_register_name(self.registers, destination)?;
+                let source_name = unique_raw_register_name(self.registers, source)?;
+                if !is_x86_64_gp_register_name(destination_name)
+                    || Mreg::x86(destination_name) != reg
+                    || !is_x86_64_gp_register_name(source_name)
+                {
+                    return None;
+                }
+                self.coordinate_before_inner(definition, function, source_name, visiting)
+            }
+            "LEA" | "LEAQ" => {
+                let rows = self.leas.get(&definition)?;
+                if rows.len() != 1 {
+                    return None;
+                }
+                let (destination, source) = *rows.iter().next().unwrap();
+                let destination_name = unique_raw_register_name(self.registers, destination)?;
+                if !is_x86_64_gp_register_name(destination_name)
+                    || Mreg::x86(destination_name) != reg
+                {
+                    return None;
+                }
+                let (source_base, displacement) = raw_affine_address(self.indirect, source)?;
+                self.coordinate_before_inner(definition, function, source_base, visiting)?
+                    .checked_add(displacement)
+            }
+            "ADD" | "ADDQ" | "SUB" | "SUBQ" => {
+                let rows = if matches!(mnemonic, "ADD" | "ADDQ") {
+                    self.adds.get(&definition)?
+                } else {
+                    self.subs.get(&definition)?
+                };
+                if rows.len() != 1 {
+                    return None;
+                }
+                let (destination, source) = *rows.iter().next().unwrap();
+                let destination_name = unique_raw_register_name(self.registers, destination)?;
+                if !is_x86_64_gp_register_name(destination_name)
+                    || Mreg::x86(destination_name) != reg
+                {
+                    return None;
+                }
+                let deltas = self.immediates.get(&source)?;
+                if deltas.len() != 1 {
+                    return None;
+                }
+                let delta = *deltas.iter().next().unwrap();
+                let prior =
+                    self.coordinate_before_inner(definition, function, destination_name, visiting)?;
+                if matches!(mnemonic, "ADD" | "ADDQ") {
+                    prior.checked_add(delta)
+                } else {
+                    prior.checked_sub(delta)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn slot_coordinate(&self, node: Node, function: Address, slot: RawStackSlot) -> Option<i64> {
+        self.coordinate_before(node, function, slot.base)?
+            .checked_add(slot.displacement)
+    }
+}
+
+fn byte_ranges_overlap(
+    first_start: i64,
+    first_end: i64,
+    second_start: i64,
+    second_end: i64,
+) -> bool {
+    first_start < second_end && second_start < first_end
+}
+
+fn msvc_gs_exact_nonmutating_jcc(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "JE" | "JNE"
+            | "JL"
+            | "JLE"
+            | "JG"
+            | "JGE"
+            | "JB"
+            | "JBE"
+            | "JA"
+            | "JAE"
+            | "JP"
+            | "JNP"
+            | "JO"
+            | "JNO"
+            | "JS"
+            | "JNS"
+            | "JCXZ"
+            | "JECXZ"
+            | "JRCXZ"
+    )
+}
+
+fn msvc_gs_exact_cmov(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "CMOVA"
+            | "CMOVAE"
+            | "CMOVB"
+            | "CMOVBE"
+            | "CMOVC"
+            | "CMOVE"
+            | "CMOVG"
+            | "CMOVGE"
+            | "CMOVL"
+            | "CMOVLE"
+            | "CMOVNA"
+            | "CMOVNAE"
+            | "CMOVNB"
+            | "CMOVNBE"
+            | "CMOVNC"
+            | "CMOVNE"
+            | "CMOVNG"
+            | "CMOVNGE"
+            | "CMOVNL"
+            | "CMOVNLE"
+            | "CMOVNO"
+            | "CMOVNP"
+            | "CMOVNS"
+            | "CMOVNZ"
+            | "CMOVO"
+            | "CMOVP"
+            | "CMOVPE"
+            | "CMOVPO"
+            | "CMOVS"
+            | "CMOVZ"
+    )
+}
+
+fn msvc_gs_exact_setcc(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "SETA"
+            | "SETAE"
+            | "SETB"
+            | "SETBE"
+            | "SETC"
+            | "SETE"
+            | "SETG"
+            | "SETGE"
+            | "SETL"
+            | "SETLE"
+            | "SETNA"
+            | "SETNAE"
+            | "SETNB"
+            | "SETNBE"
+            | "SETNC"
+            | "SETNE"
+            | "SETNG"
+            | "SETNGE"
+            | "SETNL"
+            | "SETNLE"
+            | "SETNO"
+            | "SETNP"
+            | "SETNS"
+            | "SETNZ"
+            | "SETO"
+            | "SETP"
+            | "SETPE"
+            | "SETPO"
+            | "SETS"
+            | "SETZ"
+    )
+}
+
+fn msvc_gs_explicit_move_mnemonic(mnemonic: &str, operand_count: usize) -> bool {
+    operand_count == 2
+        && matches!(
+            mnemonic,
+            "MOV"
+                | "MOVQ"
+                | "MOVABS"
+                | "MOVSX"
+                | "MOVSXD"
+                | "MOVZX"
+                | "MOVAPS"
+                | "MOVUPS"
+                | "MOVAPD"
+                | "MOVUPD"
+                | "MOVDQA"
+                | "MOVDQU"
+                | "MOVD"
+                | "MOVSS"
+                | "MOVSD"
+                | "VMOVAPS"
+                | "VMOVUPS"
+                | "VMOVAPD"
+                | "VMOVUPD"
+                | "VMOVDQA"
+                | "VMOVDQU"
+                | "VMOVD"
+                | "VMOVQ"
+                | "VMOVSS"
+                | "VMOVSD"
+        )
+}
+
+fn msvc_gs_explicit_destination_mnemonic(mnemonic: &str, operand_count: usize) -> bool {
+    msvc_gs_explicit_move_mnemonic(mnemonic, operand_count)
+        || (operand_count == 2
+            && matches!(
+                mnemonic,
+                "ADC"
+                    | "ADD"
+                    | "ADDQ"
+                    | "AND"
+                    | "BSF"
+                    | "BSR"
+                    | "BTC"
+                    | "BTR"
+                    | "BTS"
+                    | "LZCNT"
+                    | "OR"
+                    | "POPCNT"
+                    | "SBB"
+                    | "SUB"
+                    | "SUBQ"
+                    | "TZCNT"
+                    | "XOR"
+                    | "XORQ"
+            ))
+        || (matches!(operand_count, 1 | 2)
+            && matches!(
+                mnemonic,
+                "DEC"
+                    | "INC"
+                    | "NEG"
+                    | "NOT"
+                    | "RCL"
+                    | "RCR"
+                    | "ROL"
+                    | "ROR"
+                    | "SAL"
+                    | "SAR"
+                    | "SHL"
+                    | "SHR"
+            ))
+        || (mnemonic == "IMUL" && matches!(operand_count, 2 | 3))
+        || (matches!(mnemonic, "SHLD" | "SHRD") && matches!(operand_count, 2 | 3))
+        || (operand_count == 1 && mnemonic == "BSWAP")
+        || (operand_count == 2 && msvc_gs_exact_cmov(mnemonic))
+        || (operand_count == 1 && msvc_gs_exact_setcc(mnemonic))
+        || (operand_count == 2 && matches!(mnemonic, "LEA" | "LEAQ"))
+}
+
+fn msvc_gs_explicit_store_mnemonic(mnemonic: &str, operand_count: usize) -> bool {
+    msvc_gs_explicit_move_mnemonic(mnemonic, operand_count)
+        || (operand_count == 2
+            && matches!(
+                mnemonic,
+                "ADC"
+                    | "ADD"
+                    | "ADDQ"
+                    | "AND"
+                    | "BTC"
+                    | "BTR"
+                    | "BTS"
+                    | "OR"
+                    | "SBB"
+                    | "SUB"
+                    | "SUBQ"
+                    | "XOR"
+                    | "XORQ"
+            ))
+        || (matches!(operand_count, 1 | 2)
+            && matches!(
+                mnemonic,
+                "DEC"
+                    | "INC"
+                    | "NEG"
+                    | "NOT"
+                    | "RCL"
+                    | "RCR"
+                    | "ROL"
+                    | "ROR"
+                    | "SAL"
+                    | "SAR"
+                    | "SHL"
+                    | "SHR"
+            ))
+        || (operand_count == 1 && msvc_gs_exact_setcc(mnemonic))
+}
+
+fn msvc_gs_lbranch_has_independent_effect_model(
+    mnemonic: &str,
+    operand_count: usize,
+    control_flow_is_represented: bool,
+) -> bool {
+    // LinearPass installs an Lbranch fallback for every raw instruction that
+    // received no semantic lowering.  It is evidence only for this closed set:
+    // architectural no-ops, or exact control transfers whose behavior is also
+    // present in the decoded CFG.  In particular, prefix matching would admit
+    // SETSSBSY, and treating every CFG fallthrough as harmless would admit
+    // opaque transfers such as SYSCALL.
+    (matches!(mnemonic, "NOP" | "NOPW" | "NOPL") && operand_count <= 1)
+        || (control_flow_is_represented
+            && operand_count == 1
+            && (matches!(mnemonic, "JMP" | "JMPQ") || msvc_gs_exact_nonmutating_jcc(mnemonic)))
+}
+
+fn msvc_gs_decoded_defs_are_exact_destination(
+    decoded_defs: &BTreeSet<Mreg>,
+    destination: Mreg,
+) -> bool {
+    !destination.is_unknown() && decoded_defs.len() == 1 && decoded_defs.contains(&destination)
+}
+
+fn msvc_gs_instruction_effects_are_fully_modeled(
+    mnemonic: &str,
+    candidates: Option<&Vec<LTLInst>>,
+    decoded_defs: Option<&BTreeSet<Mreg>>,
+    decoded_write_operands: Option<&BTreeSet<Symbol>>,
+    operand_count: Option<usize>,
+    control_flow_is_represented: bool,
+) -> bool {
+    let Some(candidates) = candidates else {
+        return false;
+    };
+    // COFF relocation lowering and the raw RIP-relative fallback can publish
+    // two syntactically different global candidates for the same exact load
+    // or store.  Collapse only the checked effective-address equivalence used
+    // by the recognizer's own LTL map; every other ambiguity remains a veto.
+    let Some(candidate) = msvc_gs_exact_ltl_candidate(candidates) else {
+        return false;
+    };
+    let decoded_defs = decoded_defs.cloned().unwrap_or_default();
+    let decoded_write_operands = decoded_write_operands.cloned().unwrap_or_default();
+    let Some(operand_count) = operand_count else {
+        return false;
+    };
+    let no_decoded_writes = decoded_write_operands.is_empty();
+    let no_decoded_defs = decoded_defs.is_empty();
+
+    match &candidate {
+        // These are genuine semantic lowerings, unlike the synthetic Lbranch.
+        // Exact destination equality makes every published Capstone clobber a
+        // veto unless the lowering owns it.  Capstone can omit some implicit
+        // GP defs, so the closed mnemonic/form gate also excludes LOOP,
+        // MUL/DIV, one-operand IMUL, CPUID-like, and opaque instruction forms.
+        // The alias proof separately treats every admitted decoded definition
+        // as an alias kill.
+        LTLInst::Lop(_, _, destination)
+        | LTLInst::Lload(_, _, _, destination)
+        | LTLInst::Lgetstack(_, _, _, destination) => {
+            no_decoded_writes
+                && msvc_gs_explicit_destination_mnemonic(mnemonic, operand_count)
+                && msvc_gs_decoded_defs_are_exact_destination(&decoded_defs, *destination)
+        }
+        // One LTL store represents one explicit decoded memory destination.
+        // Requiring an exact singleton prevents an instruction with additional
+        // decoded writes from borrowing that lowering as incomplete coverage.
+        LTLInst::Lstore(..) => {
+            no_decoded_defs
+                && decoded_write_operands.len() == 1
+                && msvc_gs_explicit_store_mnemonic(mnemonic, operand_count)
+        }
+        LTLInst::Lsetstack(..) => {
+            no_decoded_defs
+                && decoded_write_operands.len() == 1
+                && msvc_gs_explicit_move_mnemonic(mnemonic, operand_count)
+        }
+        LTLInst::Lcond(..) => {
+            no_decoded_writes
+                && no_decoded_defs
+                && ((operand_count == 2 && matches!(mnemonic, "CMP" | "TEST" | "BT"))
+                    || (operand_count == 1
+                        && control_flow_is_represented
+                        && msvc_gs_exact_nonmutating_jcc(mnemonic)))
+        }
+        LTLInst::Ljumptable(..) => {
+            no_decoded_writes
+                && no_decoded_defs
+                && operand_count == 1
+                && control_flow_is_represented
+                && matches!(mnemonic, "JMP" | "JMPQ")
+        }
+        LTLInst::Lbranch(..) => {
+            no_decoded_writes
+                && no_decoded_defs
+                && msvc_gs_lbranch_has_independent_effect_model(
+                    mnemonic,
+                    operand_count,
+                    control_flow_is_represented,
+                )
+        }
+        // Calls and opaque builtins may modify memory.  Tail calls and returns
+        // cannot be interior to an authenticated spill-to-reload slice.  None
+        // of them supplies the complete positive effect evidence required here.
+        LTLInst::Lcall(..) | LTLInst::Ltailcall(..) | LTLInst::Lbuiltin(..) | LTLInst::Lreturn => {
+            false
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn msvc_gs_terminal_restore_ret(
+    call: Node,
+    cookie_load: Node,
+    function: Address,
+    frame_offset: i64,
+    next: &BTreeMap<Node, BTreeSet<Node>>,
+    cfg: &BTreeMap<Node, BTreeSet<Node>>,
+    call_targets_noreturn: &BTreeSet<Node>,
+    call_return_sites: &BTreeMap<Node, BTreeSet<Node>>,
+    canonical_owners: &BTreeMap<Node, Address>,
+    claimants: &BTreeMap<Node, BTreeSet<Address>>,
+    ltl: &BTreeMap<Node, LTLInst>,
+    mnemonics: &BTreeMap<Node, &'static str>,
+    moves: &BTreeMap<Node, BTreeSet<(Symbol, Symbol)>>,
+    adds: &BTreeMap<Node, BTreeSet<(Symbol, Symbol)>>,
+    leas: &BTreeMap<Node, BTreeSet<(Symbol, Symbol)>>,
+    registers: &BTreeMap<Symbol, BTreeSet<&'static str>>,
+    immediates: &BTreeMap<Symbol, BTreeSet<i64>>,
+    indirect: &BTreeMap<
+        Symbol,
+        BTreeSet<(&'static str, &'static str, &'static str, i64, i64, usize)>,
+    >,
+    operands: &BTreeMap<Node, [Symbol; 4]>,
+    operand_counts: &BTreeMap<Node, usize>,
+    frame_offsets: &BTreeMap<(Address, Node), BTreeSet<i64>>,
+    adjustments: &BTreeMap<Node, BTreeSet<(&'static str, i64)>>,
+    frame_setups: &BTreeMap<(Node, Address), BTreeSet<(Node, i64)>>,
+    stack_base_moves: &BTreeMap<Node, BTreeSet<(Symbol, Symbol)>>,
+) -> Option<(Node, BTreeSet<Node>)> {
+    if call_targets_noreturn.contains(&call) {
+        return None;
+    }
+    let mut current = unique_next(next, call)?;
+    let mut restored_sp = false;
+    let mut logical_sp = frame_offset;
+    let mut authoritative_rsp = true;
+    let mut authenticated_raw_only_nodes = BTreeSet::new();
+
+    if !call_return_sites
+        .get(&call)
+        .is_some_and(|return_sites| return_sites.contains(&current))
+        || !cfg
+            .get(&call)
+            .is_some_and(|successors| successors.contains(&current))
+        || !node_dominates_in_function(call, current, function, cfg, canonical_owners, claimants)
+        || unique_frame_offset(frame_offsets, function, call) != Some(frame_offset)
+        || unique_frame_offset(frame_offsets, function, current) != Some(frame_offset)
+    {
+        return None;
+    }
+
+    // A normal Win64 epilogue is short.  The bound is deliberately generous
+    // enough for callee-save pops while preventing a raw address-order walk
+    // from escaping into a following function.
+    for _ in 0..24 {
+        if !node_belongs_to_function(canonical_owners, claimants, current, function) {
+            return None;
+        }
+        if !node_dominates_in_function(call, current, function, cfg, canonical_owners, claimants) {
+            return None;
+        }
+        if matches!(ltl.get(&current), Some(LTLInst::Lreturn)) {
+            if operand_counts.get(&current) != Some(&0)
+                || !mnemonics
+                    .get(&current)
+                    .is_some_and(|mnemonic| matches!(*mnemonic, "RET" | "RETQ" | "RETN"))
+            {
+                return None;
+            }
+            let frame_is_restored = !authoritative_rsp
+                || unique_frame_offset(frame_offsets, function, current) == Some(0);
+            return (restored_sp && logical_sp == 0 && frame_is_restored)
+                .then_some((current, authenticated_raw_only_nodes));
+        }
+
+        let mnemonic = *mnemonics.get(&current)?;
+        let next_node = unique_next(next, current)?;
+        if !node_belongs_to_function(canonical_owners, claimants, next_node, function)
+            || !cfg
+                .get(&current)
+                .is_some_and(|successors| successors.contains(&next_node))
+        {
+            return None;
+        }
+        let allowed = match mnemonic {
+            "NOP" | "NOPW" | "NOPL" => {
+                operand_counts.get(&current).is_some_and(|count| *count <= 1)
+                    && (!authoritative_rsp
+                    || (unique_frame_offset(frame_offsets, function, current) == Some(logical_sp)
+                        && unique_frame_offset(frame_offsets, function, next_node)
+                            == Some(logical_sp)))
+                    && !adjustments.contains_key(&current)
+            }
+            "ADD" | "ADDQ" => adds.get(&current).is_some_and(|rows| {
+                rows.len() == 1
+                    && rows.iter().any(|(dst, src)| {
+                        if !exact_raw_binary_operands(
+                            operands,
+                            operand_counts,
+                            current,
+                            *dst,
+                            *src,
+                        ) {
+                            return false;
+                        }
+                        let is_rsp = raw_operand_is_register(registers, *dst, "RSP");
+                        let delta = exact_stack_adjustment(adjustments, current);
+                        let immediate = immediates.get(src).and_then(|values| {
+                            (values.len() == 1).then(|| *values.iter().next().unwrap())
+                        });
+                        delta.is_some_and(|delta| delta > 0 && immediate == Some(delta)) && is_rsp
+                    })
+            }),
+            "LEA" | "LEAQ" => leas.get(&current).is_some_and(|rows| {
+                rows.len() == 1
+                    && rows.iter().any(|(dst, src)| {
+                        if !exact_raw_binary_operands(
+                            operands,
+                            operand_counts,
+                            current,
+                            *dst,
+                            *src,
+                        ) {
+                            return false;
+                        }
+                        if !raw_operand_is_register(registers, *dst, "RSP") {
+                            return false;
+                        }
+                        let Some(slot) = raw_stack_slot(indirect, *src) else {
+                            return false;
+                        };
+                        if slot.base == "RSP" {
+                            exact_stack_adjustment(adjustments, current) == Some(slot.displacement)
+                                && slot.displacement > 0
+                        } else if slot.base == "RBP" {
+                            let Some(setup_offset) = matching_frame_pointer_setup(
+                                current,
+                                cookie_load,
+                                function,
+                                next,
+                                canonical_owners,
+                                claimants,
+                                frame_setups,
+                                stack_base_moves,
+                            ) else {
+                                return false;
+                            };
+                            let Some(restored) = setup_offset.checked_add(slot.displacement) else {
+                                return false;
+                            };
+                            logical_sp = restored;
+                            authoritative_rsp = false;
+                            restored_sp = true;
+                            true
+                        } else {
+                            false
+                        }
+                    })
+            }),
+            "MOV" | "MOVQ" => moves.get(&current).is_some_and(|rows| {
+                rows.len() == 1
+                    && rows.iter().any(|(dst, src)| {
+                        if !exact_raw_binary_operands(
+                            operands,
+                            operand_counts,
+                            current,
+                            *dst,
+                            *src,
+                        ) {
+                            return false;
+                        }
+                        let valid = raw_operand_is_register(registers, *dst, "RSP")
+                            && raw_operand_is_register(registers, *src, "RBP");
+                        if valid {
+                            let Some(setup_offset) = matching_frame_pointer_setup(
+                                current,
+                                cookie_load,
+                                function,
+                                next,
+                                canonical_owners,
+                                claimants,
+                                frame_setups,
+                                stack_base_moves,
+                            ) else {
+                                return false;
+                            };
+                            logical_sp = setup_offset;
+                            authoritative_rsp = false;
+                            restored_sp = true;
+                        }
+                        valid
+                    })
+            }),
+            "LEAVE" | "LEAVEQ" => {
+                if operand_counts.get(&current) != Some(&0) {
+                    return None;
+                }
+                let Some(setup_offset) = matching_frame_pointer_setup(
+                    current,
+                    cookie_load,
+                    function,
+                    next,
+                    canonical_owners,
+                    claimants,
+                    frame_setups,
+                    stack_base_moves,
+                ) else {
+                    return None;
+                };
+                let Some(restored) = setup_offset.checked_add(8) else {
+                    return None;
+                };
+                logical_sp = restored;
+                authoritative_rsp = false;
+                restored_sp = true;
+                !adjustments.contains_key(&current)
+            }
+            "POP" | "POPQ" => {
+                let operand = operands.get(&current).map(|ops| ops[0]);
+                operand_counts.get(&current) == Some(&1)
+                    && operand.is_some_and(|operand| {
+                        registers.get(&operand).is_some_and(|names| {
+                            names.len() == 1
+                                && names.iter().any(|name| {
+                                    matches!(
+                                        *name,
+                                        "RBX" | "RBP" | "RSI" | "RDI" | "R12" | "R13" | "R14" | "R15"
+                                    )
+                                })
+                                && exact_stack_adjustment(adjustments, current) == Some(8)
+                        })
+                    })
+            }
+            _ => false,
+        };
+        if !allowed {
+            return None;
+        }
+        if matches!(mnemonic, "POP" | "POPQ") {
+            authenticated_raw_only_nodes.insert(current);
+        }
+
+        if matches!(mnemonic, "ADD" | "ADDQ")
+            || (matches!(mnemonic, "LEA" | "LEAQ") && authoritative_rsp)
+            || matches!(mnemonic, "POP" | "POPQ")
+        {
+            let delta = exact_stack_adjustment(adjustments, current)?;
+            let before = logical_sp;
+            logical_sp = logical_sp.checked_add(delta)?;
+            if delta > 0 {
+                restored_sp = true;
+            }
+            if authoritative_rsp
+                && (unique_frame_offset(frame_offsets, function, current) != Some(before)
+                    || unique_frame_offset(frame_offsets, function, next_node) != Some(logical_sp))
+            {
+                return None;
+            }
+        }
+        if logical_sp > 0 {
+            return None;
+        }
+        current = next_node;
+    }
+    None
+}
+
+/// Authenticate the MSVC x64 /GS cookie idiom without matching a particular
+/// name, address, byte hash, or corpus identity. Every accepted call has a
+/// global qword cookie load, the two full-width SP XORs, one reaching
+/// same-slot spill/reload, and a terminal restore/return chain in one function.
+fn recognize_msvc_gs_cookie_guards(db: &DecompileDB) -> Vec<MsvcGsCookieGuardWitness> {
+    // Shared GP/XMM argument ordinals identify the Win64 ABI.  Combined with
+    // the required qword stack accesses and exact RAX/RCX/RSP spellings below,
+    // this is a 64-bit structural gate even when the optional arch_bit preset
+    // relation is absent (as it is in direct COFF pass pipelines).
+    if !db.abi().uses_shared_arg_slots() {
+        return Vec::new();
+    }
+
+    let mut next: BTreeMap<Node, BTreeSet<Node>> = BTreeMap::new();
+    for (src, dst) in db.rel_iter::<(Node, Node)>("next") {
+        next.entry(*src).or_default().insert(*dst);
+    }
+    let mut flags_and_jump_pairs: BTreeMap<Node, BTreeSet<(Node, &'static str)>> =
+        BTreeMap::new();
+    for (producer, consumer, condition) in
+        db.rel_iter::<(Node, Node, &'static str)>("flags_and_jump_pair")
+    {
+        flags_and_jump_pairs
+            .entry(*consumer)
+            .or_default()
+            .insert((*producer, *condition));
+    }
+    let mut blocks_by_node: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for (node, block) in db.rel_iter::<(Node, Address)>("code_in_block") {
+        blocks_by_node.entry(*node).or_default().insert(*block);
+    }
+    // Match AsmPass's decoded instruction CFG: physical adjacency is valid
+    // only within one basic block; inter-block traversal needs a real CFG edge.
+    let mut cfg: BTreeMap<Node, BTreeSet<Node>> = BTreeMap::new();
+    for (src, successors) in &next {
+        for dst in successors {
+            if blocks_by_node
+                .get(src)
+                .zip(blocks_by_node.get(dst))
+                .is_some_and(|(src_blocks, dst_blocks)| !src_blocks.is_disjoint(dst_blocks))
+            {
+                cfg.entry(*src).or_default().insert(*dst);
+            }
+        }
+    }
+    let mut unresolved_indirect_sources = BTreeSet::new();
+    for (src, dst, edge_type) in db.rel_iter::<(Node, Node, Symbol)>("ddisasm_cfg_edge") {
+        if matches!(*edge_type, "indirect" | "indirect_call") {
+            unresolved_indirect_sources.insert(*src);
+        }
+        if !matches!(*edge_type, "call" | "indirect" | "indirect_call") {
+            cfg.entry(*src).or_default().insert(*dst);
+        }
+    }
+    let mut reverse_cfg: BTreeMap<Node, BTreeSet<Node>> = BTreeMap::new();
+    for (src, successors) in &cfg {
+        for dst in successors {
+            reverse_cfg.entry(*dst).or_default().insert(*src);
+        }
+    }
+    let members: Vec<(Node, Address)> = db
+        .rel_iter::<(Node, Address)>("instr_in_function")
+        .copied()
+        .collect();
+    let canonical_owners = canonical_function_owners(members.iter().copied());
+    let mut claimants: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for (node, function) in members {
+        claimants.entry(node).or_default().insert(function);
+    }
+    let mut ltl_candidates: BTreeMap<Node, Vec<LTLInst>> = BTreeMap::new();
+    for (node, inst) in db.rel_iter::<(Node, LTLInst)>("ltl_inst") {
+        ltl_candidates.entry(*node).or_default().push(inst.clone());
+    }
+    // COFF relocation resolution and the raw RIP-relative fallback can both
+    // lower one load.  Treat them as one exact semantic instruction only when
+    // every candidate has the same chunk, destination, empty argument list,
+    // and checked effective global address.  Every other ambiguity remains a
+    // veto.
+    let ltl: BTreeMap<Node, LTLInst> = ltl_candidates
+        .iter()
+        .filter_map(|(node, candidates)| {
+            msvc_gs_exact_ltl_candidate(candidates).map(|candidate| (*node, candidate))
+        })
+        .collect();
+    let unique_ltl_nodes: BTreeSet<Node> = ltl.keys().copied().collect();
+
+    let mut moves: BTreeMap<Node, BTreeSet<(Symbol, Symbol)>> = BTreeMap::new();
+    for (node, dst, src) in db.rel_iter::<(Node, Symbol, Symbol)>("pmov") {
+        moves.entry(*node).or_default().insert((*dst, *src));
+    }
+    let mut xors: BTreeMap<Node, BTreeSet<(Symbol, Symbol)>> = BTreeMap::new();
+    for (node, dst, src) in db.rel_iter::<(Node, Symbol, Symbol)>("pxor") {
+        xors.entry(*node).or_default().insert((*dst, *src));
+    }
+    let mut adds: BTreeMap<Node, BTreeSet<(Symbol, Symbol)>> = BTreeMap::new();
+    for (node, dst, src) in db.rel_iter::<(Node, Symbol, Symbol)>("padd") {
+        adds.entry(*node).or_default().insert((*dst, *src));
+    }
+    let mut subs: BTreeMap<Node, BTreeSet<(Symbol, Symbol)>> = BTreeMap::new();
+    for (node, dst, src) in db.rel_iter::<(Node, Symbol, Symbol)>("psub") {
+        subs.entry(*node).or_default().insert((*dst, *src));
+    }
+    let mut leas: BTreeMap<Node, BTreeSet<(Symbol, Symbol)>> = BTreeMap::new();
+    for (node, dst, src) in db.rel_iter::<(Node, Symbol, Symbol)>("plea") {
+        leas.entry(*node).or_default().insert((*dst, *src));
+    }
+    let mut adjustments: BTreeMap<Node, BTreeSet<(Symbol, i64)>> = BTreeMap::new();
+    for (node, base, delta) in db.rel_iter::<(Node, Symbol, i64)>("adjusts_stack") {
+        adjustments
+            .entry(*node)
+            .or_default()
+            .insert((*base, *delta));
+    }
+    let mut stack_base_moves: BTreeMap<Node, BTreeSet<(Symbol, Symbol)>> = BTreeMap::new();
+    for (node, src, dst) in db.rel_iter::<(Node, Symbol, Symbol)>("stack_base_move") {
+        stack_base_moves
+            .entry(*node)
+            .or_default()
+            .insert((*src, *dst));
+    }
+    let mut frame_offsets: BTreeMap<(Address, Node), BTreeSet<i64>> = BTreeMap::new();
+    for (function, node, offset) in db.rel_iter::<(Address, Node, i64)>("rsp_frame_offset_at") {
+        frame_offsets
+            .entry((*function, *node))
+            .or_default()
+            .insert(*offset);
+    }
+    let mut frame_setups: BTreeMap<(Node, Address), BTreeSet<(Node, i64)>> = BTreeMap::new();
+    for (use_node, function, setup, offset) in
+        db.rel_iter::<(Node, Address, Node, i64)>("bp_frame_setup_at")
+    {
+        frame_setups
+            .entry((*use_node, *function))
+            .or_default()
+            .insert((*setup, *offset));
+    }
+    let mut registers: BTreeMap<Symbol, BTreeSet<&'static str>> = BTreeMap::new();
+    for (operand, name) in db.rel_iter::<(Symbol, &'static str)>("op_register") {
+        registers.entry(*operand).or_default().insert(*name);
+    }
+    let mut immediates: BTreeMap<Symbol, BTreeSet<i64>> = BTreeMap::new();
+    for (operand, value, _) in db.rel_iter::<(Symbol, i64, usize)>("op_immediate") {
+        immediates.entry(*operand).or_default().insert(*value);
+    }
+    let mut indirect: BTreeMap<Symbol, BTreeSet<RawIndirect>> = BTreeMap::new();
+    for (operand, segment, base, index, scale, displacement, size) in db.rel_iter::<(
+        Symbol,
+        &'static str,
+        &'static str,
+        &'static str,
+        i64,
+        i64,
+        usize,
+    )>("op_indirect")
+    {
+        indirect.entry(*operand).or_default().insert((
+            *segment,
+            *base,
+            *index,
+            *scale,
+            *displacement,
+            *size,
+        ));
+    }
+    let mut raw_candidates: BTreeMap<Node, Vec<RawInstruction>> = BTreeMap::new();
+    for (node, size, prefix, mnemonic, op1, op2, op3, op4, metadata0, metadata1) in
+        db.rel_iter::<(
+            Address,
+            usize,
+            &'static str,
+            &'static str,
+            Symbol,
+            Symbol,
+            Symbol,
+            Symbol,
+            usize,
+            usize,
+        )>("unrefinedinstruction")
+    {
+        raw_candidates.entry(*node).or_default().push((
+            *size, *prefix, *mnemonic, *op1, *op2, *op3, *op4, *metadata0, *metadata1,
+        ));
+    }
+    let unique_raw_nodes: BTreeSet<Node> = raw_candidates
+        .iter()
+        .filter_map(|(node, rows)| (rows.len() == 1).then_some(*node))
+        .collect();
+    let mnemonics: BTreeMap<Node, &'static str> = raw_candidates
+        .iter()
+        .filter_map(|(node, rows)| (rows.len() == 1).then_some((*node, rows[0].2)))
+        .collect();
+    let operands: BTreeMap<Node, [Symbol; 4]> = raw_candidates
+        .iter()
+        .filter_map(|(node, rows)| {
+            (rows.len() == 1).then_some((*node, [rows[0].3, rows[0].4, rows[0].5, rows[0].6]))
+        })
+        .collect();
+    let operand_counts: BTreeMap<Node, usize> = raw_candidates
+        .iter()
+        .filter_map(|(node, rows)| {
+            (rows.len() == 1)
+                .then(|| msvc_gs_exact_raw_operand_count(&rows[0]))
+                .flatten()
+                .map(|count| (*node, count))
+        })
+        .collect();
+    type StackReach = (Node, Symbol, i64, Symbol, i64);
+    let mut stack_reaches_by_use: BTreeMap<Node, BTreeSet<StackReach>> = BTreeMap::new();
+    for (def, def_base, def_offset, use_node, use_base, use_offset) in
+        db.rel_iter::<(Node, Symbol, i64, Node, Symbol, i64)>("stack_def_used")
+    {
+        stack_reaches_by_use.entry(*use_node).or_default().insert((
+            *def,
+            *def_base,
+            *def_offset,
+            *use_base,
+            *use_offset,
+        ));
+    }
+    let mut decoded_defs: BTreeMap<Node, BTreeSet<Mreg>> = BTreeMap::new();
+    for (node, reg) in db.rel_iter::<(Node, Mreg)>("decoded_reg_def") {
+        decoded_defs.entry(*node).or_default().insert(*reg);
+    }
+    let mut decoded_write_operands: BTreeMap<Node, BTreeSet<Symbol>> = BTreeMap::new();
+    for (node, operand) in db.rel_iter::<(Node, Symbol)>("decoded_memory_write_operand") {
+        decoded_write_operands
+            .entry(*node)
+            .or_default()
+            .insert(*operand);
+    }
+    // Some decoder nodes are intentionally fused into a neighboring LTL
+    // instruction.  Admit only two closed raw-only classes: an exact no-op,
+    // or the unique Jcc consumer of an exact adjacent Lcond whose targets are
+    // identical to the decoded CFG.  Published-but-ambiguous LTL is never
+    // treated as absence.
+    let authenticated_raw_only_control_nodes: BTreeSet<Node> = unique_raw_nodes
+        .iter()
+        .filter(|node| !ltl_candidates.contains_key(node))
+        .filter(|node| {
+            decoded_defs.get(node).map_or(true, BTreeSet::is_empty)
+                && decoded_write_operands
+                    .get(node)
+                    .map_or(true, BTreeSet::is_empty)
+        })
+        .filter_map(|node| {
+            let mnemonic = *mnemonics.get(node)?;
+            let operand_count = *operand_counts.get(node)?;
+            if matches!(mnemonic, "NOP" | "NOPW" | "NOPL") {
+                return (operand_count <= 1
+                    && cfg
+                        .get(node)
+                        .is_some_and(|successors| successors.len() == 1))
+                .then_some(*node);
+            }
+            if operand_count != 1 || !msvc_gs_exact_nonmutating_jcc(mnemonic) {
+                return None;
+            }
+            let pairs = flags_and_jump_pairs.get(node)?;
+            if pairs.len() != 1 {
+                return None;
+            }
+            let (producer, _) = *pairs.iter().next().unwrap();
+            let function = canonical_owners.get(node).copied()?;
+            if !node_belongs_to_function(&canonical_owners, &claimants, *node, function)
+                || !node_belongs_to_function(&canonical_owners, &claimants, producer, function)
+                || unique_next(&next, producer) != Some(*node)
+                || !cfg
+                    .get(&producer)
+                    .is_some_and(|successors| successors.contains(node))
+            {
+                return None;
+            }
+            let LTLInst::Lcond(
+                _,
+                _,
+                Either::Right(taken),
+                Either::Right(fallthrough),
+            ) = ltl.get(&producer)?
+            else {
+                return None;
+            };
+            let targets = BTreeSet::from([*taken, *fallthrough]);
+            (targets.len() == 2 && cfg.get(node) == Some(&targets)).then_some(*node)
+        })
+        .collect();
+    let call_nodes: BTreeSet<Node> = ltl
+        .iter()
+        .filter_map(|(node, inst)| {
+            matches!(inst, LTLInst::Lcall(_) | LTLInst::Ltailcall(_)).then_some(*node)
+        })
+        .collect();
+    let mut call_targets_noreturn: BTreeSet<Node> = db
+        .rel_iter::<(Node,)>("call_targets_noreturn")
+        .map(|(node,)| *node)
+        .collect();
+    let mut function_noreturn: BTreeSet<Address> = db
+        .rel_iter::<(Address,)>("function_noreturn")
+        .map(|(function,)| *function)
+        .collect();
+    // Whole-function noreturn recovery normally becomes available inside the
+    // RTL fixed point, after this imperative recognizer has seeded its facts.
+    // Derive the same local proof from the already-final Linear ownership and
+    // instruction relations so dead physical bytes after a UD2/abort wrapper
+    // cannot impersonate a live guard epilogue at this staging boundary.
+    let functions_with_return_or_tailcall: BTreeSet<Address> = canonical_owners
+        .iter()
+        .filter_map(|(node, function)| {
+            matches!(
+                ltl.get(node),
+                Some(LTLInst::Lreturn | LTLInst::Ltailcall(_))
+            )
+            .then_some(*function)
+        })
+        .collect();
+    function_noreturn.extend(
+        canonical_owners
+            .values()
+            .copied()
+            .filter(|function| !functions_with_return_or_tailcall.contains(function)),
+    );
+    call_targets_noreturn.extend(
+        db.rel_iter::<(Node, Address)>("call_to_callee")
+            .filter_map(|(call, callee)| function_noreturn.contains(callee).then_some(*call)),
+    );
+    let mut call_return_sites: BTreeMap<Node, BTreeSet<Node>> = BTreeMap::new();
+    for (call, return_site) in db.rel_iter::<(Node, Node)>("call_return_site") {
+        call_return_sites
+            .entry(*call)
+            .or_default()
+            .insert(*return_site);
+    }
+    let caller_saved: BTreeSet<Mreg> = db.abi().caller_saved.iter().copied().collect();
+
+    let external_addresses: BTreeSet<Address> = db
+        .rel_iter::<(Address,)>("is_external_function")
+        .map(|(address,)| *address)
+        .collect();
+    let function_spans: Vec<(Address, Address)> = db
+        .rel_iter::<(Symbol, Address, Address)>("func_span")
+        .map(|(_, start, end)| (*start, *end))
+        .collect();
+    let mut symbol_rows_by_name: BTreeMap<Symbol, BTreeSet<SymbolTableRow>> = BTreeMap::new();
+    let mut symbol_rows_by_address: BTreeMap<Address, BTreeSet<SymbolTableRow>> = BTreeMap::new();
+    for row in db.rel_iter::<SymbolTableRow>("symbol_table") {
+        symbol_rows_by_name.entry(row.8).or_default().insert(*row);
+        symbol_rows_by_address
+            .entry(row.0)
+            .or_default()
+            .insert(*row);
+    }
+    let mut symbols_by_address: BTreeMap<Address, BTreeSet<Symbol>> = BTreeMap::new();
+    let mut addresses_by_symbol: BTreeMap<Symbol, BTreeSet<Address>> = BTreeMap::new();
+    for (address, name, _) in db.rel_iter::<(Address, Symbol, Symbol)>("symbols") {
+        symbols_by_address
+            .entry(*address)
+            .or_default()
+            .insert(*name);
+        addresses_by_symbol
+            .entry(*name)
+            .or_default()
+            .insert(*address);
+    }
+    let mut resolved_by_symbol: BTreeMap<Symbol, BTreeSet<Address>> = BTreeMap::new();
+    for (name, address) in db.rel_iter::<(Symbol, Address)>("symbol_resolved_addr") {
+        resolved_by_symbol
+            .entry(*name)
+            .or_default()
+            .insert(*address);
+    }
+    let mut call_targets: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for (call, address) in db.rel_iter::<(Node, Address)>("call_to_callee") {
+        call_targets.entry(*call).or_default().insert(*address);
+    }
+    let decoded_nodes: BTreeSet<Node> = raw_candidates.keys().copied().collect();
+    let register_operands: BTreeSet<Symbol> = registers.keys().copied().collect();
+    let indirect_operands: BTreeSet<Symbol> = indirect.keys().copied().collect();
+    let target_proof = MsvcGsExternalTargetProof {
+        external_addresses: &external_addresses,
+        decoded_nodes: &decoded_nodes,
+        claimants: &claimants,
+        function_spans: &function_spans,
+        symbol_rows_by_name: &symbol_rows_by_name,
+        symbol_rows_by_address: &symbol_rows_by_address,
+        symbols_by_address: &symbols_by_address,
+        addresses_by_symbol: &addresses_by_symbol,
+        resolved_by_symbol: &resolved_by_symbol,
+        call_targets: &call_targets,
+        operands: &operands,
+        operand_counts: &operand_counts,
+        immediates: &immediates,
+        register_operands: &register_operands,
+        indirect_operands: &indirect_operands,
+    };
+
+    let alias_proof = MsvcGsStackAliasProof {
+        cfg: &cfg,
+        reverse_cfg: &reverse_cfg,
+        canonical_owners: &canonical_owners,
+        claimants: &claimants,
+        decoded_defs: &decoded_defs,
+        call_nodes: &call_nodes,
+        caller_saved: &caller_saved,
+        mnemonics: &mnemonics,
+        moves: &moves,
+        adds: &adds,
+        subs: &subs,
+        leas: &leas,
+        registers: &registers,
+        immediates: &immediates,
+        indirect: &indirect,
+        frame_offsets: &frame_offsets,
+        frame_setups: &frame_setups,
+        stack_base_moves: &stack_base_moves,
+    };
+
+    let exact_xor = |node: Node, dst_name: &str, src_name: &str| {
+        xors.get(&node).is_some_and(|rows| {
+                rows.len() == 1
+                    && rows.iter().any(|(dst, src)| {
+                        exact_raw_binary_operands(
+                            &operands,
+                            &operand_counts,
+                            node,
+                            *dst,
+                            *src,
+                        ) && raw_operand_is_register(&registers, *dst, dst_name)
+                            && raw_operand_is_register(&registers, *src, src_name)
+                    })
+            })
+    };
+    let write_scan_nodes: BTreeSet<Node> = raw_candidates
+        .keys()
+        .chain(decoded_write_operands.keys())
+        .copied()
+        .collect();
+
+    let mut witnesses = BTreeSet::new();
+    for (load, inst) in &ltl {
+        let is_global_cookie_load = matches!(
+            inst,
+            LTLInst::Lload(
+                MemoryChunk::MInt64 | MemoryChunk::MAny64,
+                Addressing::Aglobal(_, _),
+                args,
+                Mreg::AX
+            ) if args.is_empty()
+        );
+        if !is_global_cookie_load {
+            continue;
+        }
+        let raw_load_matches = operands.get(load).is_some_and(|raw| {
+            operand_counts.get(load) == Some(&2)
+                && raw_operand_is_register(&registers, raw[1], "RAX")
+                && indirect.get(&raw[0]).is_some_and(|rows| {
+                    rows.len() == 1
+                        && rows.iter().all(|(segment, base, index, _, _, size)| {
+                            matches!(*segment, "" | "NONE" | "SS")
+                                && *base == "RIP"
+                                && (index.is_empty() || *index == "NONE")
+                                && *size == 8
+                        })
+                })
+        });
+        if !mnemonics
+            .get(load)
+            .is_some_and(|mnemonic| matches!(*mnemonic, "MOV" | "MOVQ"))
+            || !raw_load_matches
+        {
+            continue;
+        }
+        let Some(prologue_xor) = unique_next(&next, *load) else {
+            continue;
+        };
+        let Some(spill) = unique_next(&next, prologue_xor) else {
+            continue;
+        };
+        if !cfg
+            .get(load)
+            .is_some_and(|successors| successors.contains(&prologue_xor))
+            || !cfg
+                .get(&prologue_xor)
+                .is_some_and(|successors| successors.contains(&spill))
+            || !mnemonics
+                .get(&prologue_xor)
+                .is_some_and(|mnemonic| matches!(*mnemonic, "XOR" | "XORQ"))
+            || !exact_xor(prologue_xor, "RAX", "RSP")
+            || !msvc_gs_ltl_xor_is_absent_or_exact(
+                ltl_candidates.get(&prologue_xor).map(Vec::as_slice),
+                Mreg::AX,
+                Mreg::SP,
+            )
+        {
+            continue;
+        }
+
+        let spill_slots: BTreeSet<(Symbol, RawStackSlot)> = moves
+            .get(&spill)
+            .into_iter()
+            .flatten()
+            .filter_map(|(dst, src)| {
+                (exact_raw_binary_operands(
+                    &operands,
+                    &operand_counts,
+                    spill,
+                    *dst,
+                    *src,
+                ) && raw_operand_is_register(&registers, *src, "RAX"))
+                    .then(|| raw_stack_slot(&indirect, *dst).map(|slot| (*dst, slot)))
+                    .flatten()
+            })
+            .collect();
+        if !mnemonics
+            .get(&spill)
+            .is_some_and(|mnemonic| matches!(*mnemonic, "MOV" | "MOVQ"))
+            || moves.get(&spill).map_or(true, |rows| rows.len() != 1)
+            || spill_slots.len() != 1
+        {
+            continue;
+        }
+        let (spill_operand, slot) = *spill_slots.iter().next().unwrap();
+
+        let Some(function) = canonical_owners.get(load).copied() else {
+            continue;
+        };
+        if !node_belongs_to_function(&canonical_owners, &claimants, *load, function)
+            || !node_belongs_to_function(&canonical_owners, &claimants, prologue_xor, function)
+            || !node_belongs_to_function(&canonical_owners, &claimants, spill, function)
+            || !node_dominates_in_function(
+                *load,
+                prologue_xor,
+                function,
+                &cfg,
+                &canonical_owners,
+                &claimants,
+            )
+            || !node_dominates_in_function(
+                prologue_xor,
+                spill,
+                function,
+                &cfg,
+                &canonical_owners,
+                &claimants,
+            )
+        {
+            continue;
+        }
+        let Some(frame_offset) = unique_frame_offset(&frame_offsets, function, *load) else {
+            continue;
+        };
+        if unique_frame_offset(&frame_offsets, function, prologue_xor) != Some(frame_offset)
+            || unique_frame_offset(&frame_offsets, function, spill) != Some(frame_offset)
+        {
+            continue;
+        }
+        if !proved_msvc_gs_frame_allocation(
+            function,
+            *load,
+            frame_offset,
+            &next,
+            &canonical_owners,
+            &claimants,
+            &frame_offsets,
+            &adjustments,
+        ) {
+            continue;
+        }
+        let authenticated_raw_only_frame_allocations: BTreeSet<Node> = adjustments
+            .iter()
+            .filter_map(|(allocation, rows)| {
+                if ltl_candidates.contains_key(allocation)
+                    || !decoded_write_operands
+                        .get(allocation)
+                        .map_or(true, BTreeSet::is_empty)
+                    || !node_belongs_to_function(
+                        &canonical_owners,
+                        &claimants,
+                        *allocation,
+                        function,
+                    )
+                    || operand_counts.get(allocation) != Some(&2)
+                    || !mnemonics
+                        .get(allocation)
+                        .is_some_and(|mnemonic| matches!(*mnemonic, "SUB" | "SUBQ"))
+                    || rows.len() != 1
+                {
+                    return None;
+                }
+                let (base, delta) = *rows.iter().next().unwrap();
+                let sub_rows = subs.get(allocation)?;
+                if base != "RSP" || delta >= 0 || sub_rows.len() != 1 {
+                    return None;
+                }
+                let (dst, src) = *sub_rows.iter().next().unwrap();
+                let immediate = immediates
+                    .get(&src)
+                    .and_then(|values| (values.len() == 1).then(|| *values.iter().next().unwrap()));
+                let after = unique_next(&next, *allocation)?;
+                let before_offset = unique_frame_offset(&frame_offsets, function, *allocation)?;
+                (exact_raw_binary_operands(
+                    &operands,
+                    &operand_counts,
+                    *allocation,
+                    dst,
+                    src,
+                ) && raw_operand_is_register(&registers, dst, "RSP")
+                    && immediate == delta.checked_neg()
+                    && unique_frame_offset(&frame_offsets, function, after) == Some(frame_offset)
+                    && before_offset.checked_add(delta) == Some(frame_offset)
+                    && node_reaches_in_function(
+                        function,
+                        *allocation,
+                        function,
+                        &next,
+                        &canonical_owners,
+                        &claimants,
+                    )
+                    && node_reaches_in_function(
+                        *allocation,
+                        *load,
+                        function,
+                        &next,
+                        &canonical_owners,
+                        &claimants,
+                    ))
+                .then_some(*allocation)
+            })
+            .collect();
+        let Some(spill_coordinate) = alias_proof.slot_coordinate(spill, function, slot) else {
+            continue;
+        };
+        let Ok(cookie_size) = i64::try_from(slot.size) else {
+            continue;
+        };
+        let Some(cookie_end) = spill_coordinate.checked_add(cookie_size) else {
+            continue;
+        };
+        // The authenticated allocation is exactly the half-open entry-SP
+        // interval [frame_offset, 0).  A cookie that reaches below the frame,
+        // crosses entry SP, or occupies the caller's return-address cell is
+        // not an MSVC /GS local.
+        if spill_coordinate < frame_offset || cookie_end > 0 {
+            continue;
+        }
+        for (reload, rows) in &moves {
+            if !node_belongs_to_function(&canonical_owners, &claimants, *reload, function)
+                || unique_frame_offset(&frame_offsets, function, *reload) != Some(frame_offset)
+                || !mnemonics
+                    .get(reload)
+                    .is_some_and(|mnemonic| matches!(*mnemonic, "MOV" | "MOVQ"))
+            {
+                continue;
+            }
+            let reload_slots: BTreeSet<RawStackSlot> = rows
+                .iter()
+                .filter_map(|(dst, src)| {
+                    (exact_raw_binary_operands(
+                        &operands,
+                        &operand_counts,
+                        *reload,
+                        *dst,
+                        *src,
+                    ) && raw_operand_is_register(&registers, *dst, "RCX"))
+                        .then(|| raw_stack_slot(&indirect, *src))
+                        .flatten()
+                })
+                .collect();
+            if rows.len() != 1 || reload_slots.len() != 1 {
+                continue;
+            }
+            let reload_slot = *reload_slots.iter().next().unwrap();
+            let Some(reload_coordinate) =
+                alias_proof.slot_coordinate(*reload, function, reload_slot)
+            else {
+                continue;
+            };
+            if reload_coordinate != spill_coordinate
+                || !node_dominates_in_function(
+                    spill,
+                    *reload,
+                    function,
+                    &cfg,
+                    &canonical_owners,
+                    &claimants,
+                )
+            {
+                continue;
+            }
+
+            let mut writes_are_disjoint = true;
+            let mut witnessed_spill_write = false;
+            'writes: for write in &write_scan_nodes {
+                if !claimants
+                    .get(write)
+                    .is_some_and(|owners| owners.contains(&function))
+                {
+                    continue;
+                }
+                let spill_reaches_write = cfg_reaches_in_function(
+                    spill,
+                    *write,
+                    function,
+                    &cfg,
+                    &canonical_owners,
+                    &claimants,
+                    None,
+                );
+                let write_reaches_reload = cfg_reaches_in_function(
+                    *write,
+                    *reload,
+                    function,
+                    &cfg,
+                    &canonical_owners,
+                    &claimants,
+                    None,
+                );
+                match (spill_reaches_write, write_reaches_reload) {
+                    (Some(true), Some(true)) => {}
+                    (None, _) | (_, None) => {
+                        writes_are_disjoint = false;
+                        break;
+                    }
+                    _ => continue,
+                }
+                if !node_belongs_to_function(&canonical_owners, &claimants, *write, function) {
+                    writes_are_disjoint = false;
+                    break;
+                }
+                let Some(mnemonic) = mnemonics.get(write).copied() else {
+                    writes_are_disjoint = false;
+                    break;
+                };
+                // The pushed return address is only CALL's decoder-visible
+                // write.  The callee itself has unknown memory effects and
+                // may modify the authenticated frame cell, so no ordinary
+                // body call is admissible on the spill-to-reload slice.
+                if matches!(mnemonic, "CALL" | "CALLQ") {
+                    writes_are_disjoint = false;
+                    break;
+                }
+                let write_operands = decoded_write_operands.get(write);
+                for write_operand in write_operands.into_iter().flatten() {
+                    let Some(write_facts) = indirect.get(write_operand) else {
+                        writes_are_disjoint = false;
+                        break 'writes;
+                    };
+                    if write_facts.len() != 1 {
+                        writes_are_disjoint = false;
+                        break 'writes;
+                    }
+                    let (segment, base, index, _, displacement, size) =
+                        *write_facts.iter().next().unwrap();
+                    // A non-default segment contributes an unknown runtime
+                    // base even when Capstone spells the encoded operand as
+                    // base-less or RIP-relative.  Reject it before granting
+                    // the ordinary global-memory exemption.
+                    if !matches!(segment, "" | "NONE" | "SS") {
+                        writes_are_disjoint = false;
+                        break 'writes;
+                    }
+                    if matches!(base, "" | "NONE" | "RIP") && (index.is_empty() || index == "NONE")
+                    {
+                        continue;
+                    }
+                    if !is_x86_64_gp_register_name(base)
+                        || !(index.is_empty() || index == "NONE")
+                        || size == 0
+                    {
+                        writes_are_disjoint = false;
+                        break 'writes;
+                    }
+                    let Some(write_start) = alias_proof
+                        .coordinate_before(*write, function, base)
+                        .and_then(|base_coordinate| base_coordinate.checked_add(displacement))
+                    else {
+                        writes_are_disjoint = false;
+                        break 'writes;
+                    };
+                    let Ok(write_size) = i64::try_from(size) else {
+                        writes_are_disjoint = false;
+                        break 'writes;
+                    };
+                    let Some(write_end) = write_start.checked_add(write_size) else {
+                        writes_are_disjoint = false;
+                        break 'writes;
+                    };
+                    if !byte_ranges_overlap(spill_coordinate, cookie_end, write_start, write_end) {
+                        continue;
+                    }
+                    if *write == spill
+                        && *write_operand == spill_operand
+                        && write_start == spill_coordinate
+                        && write_end == cookie_end
+                    {
+                        witnessed_spill_write = true;
+                    } else {
+                        writes_are_disjoint = false;
+                        break 'writes;
+                    }
+                }
+
+                // Capstone exposes PUSH's RSP effect but no writable memory
+                // operand. Authenticate its exact pre-instruction entry-SP
+                // range; every other implicit writer is a veto.
+                let implicit_range = if mnemonic == "PUSH" {
+                    let Some(delta) =
+                        exact_stack_adjustment(&adjustments, *write).filter(|delta| *delta < 0)
+                    else {
+                        writes_are_disjoint = false;
+                        break;
+                    };
+                    let Some(before) = unique_frame_offset(&frame_offsets, function, *write) else {
+                        writes_are_disjoint = false;
+                        break;
+                    };
+                    let Some(start) = before.checked_add(delta) else {
+                        writes_are_disjoint = false;
+                        break;
+                    };
+                    Some((start, before))
+                } else {
+                    None
+                };
+                if implicit_range.is_some_and(|(start, end)| {
+                    byte_ranges_overlap(spill_coordinate, cookie_end, start, end)
+                }) {
+                    writes_are_disjoint = false;
+                    break;
+                }
+
+                // Accept only positive, complete effect evidence.  A missing
+                // lowering and LinearPass's generic Lbranch fallback are not
+                // semantic coverage for an arbitrary decoded instruction.
+                if !authenticated_raw_only_control_nodes.contains(write)
+                    && !msvc_gs_instruction_effects_are_fully_modeled(
+                        mnemonic,
+                        ltl_candidates.get(write),
+                        decoded_defs.get(write),
+                        write_operands,
+                        operand_counts.get(write).copied(),
+                        cfg.get(write)
+                            .is_some_and(|successors| !successors.is_empty()),
+                    )
+                {
+                    writes_are_disjoint = false;
+                    break;
+                }
+            }
+            if !writes_are_disjoint || !witnessed_spill_write {
+                continue;
+            }
+            let reaching_slot_defs: BTreeSet<StackReach> = stack_reaches_by_use
+                .get(reload)
+                .into_iter()
+                .flatten()
+                .filter(|(_, _, _, use_base, use_offset)| {
+                    *use_base == reload_slot.base && *use_offset == reload_slot.displacement
+                })
+                .copied()
+                .collect();
+            let raw_chain_is_exact = reaching_slot_defs.len() == 1
+                && reaching_slot_defs.iter().next().is_some_and(
+                    |(reaching_def, def_base, def_offset, _, _)| {
+                        *reaching_def == spill
+                            && *def_base == slot.base
+                            && *def_offset == slot.displacement
+                    },
+                );
+            // StackAnalysis keys liveness by one raw base.  A proven alternate
+            // base can therefore lack a raw relation; a contradictory raw
+            // relation is always a veto, and a same RSP/RBP base still needs
+            // the exact chain.
+            let raw_bases_are_tracked =
+                matches!(slot.base, "RSP" | "RBP") && matches!(reload_slot.base, "RSP" | "RBP");
+            if !raw_chain_is_exact
+                && (!reaching_slot_defs.is_empty()
+                    || (raw_bases_are_tracked && slot.base == reload_slot.base))
+            {
+                continue;
+            }
+            let Some(check_xor) = unique_next(&next, *reload) else {
+                continue;
+            };
+            let Some(call) = unique_next(&next, check_xor) else {
+                continue;
+            };
+            if !cfg
+                .get(reload)
+                .is_some_and(|successors| successors.contains(&check_xor))
+                || !cfg
+                    .get(&check_xor)
+                    .is_some_and(|successors| successors.contains(&call))
+                || !node_dominates_in_function(
+                    *reload,
+                    check_xor,
+                    function,
+                    &cfg,
+                    &canonical_owners,
+                    &claimants,
+                )
+                || !node_dominates_in_function(
+                    check_xor,
+                    call,
+                    function,
+                    &cfg,
+                    &canonical_owners,
+                    &claimants,
+                )
+                || !exact_xor(check_xor, "RCX", "RSP")
+                || !msvc_gs_ltl_xor_is_absent_or_exact(
+                    ltl_candidates.get(&check_xor).map(Vec::as_slice),
+                    Mreg::CX,
+                    Mreg::SP,
+                )
+                || !mnemonics
+                    .get(&check_xor)
+                    .is_some_and(|mnemonic| matches!(*mnemonic, "XOR" | "XORQ"))
+                || !mnemonics
+                    .get(&call)
+                    .is_some_and(|mnemonic| matches!(*mnemonic, "CALL" | "CALLQ"))
+                || !node_belongs_to_function(&canonical_owners, &claimants, check_xor, function)
+                || !node_belongs_to_function(&canonical_owners, &claimants, call, function)
+                || unique_frame_offset(&frame_offsets, function, check_xor) != Some(frame_offset)
+                || unique_frame_offset(&frame_offsets, function, call) != Some(frame_offset)
+            {
+                continue;
+            }
+            let Some(LTLInst::Lcall(callee)) = ltl.get(&call) else {
+                continue;
+            };
+            if !target_proof.accepts(call, callee) {
+                continue;
+            }
+            let Some((ret, terminal_raw_only_nodes)) = msvc_gs_terminal_restore_ret(
+                call,
+                *load,
+                function,
+                frame_offset,
+                &next,
+                &cfg,
+                &call_targets_noreturn,
+                &call_return_sites,
+                &canonical_owners,
+                &claimants,
+                &ltl,
+                &mnemonics,
+                &moves,
+                &adds,
+                &leas,
+                &registers,
+                &immediates,
+                &indirect,
+                &operands,
+                &operand_counts,
+                &frame_offsets,
+                &adjustments,
+                &frame_setups,
+                &stack_base_moves,
+            ) else {
+                continue;
+            };
+            let mut authenticated_raw_only_nodes =
+                BTreeSet::from([prologue_xor, check_xor]);
+            authenticated_raw_only_nodes.extend(
+                authenticated_raw_only_control_nodes
+                    .iter()
+                    .filter(|node| {
+                        node_belongs_to_function(
+                            &canonical_owners,
+                            &claimants,
+                            **node,
+                            function,
+                        )
+                    })
+                    .copied(),
+            );
+            authenticated_raw_only_nodes
+                .extend(authenticated_raw_only_frame_allocations.iter().copied());
+            authenticated_raw_only_nodes.extend(
+                terminal_raw_only_nodes
+                    .into_iter()
+                    .filter(|node| {
+                        !ltl_candidates.contains_key(node)
+                            && decoded_write_operands
+                                .get(node)
+                                .map_or(true, BTreeSet::is_empty)
+                    }),
+            );
+            if authenticated_msvc_gs_cfg_slice(
+                function,
+                ret,
+                function,
+                &cfg,
+                &reverse_cfg,
+                &canonical_owners,
+                &claimants,
+                &unique_raw_nodes,
+                &unique_ltl_nodes,
+                &authenticated_raw_only_nodes,
+                &mnemonics,
+                &unresolved_indirect_sources,
+            )
+            .is_none()
+            {
+                continue;
+            }
+            witnesses.insert(MsvcGsCookieGuardWitness {
+                cookie_load: *load,
+                cookie_xor: prologue_xor,
+                call,
+                function,
+                check_xor,
+                ret,
+                argument: fresh_xtl_reg(check_xor, Mreg::CX),
+            });
+        }
+    }
+    witnesses.into_iter().collect()
+}
+
+fn seed_msvc_gs_cookie_guards(db: &mut DecompileDB) {
+    let mut by_call: BTreeMap<Node, BTreeSet<MsvcGsCookieGuardWitness>> = BTreeMap::new();
+    for witness in recognize_msvc_gs_cookie_guards(db) {
+        by_call.entry(witness.call).or_default().insert(witness);
+    }
+    // A call reached through more than one structural interpretation is not
+    // an exact call instance. Discard it instead of choosing an address-order
+    // winner.
+    let witnesses: Vec<MsvcGsCookieGuardWitness> = by_call
+        .into_values()
+        .filter_map(|rows| (rows.len() == 1).then(|| *rows.iter().next().unwrap()))
+        .collect();
+    db.rel_set(
+        "msvc_gs_cookie_guard_call",
+        witnesses
+            .iter()
+            .map(|witness| {
+                (
+                    witness.call,
+                    witness.function,
+                    witness.check_xor,
+                    witness.ret,
+                    witness.argument,
+                )
+            })
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "msvc_gs_cookie_setup_ax_def",
+        witnesses
+            .iter()
+            .flat_map(|witness| [(witness.cookie_load,), (witness.cookie_xor,)])
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+}
+
+fn normalize_msvc_gs_cookie_guard_calls(db: &mut DecompileDB) {
+    let guard_rows: Vec<(Node, Address, Node, Node, RTLReg)> = db
+        .rel_iter::<(Node, Address, Node, Node, RTLReg)>("msvc_gs_cookie_guard_call")
+        .copied()
+        .collect();
+    let guards: BTreeMap<Node, Node> = guard_rows
+        .iter()
+        .map(|(call, _, check_xor, _, _)| (*call, *check_xor))
+        .collect();
+    if guards.is_empty() {
+        return;
+    }
+
+    let guard_checks: BTreeSet<Node> = guards.values().copied().collect();
+    let exact_defs: BTreeSet<(Node, RTLReg)> = db
+        .rel_iter::<(Node, RTLReg)>("is_def")
+        .filter(|(node, _)| guard_checks.contains(node))
+        .copied()
+        .collect();
+    let mut xor_results: BTreeMap<Node, BTreeSet<RTLReg>> = BTreeMap::new();
+    for (node, reg, def_id) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_xtl") {
+        if *reg == Mreg::CX && exact_defs.contains(&(*node, *def_id)) {
+            xor_results.entry(*node).or_default().insert(*def_id);
+        }
+    }
+    let argument_for_call: BTreeMap<Node, RTLReg> = guard_rows
+        .iter()
+        .filter_map(|(call, _, check_xor, _, argument)| {
+            let results = xor_results.get(check_xor)?;
+            // `argument` is the recognizer's exact fresh CX identity.  The
+            // monotone fixed point may retain additional aliases, but those
+            // do not make this witnessed identity ambiguous.
+            if !results.contains(argument) {
+                return None;
+            }
+            Some((*call, *argument))
+        })
+        .collect();
+
+    // The guard is AX-transparent.  The monotone canonical-alias projection
+    // can retain intermediate return-use and branch-local representatives
+    // alongside the final body-value representative.  Use the function's
+    // already-selected return identity as the authority, then substitute each
+    // authenticated body representative through every definition and use in
+    // that function.  Rewriting only the return and definition destinations
+    // would leave stale operands whenever the body consumes its return value
+    // before reaching the cookie check.
+    let protected_returns: BTreeSet<Node> =
+        guard_rows.iter().map(|(_, _, _, ret, _)| *ret).collect();
+    let setup_ax_defs: BTreeSet<Node> = db
+        .rel_iter::<(Node,)>("msvc_gs_cookie_setup_ax_def")
+        .map(|(node,)| *node)
+        .collect();
+    let mut body_defs_by_return: BTreeMap<Node, BTreeSet<Node>> = BTreeMap::new();
+    for (ret, def, reg) in db.rel_iter::<(Node, Node, Mreg)>("def_reaches_return") {
+        if *reg == Mreg::AX
+            && protected_returns.contains(ret)
+            && !guards.contains_key(def)
+            && !setup_ax_defs.contains(def)
+        {
+            body_defs_by_return.entry(*ret).or_default().insert(*def);
+        }
+    }
+    let old_candidates: Vec<(Node, RTLInst)> = db
+        .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+        .map(|(node, inst)| (*node, inst.clone()))
+        .collect();
+    let members: Vec<(Node, Address)> = db
+        .rel_iter::<(Node, Address)>("instr_in_function")
+        .copied()
+        .collect();
+    let canonical_owners = canonical_function_owners(members);
+    let candidate_destination = |inst: &RTLInst| match inst {
+        RTLInst::Iop(_, _, destination) | RTLInst::Iload(_, _, _, destination) => {
+            Some(*destination)
+        }
+        RTLInst::Icall(_, _, _, Some(destination), _) => Some(*destination),
+        RTLInst::Ibuiltin(_, _, BuiltinArg::BA(destination)) => Some(*destination),
+        _ => None,
+    };
+    let mut protected_returns_by_owner: BTreeMap<Address, BTreeSet<Node>> = BTreeMap::new();
+    for (_, owner, _, ret, _) in &guard_rows {
+        if canonical_owners.get(ret) == Some(owner) {
+            protected_returns_by_owner
+                .entry(*owner)
+                .or_default()
+                .insert(*ret);
+        }
+    }
+    let mut emitted_returns_by_owner: BTreeMap<Address, BTreeSet<RTLReg>> = BTreeMap::new();
+    for (owner, value) in db.rel_iter::<(Address, RTLReg)>("emit_function_return") {
+        emitted_returns_by_owner
+            .entry(*owner)
+            .or_default()
+            .insert(*value);
+    }
+    let canonical_by_id = final_xtl_canonical_map(db);
+    let all_exact_defs: BTreeSet<(Node, RTLReg)> = db
+        .rel_iter::<(Node, RTLReg)>("is_def")
+        .copied()
+        .collect();
+    let mut ax_def_components_by_node: BTreeMap<Node, BTreeSet<RTLReg>> = BTreeMap::new();
+    for (node, reg, identity) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_xtl") {
+        if *reg == Mreg::AX && all_exact_defs.contains(&(*node, *identity)) {
+            if let Some(canonical) = canonical_by_id.get(identity) {
+                ax_def_components_by_node
+                    .entry(*node)
+                    .or_default()
+                    .insert(*canonical);
+            }
+        }
+    }
+    let mut destinations_by_node: BTreeMap<Node, BTreeSet<RTLReg>> = BTreeMap::new();
+    for (node, inst) in &old_candidates {
+        if let Some(destination) = candidate_destination(inst) {
+            if canonical_by_id.get(&destination).is_some_and(|canonical| {
+                ax_def_components_by_node
+                    .get(node)
+                    .is_some_and(|components| components.contains(canonical))
+            }) {
+                destinations_by_node
+                    .entry(*node)
+                    .or_default()
+                    .insert(destination);
+            }
+        }
+    }
+    let mut members_by_canonical: BTreeMap<RTLReg, Vec<RTLReg>> = BTreeMap::new();
+    for (identity, canonical) in &canonical_by_id {
+        members_by_canonical
+            .entry(*canonical)
+            .or_default()
+            .push(*identity);
+    }
+
+    let mut substitutions_by_owner: BTreeMap<Address, BTreeMap<RTLReg, RTLReg>> =
+        BTreeMap::new();
+    let mut return_value_for_node: BTreeMap<Node, RTLReg> = BTreeMap::new();
+    for (owner, returns) in protected_returns_by_owner {
+        let Some(emitted) = emitted_returns_by_owner.get(&owner) else {
+            continue;
+        };
+        if emitted.len() != 1 {
+            continue;
+        }
+        let chosen = *emitted.iter().next().unwrap();
+        let mut body_defs = BTreeSet::new();
+        let mut complete = true;
+        for ret in &returns {
+            let Some(defs) = body_defs_by_return.get(ret) else {
+                continue;
+            };
+            for def in defs {
+                if canonical_owners.get(def) != Some(&owner)
+                    || destinations_by_node.get(def).map_or(true, BTreeSet::is_empty)
+                {
+                    complete = false;
+                    break;
+                }
+                body_defs.insert(*def);
+            }
+            if !complete {
+                break;
+            }
+        }
+        if !complete || body_defs.is_empty() {
+            continue;
+        }
+
+        let mut substitutions = BTreeMap::new();
+        for def in body_defs {
+            for old in &destinations_by_node[&def] {
+                substitutions.insert(*old, chosen);
+            }
+        }
+        // Candidate construction can retain several node-local identities for
+        // one reaching AX value (for example, the definition identity and a
+        // store-use identity on each arm). They are already proven equal by
+        // the fixed-point alias component. Close the substitution over that
+        // component so definitions and consumers are rewritten together.
+        let body_components: BTreeSet<RTLReg> = substitutions
+            .keys()
+            .filter_map(|identity| canonical_by_id.get(identity))
+            .copied()
+            .collect();
+        for canonical in body_components {
+            if let Some(members) = members_by_canonical.get(&canonical) {
+                for identity in members {
+                    substitutions.insert(*identity, chosen);
+                }
+            }
+        }
+        if substitutions.is_empty() {
+            continue;
+        }
+        for ret in returns {
+            if body_defs_by_return.contains_key(&ret) {
+                return_value_for_node.insert(ret, chosen);
+            }
+        }
+        substitutions_by_owner.insert(owner, substitutions);
+    }
+
+    let rewrite_reg_at_node = |node: Node, value: RTLReg| {
+        canonical_owners
+            .get(&node)
+            .and_then(|owner| substitutions_by_owner.get(owner))
+            .and_then(|substitutions| substitutions.get(&value))
+            .copied()
+            .unwrap_or(value)
+    };
+
+    let guard_signature = Signature {
+        sig_args: Arc::new(vec![XType::Xlong]),
+        sig_res: XType::Xvoid,
+        sig_cc: CallConv::default(),
+    };
+    let mut candidates: Vec<(Node, RTLInst)> = old_candidates
+        .into_iter()
+        .map(|(node, inst)| {
+            let inst = canonical_owners
+                .get(&node)
+                .and_then(|owner| substitutions_by_owner.get(owner))
+                .map_or(inst.clone(), |substitutions| {
+                    rewrite_rtl_inst_regs(&inst, substitutions)
+                });
+            let rewritten = if let Some(argument) = argument_for_call.get(&node) {
+                match inst {
+                    RTLInst::Icall(_, callee, _, _, successor) => RTLInst::Icall(
+                        Some(guard_signature.clone()),
+                        callee,
+                        Arc::new(vec![*argument]),
+                        None,
+                        successor,
+                    ),
+                    other => other,
+                }
+            } else if let Some(return_value) = return_value_for_node.get(&node) {
+                match inst {
+                    RTLInst::Ireturn(_) => RTLInst::Ireturn(*return_value),
+                    other => other,
+                }
+            } else {
+                inst
+            };
+            (node, rewritten)
+        })
+        .collect();
+    candidates.sort_by_cached_key(|(node, inst)| (*node, format!("{inst:?}")));
+    candidates.dedup();
+    db.rel_set(
+        "rtl_inst_candidate",
+        candidates.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    let mut call_args: Vec<(Node, usize, RTLReg)> = db
+        .rel_iter::<(Node, usize, RTLReg)>("call_arg_mapping")
+        // If an internal invariant ever prevents post-fixed-point validation,
+        // preserve the original relation rather than deleting the only call
+        // argument while leaving the public guard tag in place.
+        .filter(|(call, _, _)| !argument_for_call.contains_key(call))
+        .map(|(call, position, value)| (*call, *position, rewrite_reg_at_node(*call, *value)))
+        .collect();
+    call_args.extend(
+        argument_for_call
+            .iter()
+            .map(|(call, argument)| (*call, 0usize, *argument)),
+    );
+    call_args.sort();
+    call_args.dedup();
+    db.rel_set(
+        "call_arg_mapping",
+        call_args.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    let mut public_call_args: Vec<(Node, usize, RTLReg)> = db
+        .rel_iter::<(Node, usize, RTLReg)>("call_arg")
+        .filter(|(call, _, _)| !argument_for_call.contains_key(call))
+        .map(|(call, position, value)| (*call, *position, rewrite_reg_at_node(*call, *value)))
+        .collect();
+    public_call_args.extend(
+        argument_for_call
+            .iter()
+            .map(|(call, argument)| (*call, 0usize, *argument)),
+    );
+    public_call_args.sort();
+    public_call_args.dedup();
+    db.rel_set(
+        "call_arg",
+        public_call_args
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    let mut collected_args: Vec<(Node, Args)> = db
+        .rel_iter::<(Node, Args)>("call_args_collected_candidate")
+        .filter(|(call, _)| !argument_for_call.contains_key(call))
+        .map(|(call, args)| {
+            (
+                *call,
+                Arc::new(
+                    args.iter()
+                        .map(|value| rewrite_reg_at_node(*call, *value))
+                        .collect(),
+                ),
+            )
+        })
+        .collect();
+    collected_args.extend(
+        argument_for_call
+            .iter()
+            .map(|(call, argument)| (*call, Arc::new(vec![*argument]))),
+    );
+    db.rel_set(
+        "call_args_collected_candidate",
+        collected_args
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    let float_arg_mapping: Vec<(Node, usize, RTLReg)> = db
+        .rel_iter::<(Node, usize, RTLReg)>("call_float_arg_mapping")
+        .map(|(call, position, value)| (*call, *position, rewrite_reg_at_node(*call, *value)))
+        .collect();
+    db.rel_set(
+        "call_float_arg_mapping",
+        float_arg_mapping
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    let float_args: Vec<(Node, Args)> = db
+        .rel_iter::<(Node, Args)>("call_float_args_collected")
+        .map(|(call, args)| {
+            (
+                *call,
+                Arc::new(
+                    args.iter()
+                        .map(|value| rewrite_reg_at_node(*call, *value))
+                        .collect(),
+                ),
+            )
+        })
+        .collect();
+    db.rel_set(
+        "call_float_args_collected",
+        float_args.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+}
 
 // Strict-dominator set plus the node itself, mirroring structuring_pass's dom_set helper. Used by the block-dominator lattice in RTLPassProgram so dominance is maintained as O(blocks * dom-depth) lattice state rather than an O(blocks^2) pairwise/path-avoiding workspace.
 fn dom_set_with_self(strict: &Set<Address>, n: Address) -> Set<Address> {
@@ -292,6 +3214,12 @@ ascent_par! {
     pub struct RTLPassProgram;
 
     relation arch_bit(i64);
+    // Authenticated imperatively before the fixed point. This is the only
+    // public /GS fact: one exact call, owner, check XOR, return and argument.
+    relation msvc_gs_cookie_guard_call(Node, Address, Node, Node, RTLReg);
+    // Private setup definitions keep the cookie load/XOR from becoming body
+    // return-value evidence. It is neither exported nor consumed downstream.
+    relation msvc_gs_cookie_setup_ax_def(Node);
     relation arg_constrained_as_ptr(Node, RTLReg);
     // RSP<->RBP register moves from disassembly; use-specific proofs below
     // decide whether an individual BP-relative access is frame based.
@@ -323,6 +3251,7 @@ ascent_par! {
     relation rsp_frame_at(Address, Address);
     relation rsp_frame_offset_at(Address, Address, i64);
     relation bp_frame_at(Address, Address);
+    relation bp_frame_setup_at(Address, Address, Address, i64);
     relation unsupported_stack_address_seed(Address, Address, Symbol);
     relation unsupported_address_detail_seed(Address, Address, Symbol);
     relation unsupported_address_detail(Address, Address, Symbol);
@@ -401,6 +3330,7 @@ ascent_par! {
     relation plea(Address, Symbol, Symbol);
     // 3.8 R3 inputs: MOV operand rows plus the asm-side RIP/global resolution, needed for the plain RIP-relative immediate global store, which has no mach/ltl route.
     relation pmov(Address, Symbol, Symbol);
+    relation pxor(Address, Symbol, Symbol);
     relation rip_target_addr(Address, Address);
     relation resolved_addr_to_symbol(Address, Ident, i64);
     relation psub(Address, Symbol, Symbol);
@@ -601,7 +3531,16 @@ ascent_par! {
         ltl_inst(addr, ?LTLInst::Lbranch(Either::Right(target))),
         emit_function(_, _, target);
 
-    is_call_clobbered(n, r) <-- is_call_or_tailcall(n), is_caller_saved(r);
+    is_call_clobbered(n, r) <--
+        is_call_or_tailcall(n),
+        is_caller_saved(r),
+        if *r != Mreg::AX && *r != Mreg::X0;
+    is_call_clobbered(n, Mreg::X0) <--
+        is_call_or_tailcall(n),
+        !msvc_gs_cookie_guard_call(n, _, _, _, _);
+    is_call_clobbered(n, Mreg::AX) <--
+        is_call_or_tailcall(n),
+        !msvc_gs_cookie_guard_call(n, _, _, _, _);
 
 
     call_args_collected_candidate(call_addr, args) <--
@@ -3787,6 +6726,7 @@ ascent_par! {
 
     reg_xtl(call_addr, x0, ret_rtl), call_return_reg(call_addr, ret_rtl) <--
         ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        !msvc_gs_cookie_guard_call(call_addr, _, _, _, _),
         next(call_addr, next_addr),
         let x0 = Mreg::X0,
         ltl_inst_uses_mreg(next_addr, x0),
@@ -3795,6 +6735,7 @@ ascent_par! {
 
     reg_xtl(call_addr, mreg, ret_rtl), call_return_reg(call_addr, ret_rtl) <--
         call_has_known_signature(call_addr, _name, _count, ret_type),
+        !msvc_gs_cookie_guard_call(call_addr, _, _, _, _),
         if *ret_type != XType::Xvoid,
         !call_returns_value(call_addr, _),
         let mreg = if matches!(ret_type, XType::Xfloat | XType::Xsingle) {
@@ -3822,18 +6763,21 @@ ascent_par! {
 
     reg_def_site(*call_addr, *reg) <--
         ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        !msvc_gs_cookie_guard_call(call_addr, _, _, _, _),
         is_caller_saved(reg),
         reg_def_used(*call_addr, *reg, _);
 
 
     return_val_used(*call_addr, 0u64, Mreg::AX, *use_addr, 0i64) <--
         ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        !msvc_gs_cookie_guard_call(call_addr, _, _, _, _),
         reg_def_used(*call_addr, Mreg::AX, use_addr),
         instr_in_function(call_addr, func_start),
         instr_in_function(use_addr, func_start);
 
     call_returns_value(*call_addr, Mreg::AX) <--
         ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        !msvc_gs_cookie_guard_call(call_addr, _, _, _, _),
         reg_def_used(*call_addr, Mreg::AX, use_addr),
         instr_in_function(call_addr, func_start),
         instr_in_function(use_addr, func_start);
@@ -3841,6 +6785,7 @@ ascent_par! {
     // XMM0 return detection GATED on the callee actually returning float, or a bare call's caller-saved XMM0 clobber mints a spurious X0 return that poisons the real int/ptr return.
     call_returns_value(*call_addr, Mreg::X0) <--
         ltl_inst(call_addr, ?LTLInst::Lcall(_)),
+        !msvc_gs_cookie_guard_call(call_addr, _, _, _, _),
         reg_def_used(*call_addr, Mreg::X0, use_addr),
         instr_in_function(call_addr, func_start),
         instr_in_function(use_addr, func_start),
@@ -4303,7 +7248,8 @@ ascent_par! {
     relation ax_value_direct(Address, Address);
     ax_value_direct(ret_addr, def_addr) <--
         ltl_inst(ret_addr, ?LTLInst::Lreturn),
-        reg_def_used(def_addr, Mreg::AX, ret_addr);
+        reg_def_used(def_addr, Mreg::AX, ret_addr),
+        !msvc_gs_cookie_guard_call(def_addr, _, _, _, _);
 
     // Availability-based void detection: any AX def reaching a return looks like a return value, so detect genuine void functions as those with a return reachable on a path setting no real value.
 
@@ -4326,6 +7272,7 @@ ascent_par! {
     relation ax_retval_def_base(Address);
     ax_retval_def_base(def_addr) <--
         reg_def_site(def_addr, Mreg::AX),
+        !msvc_gs_cookie_setup_ax_def(def_addr),
         !ax_def_consumed_nonret(def_addr);
 
     // Void-callee return-value exclusion: a call whose callee leaves no value in AX is a dead clobber, so a caller whose only value source is that clobber is itself void.
@@ -4343,11 +7290,13 @@ ascent_par! {
     func_produces_retval(func_start) <--
         instr_in_function(ret_addr, func_start),
         def_reaches_return(ret_addr, def_addr, Mreg::X0),
+        !msvc_gs_cookie_guard_call(def_addr, _, _, _, _),
         x0_value_write(def_addr);
     // (c) the function forwards a local callee's result and that callee itself produces a value (positive recursion; keeps the SCC negation-free and thus stratifiable).
     func_produces_retval(func_start) <--
         instr_in_function(call_addr, func_start),
         ltl_inst(call_addr, ?LTLInst::Lcall(Either::Right(Either::Left(callee)))),
+        !msvc_gs_cookie_guard_call(call_addr, _, _, _, _),
         ax_retval_def_base(call_addr),
         reg_def_used(call_addr, Mreg::AX, ret_addr),
         ltl_inst(ret_addr, ?LTLInst::Lreturn),
@@ -4360,6 +7309,7 @@ ascent_par! {
         ltl_inst(call_addr, ?LTLInst::Ltailcall(Either::Right(Either::Left(_))));
     func_produces_retval(func_start) <--
         instr_in_function(call_addr, func_start),
+        !msvc_gs_cookie_guard_call(call_addr, _, _, _, _),
         ax_retval_def_base(call_addr),
         is_call_or_tailcall(call_addr),
         !local_addr_call(call_addr),
@@ -4423,6 +7373,8 @@ ascent_par! {
         !ax_value_direct(ret_addr, _),
         instr_in_function(ret_addr, func_start),
         def_reaches_return(ret_addr, def_addr, Mreg::AX),
+        !msvc_gs_cookie_guard_call(def_addr, _, _, _, _),
+        !msvc_gs_cookie_setup_ax_def(def_addr),
         func_ax_def(func_start, def_addr, _);
 
     // Several defs can reach one return, so keep one deterministic representative (max def address); this is a tie-break among structurally-proven candidates, not a reachability decision.
@@ -4734,13 +7686,29 @@ ascent_par! {
 
 
     relation asm_effective_def(Address, Mreg);
-    asm_effective_def(addr, reg) <-- reg_def(addr, reg), !trim_instruction(addr);
+    asm_effective_def(addr, reg) <--
+        reg_def(addr, reg),
+        !trim_instruction(addr),
+        if *reg != Mreg::AX && *reg != Mreg::X0;
+    asm_effective_def(addr, Mreg::X0) <--
+        reg_def(addr, ?&Mreg::X0),
+        !trim_instruction(addr),
+        !msvc_gs_cookie_guard_call(addr, _, _, _, _);
     asm_effective_def(addr, Mreg::AX) <--
-        unrefinedinstruction(addr, _, _, "CALL", _, _, _, _, _, _);
+        reg_def(addr, ?&Mreg::AX),
+        !trim_instruction(addr),
+        !msvc_gs_cookie_guard_call(addr, _, _, _, _);
+    asm_effective_def(addr, Mreg::AX) <--
+        unrefinedinstruction(addr, _, _, "CALL", _, _, _, _, _, _),
+        !msvc_gs_cookie_guard_call(addr, _, _, _, _);
 
     asm_effective_def(addr, reg) <--
         unrefinedinstruction(addr, _, _, "CALL", _, _, _, _, _, _),
-        is_caller_saved(reg);
+        is_caller_saved(reg),
+        if *reg != Mreg::AX && *reg != Mreg::X0;
+    asm_effective_def(addr, Mreg::X0) <--
+        unrefinedinstruction(addr, _, _, "CALL", _, _, _, _, _, _),
+        !msvc_gs_cookie_guard_call(addr, _, _, _, _);
 
     // Lbuiltin results are effective defs even at trimmed addresses (e.g. VLA alloca replaces trimmed MOV RSP)
     asm_effective_def(addr, *dst_reg) <--
@@ -4749,7 +7717,15 @@ ascent_par! {
 
     // A def-EVENT: every register write INCLUDING trimmed instructions, so older defs are not spliced through a trimmed site; value-consuming rules additionally require asm_effective_def.
     relation asm_def_kill(Address, Mreg);
-    asm_def_kill(addr, reg) <-- reg_def(addr, reg);
+    asm_def_kill(addr, reg) <--
+        reg_def(addr, reg),
+        if *reg != Mreg::AX && *reg != Mreg::X0;
+    asm_def_kill(addr, Mreg::X0) <--
+        reg_def(addr, ?&Mreg::X0),
+        !msvc_gs_cookie_guard_call(addr, _, _, _, _);
+    asm_def_kill(addr, Mreg::AX) <--
+        reg_def(addr, ?&Mreg::AX),
+        !msvc_gs_cookie_guard_call(addr, _, _, _, _);
     asm_def_kill(addr, reg) <-- asm_effective_def(addr, reg);
 
     reg_use(addr, Mreg::AX) <--
@@ -4764,9 +7740,11 @@ ascent_par! {
     x0_value_write(addr) <-- ltl_inst(addr, ?LTLInst::Lgetstack(_, _, _, Mreg::X0));
     x0_value_write(addr) <--
         ltl_inst(addr, ?LTLInst::Lcall(Either::Right(Either::Left(callee)))),
+        !msvc_gs_cookie_guard_call(addr, _, _, _, _),
         func_returns_float(callee);
     x0_value_write(addr) <--
         external_call_site(addr, _, name),
+        !msvc_gs_cookie_guard_call(addr, _, _, _, _),
         known_extern_signature(name, _, ret, _),
         if matches!(ret, XType::Xfloat | XType::Xsingle);
     // 3.8 R1: a FUSED float op writing X0 is a genuine X0 VALUE write; it has no Lop/Lload, so func_returns_float stayed false and DCE collapsed the body to return 0.
@@ -4781,12 +7759,17 @@ ascent_par! {
     func_x0_def_reaches_return(func_start) <--
         instr_in_function(ret_addr, func_start),
         def_reaches_return(ret_addr, def_addr, Mreg::X0),
+        !msvc_gs_cookie_guard_call(def_addr, _, _, _, _),
         x0_value_write(def_addr);
 
     // An AX def-site reaching a return means an int/ptr/bool result in AX, not a float return; structural (reg_def_site only) so it stays OUT of the reg_def_used/reg_use SCC.
     #[local] relation ax_value_write(Address);
-    ax_value_write(addr) <-- ltl_inst(addr, ?LTLInst::Lop(_, _, Mreg::AX));
-    ax_value_write(addr) <-- ltl_inst(addr, ?LTLInst::Lload(_, _, _, Mreg::AX));
+    ax_value_write(addr) <--
+        ltl_inst(addr, ?LTLInst::Lop(_, _, Mreg::AX)),
+        !msvc_gs_cookie_setup_ax_def(addr);
+    ax_value_write(addr) <--
+        ltl_inst(addr, ?LTLInst::Lload(_, _, _, Mreg::AX)),
+        !msvc_gs_cookie_setup_ax_def(addr);
     ax_value_write(addr) <-- ltl_inst(addr, ?LTLInst::Lgetstack(_, _, _, Mreg::AX));
     // A fused integer memory operation has no Lop/Lload, but its destination
     // is still a genuine AX value definition. Without this evidence a value
@@ -4946,11 +7929,13 @@ ascent_par! {
     func_ax_def_reaches_return(func_start) <--
         instr_in_function(ret_addr, func_start),
         def_reaches_return(ret_addr, def_addr, Mreg::AX),
+        !msvc_gs_cookie_guard_call(def_addr, _, _, _, _),
         ax_value_write(def_addr),
         !ax_return_def_disqualified(func_start, def_addr);
     func_ax_def_reaches_return(func_start) <--
         instr_in_function(ret_addr, func_start),
         def_reaches_return(ret_addr, def_addr, Mreg::AX),
+        !msvc_gs_cookie_guard_call(def_addr, _, _, _, _),
         ax_call_result_used_in_body(def_addr);
 
     // The X0 def consumed by an X0-to-memory store (intra-block last def, else lattice membership at the store's block) - same def-reaches-point shape as def_reaches_return/def_reaches_call.
@@ -5681,6 +8666,7 @@ ascent_par! {
         func_produces_retval(func),
         instr_in_function(ret_addr, func),
         def_reaches_return(ret_addr, def_addr, Mreg::AX),
+        !msvc_gs_cookie_guard_call(def_addr, _, _, _, _),
         ltl_inst(ret_addr, ?LTLInst::Lreturn),
         reg_xtl(ret_addr, Mreg::AX, use_id),
         !is_def(ret_addr, use_id),
@@ -6488,15 +9474,18 @@ ascent_par! {
 
     call_arg_position_allowed(call_addr, pos) <--
         call_has_arg_at_position(call_addr, pos),
+        !msvc_gs_cookie_guard_call(call_addr, _, _, _, _),
         !call_has_known_signature(call_addr, _, _, _);
 
     call_arg_position_allowed(call_addr, pos) <--
         call_has_arg_at_position(call_addr, pos),
+        !msvc_gs_cookie_guard_call(call_addr, _, _, _, _),
         call_has_known_signature(call_addr, name, _, _),
         known_varargs_function(name, _);
 
     call_arg_position_allowed(call_addr, pos) <--
         call_has_arg_at_position(call_addr, pos),
+        !msvc_gs_cookie_guard_call(call_addr, _, _, _, _),
         call_has_known_signature(call_addr, name, sig_arg_count, _),
         !known_varargs_function(name, _),
         !abi_shared_arg_slots(true),
@@ -6504,6 +9493,7 @@ ascent_par! {
 
     call_arg_position_allowed(call_addr, pos) <--
         call_has_arg_at_position(call_addr, pos),
+        !msvc_gs_cookie_guard_call(call_addr, _, _, _, _),
         call_has_known_signature(call_addr, name, _, _),
         !known_varargs_function(name, _),
         known_extern_signature(name, _, _, arg_types),
@@ -6511,6 +9501,12 @@ ascent_par! {
         abi_first_stack_arg_position(first_stack),
         if *pos < arg_types.len(),
         if *pos >= *first_stack || !matches!(arg_types[*pos], XType::Xfloat | XType::Xsingle);
+
+    // The authenticated check consumes exactly the witnessed RCX-XOR result.
+    // It never enters generic GP/XMM argument inference, so stale shared-slot
+    // values cannot compete with this one call-instance fact.
+    call_arg_mapping(call_addr, 0usize, argument) <--
+        msvc_gs_cookie_guard_call(call_addr, _, _, _, argument);
 
     call_arg_mapping(*call_addr, pos, rtl_reg) <--
         call_arg_setup_detected(defaddr, dst_reg, call_addr),
@@ -10833,7 +13829,8 @@ ascent_par! {
     // Float/double returns place the result in XMM0 (X0), which the AX-keyed machinery misses; treat an X0 def reaching a return as a return value so they are not misclassified as void.
     func_has_ax_return_value(func_start) <--
         instr_in_function(ret_point, func_start),
-        def_reaches_return(ret_point, _, Mreg::X0);
+        def_reaches_return(ret_point, x0_def, Mreg::X0),
+        !msvc_gs_cookie_guard_call(x0_def, _, _, _, _);
 
     // Genuine void: a function whose return points have no AX/X0 value source at all; without this the void fallback fabricates an undefined AX reg typed as `long`, emitting `return <uninitialized var>`.
     emit_function_void_candidate(func_start) <--
@@ -12333,67 +15330,72 @@ fn win64_home_backing_site_diagnostics_are_safe(
         && (!has_unsupported_reason || win64_home_backing_has_only_resolvable_details(details))
 }
 
-fn rewrite_home_backing_builtin(
+fn rewrite_rtl_builtin_regs<F>(
     arg: &BuiltinArg<RTLReg>,
-    old: RTLReg,
-    slot: RTLReg,
-) -> BuiltinArg<RTLReg> {
+    rewrite: &F,
+) -> BuiltinArg<RTLReg>
+where
+    F: Fn(RTLReg) -> RTLReg,
+{
     match arg {
-        BuiltinArg::BA(reg) => BuiltinArg::BA(if *reg == old { slot } else { *reg }),
+        BuiltinArg::BA(reg) => BuiltinArg::BA(rewrite(*reg)),
         BuiltinArg::BASplitLong(left, right) => BuiltinArg::BASplitLong(
-            Box::new(rewrite_home_backing_builtin(left, old, slot)),
-            Box::new(rewrite_home_backing_builtin(right, old, slot)),
+            Box::new(rewrite_rtl_builtin_regs(left, rewrite)),
+            Box::new(rewrite_rtl_builtin_regs(right, rewrite)),
         ),
         BuiltinArg::BAAddPtr(left, right) => BuiltinArg::BAAddPtr(
-            Box::new(rewrite_home_backing_builtin(left, old, slot)),
-            Box::new(rewrite_home_backing_builtin(right, old, slot)),
+            Box::new(rewrite_rtl_builtin_regs(left, rewrite)),
+            Box::new(rewrite_rtl_builtin_regs(right, rewrite)),
         ),
         _ => arg.clone(),
     }
 }
 
-// Replace one ordinary stack-cell value with the canonical backing local in
-// an already-selected instruction.  This is deliberately structural rather
-// than mnemonic-based; Cshminor later interprets a use/definition of `slot`
-// at the authenticated access node as a typed memory read/write.
-fn rewrite_home_backing_inst(inst: &RTLInst, old: RTLReg, slot: RTLReg) -> RTLInst {
-    let reg = |value: RTLReg| if value == old { slot } else { value };
+fn rewrite_rtl_inst_with<F>(inst: &RTLInst, rewrite: &F) -> RTLInst
+where
+    F: Fn(RTLReg) -> RTLReg,
+{
     let args = |values: &Arc<Vec<RTLReg>>| {
-        Arc::new(values.iter().map(|value| reg(*value)).collect::<Vec<_>>())
+        Arc::new(
+            values
+                .iter()
+                .map(|value| rewrite(*value))
+                .collect::<Vec<_>>(),
+        )
     };
     match inst {
         RTLInst::Inop => RTLInst::Inop,
         RTLInst::Iop(op, values, destination) => {
-            RTLInst::Iop(op.clone(), args(values), reg(*destination))
+            RTLInst::Iop(op.clone(), args(values), rewrite(*destination))
         }
         RTLInst::Iload(chunk, addressing, values, destination) => RTLInst::Iload(
             *chunk,
             addressing.clone(),
             args(values),
-            reg(*destination),
+            rewrite(*destination),
         ),
         RTLInst::Istore(chunk, addressing, values, source) => RTLInst::Istore(
             *chunk,
             addressing.clone(),
             args(values),
-            reg(*source),
+            rewrite(*source),
         ),
         RTLInst::Icall(signature, callee, values, destination, successor) => {
             let callee = match callee {
-                Either::Left(value) => Either::Left(reg(*value)),
+                Either::Left(value) => Either::Left(rewrite(*value)),
                 other => other.clone(),
             };
             RTLInst::Icall(
                 signature.clone(),
                 callee,
                 args(values),
-                destination.map(reg),
+                destination.map(rewrite),
                 *successor,
             )
         }
         RTLInst::Itailcall(signature, callee, values) => {
             let callee = match callee {
-                Either::Left(value) => Either::Left(reg(*value)),
+                Either::Left(value) => Either::Left(rewrite(*value)),
                 other => other.clone(),
             };
             RTLInst::Itailcall(signature.clone(), callee, args(values))
@@ -12402,9 +15404,9 @@ fn rewrite_home_backing_inst(inst: &RTLInst, old: RTLReg, slot: RTLReg) -> RTLIn
             name.clone(),
             values
                 .iter()
-                .map(|value| rewrite_home_backing_builtin(value, old, slot))
+                .map(|value| rewrite_rtl_builtin_regs(value, rewrite))
                 .collect(),
-            rewrite_home_backing_builtin(result, old, slot),
+            rewrite_rtl_builtin_regs(result, rewrite),
         ),
         RTLInst::Icond(condition, values, if_true, if_false) => RTLInst::Icond(
             condition.clone(),
@@ -12413,11 +15415,30 @@ fn rewrite_home_backing_inst(inst: &RTLInst, old: RTLReg, slot: RTLReg) -> RTLIn
             if_false.clone(),
         ),
         RTLInst::Ijumptable(value, targets) => {
-            RTLInst::Ijumptable(reg(*value), targets.clone())
+            RTLInst::Ijumptable(rewrite(*value), targets.clone())
         }
         RTLInst::Ibranch(target) => RTLInst::Ibranch(target.clone()),
-        RTLInst::Ireturn(value) => RTLInst::Ireturn(reg(*value)),
+        RTLInst::Ireturn(value) => RTLInst::Ireturn(rewrite(*value)),
     }
+}
+
+// Replace one ordinary stack-cell value with the canonical backing local in
+// an already-selected instruction. This is deliberately structural rather
+// than mnemonic-based; Cshminor later interprets a use/definition of `slot`
+// at the authenticated access node as a typed memory read/write.
+fn rewrite_home_backing_inst(inst: &RTLInst, old: RTLReg, slot: RTLReg) -> RTLInst {
+    rewrite_rtl_inst_with(inst, &|value| if value == old { slot } else { value })
+}
+
+// Apply one exact value-web collapse to definitions and uses in a single
+// traversal. Every map used by the /GS normalizer has one common target.
+fn rewrite_rtl_inst_regs(
+    inst: &RTLInst,
+    substitutions: &BTreeMap<RTLReg, RTLReg>,
+) -> RTLInst {
+    rewrite_rtl_inst_with(inst, &|value| {
+        substitutions.get(&value).copied().unwrap_or(value)
+    })
 }
 
 fn win64_home_normalize_integer_chunk(chunk: MemoryChunk) -> Option<MemoryChunk> {
@@ -16483,7 +19504,9 @@ impl IRPass for RTLPass {
             "unsupported_address_detail",
             ascent::boxcar::Vec::<(Address, Address, Symbol)>::new(),
         );
+        seed_msvc_gs_cookie_guards(db);
         run_pass!(db, RTLPassProgram);
+        normalize_msvc_gs_cookie_guard_calls(db);
         canonicalize_indexed_stack_rtl_values(db);
         select_sp_indexed_fused_lowerings(db);
         materialize_synthetic_members(db);
@@ -16510,7 +19533,9 @@ impl IRPass for RTLPass {
                 .filter(|relation| {
                     !matches!(
                         *relation,
-                        "win64_home_backing_access"
+                        "msvc_gs_cookie_guard_call"
+                            | "msvc_gs_cookie_setup_ax_def"
+                            | "win64_home_backing_access"
                             | "win64_home_backing_selected_candidate"
                             | "suppressed_unsupported_address"
                             | "suppressed_unsupported_address_node"
@@ -16533,6 +19558,7 @@ impl IRPass for RTLPass {
                 .iter()
                 .copied()
                 .chain([
+                    "msvc_gs_cookie_guard_call",
                     "win64_home_backing_access",
                     "win64_home_backing_selected_candidate",
                     "suppressed_unsupported_address",
@@ -16541,6 +19567,44 @@ impl IRPass for RTLPass {
                 ])
                 .collect()
         })
+    }
+
+    fn extra_reads(&self) -> &'static [&'static str] {
+        // The recognizer runs before the Ascent fixed point and reads these
+        // immutable structural relations directly.
+        &[
+            "next",
+            "code_in_block",
+            "ddisasm_cfg_edge",
+            "instr_in_function",
+            "ltl_inst",
+            "pmov",
+            "pxor",
+            "padd",
+            "psub",
+            "plea",
+            "adjusts_stack",
+            "stack_base_move",
+            "rsp_frame_offset_at",
+            "bp_frame_setup_at",
+            "op_register",
+            "op_immediate",
+            "op_indirect",
+            "unrefinedinstruction",
+            "stack_def_used",
+            "decoded_reg_def",
+            "decoded_memory_write_operand",
+            "flags_and_jump_pair",
+            "call_targets_noreturn",
+            "call_return_site",
+            "call_to_callee",
+            "function_noreturn",
+            "is_external_function",
+            "func_span",
+            "symbols",
+            "symbol_resolved_addr",
+            "symbol_table",
+        ]
     }
 }
 
@@ -16562,6 +19626,713 @@ mod encoding_tests {
             assert!(pass.outputs().contains(&relation));
             assert!(!pass.inputs().contains(&relation));
         }
+    }
+
+    #[test]
+    fn rtl_pass_exports_only_the_per_call_gs_fact() {
+        let pass = RTLPass;
+        assert!(pass.outputs().contains(&"msvc_gs_cookie_guard_call"));
+        assert!(!pass.inputs().contains(&"msvc_gs_cookie_guard_call"));
+        assert!(!pass.outputs().contains(&"msvc_gs_cookie_setup_ax_def"));
+        assert!(!pass.inputs().contains(&"msvc_gs_cookie_setup_ax_def"));
+        for relation in [
+            "bp_frame_setup_at",
+            "call_return_site",
+            "call_targets_noreturn",
+            "call_to_callee",
+            "ddisasm_cfg_edge",
+            "decoded_memory_write_operand",
+            "flags_and_jump_pair",
+            "func_span",
+            "is_external_function",
+            "symbol_resolved_addr",
+            "symbol_table",
+            "unrefinedinstruction",
+        ] {
+            assert!(pass.extra_reads().contains(&relation), "missing {relation}");
+        }
+    }
+
+    #[test]
+    fn gs_raw_operand_count_uses_contiguous_no_op_padding() {
+        let move_row: RawInstruction = (
+            3,
+            "",
+            "MOV",
+            "move_source",
+            "move_destination",
+            NO_OP,
+            NO_OP,
+            0,
+            0,
+        );
+        let direct_call_row: RawInstruction =
+            (5, "", "CALL", "direct_target", NO_OP, NO_OP, NO_OP, 0, 0);
+        let malformed_hole_row: RawInstruction = (
+            3,
+            "",
+            "MOV",
+            "move_source",
+            NO_OP,
+            "move_destination",
+            NO_OP,
+            0,
+            0,
+        );
+
+        assert_eq!(msvc_gs_exact_raw_operand_count(&move_row), Some(2));
+        assert_eq!(msvc_gs_exact_raw_operand_count(&direct_call_row), Some(1));
+        assert_eq!(msvc_gs_exact_raw_operand_count(&malformed_hole_row), None);
+    }
+
+    #[test]
+    fn gs_normalization_uses_witnessed_cx_identity_among_stale_aliases() {
+        let mut db = DecompileDB::default();
+        let owner: Address = 0x1000;
+        let check: Node = 0x1010;
+        let call: Node = 0x1020;
+        let ret: Node = 0x1030;
+        let argument = fresh_xtl_reg(check, Mreg::CX);
+        let stale_alias = argument + 1;
+        let stale_destination = argument + 2;
+        db.rel_push(
+            "msvc_gs_cookie_guard_call",
+            (call, owner, check, ret, argument),
+        );
+        for identity in [argument, stale_alias] {
+            db.rel_push("is_def", (check, identity));
+            db.rel_push("reg_xtl", (check, Mreg::CX, identity));
+        }
+        for node in [check, call, ret] {
+            db.rel_push("instr_in_function", (node, owner));
+        }
+        db.rel_push("call_arg_mapping", (call, 0usize, stale_alias));
+        db.rel_push("call_arg", (call, 0usize, stale_alias));
+        db.rel_push(
+            "call_args_collected_candidate",
+            (call, Arc::new(vec![stale_alias])),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                call,
+                RTLInst::Icall(
+                    None,
+                    Either::Right(Either::Right("opaque_guard")),
+                    Arc::new(vec![stale_alias]),
+                    Some(stale_destination),
+                    ret,
+                ),
+            ),
+        );
+
+        normalize_msvc_gs_cookie_guard_calls(&mut db);
+
+        assert_eq!(
+            db.rel_iter::<(Node, usize, RTLReg)>("call_arg_mapping")
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(call, 0usize, argument)])
+        );
+        assert_eq!(
+            db.rel_iter::<(Node, usize, RTLReg)>("call_arg")
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(call, 0usize, argument)])
+        );
+        let candidates: Vec<_> = db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .filter_map(|(node, inst)| (*node == call).then_some(inst))
+            .collect();
+        assert_eq!(candidates.len(), 1);
+        let RTLInst::Icall(Some(signature), _, args, destination, _) = candidates[0] else {
+            panic!("guard call was not normalized: {:?}", candidates[0]);
+        };
+        assert_eq!(signature.sig_args.as_slice(), &[XType::Xlong]);
+        assert_eq!(signature.sig_res, XType::Xvoid);
+        assert_eq!(args.as_slice(), &[argument]);
+        assert_eq!(*destination, None);
+    }
+
+    #[test]
+    fn gs_normalization_preserves_metadata_if_witness_identity_is_missing() {
+        let mut db = DecompileDB::default();
+        let owner: Address = 0x2000;
+        let check: Node = 0x2010;
+        let call: Node = 0x2020;
+        let ret: Node = 0x2030;
+        let argument = fresh_xtl_reg(check, Mreg::CX);
+        let destination = argument + 1;
+        let original_signature = Signature {
+            sig_args: Arc::new(vec![XType::Xint]),
+            sig_res: XType::Xint,
+            sig_cc: CallConv::default(),
+        };
+        db.rel_push(
+            "msvc_gs_cookie_guard_call",
+            (call, owner, check, ret, argument),
+        );
+        for node in [check, call, ret] {
+            db.rel_push("instr_in_function", (node, owner));
+        }
+        db.rel_push("call_arg_mapping", (call, 0usize, argument));
+        db.rel_push("call_arg", (call, 0usize, argument));
+        db.rel_push(
+            "call_args_collected_candidate",
+            (call, Arc::new(vec![argument])),
+        );
+        let original = RTLInst::Icall(
+            Some(original_signature),
+            Either::Right(Either::Right("ordinary_call")),
+            Arc::new(vec![argument]),
+            Some(destination),
+            ret,
+        );
+        db.rel_push("rtl_inst_candidate", (call, original.clone()));
+
+        normalize_msvc_gs_cookie_guard_calls(&mut db);
+
+        assert!(db
+            .rel_iter::<(Node, usize, RTLReg)>("call_arg_mapping")
+            .any(|row| *row == (call, 0usize, argument)));
+        assert!(db
+            .rel_iter::<(Node, usize, RTLReg)>("call_arg")
+            .any(|row| *row == (call, 0usize, argument)));
+        assert!(db
+            .rel_iter::<(Node, Args)>("call_args_collected_candidate")
+            .any(|(node, args)| *node == call && args.as_slice() == [argument]));
+        assert!(db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .any(|(node, inst)| *node == call && *inst == original));
+    }
+
+    #[test]
+    fn gs_normalization_closes_final_ax_component_but_preserves_competing_webs() {
+        let mut db = DecompileDB::default();
+        let owner: Address = 0x3000;
+        let body: Node = 0x3010;
+        let consumer: Node = 0x3020;
+        let check: Node = 0x3030;
+        let call: Node = 0x3040;
+        let ret: Node = 0x3050;
+        let argument = fresh_xtl_reg(check, Mreg::CX);
+        let chosen: RTLReg = 0x100;
+        let stale_consumer: RTLReg = 0x101;
+        let competing: RTLReg = 0x200;
+
+        db.rel_push(
+            "msvc_gs_cookie_guard_call",
+            (call, owner, check, ret, argument),
+        );
+        for node in [body, consumer, check, call, ret] {
+            db.rel_push("instr_in_function", (node, owner));
+        }
+        db.rel_push("is_def", (check, argument));
+        db.rel_push("reg_xtl", (check, Mreg::CX, argument));
+        db.rel_push("is_def", (body, chosen));
+        db.rel_push("reg_xtl", (body, Mreg::AX, chosen));
+        db.rel_push("def_reaches_return", (ret, body, Mreg::AX));
+        db.rel_push("emit_function_return", (owner, chosen));
+
+        // The regular lattice projection deliberately retains historical
+        // representatives. Insert the stale row last so a plain map collect
+        // would select it, while final_xtl_canonical_map must still select the
+        // minimum representative.
+        for row in [
+            (chosen, chosen),
+            (stale_consumer, chosen),
+            (stale_consumer, stale_consumer),
+            (competing, competing),
+        ] {
+            db.rel_push("xtl_canonical", row);
+        }
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                body,
+                RTLInst::Iop(Operation::Omove, Arc::new(vec![chosen]), chosen),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                body,
+                RTLInst::Iop(Operation::Omove, Arc::new(vec![competing]), competing),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                consumer,
+                RTLInst::Istore(
+                    MemoryChunk::MInt32,
+                    Addressing::Aglobal(0x4000, 0),
+                    Arc::new(vec![]),
+                    stale_consumer,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                call,
+                RTLInst::Icall(
+                    None,
+                    Either::Right(Either::Right("opaque_guard")),
+                    Arc::new(vec![argument]),
+                    Some(competing + 1),
+                    ret,
+                ),
+            ),
+        );
+        db.rel_push("rtl_inst_candidate", (ret, RTLInst::Ireturn(stale_consumer)));
+
+        normalize_msvc_gs_cookie_guard_calls(&mut db);
+
+        let body_destinations: BTreeSet<RTLReg> = db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .filter_map(|(node, inst)| {
+                (*node == body).then_some(inst).and_then(|inst| match inst {
+                    RTLInst::Iop(_, _, destination) => Some(*destination),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(body_destinations, BTreeSet::from([chosen, competing]));
+        assert!(db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .any(|(node, inst)| {
+                *node == consumer
+                    && matches!(inst, RTLInst::Istore(_, _, _, source) if *source == chosen)
+            }));
+        assert!(!db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+            .any(|(_, inst)| matches!(inst, RTLInst::Istore(_, _, _, source) if *source == stale_consumer)));
+    }
+
+    #[test]
+    fn gs_cfg_slice_allows_only_explicitly_authenticated_raw_only_nodes() {
+        let function = 0x1000;
+        let ret = 0x1001;
+        let cfg = BTreeMap::from([(function, BTreeSet::from([ret])), (ret, BTreeSet::new())]);
+        let reverse_cfg = BTreeMap::from([(ret, BTreeSet::from([function]))]);
+        let canonical_owners = BTreeMap::from([(function, function), (ret, function)]);
+        let claimants = BTreeMap::from([
+            (function, BTreeSet::from([function])),
+            (ret, BTreeSet::from([function])),
+        ]);
+        let raw_nodes = BTreeSet::from([function, ret]);
+        let ltl_nodes = BTreeSet::from([ret]);
+        let mnemonics = BTreeMap::from([(function, "XOR"), (ret, "RET")]);
+        let unresolved = BTreeSet::new();
+
+        assert_eq!(
+            authenticated_msvc_gs_cfg_slice(
+                function,
+                ret,
+                function,
+                &cfg,
+                &reverse_cfg,
+                &canonical_owners,
+                &claimants,
+                &raw_nodes,
+                &ltl_nodes,
+                &BTreeSet::from([function]),
+                &mnemonics,
+                &unresolved,
+            ),
+            Some(raw_nodes.clone())
+        );
+        assert_eq!(
+            authenticated_msvc_gs_cfg_slice(
+                function,
+                ret,
+                function,
+                &cfg,
+                &reverse_cfg,
+                &canonical_owners,
+                &claimants,
+                &raw_nodes,
+                &ltl_nodes,
+                &BTreeSet::new(),
+                &mnemonics,
+                &unresolved,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn gs_ltl_equivalence_is_closed_to_identical_effective_global_accesses() {
+        assert_eq!(msvc_gs_effective_global_address(0x1001, -1), Some(0x1000));
+        assert_eq!(msvc_gs_effective_global_address(0, -1), None);
+        let relocation_load = LTLInst::Lload(
+            MemoryChunk::MAny64,
+            Addressing::Aglobal(0x1000_1000, 0),
+            Arc::new(vec![]),
+            Mreg::AX,
+        );
+        let rip_fallback_load = LTLInst::Lload(
+            MemoryChunk::MAny64,
+            Addressing::Aglobal(0x1000_01e9, 3607),
+            Arc::new(vec![]),
+            Mreg::AX,
+        );
+        assert_eq!(
+            msvc_gs_exact_ltl_candidate(&[relocation_load.clone(), rip_fallback_load.clone(),]),
+            Some(relocation_load.clone())
+        );
+
+        let different_address = LTLInst::Lload(
+            MemoryChunk::MAny64,
+            Addressing::Aglobal(0x1000_01e9, 3608),
+            Arc::new(vec![]),
+            Mreg::AX,
+        );
+        assert_eq!(
+            msvc_gs_exact_ltl_candidate(&[relocation_load.clone(), different_address]),
+            None
+        );
+        let different_destination = LTLInst::Lload(
+            MemoryChunk::MAny64,
+            Addressing::Aglobal(0x1000_1000, 0),
+            Arc::new(vec![]),
+            Mreg::CX,
+        );
+        assert_eq!(
+            msvc_gs_exact_ltl_candidate(&[relocation_load.clone(), different_destination]),
+            None
+        );
+        let different_chunk = LTLInst::Lload(
+            MemoryChunk::MInt32,
+            Addressing::Aglobal(0x1000_1000, 0),
+            Arc::new(vec![]),
+            Mreg::AX,
+        );
+        assert_eq!(
+            msvc_gs_exact_ltl_candidate(&[relocation_load.clone(), different_chunk]),
+            None
+        );
+        let nonempty_args = LTLInst::Lload(
+            MemoryChunk::MAny64,
+            Addressing::Aglobal(0x1000_1000, 0),
+            Arc::new(vec![Mreg::R11]),
+            Mreg::AX,
+        );
+        assert_eq!(
+            msvc_gs_exact_ltl_candidate(&[relocation_load.clone(), nonempty_args]),
+            None
+        );
+        let relocation_store = LTLInst::Lstore(
+            MemoryChunk::MInt32,
+            Addressing::Aglobal(0x1000_2000, 0),
+            Arc::new(vec![]),
+            Mreg::AX,
+        );
+        let rip_fallback_store = LTLInst::Lstore(
+            MemoryChunk::MInt32,
+            Addressing::Aglobal(0x1000_01e9, 7703),
+            Arc::new(vec![]),
+            Mreg::AX,
+        );
+        assert_eq!(
+            msvc_gs_exact_ltl_candidate(&[
+                relocation_store.clone(),
+                rip_fallback_store.clone(),
+            ]),
+            Some(relocation_store.clone())
+        );
+        let different_store_source = LTLInst::Lstore(
+            MemoryChunk::MInt32,
+            Addressing::Aglobal(0x1000_2000, 0),
+            Arc::new(vec![]),
+            Mreg::DX,
+        );
+        assert_eq!(
+            msvc_gs_exact_ltl_candidate(&[relocation_store, different_store_source]),
+            None
+        );
+        let opaque = LTLInst::Lbranch(Either::Right(0x1234));
+        assert_eq!(msvc_gs_exact_ltl_candidate(&[opaque.clone(), opaque]), None);
+        assert_eq!(
+            msvc_gs_exact_ltl_candidate(&[rip_fallback_load]),
+            Some(LTLInst::Lload(
+                MemoryChunk::MAny64,
+                Addressing::Aglobal(0x1000_01e9, 3607),
+                Arc::new(vec![]),
+                Mreg::AX,
+            ))
+        );
+    }
+
+    #[test]
+    fn gs_sp_xor_allows_absent_ltl_but_rejects_published_contradictions() {
+        assert!(msvc_gs_ltl_xor_is_absent_or_exact(None, Mreg::AX, Mreg::SP,));
+
+        let exact = LTLInst::Lop(
+            Operation::Oxorl,
+            Arc::new(vec![Mreg::AX, Mreg::SP]),
+            Mreg::AX,
+        );
+        let exact_rows = vec![exact.clone(), exact.clone()];
+        assert!(msvc_gs_ltl_xor_is_absent_or_exact(
+            Some(&exact_rows),
+            Mreg::AX,
+            Mreg::SP,
+        ));
+        assert!(!msvc_gs_ltl_xor_is_absent_or_exact(
+            Some(&[]),
+            Mreg::AX,
+            Mreg::SP,
+        ));
+
+        let narrow = LTLInst::Lop(
+            Operation::Oxor,
+            Arc::new(vec![Mreg::AX, Mreg::SP]),
+            Mreg::AX,
+        );
+        assert!(!msvc_gs_ltl_xor_is_absent_or_exact(
+            Some(std::slice::from_ref(&narrow)),
+            Mreg::AX,
+            Mreg::SP,
+        ));
+        let ambiguous_width = [exact, narrow];
+        assert!(!msvc_gs_ltl_xor_is_absent_or_exact(
+            Some(&ambiguous_width),
+            Mreg::AX,
+            Mreg::SP,
+        ));
+
+        let wrong_result = LTLInst::Lop(
+            Operation::Oxorl,
+            Arc::new(vec![Mreg::AX, Mreg::SP]),
+            Mreg::SP,
+        );
+        let wrong_args = LTLInst::Lop(
+            Operation::Oxorl,
+            Arc::new(vec![Mreg::SP, Mreg::AX]),
+            Mreg::AX,
+        );
+        let wrong_operation = LTLInst::Lop(
+            Operation::Oaddl,
+            Arc::new(vec![Mreg::AX, Mreg::SP]),
+            Mreg::AX,
+        );
+        for contradiction in [wrong_result, wrong_args, wrong_operation] {
+            assert!(!msvc_gs_ltl_xor_is_absent_or_exact(
+                Some(std::slice::from_ref(&contradiction)),
+                Mreg::AX,
+                Mreg::SP,
+            ));
+        }
+    }
+
+    #[test]
+    fn gs_effect_proof_is_positive_and_rejects_synthetic_opaque_nodes() {
+        let branch = vec![LTLInst::Lbranch(Either::Right(0x1234))];
+        let no_defs = BTreeSet::new();
+        let no_writes = BTreeSet::new();
+
+        for mnemonic in ["NOP", "NOPW", "NOPL"] {
+            assert!(msvc_gs_instruction_effects_are_fully_modeled(
+                mnemonic,
+                Some(&branch),
+                Some(&no_defs),
+                Some(&no_writes),
+                Some(0),
+                false,
+            ));
+        }
+        for mnemonic in ["JMP", "JE", "JRCXZ"] {
+            assert!(msvc_gs_instruction_effects_are_fully_modeled(
+                mnemonic,
+                Some(&branch),
+                Some(&no_defs),
+                Some(&no_writes),
+                Some(1),
+                true,
+            ));
+        }
+        for (mnemonic, operand_count) in [
+            ("SETSSBSY", 0),
+            ("SYSCALL", 0),
+            ("RANDOM_UNKNOWN_ZERO_OPERAND", 0),
+            ("LOOP", 1),
+            ("LOOPE", 1),
+            ("J_UNMODELED", 1),
+        ] {
+            assert!(!msvc_gs_instruction_effects_are_fully_modeled(
+                mnemonic,
+                Some(&branch),
+                Some(&no_defs),
+                Some(&no_writes),
+                Some(operand_count),
+                true,
+            ));
+        }
+
+        let implicit_clobber = BTreeSet::from([Mreg::R11]);
+        assert!(!msvc_gs_instruction_effects_are_fully_modeled(
+            "NOP",
+            Some(&branch),
+            Some(&implicit_clobber),
+            Some(&no_writes),
+            Some(0),
+            false,
+        ));
+
+        let operation = vec![LTLInst::Lop(
+            Operation::Omove,
+            Arc::new(vec![Mreg::CX]),
+            Mreg::R11,
+        )];
+        assert!(msvc_gs_instruction_effects_are_fully_modeled(
+            "MOV",
+            Some(&operation),
+            Some(&implicit_clobber),
+            Some(&no_writes),
+            Some(2),
+            false,
+        ));
+        let extra_implicit_clobber = BTreeSet::from([Mreg::CX, Mreg::R11]);
+        assert!(!msvc_gs_instruction_effects_are_fully_modeled(
+            "MOV",
+            Some(&operation),
+            Some(&extra_implicit_clobber),
+            Some(&no_writes),
+            Some(2),
+            false,
+        ));
+        for (mnemonic, operand_count) in [
+            ("MUL", 1),
+            ("DIV", 1),
+            ("IDIV", 1),
+            ("IMUL", 1),
+            ("CPUID", 0),
+            ("SETSSBSY", 0),
+        ] {
+            assert!(!msvc_gs_instruction_effects_are_fully_modeled(
+                mnemonic,
+                Some(&operation),
+                Some(&implicit_clobber),
+                Some(&no_writes),
+                Some(operand_count),
+                false,
+            ));
+        }
+
+        let condition = vec![LTLInst::Lcond(
+            Condition::Ccomp(Comparison::Ceq),
+            Arc::new(vec![Mreg::CX]),
+            Either::Right(0x2000),
+            Either::Right(0x3000),
+        )];
+        for mnemonic in ["LOOP", "LOOPE", "LOOPNE"] {
+            assert!(!msvc_gs_instruction_effects_are_fully_modeled(
+                mnemonic,
+                Some(&condition),
+                Some(&no_defs),
+                Some(&no_writes),
+                Some(1),
+                true,
+            ));
+        }
+    }
+
+    #[test]
+    fn gs_target_proof_accepts_only_exact_external_target_forms() {
+        let direct_call = 0x1010;
+        let relocated_call = 0x1020;
+        let undefined_call = 0x1030;
+        let local_conflict_call = 0x1040;
+        let external = 0x9000;
+        let local = 0x4000;
+        let relocated_name = "exact_relocated_external";
+        let undefined_name = "exact_undefined_external";
+        let relocated_row: SymbolTableRow = (
+            external,
+            0,
+            "FUNC",
+            "GLOBAL",
+            "UNDEF",
+            0,
+            ".extern",
+            0,
+            relocated_name,
+        );
+        let undefined_row: SymbolTableRow =
+            (0, 0, "FUNC", "GLOBAL", "UNDEF", 0, "", 0, undefined_name);
+        let external_addresses = BTreeSet::from([external]);
+        let decoded_nodes = BTreeSet::from([local]);
+        let claimants = BTreeMap::from([(local, BTreeSet::from([local]))]);
+        let function_spans = vec![(local, local + 0x20)];
+        let symbol_rows_by_name = BTreeMap::from([
+            (relocated_name, BTreeSet::from([relocated_row])),
+            (undefined_name, BTreeSet::from([undefined_row])),
+        ]);
+        let symbol_rows_by_address = BTreeMap::from([
+            (external, BTreeSet::from([relocated_row])),
+            (0, BTreeSet::from([undefined_row])),
+        ]);
+        let symbols_by_address = BTreeMap::from([(external, BTreeSet::from([relocated_name]))]);
+        let addresses_by_symbol = BTreeMap::from([(relocated_name, BTreeSet::from([external]))]);
+        let resolved_by_symbol = BTreeMap::from([(relocated_name, BTreeSet::from([external]))]);
+        let call_targets = BTreeMap::from([
+            (direct_call, BTreeSet::from([external])),
+            (relocated_call, BTreeSet::from([external])),
+        ]);
+        let operands = BTreeMap::from([
+            (direct_call, ["direct_operand", "", "", ""]),
+            (relocated_call, ["relocated_operand", "", "", ""]),
+            (undefined_call, ["undefined_operand", "", "", ""]),
+            (local_conflict_call, ["local_operand", "", "", ""]),
+        ]);
+        let operand_counts = BTreeMap::from([
+            (direct_call, 1usize),
+            (relocated_call, 1usize),
+            (undefined_call, 1usize),
+            (local_conflict_call, 1usize),
+        ]);
+        let immediates = BTreeMap::from([
+            ("direct_operand", BTreeSet::from([external as i64])),
+            ("relocated_operand", BTreeSet::from([external as i64])),
+            ("undefined_operand", BTreeSet::from([0i64])),
+            ("local_operand", BTreeSet::from([local as i64])),
+        ]);
+        let register_operands = BTreeSet::new();
+        let indirect_operands = BTreeSet::new();
+        let proof = MsvcGsExternalTargetProof {
+            external_addresses: &external_addresses,
+            decoded_nodes: &decoded_nodes,
+            claimants: &claimants,
+            function_spans: &function_spans,
+            symbol_rows_by_name: &symbol_rows_by_name,
+            symbol_rows_by_address: &symbol_rows_by_address,
+            symbols_by_address: &symbols_by_address,
+            addresses_by_symbol: &addresses_by_symbol,
+            resolved_by_symbol: &resolved_by_symbol,
+            call_targets: &call_targets,
+            operands: &operands,
+            operand_counts: &operand_counts,
+            immediates: &immediates,
+            register_operands: &register_operands,
+            indirect_operands: &indirect_operands,
+        };
+
+        assert!(proof.accepts(direct_call, &Either::Right(Either::Left(external)),));
+        assert!(proof.accepts(
+            relocated_call,
+            &Either::Right(Either::Right(relocated_name)),
+        ));
+        assert!(proof.accepts(
+            undefined_call,
+            &Either::Right(Either::Right(undefined_name)),
+        ));
+        assert!(!proof.accepts(
+            local_conflict_call,
+            &Either::Right(Either::Right(undefined_name)),
+        ));
+        assert!(!proof.accepts(undefined_call, &Either::Left(Mreg::x86("R10")),));
     }
 
     #[test]

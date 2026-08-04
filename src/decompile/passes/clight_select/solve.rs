@@ -596,7 +596,17 @@ fn constrain_stmt(
                 sink.assert_soft_tagged(guard, &t.is_ptrish(&ft.term(t)), compat_w, "callee_fun");
             }
             // Cross-function: bind each argument and the result to the callee's signature.
-            let sig = callee_ident_from_expr(f, name_to_ident)
+            let explicit_function_cast = matches!(
+                f,
+                ClightExpr::Ecast(_, ty)
+                    if matches!(
+                        crate::decompile::passes::clight_select::ctyping::classify_fun(ty),
+                        crate::decompile::passes::clight_select::ctyping::FunCase::F(..)
+                    )
+            );
+            let sig = (!explicit_function_cast)
+                .then(|| callee_ident_from_expr(f, name_to_ident))
+                .flatten()
                 .and_then(|id| func.callee_signatures.get(&id));
             for (i, a) in args.iter().enumerate() {
                 let at = type_of(t, tyvar, sink, guard, a);

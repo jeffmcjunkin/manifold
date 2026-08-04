@@ -58,6 +58,7 @@ ascent_par! {
     relation call_has_arg_evidence(Node, usize);
     relation call_args_collected_candidate(Node, Args);
     relation call_float_args_collected(Node, Args);
+    relation msvc_gs_cookie_guard_call(Node, Address, Node, Node, RTLReg);
     relation emit_function_param_count_candidate(Address, usize);
     relation emit_function_float_param_count(Address, usize);
     relation emit_function_stack_param_count(Address, usize);
@@ -72,14 +73,19 @@ ascent_par! {
 
     // Calls that have precise per-position arg_mapping.
     #[local] relation call_precise(Node);
-    call_precise(n) <-- call_arg(n, _, _);
+    call_precise(n) <--
+        call_arg(n, _, _),
+        !msvc_gs_cookie_guard_call(n, _, _, _, _);
 
     // Per-call integer-position evidence; precise mapping wins.
     #[local] relation call_int_pos(Node, usize);
-    call_int_pos(n, p) <-- call_arg(n, p, _);
+    call_int_pos(n, p) <--
+        call_arg(n, p, _),
+        !msvc_gs_cookie_guard_call(n, _, _, _, _);
     // Fall back to call_has_arg_evidence only when no precise mapping exists for this call.
     call_int_pos(n, p) <--
         call_has_arg_evidence(n, p),
+        !msvc_gs_cookie_guard_call(n, _, _, _, _),
         !call_precise(n);
 
     // A call site is informative if it has any arg evidence for its target.
@@ -181,9 +187,11 @@ ascent_par! {
     #[local] relation call_site_count_sample(Address, Node, usize);
     call_site_count_sample(target, n, c) <--
         call_target_func(n, target),
+        !msvc_gs_cookie_guard_call(n, _, _, _, _),
         call_total_arg_count(n, c);
     call_site_count_sample(target, n, 0) <--
         call_target_func(n, target),
+        !msvc_gs_cookie_guard_call(n, _, _, _, _),
         !call_total_arg_count(n, _);
 
     // Total call sites per function (every call_target_func entry).
@@ -205,12 +213,15 @@ ascent_par! {
 
     // has_call_sites: any call_target_func entry for f.
     relation has_call_sites(Address);
-    has_call_sites(f) <-- call_target_func(_, f);
+    has_call_sites(f) <--
+        call_target_func(n, f),
+        !msvc_gs_cookie_guard_call(n, _, _, _, _);
 
     // True when some call site targeting f has its return value consumed.
     relation any_call_uses_return(Address);
     any_call_uses_return(f) <--
         call_target_func(n, f),
+        !msvc_gs_cookie_guard_call(n, _, _, _, _),
         call_returns_value(n, _);
 
     // Varargs: emit_function listed in known_varargs_function, OR functions whose prologue spills all 8 XMM arg regs (SysV variadic register save area; see func_has_variadic_xmm_prologue in rtl_pass.rs).
@@ -317,6 +328,7 @@ impl IRPass for SignatureReconciliationPass {
             "abi_int_arg_position",
             "arg_reg_param_live_at",
             "instr_in_function",
+            "msvc_gs_cookie_guard_call",
         ]
     }
 
@@ -522,6 +534,10 @@ fn reconcile_signatures(db: &mut DecompileDB) {
     let call_targets: HashMap<Node, Address> = db.rel_iter::<(Node, Address)>("call_target_func")
         .map(|&(call_node, target)| (call_node, target))
         .collect();
+    let per_call_contracts: HashSet<Node> = db
+        .rel_iter::<(Node, Address, Node, Node, RTLReg)>("msvc_gs_cookie_guard_call")
+        .map(|(call, ..)| *call)
+        .collect();
 
     let emit_var_types: HashMap<RTLReg, Vec<XType>> = {
         let mut map: HashMap<RTLReg, Vec<XType>> = HashMap::new();
@@ -540,6 +556,7 @@ fn reconcile_signatures(db: &mut DecompileDB) {
 
     let call_arg_data: Vec<(Node, usize, RTLReg)> = db
         .rel_iter::<(Node, usize, RTLReg)>("call_arg")
+        .filter(|(call, _, _)| !per_call_contracts.contains(call))
         .cloned()
         .collect();
 
@@ -1338,6 +1355,10 @@ fn patch_db(
     let call_targets: HashMap<Node, Address> = db.rel_iter::<(Node, Address)>("call_target_func")
         .map(|&(call_node, target)| (call_node, target))
         .collect();
+    let per_call_contracts: HashSet<Node> = db
+        .rel_iter::<(Node, Address, Node, Node, RTLReg)>("msvc_gs_cookie_guard_call")
+        .map(|(call, ..)| *call)
+        .collect();
 
     let rtl_to_mreg: HashMap<(Address, RTLReg), Mreg> = db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl")
         .map(|&(node, ref mreg, rtl_reg)| ((node, rtl_reg), *mreg))
@@ -1689,6 +1710,10 @@ fn patch_db(
         let mut patched_calls: std::collections::HashSet<Node> = std::collections::HashSet::new();
 
         for &(call_node, ref args) in db.rel_iter::<(Node, Args)>("call_args_collected_candidate") {
+            if per_call_contracts.contains(&call_node) {
+                new_call_args.push((call_node, args.clone()));
+                continue;
+            }
             let target = match call_targets.get(&call_node) {
                 Some(&t) => t,
                 None => {
@@ -1842,6 +1867,10 @@ fn patch_db(
         for &(node, ref inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
             match inst {
                 RTLInst::Icall(sig_opt, callee, args, dst, succ) => {
+                    if per_call_contracts.contains(&node) {
+                        new_insts.push((node, inst.clone()));
+                        continue;
+                    }
                     let target = call_targets.get(&node).copied();
                     let final_signature = target
                         .filter(|address| {
@@ -1956,5 +1985,154 @@ fn patch_db(
             log::info!("SignatureReconciliation: patched {} call signatures in rtl_inst", patched_insts);
             db.rel_set("rtl_inst", new_insts.into_iter().collect::<ascent::boxcar::Vec<_>>());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use either::Either;
+
+    fn guard_signature() -> Signature {
+        Signature {
+            sig_args: Arc::new(vec![XType::Xlong]),
+            sig_res: XType::Xvoid,
+            sig_cc: CallConv::default(),
+        }
+    }
+
+    #[test]
+    fn per_call_contract_is_not_target_wide_signature_evidence() {
+        let mut db = DecompileDB::default();
+        let call: Node = 0x220;
+        let target: Address = 0x9000;
+        let owner: Address = 0x200;
+        let check: Node = 0x218;
+        let ret: Node = 0x230;
+        let argument: RTLReg = 0x8000_0000_0000_0218;
+        db.rel_push("call_target_func", (call, target));
+        db.rel_push("call_arg", (call, 0usize, argument));
+        db.rel_push("call_has_arg_evidence", (call, 0usize));
+        db.rel_push(
+            "call_args_collected_candidate",
+            (call, Arc::new(vec![argument])),
+        );
+        db.rel_push("call_returns_value", (call, Mreg::AX));
+        db.rel_push("abi_int_arg_position", (Mreg::CX, 0usize));
+        db.rel_push(
+            "msvc_gs_cookie_guard_call",
+            (call, owner, check, ret, argument),
+        );
+
+        run_pass!(&mut db, SignatureReconciliationProgram);
+
+        assert!(!db
+            .rel_iter::<(Address,)>("has_call_sites")
+            .any(|(address,)| *address == target));
+        assert!(!db
+            .rel_iter::<(Address, usize)>("total_call_sites")
+            .any(|(address, _)| *address == target));
+        assert!(!db
+            .rel_iter::<(Address, usize)>("reconciled_int_count")
+            .any(|(address, _)| *address == target));
+        assert!(!db
+            .rel_iter::<(Address,)>("any_call_uses_return")
+            .any(|(address,)| *address == target));
+    }
+
+    #[test]
+    fn per_call_contract_survives_conflicting_global_prototype() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        let guard: Node = 0x220;
+        let ordinary: Node = 0x260;
+        let target: Address = 0x9000;
+        let owner: Address = 0x200;
+        let check: Node = 0x218;
+        let ret: Node = 0x230;
+        let guard_argument: RTLReg = 0x8000_0000_0000_0218;
+        let ordinary_argument: RTLReg = 0x8000_0000_0000_0260;
+        let global_prototype = FunctionPrototype {
+            address: target,
+            name: "shared_external_target",
+            param_count: 0,
+            param_types: vec![],
+            return_type: XType::Xvoid,
+            confidence: SignatureConfidence::DefinitionOnly,
+            is_varargs: false,
+        };
+        db.rel_push("call_target_func", (guard, target));
+        db.rel_push("call_target_func", (ordinary, target));
+        db.rel_push(
+            "msvc_gs_cookie_guard_call",
+            (guard, owner, check, ret, guard_argument),
+        );
+        db.rel_push(
+            "call_args_collected_candidate",
+            (guard, Arc::new(vec![guard_argument])),
+        );
+        db.rel_push(
+            "call_args_collected_candidate",
+            (ordinary, Arc::new(vec![ordinary_argument])),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                guard,
+                RTLInst::Icall(
+                    Some(guard_signature()),
+                    Either::Right(Either::Left(target)),
+                    Arc::new(vec![guard_argument]),
+                    None,
+                    ret,
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                ordinary,
+                RTLInst::Icall(
+                    Some(guard_signature()),
+                    Either::Right(Either::Left(target)),
+                    Arc::new(vec![ordinary_argument]),
+                    None,
+                    ordinary + 8,
+                ),
+            ),
+        );
+
+        patch_db(&mut db, &[global_prototype], &HashSet::new());
+
+        let collected: HashMap<Node, Vec<RTLReg>> = db
+            .rel_iter::<(Node, Args)>("call_args_collected")
+            .map(|(node, args)| (*node, args.as_ref().clone()))
+            .collect();
+        assert_eq!(collected.get(&guard), Some(&vec![guard_argument]));
+        assert_eq!(collected.get(&ordinary), Some(&vec![]));
+        let calls: HashMap<Node, (Option<Signature>, Vec<RTLReg>)> = db
+            .rel_iter::<(Node, RTLInst)>("rtl_inst")
+            .filter_map(|(node, inst)| match inst {
+                RTLInst::Icall(signature, _, args, _, _) => {
+                    Some((*node, (signature.clone(), args.as_ref().clone())))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls.get(&guard),
+            Some(&(Some(guard_signature()), vec![guard_argument]))
+        );
+        assert_eq!(
+            calls.get(&ordinary),
+            Some(&(
+                Some(Signature {
+                    sig_args: Arc::new(vec![]),
+                    sig_res: XType::Xvoid,
+                    sig_cc: CallConv::default(),
+                }),
+                vec![],
+            ))
+        );
     }
 }

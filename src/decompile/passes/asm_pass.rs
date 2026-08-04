@@ -502,8 +502,8 @@ ascent_par! {
         frame_cfg_step(cur, next_addr),
         instr_in_function(next_addr, func);
 
-    // Only RSP->RBP copies queried at BP-based memory accesses can consume a
-    // dominance fact below.  Keeping this demand relation explicit is
+    // Only RSP->RBP copies queried at BP-based memory accesses or exact frame
+    // restores can consume a dominance fact below. Keeping this demand relation explicit is
     // important for large translation units: the unconstrained form of
     // bp_copy_dominates materialized every ordered instruction pair in a
     // block and every instruction pair across dominated blocks (quadratic in
@@ -511,6 +511,22 @@ ascent_par! {
     // bp_rsp_value_reaches join.
     #[local] relation bp_provenance_access(Address);
     bp_provenance_access(addr) <-- exact_rbp_mem_access(addr);
+    // Terminal frame restores also consume the established BP value even
+    // though they have no BP-relative memory operand. Demand the same
+    // unique-reaching/dominance proof for those exact decoded forms so later
+    // passes never have to reconstruct frame provenance from RTL facts that
+    // do not exist until after their own fixed point starts.
+    bp_provenance_access(addr) <--
+        pmov(addr, dst, src),
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "MOV" | "MOVQ"),
+        op_register(dst, dst_str),
+        if *dst_str == "RSP",
+        op_register(src, src_str),
+        if *src_str == "RBP";
+    bp_provenance_access(addr) <--
+        instruction(addr, _, _, mnem, _, _, _, _, _, _),
+        if matches!(*mnem, "LEAVE" | "LEAVEQ");
     bp_provenance_access(addr) <--
         addr32_memory_operand(addr, _, _, base, index, _, _),
         if *base == "EBP" || *index == "EBP";
@@ -825,6 +841,14 @@ ascent_par! {
     bp_frame_at(*access, *func) <--
         bp_rsp_copy_reaches(access, func, copy),
         rsp_frame_at(copy, func);
+
+    // Export the exact frame-pointer setup and its entry-RSP coordinate for
+    // each demanded BP consumer. bp_rsp_value_reaches already requires one
+    // dominating RSP->RBP copy and rejects every competing reaching BP def.
+    relation bp_frame_setup_at(Address, Address, Address, i64);
+    bp_frame_setup_at(*access, *func, *copy, *ofs) <--
+        bp_rsp_value_reaches(access, func, copy),
+        rsp_frame_offset_at(func, copy, ofs);
 
     #[local] relation invalid_rsp_derived_bp_at(Address, Address);
     invalid_rsp_derived_bp_at(*access, *func) <--

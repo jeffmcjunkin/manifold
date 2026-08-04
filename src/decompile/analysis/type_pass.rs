@@ -473,6 +473,7 @@ ascent_par! {
     relation call_return_reg(Node, RTLReg);
     relation call_arg_mapping(Node, usize, RTLReg);
     relation abi_shared_arg_slots(bool);
+    relation msvc_gs_cookie_guard_call(Node, Address, Node, Node, RTLReg);
 
     // Derive call_site from call_target_func + emit_function (internal calls)
     call_site(node, *name) <--
@@ -482,6 +483,11 @@ ascent_par! {
     // Derive call_arg from call_arg_mapping
     call_arg(node, pos, reg) <--
         call_arg_mapping(node, pos, reg);
+
+    // The authenticated MSVC cookie checker has a per-call ABI contract that
+    // is independent of any global symbol or local target prototype.
+    emit_var_type_candidate(argument, XType::Xlong) <--
+        msvc_gs_cookie_guard_call(_, _, _, _, argument);
 
 
     // 1. Direct type emission from instructions; each instruction encodes width and signedness, emitting concrete types directly
@@ -755,7 +761,8 @@ ascent_par! {
     must_be_ptr(reg) <--
         call_site(node, func_name),
         call_arg(node, arg_idx, reg),
-        known_func_param_is_ptr(func_name, arg_idx);
+        known_func_param_is_ptr(func_name, arg_idx),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _);
 
     must_be_ptr(ret_reg) <--
         call_site(node, func_name),
@@ -781,6 +788,7 @@ ascent_par! {
         call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
         known_extern_signature(func_name, _, _, params),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         if *arg_idx < params.len(),
         if matches!(params[*arg_idx], XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
             XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
@@ -808,6 +816,7 @@ ascent_par! {
         call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
         internal_func_signature(func_name, arg_idx, xtype),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         if matches!(xtype, XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
             XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_));
 
@@ -939,6 +948,7 @@ ascent_par! {
         call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
         known_extern_signature(func_name, _, _, params),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         if *arg_idx < params.len(),
         if params[*arg_idx] == XType::Xintptr;
 
@@ -946,6 +956,7 @@ ascent_par! {
         call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
         known_extern_signature(func_name, _, _, params),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         if *arg_idx < params.len(),
         if params[*arg_idx] == XType::Xfloatptr;
 
@@ -953,6 +964,7 @@ ascent_par! {
         call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
         known_extern_signature(func_name, _, _, params),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         if *arg_idx < params.len(),
         if params[*arg_idx] == XType::Xsingleptr;
 
@@ -1070,6 +1082,7 @@ ascent_par! {
         call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
         known_extern_signature(func_name, _, _, params),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         if *arg_idx < params.len(),
         if params[*arg_idx] != XType::Xany32 && params[*arg_idx] != XType::Xany64;
 
@@ -1085,6 +1098,7 @@ ascent_par! {
         call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
         internal_func_signature(func_name, arg_idx, xtype),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         if *xtype != XType::Xany32 && *xtype != XType::Xany64,
         if !matches!(xtype, XType::Xfloat | XType::Xsingle);
 
@@ -1093,6 +1107,7 @@ ascent_par! {
         call_site(node, func_name),
         call_arg(node, arg_idx, arg_reg),
         internal_func_signature(func_name, arg_idx, xtype),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         if matches!(xtype, XType::Xfloat | XType::Xsingle);
 
     // Internal function return types
@@ -1342,6 +1357,7 @@ ascent_par! {
         call_arg(node, arg_idx, loaded_rtl),
         call_site(node, func_name),
         known_extern_signature(func_name, _, _, params),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         if *arg_idx < params.len(),
         if matches!(params[*arg_idx], XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
             XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_)),
@@ -1352,6 +1368,7 @@ ascent_par! {
         call_arg(node, arg_idx, loaded_rtl),
         call_site(node, func_name),
         internal_func_signature(func_name, arg_idx, xtype),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         if matches!(xtype, XType::Xptr | XType::Xcharptr | XType::Xcharptrptr | XType::Xintptr |
             XType::Xfloatptr | XType::Xsingleptr | XType::Xfuncptr | XType::XstructPtr(_)),
         !global_ptr_vetoed(ident);
@@ -1361,6 +1378,7 @@ ascent_par! {
         call_arg(node, arg_idx, loaded_rtl),
         call_site(node, func_name),
         known_func_param_is_ptr(func_name, arg_idx),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         !global_ptr_vetoed(ident);
 
     // A global is a char pointer if its loaded value is used to load/store bytes; a weak signal, vetoed under dominant integer counter-evidence.
@@ -1375,6 +1393,7 @@ ascent_par! {
         call_arg(node, arg_idx, loaded_rtl),
         call_site(node, func_name),
         known_extern_signature(func_name, _, _, params),
+        !msvc_gs_cookie_guard_call(node, _, _, _, _),
         if *arg_idx < params.len(),
         if params[*arg_idx] == XType::Xcharptr,
         !global_ptr_vetoed(ident);
@@ -1472,6 +1491,60 @@ mod tests {
             &MemoryChunk::MInt64,
             &Mreg::a64(A64Mreg::V0)
         ));
+    }
+
+    #[test]
+    fn per_call_gs_contract_isolated_from_conflicting_target_types() {
+        for (case, conflicting_type) in [XType::Xfloat, XType::Xptr].into_iter().enumerate() {
+            let mut db = DecompileDB::default();
+            let guard_call = 0x1800 + case as u64 * 0x100;
+            let ordinary_call = guard_call + 0x10;
+            let owner = guard_call - 0x20;
+            let check = guard_call - 0x10;
+            let ret = guard_call + 0x20;
+            let guard_arg =
+                crate::decompile::passes::rtl_pass::fresh_xtl_reg(check, Mreg::CX);
+            let ordinary_arg = guard_arg + 1;
+            let target = "conflicting_guard_target";
+            for call in [guard_call, ordinary_call] {
+                db.rel_push("call_site", (call, target));
+            }
+            db.rel_push("call_arg_mapping", (guard_call, 0usize, guard_arg));
+            db.rel_push("call_arg_mapping", (ordinary_call, 0usize, ordinary_arg));
+            db.rel_push(
+                "known_extern_signature",
+                (
+                    target,
+                    1usize,
+                    XType::Xvoid,
+                    Arc::new(vec![conflicting_type]),
+                ),
+            );
+            db.rel_push(
+                "msvc_gs_cookie_guard_call",
+                (guard_call, owner, check, ret, guard_arg),
+            );
+
+            TypePass.run(&mut db);
+
+            assert_eq!(
+                candidates_for(&db, guard_arg),
+                BTreeSet::from([XType::Xlong]),
+                "guard argument inherited {conflicting_type:?}"
+            );
+            assert!(
+                candidates_for(&db, ordinary_arg).contains(&conflicting_type),
+                "ordinary call lost target-derived {conflicting_type:?} evidence"
+            );
+            assert!(!db
+                .rel_iter::<(RTLReg,)>("is_ptr")
+                .any(|(reg,)| *reg == guard_arg));
+            if conflicting_type == XType::Xptr {
+                assert!(db
+                    .rel_iter::<(RTLReg,)>("is_ptr")
+                    .any(|(reg,)| *reg == ordinary_arg));
+            }
+        }
     }
 
     #[test]

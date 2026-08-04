@@ -765,6 +765,10 @@ fn mark_functions_void(db: &mut DecompileDB, void_funcs: &HashSet<Address>) {
 }
 
 pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
+    let per_call_contracts: HashSet<Node> = db
+        .rel_iter::<(Node, Address, Node, Node, RTLReg)>("msvc_gs_cookie_guard_call")
+        .map(|(call, ..)| *call)
+        .collect();
     let mut callee_arity: HashMap<Address, usize> = db
         .rel_iter::<(Address, Signature)>("emit_function_signature_candidate")
         .fold(HashMap::new(), |mut acc, (addr, sig)| {
@@ -801,7 +805,10 @@ pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
     let filtered_mapping: Vec<(Node, usize, RTLReg)> = db
         .rel_iter::<(Node, usize, RTLReg)>("call_arg_mapping")
         .filter_map(|&(node, pos, reg)| {
-            if let Some(&target) = call_targets.get(&node) {
+            if !per_call_contracts.contains(&node) {
+                let Some(&target) = call_targets.get(&node) else {
+                    return Some((node, pos, reg));
+                };
                 // Root E: keep the whole argument tail for a detected-variadic callee; arg_setup_candidate already restricts each position to a def that structurally reaches the call.
                 let keep_varargs_tail = varargs_callees.contains(&target);
                 if !keep_varargs_tail {
@@ -833,11 +840,13 @@ pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
 
     let mut normalized_mapping: HashMap<(Node, usize), RTLReg> = HashMap::new();
     for (node, pos, reg) in filtered_mapping {
-        if let Some(&target) = call_targets.get(&node) {
-            let keep_varargs_tail = varargs_callees.contains(&target);
-            if !keep_varargs_tail {
-                if let Some(&arity) = callee_arity.get(&target) {
-                    debug_assert!(pos < arity);
+        if !per_call_contracts.contains(&node) {
+            if let Some(&target) = call_targets.get(&node) {
+                let keep_varargs_tail = varargs_callees.contains(&target);
+                if !keep_varargs_tail {
+                    if let Some(&arity) = callee_arity.get(&target) {
+                        debug_assert!(pos < arity);
+                    }
                 }
             }
         }
@@ -902,6 +911,9 @@ pub(crate) fn trim_direct_call_args_to_callee_arity(db: &mut DecompileDB) {
     for &(call_node, ref float_args) in
         db.rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_float_args_collected")
     {
+        if per_call_contracts.contains(&call_node) {
+            continue;
+        }
         if !float_args.is_empty() {
             let int_args = rebuilt_args
                 .entry(call_node)
@@ -976,6 +988,7 @@ impl IRPass for RTLOptimizePass {
             "call_args_collected_candidate",
             "call_float_args_collected",
             "func_has_variadic_xmm_prologue",
+            "msvc_gs_cookie_guard_call",
         ]
     }
 
@@ -2380,6 +2393,101 @@ mod inline_temp_tests {
         let du = DefUseInfo::build(func);
         let liveness = LivenessInfo::build(func, &du);
         find_inline_temps(func, &du, &liveness)
+    }
+
+    #[test]
+    fn per_call_contract_survives_direct_callee_arity_trimming() {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        let call: Node = 0x220;
+        let owner: Address = 0x200;
+        let target: Address = 0x9000;
+        let check: Node = 0x218;
+        let ret: Node = 0x230;
+        let argument: RTLReg = 0x8000_0000_0000_0218;
+        let stale_float: RTLReg = 0x8000_0000_0000_0220;
+        let guard_signature = Signature {
+            sig_args: Arc::new(vec![XType::Xlong]),
+            sig_res: XType::Xvoid,
+            sig_cc: CallConv::default(),
+        };
+        db.rel_push(
+            "emit_function_signature_candidate",
+            (
+                target,
+                Signature {
+                    sig_args: Arc::new(vec![]),
+                    sig_res: XType::Xvoid,
+                    sig_cc: CallConv::default(),
+                },
+            ),
+        );
+        db.rel_push("call_target_func", (call, target));
+        db.rel_push("call_arg_mapping", (call, 0usize, argument));
+        db.rel_push(
+            "call_args_collected_candidate",
+            (call, Arc::new(vec![argument])),
+        );
+        db.rel_push(
+            "call_float_args_collected",
+            (call, Arc::new(vec![stale_float])),
+        );
+        db.rel_push(
+            "rtl_inst_candidate",
+            (
+                call,
+                RTLInst::Icall(
+                    Some(guard_signature.clone()),
+                    Either::Right(Either::Left(target)),
+                    Arc::new(vec![argument]),
+                    None,
+                    ret,
+                ),
+            ),
+        );
+        db.rel_push(
+            "msvc_gs_cookie_guard_call",
+            (call, owner, check, ret, argument),
+        );
+
+        trim_direct_call_args_to_callee_arity(&mut db);
+
+        assert_eq!(
+            db.rel_iter::<(Node, usize, RTLReg)>("call_arg_mapping")
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(call, 0usize, argument)])
+        );
+        assert_eq!(
+            db.rel_iter::<(Node, usize, RTLReg)>("call_arg")
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(call, 0usize, argument)])
+        );
+        assert_eq!(
+            db.rel_iter::<(Node, Arc<Vec<RTLReg>>)>("call_args_collected_candidate")
+                .map(|(node, args)| (*node, args.as_ref().clone()))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(call, vec![argument])])
+        );
+        assert_eq!(
+            db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+                .filter_map(|(node, inst)| {
+                    (*node == call).then_some(inst).and_then(|inst| match inst {
+                        RTLInst::Icall(signature, _, args, destination, _) => Some((
+                            signature.clone(),
+                            args.as_ref().clone(),
+                            *destination,
+                        )),
+                        _ => None,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            vec![(Some(guard_signature), vec![argument], None)]
+        );
+        assert!(RTLOptimizePass
+            .inputs()
+            .contains(&"msvc_gs_cookie_guard_call"));
     }
 
     #[test]
