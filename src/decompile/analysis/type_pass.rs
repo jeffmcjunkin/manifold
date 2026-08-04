@@ -122,6 +122,19 @@ fn has_genuine_float_result(op: &Operation) -> bool {
         || crate::x86::types::is_single_operation(op)
 }
 
+/// A generic-width memory transfer is not float evidence by itself.  On x86,
+/// however, a scalar value transferred through an XMM register is enough to
+/// make the destructive integral-authority cleanup fail open.  This remains a
+/// veto only: it does not manufacture an Xfloat/Xsingle candidate.
+fn has_xmm_float_transport(chunk: &MemoryChunk, mreg: &Mreg) -> bool {
+    matches!(chunk, MemoryChunk::MAny32 | MemoryChunk::MAny64)
+        && mreg.as_x86().is_some_and(|reg| reg.is_xmm())
+}
+
+fn has_explicit_float_transport(chunk: &MemoryChunk) -> bool {
+    matches!(chunk, MemoryChunk::MFloat32 | MemoryChunk::MFloat64)
+}
+
 fn definitionally_integral_result_authority(db: &DecompileDB) -> HashSet<RTLReg> {
     let mut integral_results = HashSet::new();
     let mut float_results = HashSet::new();
@@ -139,6 +152,9 @@ fn definitionally_integral_result_authority(db: &DecompileDB) -> HashSet<RTLReg>
                 if matches!(chunk, MemoryChunk::MFloat32 | MemoryChunk::MFloat64) =>
             {
                 float_results.insert(*dst);
+            }
+            RTLInst::Istore(chunk, _, _, src) if has_explicit_float_transport(chunk) => {
+                float_results.insert(*src);
             }
             RTLInst::Icall(Some(signature), _, _, Some(dst), _)
                 if matches!(signature.sig_res, XType::Xfloat | XType::Xsingle) =>
@@ -197,17 +213,24 @@ fn definitionally_integral_result_authority(db: &DecompileDB) -> HashSet<RTLReg>
         ltl_result_regs.entry((node, mreg)).or_default().push(reg);
     }
     for &(node, ref inst) in db.rel_iter::<(Node, LTLInst)>("ltl_inst") {
-        let float_dst = match inst {
+        let float_mreg = match inst {
             LTLInst::Lop(op, _, dst) if has_genuine_float_result(op) => Some(*dst),
             LTLInst::Lload(chunk, _, _, dst)
-                if matches!(chunk, MemoryChunk::MFloat32 | MemoryChunk::MFloat64) =>
+                if has_explicit_float_transport(chunk)
+                    || has_xmm_float_transport(chunk, dst) =>
             {
                 Some(*dst)
             }
+            LTLInst::Lstore(chunk, _, _, src)
+                if has_explicit_float_transport(chunk)
+                    || has_xmm_float_transport(chunk, src) =>
+            {
+                Some(*src)
+            }
             _ => None,
         };
-        if let Some(dst) = float_dst {
-            if let Some(regs) = ltl_result_regs.get(&(node, dst)) {
+        if let Some(mreg) = float_mreg {
+            if let Some(regs) = ltl_result_regs.get(&(node, mreg)) {
                 float_results.extend(regs.iter().copied());
             }
         }
@@ -237,7 +260,7 @@ fn definitionally_integral_result_authority(db: &DecompileDB) -> HashSet<RTLReg>
 /// which predate the value-web authority relations below.  An unambiguous
 /// float-to-integer/cast result cannot be made floating merely by a later use;
 /// a genuinely reused float-producing web remains untouched.
-fn enforce_definitionally_integral_result_types(db: &mut DecompileDB) {
+pub(crate) fn enforce_definitionally_integral_result_types(db: &mut DecompileDB) {
     let authoritative = definitionally_integral_result_authority(db);
     if authoritative.is_empty() {
         return;
@@ -468,6 +491,9 @@ ascent_par! {
     genuine_float_result(*dst) <--
         rtl_inst(_, ?RTLInst::Iload(chunk, _, _, dst)),
         if matches!(chunk, MemoryChunk::MFloat32 | MemoryChunk::MFloat64);
+    genuine_float_result(*src) <--
+        rtl_inst(_, ?RTLInst::Istore(chunk, _, _, src)),
+        if has_explicit_float_transport(chunk);
     genuine_float_result(*dst) <--
         rtl_inst(_, ?RTLInst::Icall(Some(signature), _, _, Some(dst), _)),
         if matches!(signature.sig_res, XType::Xfloat | XType::Xsingle);
@@ -477,8 +503,14 @@ ascent_par! {
         reg_rtl(node, *dst_mreg, rtl_reg);
     genuine_float_result(rtl_reg) <--
         ltl_inst(node, ?LTLInst::Lload(chunk, _, _, dst_mreg)),
-        if matches!(chunk, MemoryChunk::MFloat32 | MemoryChunk::MFloat64),
+        if has_explicit_float_transport(chunk)
+            || has_xmm_float_transport(chunk, dst_mreg),
         reg_rtl(node, *dst_mreg, rtl_reg);
+    genuine_float_result(rtl_reg) <--
+        ltl_inst(node, ?LTLInst::Lstore(chunk, _, _, src_mreg)),
+        if has_explicit_float_transport(chunk)
+            || has_xmm_float_transport(chunk, src_mreg),
+        reg_rtl(node, *src_mreg, rtl_reg);
     genuine_float_result(dst) <--
         f64_copy_edge(src, dst),
         genuine_float_result(src);
