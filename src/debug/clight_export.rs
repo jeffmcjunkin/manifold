@@ -15,9 +15,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
-pub const CLIGHT_EXPORT_SCHEMA_ID: &str = "manifold-clight-v3";
-pub const PARTIAL_SUPPRESSION_CERTIFICATE_ID: &str =
-    "atomic-unsupported-address-suppression-v1";
+pub const CLIGHT_EXPORT_SCHEMA_ID: &str = "manifold-clight-v4";
+pub const PARTIAL_SUPPRESSION_CERTIFICATE_ID: &str = "atomic-unsupported-address-suppression-v1";
 
 /// Export the selected Clight IR from the decompile DB to a JSON file.
 pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), String> {
@@ -415,21 +414,18 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         .coff_address_map
         .as_ref()
         .map(|map| {
-            crate::decompile::disassembly::machine_state::recognize_machine_state_stubs(
-                db, map,
-            )
+            crate::decompile::disassembly::machine_state::recognize_machine_state_stubs(db, map)
         })
         .unwrap_or_default()
         .into_iter()
         .filter(|stub| {
-            let Ok(address) = u64::from_str_radix(
-                stub.function.address.trim_start_matches("0x"),
-                16,
-            ) else {
+            let Ok(address) =
+                u64::from_str_radix(stub.function_address().trim_start_matches("0x"), 16)
+            else {
                 return false;
             };
             emitted_addresses.contains(&address)
-                && provider_names.get(&address) == Some(&stub.function.name)
+                && provider_names.get(&address).map(String::as_str) == Some(stub.function_name())
         })
         .collect::<Vec<_>>();
 
