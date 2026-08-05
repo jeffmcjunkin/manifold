@@ -32,6 +32,8 @@ fn print_usage_and_exit() -> ! {
         	--dump-ir        dump each IR stage to separate files (.asm, .mach, .linear, etc.)\n\
         	--dump-clight-json   export selected Clight IR as JSON (.clight.json)\n\
         \t--dump-coff-map      export the deterministic COFF address map (.coff-map.json)\n\
+        \t--coff-function-boundaries <PATH>\n\
+        \t                    apply authenticated whole-object COFF function extents\n\
         \t--version            print build and COFF-loader identity\n\
         	--measure-rule-times  dump per-pass Ascent rule timing to debug/rule_times/\n\
         	--dump-deps          dump pipeline dependency graph as Graphviz DOT to pipeline.dot"
@@ -64,6 +66,7 @@ fn main() {
     let mut dump_deps = false;
     let mut dump_dead_rels = false;
     let mut show_version = false;
+    let mut coff_function_boundaries: Option<PathBuf> = None;
 
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -73,6 +76,21 @@ fn main() {
             "--dump-ir" => dump_ir = true,
             "--dump-clight-json" => dump_clight_json = true,
             "--dump-coff-map" => dump_coff_map = true,
+            "--coff-function-boundaries" => {
+                if coff_function_boundaries.is_some() {
+                    eprintln!("--coff-function-boundaries may be supplied only once");
+                    print_usage_and_exit();
+                }
+                let Some(path) = iter.next() else {
+                    eprintln!("--coff-function-boundaries requires a path");
+                    print_usage_and_exit();
+                };
+                if path.starts_with('-') {
+                    eprintln!("--coff-function-boundaries requires a path, got {path}");
+                    print_usage_and_exit();
+                }
+                coff_function_boundaries = Some(PathBuf::from(path));
+            }
             "--version" => show_version = true,
             "--dump-deps" => dump_deps = true,
             "--dump-dead-rels" => dump_dead_rels = true,
@@ -150,7 +168,14 @@ fn main() {
     }
 
     println!("Disassembling binary: {}", input_path.display());
-    let coff_address_map = decompile::disassembly::load_from_binary(&mut prog, &input_path);
+    let coff_address_map = match coff_function_boundaries.as_deref() {
+        Some(path) => decompile::disassembly::load_from_binary_with_coff_function_boundaries(
+            &mut prog,
+            &input_path,
+            path,
+        ),
+        None => decompile::disassembly::load_from_binary(&mut prog, &input_path),
+    };
     decompile::disassembly::load_preset(&mut prog);
 
     let load_elapsed = load_start.elapsed();

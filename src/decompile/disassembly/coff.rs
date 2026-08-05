@@ -9,6 +9,7 @@
 //! file on disk is never modified.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 
 use capstone::prelude::*;
 use object::read::coff::ImageSymbol as _;
@@ -17,7 +18,7 @@ use object::{
     RelocationKind, RelocationTarget, SectionIndex, SectionKind, SymbolIndex, SymbolKind,
     SymbolSection,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::decompile::elevator::DecompileDB;
 
@@ -28,6 +29,40 @@ const SECTION_GRANULARITY: u64 = 0x1000;
 const EXTERNAL_STRIDE: u64 = 0x10;
 pub const COFF_LOADER_ID: &str = "amd64-coff-image-v1";
 pub const MANIFOLD_UPSTREAM_COMMIT: &str = "fc944d043895ab453ce55a3f63eb4f2a922c7502";
+const FUNCTION_BOUNDARY_SCHEMA: &str = "manifold.coff-function-boundaries.v1";
+const FUNCTION_BOUNDARY_GENERATOR_ID: &str = "win10dec-packed-coff-function-boundaries";
+const FUNCTION_BOUNDARY_GENERATOR_VERSION: u64 = 1;
+const FUNCTION_BOUNDARY_ARCHITECTURE: &str = "x86_64-pc-windows-msvc";
+const FUNCTION_BOUNDARY_RANGE_MAP_SCHEMA_VERSION: u64 = 1;
+const MAX_FUNCTION_BOUNDARY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_FUNCTION_BOUNDARIES: usize = 131_072;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FunctionBoundaryDocument {
+    schema: String,
+    generator_id: String,
+    generator_version: u64,
+    loader_id: String,
+    architecture: String,
+    target_sha256: String,
+    range_map_sha256: String,
+    reference_pe_sha256: String,
+    range_map_schema_version: u64,
+    source_record_count: usize,
+    function_count: usize,
+    functions: Vec<FunctionBoundary>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+struct FunctionBoundary {
+    source_function_index: usize,
+    section_index: usize,
+    section_name: String,
+    section_offset: u64,
+    size: u64,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CoffSectionMap {
@@ -237,6 +272,7 @@ struct SymbolPlan {
     mapped_address: u64,
     raw_type: u16,
     storage_class: u8,
+    declared_size: u64,
     authenticated_end: Option<u64>,
 }
 
@@ -257,10 +293,31 @@ struct BytePatch {
 /// Prepare a private COFF image in place.  Non-COFF inputs are returned
 /// unchanged.  The caller reparses `data` after this function returns.
 pub fn prepare_image(data: &mut Vec<u8>) -> Result<Option<CoffImage>, String> {
+    prepare_image_inner(data, None)
+}
+
+/// Prepare a private COFF image using an authenticated, whole-object function
+/// boundary sidecar.  The sidecar is validated against the unmodified input
+/// bytes before any in-memory section or relocation patch is applied.
+pub fn prepare_image_with_function_boundaries(
+    data: &mut Vec<u8>,
+    sidecar_path: &Path,
+) -> Result<Option<CoffImage>, String> {
+    let boundaries = load_function_boundaries(sidecar_path, data)?;
+    prepare_image_inner(data, Some(&boundaries))
+}
+
+fn prepare_image_inner(
+    data: &mut Vec<u8>,
+    function_boundaries: Option<&FunctionBoundaryDocument>,
+) -> Result<Option<CoffImage>, String> {
     let (mut patches, image) = {
         let obj = object::File::parse(&data[..])
             .map_err(|e| format!("invalid object: {e}"))?;
         if obj.format() != BinaryFormat::Coff {
+            if function_boundaries.is_some() {
+                return Err("function-boundary sidecar requires a COFF input".into());
+            }
             return Ok(None);
         }
         if obj.architecture() != Architecture::X86_64 {
@@ -269,7 +326,7 @@ pub fn prepare_image(data: &mut Vec<u8>) -> Result<Option<CoffImage>, String> {
                 obj.architecture()
             ));
         }
-        plan_image(&obj, &data[..])?
+        plan_image(&obj, &data[..], function_boundaries)?
     };
 
     patches.sort_by_key(|p| p.offset);
@@ -286,7 +343,248 @@ pub fn prepare_image(data: &mut Vec<u8>) -> Result<Option<CoffImage>, String> {
     Ok(Some(image))
 }
 
-fn plan_image(obj: &object::File<'_>, data: &[u8]) -> Result<(Vec<BytePatch>, CoffImage), String> {
+fn load_function_boundaries(
+    path: &Path,
+    target_data: &[u8],
+) -> Result<FunctionBoundaryDocument, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("failed to inspect function-boundary sidecar {}: {e}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "function-boundary sidecar {} must be a regular non-symlink file",
+            path.display()
+        ));
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_FUNCTION_BOUNDARY_BYTES {
+        return Err(format!(
+            "function-boundary sidecar {} has invalid size {}",
+            path.display(),
+            metadata.len()
+        ));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("failed to read function-boundary sidecar {}: {e}", path.display()))?;
+    if bytes.len() as u64 != metadata.len() {
+        return Err(format!(
+            "function-boundary sidecar {} changed while being read",
+            path.display()
+        ));
+    }
+    let document: FunctionBoundaryDocument = serde_json::from_slice(&bytes).map_err(|e| {
+        format!(
+            "invalid function-boundary sidecar {}: {e}",
+            path.display()
+        )
+    })?;
+    validate_function_boundaries(&document, target_data)?;
+    Ok(document)
+}
+
+fn validate_function_boundaries(
+    document: &FunctionBoundaryDocument,
+    target_data: &[u8],
+) -> Result<(), String> {
+    if document.schema != FUNCTION_BOUNDARY_SCHEMA {
+        return Err("unrecognized function-boundary sidecar schema".into());
+    }
+    if document.generator_id != FUNCTION_BOUNDARY_GENERATOR_ID
+        || document.generator_version != FUNCTION_BOUNDARY_GENERATOR_VERSION
+    {
+        return Err("unrecognized function-boundary sidecar generator".into());
+    }
+    if document.loader_id != COFF_LOADER_ID
+        || document.architecture != FUNCTION_BOUNDARY_ARCHITECTURE
+    {
+        return Err("function-boundary sidecar targets a different loader or architecture".into());
+    }
+    if document.range_map_schema_version != FUNCTION_BOUNDARY_RANGE_MAP_SCHEMA_VERSION {
+        return Err("unrecognized function-boundary range-map schema".into());
+    }
+    for (label, digest) in [
+        ("target", document.target_sha256.as_str()),
+        ("range map", document.range_map_sha256.as_str()),
+        ("reference PE", document.reference_pe_sha256.as_str()),
+    ] {
+        if !is_canonical_sha256(digest) {
+            return Err(format!(
+                "function-boundary sidecar {label} SHA-256 is not canonical"
+            ));
+        }
+    }
+    if sha256_hex(target_data) != document.target_sha256 {
+        return Err("function-boundary sidecar target SHA-256 does not match input".into());
+    }
+    if document.function_count == 0
+        || document.function_count > MAX_FUNCTION_BOUNDARIES
+        || document.function_count != document.functions.len()
+    {
+        return Err("function-boundary sidecar function_count is invalid".into());
+    }
+    if document.source_record_count == 0
+        || document.source_record_count > MAX_FUNCTION_BOUNDARIES
+        || document.function_count > document.source_record_count
+    {
+        return Err("function-boundary sidecar source_record_count is invalid".into());
+    }
+
+    let mut source_indices = HashSet::new();
+    let mut prior: Option<&FunctionBoundary> = None;
+    let mut section_ends: HashMap<(usize, &str), u64> = HashMap::new();
+    for (index, boundary) in document.functions.iter().enumerate() {
+        if boundary.source_function_index >= document.source_record_count
+            || !source_indices.insert(boundary.source_function_index)
+        {
+            return Err(format!(
+                "function-boundary sidecar entry {index} has an invalid source index"
+            ));
+        }
+        if boundary.section_index == 0
+            || boundary.section_name.is_empty()
+            || boundary.section_name.len() > 256
+            || boundary.section_name.contains('\0')
+            || boundary.size == 0
+            || boundary.section_offset.checked_add(boundary.size).is_none()
+        {
+            return Err(format!(
+                "function-boundary sidecar entry {index} has an invalid range"
+            ));
+        }
+        if let Some(previous) = prior {
+            let previous_key = (
+                previous.section_index,
+                previous.section_name.as_str(),
+                previous.section_offset,
+                previous.size,
+                previous.source_function_index,
+            );
+            let current_key = (
+                boundary.section_index,
+                boundary.section_name.as_str(),
+                boundary.section_offset,
+                boundary.size,
+                boundary.source_function_index,
+            );
+            if current_key <= previous_key {
+                return Err("function-boundary sidecar entries are not strictly sorted".into());
+            }
+        }
+        let key = (boundary.section_index, boundary.section_name.as_str());
+        if section_ends
+            .get(&key)
+            .map_or(false, |end| boundary.section_offset < *end)
+        {
+            return Err("function-boundary sidecar contains overlapping ranges".into());
+        }
+        section_ends.insert(key, boundary.section_offset + boundary.size);
+        prior = Some(boundary);
+    }
+    Ok(())
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    const INITIAL: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    const ROUND: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    fn compress(state: &mut [u32; 8], chunk: &[u8], round: &[u32; 64]) {
+        let mut schedule = [0u32; 64];
+        for (index, word) in chunk.chunks_exact(4).take(16).enumerate() {
+            schedule[index] = u32::from_be_bytes(word.try_into().unwrap());
+        }
+        for index in 16..64 {
+            let s0 = schedule[index - 15].rotate_right(7)
+                ^ schedule[index - 15].rotate_right(18)
+                ^ (schedule[index - 15] >> 3);
+            let s1 = schedule[index - 2].rotate_right(17)
+                ^ schedule[index - 2].rotate_right(19)
+                ^ (schedule[index - 2] >> 10);
+            schedule[index] = schedule[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(schedule[index - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+        for index in 0..64 {
+            let sum1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choice = (e & f) ^ ((!e) & g);
+            let temporary1 = h
+                .wrapping_add(sum1)
+                .wrapping_add(choice)
+                .wrapping_add(round[index])
+                .wrapping_add(schedule[index]);
+            let sum0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let temporary2 = sum0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temporary1);
+            d = c;
+            c = b;
+            b = a;
+            a = temporary1.wrapping_add(temporary2);
+        }
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+
+    let mut state = INITIAL;
+    let mut chunks = data.chunks_exact(64);
+    for chunk in &mut chunks {
+        compress(&mut state, chunk, &ROUND);
+    }
+    let remainder = chunks.remainder();
+    let mut tail = [0u8; 128];
+    tail[..remainder.len()].copy_from_slice(remainder);
+    tail[remainder.len()] = 0x80;
+    let padded_len = if remainder.len() < 56 { 64 } else { 128 };
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    tail[padded_len - 8..padded_len].copy_from_slice(&bit_len.to_be_bytes());
+    for chunk in tail[..padded_len].chunks_exact(64) {
+        compress(&mut state, chunk, &ROUND);
+    }
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(64);
+    for byte in state.into_iter().flat_map(u32::to_be_bytes) {
+        result.push(HEX[(byte >> 4) as usize] as char);
+        result.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    result
+}
+
+fn plan_image(
+    obj: &object::File<'_>,
+    data: &[u8],
+    function_boundaries: Option<&FunctionBoundaryDocument>,
+) -> Result<(Vec<BytePatch>, CoffImage), String> {
     let va_field_offsets = section_va_field_offsets(obj, data)?;
     let mut cursor = COFF_IMAGE_BASE;
     let mut sections = Vec::new();
@@ -351,6 +649,7 @@ fn plan_image(obj: &object::File<'_>, data: &[u8]) -> Result<(Vec<BytePatch>, Co
                 mapped_address,
                 raw_type,
                 storage_class,
+                declared_size: sym.size(),
                 authenticated_end: None,
             },
         );
@@ -364,6 +663,10 @@ fn plan_image(obj: &object::File<'_>, data: &[u8]) -> Result<(Vec<BytePatch>, Co
     // a null-type EXTERNAL whose complete linkage-bounded byte interval is a
     // valid instruction stream ending at an architectural function terminator.
     promote_authenticated_untyped_functions(obj, &section_by_index, &mut symbols)?;
+
+    if let Some(boundaries) = function_boundaries {
+        apply_function_boundaries(boundaries, &section_by_index, &mut symbols)?;
+    }
 
     // Classify undefined symbols from both their COFF type and their use.  Some
     // producers omit the function type, but an E8/E9 REL32 field is definitive.
@@ -769,6 +1072,146 @@ fn plan_image(obj: &object::File<'_>, data: &[u8]) -> Result<(Vec<BytePatch>, Co
     ))
 }
 
+fn boundary_callable_symbol(
+    symbol: &SymbolPlan,
+    sections: &HashMap<usize, &SectionPlan>,
+) -> bool {
+    let SymbolSection::Section(section_index) = symbol.section else {
+        return false;
+    };
+    let Some(section) = sections.get(&section_index.0) else {
+        return false;
+    };
+    section.kind == SectionKind::Text
+        && (symbol.kind == SymbolKind::Text
+            || (symbol.kind == SymbolKind::Data
+                && symbol.raw_type == object::pe::IMAGE_SYM_TYPE_NULL
+                && symbol.storage_class == object::pe::IMAGE_SYM_CLASS_EXTERNAL))
+}
+
+fn symbol_section_offset(
+    symbol: &SymbolPlan,
+    sections: &HashMap<usize, &SectionPlan>,
+) -> Option<(usize, u64)> {
+    let SymbolSection::Section(section_index) = symbol.section else {
+        return None;
+    };
+    let section = sections.get(&section_index.0)?;
+    let offset = symbol.original_address.checked_sub(section.original_address)?;
+    (offset <= section.size).then_some((section_index.0, offset))
+}
+
+fn apply_function_boundaries(
+    document: &FunctionBoundaryDocument,
+    sections: &HashMap<usize, &SectionPlan>,
+    symbols: &mut HashMap<usize, SymbolPlan>,
+) -> Result<(), String> {
+    for (boundary_index, boundary) in document.functions.iter().enumerate() {
+        let section = sections.get(&boundary.section_index).ok_or_else(|| {
+            format!(
+                "function-boundary entry {boundary_index} names missing section {}",
+                boundary.section_index
+            )
+        })?;
+        if section.name != boundary.section_name {
+            return Err(format!(
+                "function-boundary entry {boundary_index} section name does not match input"
+            ));
+        }
+        if section.kind != SectionKind::Text {
+            return Err(format!(
+                "function-boundary entry {boundary_index} is not in executable code"
+            ));
+        }
+        let boundary_end = boundary
+            .section_offset
+            .checked_add(boundary.size)
+            .ok_or_else(|| format!("function-boundary entry {boundary_index} overflows"))?;
+        if boundary_end > section.size {
+            return Err(format!(
+                "function-boundary entry {boundary_index} exceeds its section"
+            ));
+        }
+
+        let exact: Vec<usize> = symbols
+            .iter()
+            .filter_map(|(symbol_index, symbol)| {
+                if !boundary_callable_symbol(symbol, sections) {
+                    return None;
+                }
+                let (section_index, offset) = symbol_section_offset(symbol, sections)?;
+                (section_index == boundary.section_index
+                    && offset == boundary.section_offset)
+                    .then_some(*symbol_index)
+            })
+            .collect();
+        if exact.len() != 1 {
+            return Err(format!(
+                "function-boundary entry {boundary_index} does not have one unique callable symbol"
+            ));
+        }
+        let target_index = exact[0];
+        let target = symbols
+            .get(&target_index)
+            .ok_or_else(|| format!("missing boundary target symbol {target_index}"))?;
+
+        let interior: Vec<&str> = symbols
+            .values()
+            .filter_map(|symbol| {
+                if !boundary_callable_symbol(symbol, sections) {
+                    return None;
+                }
+                let (section_index, offset) = symbol_section_offset(symbol, sections)?;
+                (section_index == boundary.section_index
+                    && boundary.section_offset < offset
+                    && offset < boundary_end)
+                    .then_some(symbol.original_name.as_str())
+            })
+            .collect();
+        if !interior.is_empty() {
+            return Err(format!(
+                "function-boundary entry {boundary_index} contains interior callable symbol(s): {}",
+                interior.join(", ")
+            ));
+        }
+
+        let target_location = (boundary.section_index, boundary.section_offset);
+        if symbols.values().any(|symbol| {
+            boundary_callable_symbol(symbol, sections)
+                && symbol.original_name == target.original_name
+                && symbol_section_offset(symbol, sections) != Some(target_location)
+        }) {
+            return Err(format!(
+                "function-boundary entry {boundary_index} target name has multiple callable locations"
+            ));
+        }
+        if target.declared_size != 0 && target.declared_size < boundary.size {
+            return Err(format!(
+                "function-boundary entry {boundary_index} exceeds the target symbol's declared extent"
+            ));
+        }
+        let mapped_end = target
+            .mapped_address
+            .checked_add(boundary.size)
+            .ok_or_else(|| format!("function-boundary entry {boundary_index} mapped end overflows"))?;
+        if target
+            .authenticated_end
+            .map_or(false, |existing| existing != mapped_end)
+        {
+            return Err(format!(
+                "function-boundary entry {boundary_index} conflicts with an authenticated extent"
+            ));
+        }
+
+        let target = symbols
+            .get_mut(&target_index)
+            .ok_or_else(|| format!("missing boundary target symbol {target_index}"))?;
+        target.kind = SymbolKind::Text;
+        target.authenticated_end = Some(mapped_end);
+    }
+    Ok(())
+}
+
 fn raw_coff_symbol_fields(
     obj: &object::File<'_>,
     index: SymbolIndex,
@@ -1133,6 +1576,9 @@ mod tests {
     use super::*;
     use crate::x86::types::{Address, Symbol};
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_BOUNDARY_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     fn x64_classifier() -> Capstone {
         Capstone::new()
@@ -1370,6 +1816,159 @@ mod tests {
         bytes
     }
 
+    fn boundary_document(
+        target_data: &[u8],
+        functions: Vec<FunctionBoundary>,
+        source_record_count: usize,
+    ) -> FunctionBoundaryDocument {
+        FunctionBoundaryDocument {
+            schema: FUNCTION_BOUNDARY_SCHEMA.to_string(),
+            generator_id: FUNCTION_BOUNDARY_GENERATOR_ID.to_string(),
+            generator_version: FUNCTION_BOUNDARY_GENERATOR_VERSION,
+            loader_id: COFF_LOADER_ID.to_string(),
+            architecture: FUNCTION_BOUNDARY_ARCHITECTURE.to_string(),
+            target_sha256: sha256_hex(target_data),
+            range_map_sha256: "8".repeat(64),
+            reference_pe_sha256: "9".repeat(64),
+            range_map_schema_version: FUNCTION_BOUNDARY_RANGE_MAP_SCHEMA_VERSION,
+            source_record_count,
+            function_count: functions.len(),
+            functions,
+        }
+    }
+
+    fn boundary_fixture_path(label: &str, extension: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "manifold-coff-boundary-{label}-{}-{}.{}",
+            std::process::id(),
+            NEXT_BOUNDARY_FIXTURE.fetch_add(1, Ordering::Relaxed),
+            extension,
+        ))
+    }
+
+    fn write_boundary_document(document: &FunctionBoundaryDocument) -> std::path::PathBuf {
+        let path = boundary_fixture_path("sidecar", "json");
+        let mut bytes = serde_json::to_vec(document).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn sha256_implementation_matches_standard_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn authenticated_boundaries_shorten_functions_without_rewriting_input_file() {
+        let original = classifier_fixture();
+        let target_path = boundary_fixture_path("target", "obj");
+        std::fs::write(&target_path, &original).unwrap();
+        let document = boundary_document(
+            &original,
+            vec![
+                FunctionBoundary {
+                    source_function_index: 0,
+                    section_index: 1,
+                    section_name: ".text".to_string(),
+                    section_offset: 0,
+                    size: 6,
+                },
+                FunctionBoundary {
+                    source_function_index: 1,
+                    section_index: 1,
+                    section_name: ".text".to_string(),
+                    section_offset: 14,
+                    size: 1,
+                },
+            ],
+            2,
+        );
+        let sidecar_path = write_boundary_document(&document);
+        let sidecar_bytes = std::fs::read(&sidecar_path).unwrap();
+        assert!(!String::from_utf8_lossy(&sidecar_bytes).contains("typed_fn"));
+
+        let mut private_image = std::fs::read(&target_path).unwrap();
+        let image = prepare_image_with_function_boundaries(&mut private_image, &sidecar_path)
+            .unwrap()
+            .unwrap();
+        let functions: BTreeMap<_, _> = image
+            .address_map
+            .functions
+            .iter()
+            .map(|function| (function.original_name.as_str(), function))
+            .collect();
+        assert_eq!(functions["good_fn"].original_size, 6);
+        assert_eq!(functions["typed_fn"].original_size, 1);
+        assert_eq!(
+            functions["typed_fn"].mapped_end,
+            functions["typed_fn"].mapped_entry + 1
+        );
+        assert_eq!(std::fs::read(&target_path).unwrap(), original);
+        assert_ne!(private_image, original);
+
+        let _ = std::fs::remove_file(target_path);
+        let _ = std::fs::remove_file(sidecar_path);
+    }
+
+    #[test]
+    fn boundary_hash_and_interior_conflicts_fail_before_private_image_patching() {
+        let original = classifier_fixture();
+
+        let mut wrong_hash = boundary_document(
+            &original,
+            vec![FunctionBoundary {
+                source_function_index: 0,
+                section_index: 1,
+                section_name: ".text".to_string(),
+                section_offset: 14,
+                size: 1,
+            }],
+            1,
+        );
+        wrong_hash.target_sha256 = "0".repeat(64);
+        let wrong_hash_path = write_boundary_document(&wrong_hash);
+        let mut private_image = original.clone();
+        let error = prepare_image_with_function_boundaries(
+            &mut private_image,
+            &wrong_hash_path,
+        )
+        .unwrap_err();
+        assert!(error.contains("target SHA-256"), "{error}");
+        assert_eq!(private_image, original);
+
+        let interior = boundary_document(
+            &original,
+            vec![FunctionBoundary {
+                source_function_index: 0,
+                section_index: 1,
+                section_name: ".text".to_string(),
+                section_offset: 0,
+                size: 15,
+            }],
+            1,
+        );
+        let interior_path = write_boundary_document(&interior);
+        let mut private_image = original.clone();
+        let error = prepare_image_with_function_boundaries(
+            &mut private_image,
+            &interior_path,
+        )
+        .unwrap_err();
+        assert!(error.contains("interior callable symbol"), "{error}");
+        assert_eq!(private_image, original);
+
+        let _ = std::fs::remove_file(wrong_hash_path);
+        let _ = std::fs::remove_file(interior_path);
+    }
+
     #[test]
     fn complete_code_classifier_accepts_real_function_terminators() {
         let classifier = x64_classifier();
@@ -1598,6 +2197,7 @@ mod tests {
             raw_type: object::pe::IMAGE_SYM_DTYPE_FUNCTION
                 << object::pe::IMAGE_SYM_DTYPE_SHIFT,
             storage_class: object::pe::IMAGE_SYM_CLASS_EXTERNAL,
+            declared_size: 0,
             authenticated_end: None,
         };
         let provider = c_safe_name(&defined_provider_source_name(&sym));

@@ -30,12 +30,31 @@ pub fn load_from_binary(
     db: &mut DecompileDB,
     binary_path: &Path,
 ) -> Option<coff::CoffAddressMap> {
+    load_from_binary_inner(db, binary_path, None)
+}
+
+pub fn load_from_binary_with_coff_function_boundaries(
+    db: &mut DecompileDB,
+    binary_path: &Path,
+    function_boundaries: &Path,
+) -> Option<coff::CoffAddressMap> {
+    load_from_binary_inner(db, binary_path, Some(function_boundaries))
+}
+
+fn load_from_binary_inner(
+    db: &mut DecompileDB,
+    binary_path: &Path,
+    function_boundaries: Option<&Path>,
+) -> Option<coff::CoffAddressMap> {
     let mut bin_data = std::fs::read(binary_path)
         .unwrap_or_else(|e| panic!("Failed to read binary {:?}: {}", binary_path, e));
     // A COFF object is not a loaded image.  Build a deterministic linked-image
     // view in this private byte buffer before the normal object::File parse;
     // every downstream analysis can keep using the standard object API.
-    let coff_image = coff::prepare_image(&mut bin_data)
+    let coff_image = match function_boundaries {
+        Some(path) => coff::prepare_image_with_function_boundaries(&mut bin_data, path),
+        None => coff::prepare_image(&mut bin_data),
+    }
         .unwrap_or_else(|e| panic!("Failed to prepare COFF binary {:?}: {}", binary_path, e));
     db.coff_address_map = coff_image
         .as_ref()
