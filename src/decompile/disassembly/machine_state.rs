@@ -10,13 +10,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use crate::decompile::disassembly::coff::{CoffAddressMap, CoffFunctionMap};
+use crate::decompile::disassembly::coff::{CoffAddressMap, CoffExternalKind, CoffFunctionMap};
 use crate::decompile::elevator::DecompileDB;
 use crate::mreg::Mreg;
 use crate::x86::types::{Address, Node, Symbol};
 
 pub const MACHINE_STATE_STUB_SCHEMA_ID: &str = "manifold.machine-state-stub.set-imm32-tail-jump.v1";
 pub const WIN64_SYSCALL_STUB_SCHEMA_ID: &str = "manifold.machine-state-stub.win64-syscall.v1";
+pub const GUARDED_INDIRECT_FORWARD_TAIL_SCHEMA_ID: &str =
+    "manifold.machine-state-stub.guarded-indirect-forward-tail.v1";
 
 type Instruction = (
     Address,
@@ -73,6 +75,53 @@ pub struct MachineStateStub {
     pub function: MachineStateFunctionIdentity,
     pub state_write: MachineStateRegisterWrite,
     pub transfer: MachineStateTailTransfer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MachineStateDispatchLoad {
+    pub instruction_address: String,
+    pub target_register: &'static str,
+    pub table_register: &'static str,
+    pub displacement: u32,
+    pub width_bits: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MachineStateForwardingContract {
+    pub input_registers: [&'static str; 4],
+    pub stack_allocation_bytes: u8,
+    pub base_load_displacement: u8,
+    pub dispatch_load: MachineStateDispatchLoad,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MachineStateGuardCall {
+    pub instruction_address: String,
+    pub kind: &'static str,
+    pub argument_register: &'static str,
+    pub result_register: &'static str,
+    pub target_address: String,
+    pub target_original_name: String,
+    pub target_provider_name: String,
+    pub target_kind: &'static str,
+    pub relocation: MachineStateRelocationIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MachineStateRegisterTailTransfer {
+    pub instruction_address: String,
+    pub kind: &'static str,
+    pub target_register: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GuardedIndirectForwardTailStub {
+    pub schema: &'static str,
+    pub kind: &'static str,
+    pub function: MachineStateFunctionIdentity,
+    pub forwarding: MachineStateForwardingContract,
+    pub guard: MachineStateGuardCall,
+    pub transfer: MachineStateRegisterTailTransfer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -178,6 +227,7 @@ pub struct Win64SyscallStub {
 pub enum MachineStateStubRecord {
     SetImm32DirectTailJump(MachineStateStub),
     Win64Syscall(Win64SyscallStub),
+    GuardedIndirectForwardTail(GuardedIndirectForwardTailStub),
 }
 
 impl MachineStateStubRecord {
@@ -185,6 +235,7 @@ impl MachineStateStubRecord {
         match self {
             Self::SetImm32DirectTailJump(stub) => &stub.function.name,
             Self::Win64Syscall(stub) => &stub.function.name,
+            Self::GuardedIndirectForwardTail(stub) => &stub.function.name,
         }
     }
 
@@ -192,6 +243,7 @@ impl MachineStateStubRecord {
         match self {
             Self::SetImm32DirectTailJump(stub) => &stub.function.address,
             Self::Win64Syscall(stub) => &stub.function.address,
+            Self::GuardedIndirectForwardTail(stub) => &stub.function.address,
         }
     }
 
@@ -394,6 +446,25 @@ pub fn recognize_machine_state_stubs(
             &flags_and_jumps,
         ) {
             result.push(MachineStateStubRecord::Win64Syscall(stub));
+        }
+        if let Some(stub) = recognize_guarded_indirect_forward_tail(
+            function,
+            map,
+            &instructions,
+            &registers,
+            &immediates,
+            &indirects,
+            &memory_reads,
+            &memory_writes,
+            &owners,
+            &next,
+            &direct_jumps,
+            &direct_calls,
+            &cfg,
+            &decoded_defs,
+            &decoded_uses,
+        ) {
+            result.push(MachineStateStubRecord::GuardedIndirectForwardTail(stub));
         }
     }
     result.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
@@ -965,11 +1036,453 @@ fn recognize_win64_syscall_variant(
     })
 }
 
+fn exact_operand_register(
+    operand: Symbol,
+    expected: &'static str,
+    registers: &BTreeMap<Symbol, BTreeSet<&'static str>>,
+    immediates: &BTreeMap<Symbol, BTreeSet<i64>>,
+    indirects: &BTreeMap<Symbol, BTreeSet<IndirectOperand>>,
+) -> bool {
+    registers.get(operand) == Some(&BTreeSet::from([expected]))
+        && !immediates.contains_key(operand)
+        && !indirects.contains_key(operand)
+}
+
+fn exact_operand_immediate(
+    operand: Symbol,
+    expected: i64,
+    registers: &BTreeMap<Symbol, BTreeSet<&'static str>>,
+    immediates: &BTreeMap<Symbol, BTreeSet<i64>>,
+    indirects: &BTreeMap<Symbol, BTreeSet<IndirectOperand>>,
+) -> bool {
+    immediates.get(operand) == Some(&BTreeSet::from([expected]))
+        && !registers.contains_key(operand)
+        && !indirects.contains_key(operand)
+}
+
+fn exact_operand_memory(
+    operand: Symbol,
+    expected: IndirectOperand,
+    registers: &BTreeMap<Symbol, BTreeSet<&'static str>>,
+    immediates: &BTreeMap<Symbol, BTreeSet<i64>>,
+    indirects: &BTreeMap<Symbol, BTreeSet<IndirectOperand>>,
+) -> bool {
+    indirects.get(operand) == Some(&BTreeSet::from([expected]))
+        && !registers.contains_key(operand)
+        && !immediates.contains_key(operand)
+}
+
+fn exact_symbol_set(values: Option<&BTreeSet<Symbol>>, expected: &[Symbol]) -> bool {
+    let expected: BTreeSet<Symbol> = expected.iter().copied().collect();
+    values.map_or(expected.is_empty(), |values| values == &expected)
+}
+
+fn exact_register_effects(
+    node: Node,
+    expected_defs: &[Mreg],
+    expected_uses: &[Mreg],
+    decoded_defs: &BTreeMap<Node, BTreeSet<Mreg>>,
+    decoded_uses: &BTreeMap<Node, BTreeSet<Mreg>>,
+) -> bool {
+    let defs: BTreeSet<Mreg> = expected_defs.iter().copied().collect();
+    let uses: BTreeSet<Mreg> = expected_uses.iter().copied().collect();
+    decoded_defs
+        .get(&node)
+        .map_or(defs.is_empty(), |actual| actual == &defs)
+        && decoded_uses
+            .get(&node)
+            .map_or(uses.is_empty(), |actual| actual == &uses)
+}
+
+fn exact_instruction_header(
+    instruction: Instruction,
+    size: usize,
+    mnemonic: &'static str,
+    operand_count: usize,
+) -> bool {
+    let operands = [instruction.4, instruction.5, instruction.6, instruction.7];
+    instruction.1 == size
+        && instruction.2.is_empty()
+        && instruction.3 == mnemonic
+        && instruction.8 == 0
+        && instruction.9 == 0
+        && operands[..operand_count]
+            .iter()
+            .all(|operand| *operand != "0")
+        && operands[operand_count..]
+            .iter()
+            .all(|operand| *operand == "0")
+}
+
+/// Recognize one complete Win64 forwarding contract whose indirect target is
+/// checked through a relocation-backed pointer and then tail-transferred with
+/// the four incoming volatile integer registers restored.
+///
+/// The accepted sequence is deliberately closed: one linear owned block,
+/// exact stack slots, exact register/memory effects, one indirect guard call,
+/// and one register-indirect tail exit.  The guard identity comes only from the
+/// original COFF import-pointer relocation.  Symbol spelling, mapped address,
+/// corpus membership, and raw instruction bytes never participate.
+#[allow(clippy::too_many_arguments)]
+fn recognize_guarded_indirect_forward_tail(
+    function: &CoffFunctionMap,
+    map: &CoffAddressMap,
+    instructions: &BTreeMap<Address, Vec<Instruction>>,
+    registers: &BTreeMap<Symbol, BTreeSet<&'static str>>,
+    immediates: &BTreeMap<Symbol, BTreeSet<i64>>,
+    indirects: &BTreeMap<Symbol, BTreeSet<IndirectOperand>>,
+    memory_reads: &BTreeMap<Node, BTreeSet<Symbol>>,
+    memory_writes: &BTreeMap<Node, BTreeSet<Symbol>>,
+    owners: &BTreeMap<Node, BTreeSet<Address>>,
+    next: &BTreeMap<Node, BTreeSet<Node>>,
+    direct_jumps: &BTreeMap<Node, BTreeSet<Address>>,
+    direct_calls: &BTreeMap<Node, BTreeSet<Address>>,
+    cfg: &BTreeMap<Node, BTreeSet<(Address, Symbol)>>,
+    decoded_defs: &BTreeMap<Node, BTreeSet<Mreg>>,
+    decoded_uses: &BTreeMap<Node, BTreeSet<Mreg>>,
+) -> Option<GuardedIndirectForwardTailStub> {
+    let rows: [Instruction; 16] = instructions
+        .range(function.mapped_entry..function.mapped_end)
+        .flat_map(|(_, rows)| rows.iter().copied())
+        .collect::<Vec<_>>()
+        .try_into()
+        .ok()?;
+    let [sub, save_rdx, save_r8, save_r9, load_base, save_base, load_table, load_target, guard, preserve_target, restore_rdx, restore_r8, restore_r9, restore_base, add, jump] =
+        rows;
+
+    if function.original_size != function.manifold_size
+        || sub.0 != function.mapped_entry
+        || !exact_instruction_header(sub, 4, "SUB", 2)
+        || !exact_instruction_header(save_rdx, 5, "MOV", 2)
+        || !exact_instruction_header(save_r8, 5, "MOV", 2)
+        || !exact_instruction_header(save_r9, 5, "MOV", 2)
+        || !exact_instruction_header(load_base, 4, "MOV", 2)
+        || !exact_instruction_header(save_base, 5, "MOV", 2)
+        || !exact_instruction_header(load_table, 3, "MOV", 2)
+        || !matches!(load_target.1, 4 | 7)
+        || !exact_instruction_header(load_target, load_target.1, "MOV", 2)
+        || !exact_instruction_header(guard, 6, "CALL", 1)
+        || !exact_instruction_header(preserve_target, 3, "MOV", 2)
+        || !exact_instruction_header(restore_rdx, 5, "MOV", 2)
+        || !exact_instruction_header(restore_r8, 5, "MOV", 2)
+        || !exact_instruction_header(restore_r9, 5, "MOV", 2)
+        || !exact_instruction_header(restore_base, 5, "MOV", 2)
+        || !exact_instruction_header(add, 4, "ADD", 2)
+        || !exact_instruction_header(jump, 3, "JMP", 1)
+    {
+        return None;
+    }
+
+    for pair in rows.windows(2) {
+        if pair[0].0.checked_add(pair[0].1 as u64) != Some(pair[1].0)
+            || next.get(&pair[0].0) != Some(&BTreeSet::from([pair[1].0]))
+        {
+            return None;
+        }
+    }
+    if jump.0.checked_add(jump.1 as u64) != Some(function.mapped_end)
+        || next.get(&jump.0).is_some_and(|targets| !targets.is_empty())
+        || rows.iter().any(|instruction| {
+            owners.get(&instruction.0) != Some(&BTreeSet::from([function.mapped_entry]))
+                || direct_calls
+                    .get(&instruction.0)
+                    .is_some_and(|targets| !targets.is_empty())
+                || direct_jumps
+                    .get(&instruction.0)
+                    .is_some_and(|targets| !targets.is_empty())
+        })
+    {
+        return None;
+    }
+
+    if !exact_operand_register(sub.5, "RSP", registers, immediates, indirects)
+        || !exact_operand_immediate(sub.4, 72, registers, immediates, indirects)
+        || !exact_operand_register(save_rdx.4, "RDX", registers, immediates, indirects)
+        || !exact_operand_memory(
+            save_rdx.5,
+            ("NONE", "RSP", "NONE", 1, 40, 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_register(save_r8.4, "R8", registers, immediates, indirects)
+        || !exact_operand_memory(
+            save_r8.5,
+            ("NONE", "RSP", "NONE", 1, 48, 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_register(save_r9.4, "R9", registers, immediates, indirects)
+        || !exact_operand_memory(
+            save_r9.5,
+            ("NONE", "RSP", "NONE", 1, 56, 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_memory(
+            load_base.4,
+            ("NONE", "RCX", "NONE", 1, 32, 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_register(load_base.5, "RCX", registers, immediates, indirects)
+        || !exact_operand_register(save_base.4, "RCX", registers, immediates, indirects)
+        || !exact_operand_memory(
+            save_base.5,
+            ("NONE", "RSP", "NONE", 1, 32, 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_memory(
+            load_table.4,
+            ("NONE", "RCX", "NONE", 1, 0, 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_register(load_table.5, "R10", registers, immediates, indirects)
+    {
+        return None;
+    }
+
+    let (_, base, index, scale, displacement, width) =
+        only(indirects.get(load_target.4)?.iter().copied())?;
+    let displacement = u32::try_from(displacement).ok()?;
+    let expected_target_size = if displacement <= i8::MAX as u32 { 4 } else { 7 };
+    if base != "R10"
+        || index != "NONE"
+        || scale != 1
+        || width != 8
+        || displacement == 0
+        || displacement > i32::MAX as u32
+        || displacement % 8 != 0
+        || load_target.1 != expected_target_size
+        || !exact_operand_memory(
+            load_target.4,
+            ("NONE", "R10", "NONE", 1, i64::from(displacement), 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_register(load_target.5, "RCX", registers, immediates, indirects)
+        || !exact_operand_memory(
+            guard.4,
+            ("NONE", "RIP", "NONE", 1, 0, 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_register(preserve_target.4, "RCX", registers, immediates, indirects)
+        || !exact_operand_register(preserve_target.5, "RAX", registers, immediates, indirects)
+        || !exact_operand_memory(
+            restore_rdx.4,
+            ("NONE", "RSP", "NONE", 1, 40, 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_register(restore_rdx.5, "RDX", registers, immediates, indirects)
+        || !exact_operand_memory(
+            restore_r8.4,
+            ("NONE", "RSP", "NONE", 1, 48, 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_register(restore_r8.5, "R8", registers, immediates, indirects)
+        || !exact_operand_memory(
+            restore_r9.4,
+            ("NONE", "RSP", "NONE", 1, 56, 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_register(restore_r9.5, "R9", registers, immediates, indirects)
+        || !exact_operand_memory(
+            restore_base.4,
+            ("NONE", "RSP", "NONE", 1, 32, 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_register(restore_base.5, "RCX", registers, immediates, indirects)
+        || !exact_operand_register(add.5, "RSP", registers, immediates, indirects)
+        || !exact_operand_immediate(add.4, 72, registers, immediates, indirects)
+        || !exact_operand_register(jump.4, "RAX", registers, immediates, indirects)
+    {
+        return None;
+    }
+
+    let memory_contract: [(Option<Symbol>, Option<Symbol>); 16] = [
+        (None, None),
+        (None, Some(save_rdx.5)),
+        (None, Some(save_r8.5)),
+        (None, Some(save_r9.5)),
+        (Some(load_base.4), None),
+        (None, Some(save_base.5)),
+        (Some(load_table.4), None),
+        (Some(load_target.4), None),
+        (Some(guard.4), None),
+        (None, None),
+        (Some(restore_rdx.4), None),
+        (Some(restore_r8.4), None),
+        (Some(restore_r9.4), None),
+        (Some(restore_base.4), None),
+        (None, None),
+        (None, None),
+    ];
+    for (instruction, (read, write)) in rows.iter().zip(memory_contract) {
+        if !exact_symbol_set(
+            memory_reads.get(&instruction.0),
+            &read.into_iter().collect::<Vec<_>>(),
+        ) || !exact_symbol_set(
+            memory_writes.get(&instruction.0),
+            &write.into_iter().collect::<Vec<_>>(),
+        ) {
+            return None;
+        }
+    }
+
+    let register_contract: [(&[Mreg], &[Mreg]); 16] = [
+        (&[Mreg::SP], &[Mreg::SP]),
+        (&[], &[Mreg::SP, Mreg::DX]),
+        (&[], &[Mreg::SP, Mreg::R8]),
+        (&[], &[Mreg::SP, Mreg::R9]),
+        (&[Mreg::CX], &[Mreg::CX]),
+        (&[], &[Mreg::SP, Mreg::CX]),
+        (&[Mreg::R10], &[Mreg::CX]),
+        (&[Mreg::CX], &[Mreg::R10]),
+        (&[Mreg::SP], &[Mreg::SP]),
+        (&[Mreg::AX], &[Mreg::CX]),
+        (&[Mreg::DX], &[Mreg::SP]),
+        (&[Mreg::R8], &[Mreg::SP]),
+        (&[Mreg::R9], &[Mreg::SP]),
+        (&[Mreg::CX], &[Mreg::SP]),
+        (&[Mreg::SP], &[Mreg::SP]),
+        (&[], &[Mreg::AX]),
+    ];
+    if rows
+        .iter()
+        .zip(register_contract)
+        .any(|(instruction, (defs, uses))| {
+            !exact_register_effects(instruction.0, defs, uses, decoded_defs, decoded_uses)
+        })
+    {
+        return None;
+    }
+
+    for instruction in rows {
+        let expected = if instruction.0 == guard.0 {
+            BTreeSet::from([(0, "indirect_call"), (preserve_target.0, "fallthrough")])
+        } else if instruction.0 == jump.0 {
+            BTreeSet::from([(0, "indirect")])
+        } else {
+            BTreeSet::new()
+        };
+        if cfg
+            .get(&instruction.0)
+            .map_or(!expected.is_empty(), |actual| actual != &expected)
+        {
+            return None;
+        }
+    }
+
+    let relocations: Vec<_> = map
+        .relocations
+        .iter()
+        .filter(|relocation| {
+            relocation.section_index == function.section_index
+                && relocation.mapped_field_va >= function.mapped_entry
+                && relocation.mapped_field_va < function.mapped_end
+        })
+        .collect();
+    let relocation = only(relocations)?;
+    let sections: Vec<_> = map
+        .sections
+        .iter()
+        .filter(|section| {
+            section.index == function.section_index && section.name == relocation.section_name
+        })
+        .collect();
+    let section = only(sections)?;
+    if relocation.section_name != section.name
+        || relocation.mapped_field_va != guard.0 + 2
+        || relocation.section_offset
+            != function
+                .section_offset
+                .checked_add(guard.0.checked_sub(function.mapped_entry)?)?
+                .checked_add(2)?
+        || relocation.relocation_type != "IMAGE_REL_AMD64_REL32"
+        || relocation.width_bits != 32
+        || relocation.encoded_value != 0
+    {
+        return None;
+    }
+
+    let guard_targets: Vec<_> = map
+        .externs
+        .iter()
+        .filter(|external| {
+            external.original_name == relocation.target_original_name
+                && external.synthetic_address == relocation.target_mapped_address
+                && external.kind == CoffExternalKind::ImportPointer
+        })
+        .collect();
+    let guard_target = only(guard_targets)?;
+
+    Some(GuardedIndirectForwardTailStub {
+        schema: GUARDED_INDIRECT_FORWARD_TAIL_SCHEMA_ID,
+        kind: "guarded_indirect_forward_tail",
+        function: MachineStateFunctionIdentity {
+            name: function.provider_name.clone(),
+            address: format!("0x{:x}", function.mapped_entry),
+        },
+        forwarding: MachineStateForwardingContract {
+            input_registers: ["rcx", "rdx", "r8", "r9"],
+            stack_allocation_bytes: 72,
+            base_load_displacement: 32,
+            dispatch_load: MachineStateDispatchLoad {
+                instruction_address: format!("0x{:x}", load_target.0),
+                target_register: "rcx",
+                table_register: "r10",
+                displacement,
+                width_bits: 64,
+            },
+        },
+        guard: MachineStateGuardCall {
+            instruction_address: format!("0x{:x}", guard.0),
+            kind: "indirect_call_through_relocated_pointer",
+            argument_register: "rcx",
+            result_register: "rcx",
+            target_address: format!("0x{:x}", guard_target.synthetic_address),
+            target_original_name: guard_target.original_name.clone(),
+            target_provider_name: guard_target.provider_name.clone(),
+            target_kind: "import_pointer",
+            relocation: MachineStateRelocationIdentity {
+                section_index: relocation.section_index,
+                section_name: relocation.section_name.clone(),
+                section_offset: relocation.section_offset,
+                relocation_type: relocation.relocation_type.clone(),
+                width_bits: relocation.width_bits,
+            },
+        },
+        transfer: MachineStateRegisterTailTransfer {
+            instruction_address: format!("0x{:x}", jump.0),
+            kind: "register_indirect_tail_jump",
+            target_register: "rax",
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::decompile::disassembly::coff::{
-        CoffFunctionMap, CoffRelocationMap, CoffSectionMap, CoffSymbolMap,
+        CoffExternalMap, CoffFunctionMap, CoffRelocationMap, CoffSectionMap, CoffSymbolMap,
     };
 
     const NONE: Symbol = "0";
@@ -1616,6 +2129,348 @@ mod tests {
 
         let (db, mut map) = fixture();
         map.relocations[0].relocation_type = "IMAGE_REL_AMD64_REL32_1".into();
+        assert!(recognize_machine_state_stubs(&db, &map).is_empty());
+    }
+
+    fn guarded_fixture(displacement: i64) -> (DecompileDB, CoffAddressMap) {
+        const IMM72: Symbol = "guarded_test_imm72";
+        const RSP: Symbol = "guarded_test_rsp";
+        const RAX: Symbol = "guarded_test_rax";
+        const RCX: Symbol = "guarded_test_rcx";
+        const RDX: Symbol = "guarded_test_rdx";
+        const R8: Symbol = "guarded_test_r8";
+        const R9: Symbol = "guarded_test_r9";
+        const R10: Symbol = "guarded_test_r10";
+        const RSP32: Symbol = "guarded_test_mem_rsp32";
+        const RSP40: Symbol = "guarded_test_mem_rsp40";
+        const RSP48: Symbol = "guarded_test_mem_rsp48";
+        const RSP56: Symbol = "guarded_test_mem_rsp56";
+        const RCX0: Symbol = "guarded_test_mem_rcx0";
+        const RCX32: Symbol = "guarded_test_mem_rcx32";
+        const R10DISP: Symbol = "guarded_test_mem_r10_disp";
+        const RIP0: Symbol = "guarded_test_mem_rip0";
+
+        let mut db = DecompileDB::default();
+        let entry: Address = 0x1000_0000;
+        let target_load_size: usize = if (1..=i8::MAX as i64).contains(&displacement) {
+            4
+        } else {
+            7
+        };
+        let sizes: [usize; 16] = [
+            4,
+            5,
+            5,
+            5,
+            4,
+            5,
+            3,
+            target_load_size,
+            6,
+            3,
+            5,
+            5,
+            5,
+            5,
+            4,
+            3,
+        ];
+        let mut addresses: Vec<Address> = Vec::new();
+        let mut cursor = entry;
+        for size in sizes {
+            addresses.push(cursor);
+            cursor += size as u64;
+        }
+        let rows: Vec<Instruction> = vec![
+            (addresses[0], 4, "", "SUB", IMM72, RSP, NONE, NONE, 0, 0),
+            (addresses[1], 5, "", "MOV", RDX, RSP40, NONE, NONE, 0, 0),
+            (addresses[2], 5, "", "MOV", R8, RSP48, NONE, NONE, 0, 0),
+            (addresses[3], 5, "", "MOV", R9, RSP56, NONE, NONE, 0, 0),
+            (addresses[4], 4, "", "MOV", RCX32, RCX, NONE, NONE, 0, 0),
+            (addresses[5], 5, "", "MOV", RCX, RSP32, NONE, NONE, 0, 0),
+            (addresses[6], 3, "", "MOV", RCX0, R10, NONE, NONE, 0, 0),
+            (
+                addresses[7],
+                target_load_size,
+                "",
+                "MOV",
+                R10DISP,
+                RCX,
+                NONE,
+                NONE,
+                0,
+                0,
+            ),
+            (addresses[8], 6, "", "CALL", RIP0, NONE, NONE, NONE, 0, 0),
+            (addresses[9], 3, "", "MOV", RCX, RAX, NONE, NONE, 0, 0),
+            (addresses[10], 5, "", "MOV", RSP40, RDX, NONE, NONE, 0, 0),
+            (addresses[11], 5, "", "MOV", RSP48, R8, NONE, NONE, 0, 0),
+            (addresses[12], 5, "", "MOV", RSP56, R9, NONE, NONE, 0, 0),
+            (addresses[13], 5, "", "MOV", RSP32, RCX, NONE, NONE, 0, 0),
+            (addresses[14], 4, "", "ADD", IMM72, RSP, NONE, NONE, 0, 0),
+            (addresses[15], 3, "", "JMP", RAX, NONE, NONE, NONE, 0, 0),
+        ];
+        db.rel_set(
+            "unrefinedinstruction",
+            rows.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "op_register",
+            vec![
+                (RSP, "RSP"),
+                (RAX, "RAX"),
+                (RCX, "RCX"),
+                (RDX, "RDX"),
+                (R8, "R8"),
+                (R9, "R9"),
+                (R10, "R10"),
+            ]
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "op_immediate",
+            vec![(IMM72, 72_i64, 0_usize)]
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "op_indirect",
+            Vec::<(
+                Symbol,
+                &'static str,
+                &'static str,
+                &'static str,
+                i64,
+                i64,
+                usize,
+            )>::from([
+                (RSP32, "NONE", "RSP", "NONE", 1, 32, 8),
+                (RSP40, "NONE", "RSP", "NONE", 1, 40, 8),
+                (RSP48, "NONE", "RSP", "NONE", 1, 48, 8),
+                (RSP56, "NONE", "RSP", "NONE", 1, 56, 8),
+                (RCX0, "NONE", "RCX", "NONE", 1, 0, 8),
+                (RCX32, "NONE", "RCX", "NONE", 1, 32, 8),
+                (R10DISP, "NONE", "R10", "NONE", 1, displacement, 8),
+                (RIP0, "NONE", "RIP", "NONE", 1, 0, 8),
+            ])
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "decoded_memory_read_operand",
+            vec![
+                (addresses[4], RCX32),
+                (addresses[6], RCX0),
+                (addresses[7], R10DISP),
+                (addresses[8], RIP0),
+                (addresses[10], RSP40),
+                (addresses[11], RSP48),
+                (addresses[12], RSP56),
+                (addresses[13], RSP32),
+            ]
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "decoded_memory_write_operand",
+            vec![
+                (addresses[1], RSP40),
+                (addresses[2], RSP48),
+                (addresses[3], RSP56),
+                (addresses[5], RSP32),
+            ]
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "instr_in_function",
+            addresses
+                .iter()
+                .map(|address| (*address, entry))
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "next",
+            addresses
+                .windows(2)
+                .map(|pair| (pair[0], pair[1]))
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "direct_jump",
+            Vec::<(Node, Address)>::new()
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "direct_call",
+            Vec::<(Node, Address)>::new()
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "ddisasm_cfg_edge",
+            vec![
+                (addresses[8], 0_u64, "indirect_call"),
+                (addresses[8], addresses[9], "fallthrough"),
+                (addresses[15], 0_u64, "indirect"),
+            ]
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "decoded_reg_def",
+            vec![
+                (addresses[0], Mreg::SP),
+                (addresses[4], Mreg::CX),
+                (addresses[6], Mreg::R10),
+                (addresses[7], Mreg::CX),
+                (addresses[8], Mreg::SP),
+                (addresses[9], Mreg::AX),
+                (addresses[10], Mreg::DX),
+                (addresses[11], Mreg::R8),
+                (addresses[12], Mreg::R9),
+                (addresses[13], Mreg::CX),
+                (addresses[14], Mreg::SP),
+            ]
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "decoded_reg_use",
+            vec![
+                (addresses[0], Mreg::SP),
+                (addresses[1], Mreg::SP),
+                (addresses[1], Mreg::DX),
+                (addresses[2], Mreg::SP),
+                (addresses[2], Mreg::R8),
+                (addresses[3], Mreg::SP),
+                (addresses[3], Mreg::R9),
+                (addresses[4], Mreg::CX),
+                (addresses[5], Mreg::SP),
+                (addresses[5], Mreg::CX),
+                (addresses[6], Mreg::CX),
+                (addresses[7], Mreg::R10),
+                (addresses[8], Mreg::SP),
+                (addresses[9], Mreg::CX),
+                (addresses[10], Mreg::SP),
+                (addresses[11], Mreg::SP),
+                (addresses[12], Mreg::SP),
+                (addresses[13], Mreg::SP),
+                (addresses[14], Mreg::SP),
+                (addresses[15], Mreg::AX),
+            ]
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+        );
+
+        let guard_target: Address = 0x1000_3000;
+        let size = cursor - entry;
+        let guard_field = addresses[8] + 2;
+        let map = CoffAddressMap {
+            schema: "manifold.coff-address-map.v1",
+            loader_id: "amd64-coff-image-v1",
+            architecture: "x86_64-pc-windows-msvc",
+            image_base: entry,
+            sections: vec![CoffSectionMap {
+                index: 4,
+                name: ".text$guarded".into(),
+                kind: "Text".into(),
+                original_file_offset: Some(0x200),
+                original_offset_start: 0,
+                original_offset_end: size,
+                mapped_va_start: entry,
+                mapped_va_end: cursor,
+            }],
+            functions: vec![CoffFunctionMap {
+                original_name: "unrelated_original_spelling".into(),
+                provider_name: "coff_fn_unrelated_provider_spelling".into(),
+                section_index: 4,
+                section_offset: 0,
+                original_size: size,
+                manifold_size: size,
+                mapped_entry: entry,
+                mapped_end: cursor,
+            }],
+            symbols: vec![CoffSymbolMap {
+                original_name: "unrelated_original_spelling".into(),
+                provider_name: "coff_fn_unrelated_provider_spelling".into(),
+                kind: "function".into(),
+                defined: true,
+                section_index: Some(4),
+                section_offset: Some(0),
+                mapped_address: entry,
+            }],
+            externs: vec![CoffExternalMap {
+                original_name: "unrelated_guard_pointer".into(),
+                provider_name: "coff_ext_unrelated_guard_pointer".into(),
+                kind: CoffExternalKind::ImportPointer,
+                synthetic_address: guard_target,
+            }],
+            relocations: vec![CoffRelocationMap {
+                section_index: 4,
+                section_name: ".text$guarded".into(),
+                section_offset: guard_field - entry,
+                mapped_field_va: guard_field,
+                relocation_type: "IMAGE_REL_AMD64_REL32".into(),
+                width_bits: 32,
+                target_original_name: "unrelated_guard_pointer".into(),
+                target_mapped_address: guard_target,
+                encoded_value: 0,
+            }],
+        };
+        (db, map)
+    }
+
+    fn guarded_stub(result: &[MachineStateStubRecord]) -> &GuardedIndirectForwardTailStub {
+        match &result[0] {
+            MachineStateStubRecord::GuardedIndirectForwardTail(stub) => stub,
+            other => panic!("expected guarded forward tail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recognizes_arbitrary_named_guarded_forward_tail_encodings() {
+        let (db, map) = guarded_fixture(0x218);
+        let result = recognize_machine_state_stubs(&db, &map);
+        assert_eq!(result.len(), 1);
+        let stub = guarded_stub(&result);
+        assert_eq!(stub.forwarding.dispatch_load.displacement, 0x218);
+        assert_eq!(stub.guard.target_original_name, "unrelated_guard_pointer");
+        assert_eq!(stub.transfer.target_register, "rax");
+
+        let (db, map) = guarded_fixture(24);
+        let result = recognize_machine_state_stubs(&db, &map);
+        assert_eq!(
+            guarded_stub(&result).guard.instruction_address,
+            "0x10000023"
+        );
+        assert_eq!(map.functions[0].manifold_size, 71);
+    }
+
+    #[test]
+    fn guarded_forward_tail_fails_closed_on_effect_cfg_and_relocation_ambiguity() {
+        let (mut db, map) = guarded_fixture(0x218);
+        db.rel_push("decoded_reg_use", (0x1000_001f_u64, Mreg::R11));
+        assert!(recognize_machine_state_stubs(&db, &map).is_empty());
+
+        let (mut db, map) = guarded_fixture(0x218);
+        db.rel_push(
+            "ddisasm_cfg_edge",
+            (0x1000_0047_u64, 0x1000_4000_u64, "branch"),
+        );
+        assert!(recognize_machine_state_stubs(&db, &map).is_empty());
+
+        let (db, mut map) = guarded_fixture(0x218);
+        map.relocations.push(map.relocations[0].clone());
+        assert!(recognize_machine_state_stubs(&db, &map).is_empty());
+
+        let (db, mut map) = guarded_fixture(0x218);
+        map.externs[0].kind = CoffExternalKind::Data;
+        assert!(recognize_machine_state_stubs(&db, &map).is_empty());
+
+        let (db, map) = guarded_fixture(25);
         assert!(recognize_machine_state_stubs(&db, &map).is_empty());
     }
 }

@@ -2131,7 +2131,7 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
         serde_json::from_slice(&std::fs::read(&output).expect("read stack-safety JSON"))
             .expect("parse stack-safety JSON");
     let _ = std::fs::remove_file(&output);
-    assert_eq!(json["manifold_clight_schema"], "manifold-clight-v3");
+    assert_eq!(json["manifold_clight_schema"], "manifold-clight-v4");
     assert!(json["machine_state_stubs"].is_array());
 
     let json_function_names: Vec<&str> = json["functions"]
