@@ -84,6 +84,44 @@ fn msvc_gs_effective_global_address(ident: usize, offset: i64) -> Option<Address
     }
 }
 
+/// Signedness is immaterial to integer equality and inequality.  Older
+/// lowering paths can therefore publish both signed and unsigned candidates
+/// for one exact TEST/Jcc without disagreeing about its semantics.
+fn msvc_gs_equivalent_condition(left: &Condition, right: &Condition) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left, right) {
+        (Condition::Ccomp(left_cmp), Condition::Ccompu(right_cmp))
+        | (Condition::Ccompu(left_cmp), Condition::Ccomp(right_cmp))
+        | (Condition::Ccompl(left_cmp), Condition::Ccomplu(right_cmp))
+        | (Condition::Ccomplu(left_cmp), Condition::Ccompl(right_cmp)) => {
+            left_cmp == right_cmp && matches!(left_cmp, Comparison::Ceq | Comparison::Cne)
+        }
+        (
+            Condition::Ccompimm(left_cmp, left_value),
+            Condition::Ccompuimm(right_cmp, right_value),
+        )
+        | (
+            Condition::Ccompuimm(left_cmp, left_value),
+            Condition::Ccompimm(right_cmp, right_value),
+        )
+        | (
+            Condition::Ccomplimm(left_cmp, left_value),
+            Condition::Ccompluimm(right_cmp, right_value),
+        )
+        | (
+            Condition::Ccompluimm(left_cmp, left_value),
+            Condition::Ccomplimm(right_cmp, right_value),
+        ) => {
+            left_cmp == right_cmp
+                && left_value == right_value
+                && matches!(left_cmp, Comparison::Ceq | Comparison::Cne)
+        }
+        _ => false,
+    }
+}
+
 fn msvc_gs_exact_ltl_candidate(candidates: &[LTLInst]) -> Option<LTLInst> {
     if candidates.len() == 1 {
         return Some(candidates[0].clone());
@@ -134,6 +172,19 @@ fn msvc_gs_exact_ltl_candidate(candidates: &[LTLInst]) -> Option<LTLInst> {
                 })
                 .then(|| first.clone())
         }
+        LTLInst::Lcond(first_condition, first_args, first_taken, first_fallthrough) => candidates
+            .iter()
+            .all(|candidate| {
+                matches!(
+                    candidate,
+                    LTLInst::Lcond(condition, args, taken, fallthrough)
+                        if args == first_args
+                            && taken == first_taken
+                            && fallthrough == first_fallthrough
+                            && msvc_gs_equivalent_condition(first_condition, condition)
+                )
+            })
+            .then(|| first.clone()),
         _ => None,
     }
 }
@@ -1197,10 +1248,8 @@ fn msvc_gs_instruction_effects_are_fully_modeled(
     let Some(candidates) = candidates else {
         return false;
     };
-    // COFF relocation lowering and the raw RIP-relative fallback can publish
-    // two syntactically different global candidates for the same exact load
-    // or store.  Collapse only the checked effective-address equivalence used
-    // by the recognizer's own LTL map; every other ambiguity remains a veto.
+    // Collapse only the checked semantic equivalences used by the recognizer's
+    // own LTL map; every other candidate ambiguity remains a veto.
     let Some(candidate) = msvc_gs_exact_ltl_candidate(candidates) else {
         return false;
     };
@@ -1614,11 +1663,10 @@ fn recognize_msvc_gs_cookie_guards(db: &DecompileDB) -> Vec<MsvcGsCookieGuardWit
     for (node, inst) in db.rel_iter::<(Node, LTLInst)>("ltl_inst") {
         ltl_candidates.entry(*node).or_default().push(inst.clone());
     }
-    // COFF relocation resolution and the raw RIP-relative fallback can both
-    // lower one load.  Treat them as one exact semantic instruction only when
-    // every candidate has the same chunk, destination, empty argument list,
-    // and checked effective global address.  Every other ambiguity remains a
-    // veto.
+    // Treat multiple lowerings as one semantic instruction only when the
+    // helper proves their effects equivalent: either identical effective
+    // global accesses or signed/unsigned equality conditions with identical
+    // operands and control targets.  Every other ambiguity remains a veto.
     let ltl: BTreeMap<Node, LTLInst> = ltl_candidates
         .iter()
         .filter_map(|(node, candidates)| {
@@ -20045,6 +20093,82 @@ mod encoding_tests {
                 Mreg::AX,
             ))
         );
+    }
+
+    #[test]
+    fn gs_ltl_equivalence_accepts_only_signedness_neutral_conditions() {
+        let signed_equality = LTLInst::Lcond(
+            Condition::Ccompimm(Comparison::Ceq, 0),
+            Arc::new(vec![Mreg::DX]),
+            Either::Right(0x2000),
+            Either::Right(0x1004),
+        );
+        let unsigned_equality = LTLInst::Lcond(
+            Condition::Ccompuimm(Comparison::Ceq, 0),
+            Arc::new(vec![Mreg::DX]),
+            Either::Right(0x2000),
+            Either::Right(0x1004),
+        );
+        assert_eq!(
+            msvc_gs_exact_ltl_candidate(&[
+                signed_equality.clone(),
+                unsigned_equality.clone(),
+            ]),
+            Some(signed_equality.clone()),
+        );
+
+        let signed_long_inequality = LTLInst::Lcond(
+            Condition::Ccompl(Comparison::Cne),
+            Arc::new(vec![Mreg::R8, Mreg::R9]),
+            Either::Right(0x3000),
+            Either::Right(0x3010),
+        );
+        let unsigned_long_inequality = LTLInst::Lcond(
+            Condition::Ccomplu(Comparison::Cne),
+            Arc::new(vec![Mreg::R8, Mreg::R9]),
+            Either::Right(0x3000),
+            Either::Right(0x3010),
+        );
+        assert_eq!(
+            msvc_gs_exact_ltl_candidate(&[
+                signed_long_inequality.clone(),
+                unsigned_long_inequality,
+            ]),
+            Some(signed_long_inequality),
+        );
+
+        let contradictions = [
+            LTLInst::Lcond(
+                Condition::Ccompuimm(Comparison::Clt, 0),
+                Arc::new(vec![Mreg::DX]),
+                Either::Right(0x2000),
+                Either::Right(0x1004),
+            ),
+            LTLInst::Lcond(
+                Condition::Ccompuimm(Comparison::Ceq, 1),
+                Arc::new(vec![Mreg::DX]),
+                Either::Right(0x2000),
+                Either::Right(0x1004),
+            ),
+            LTLInst::Lcond(
+                Condition::Ccompuimm(Comparison::Ceq, 0),
+                Arc::new(vec![Mreg::CX]),
+                Either::Right(0x2000),
+                Either::Right(0x1004),
+            ),
+            LTLInst::Lcond(
+                Condition::Ccompuimm(Comparison::Ceq, 0),
+                Arc::new(vec![Mreg::DX]),
+                Either::Right(0x2008),
+                Either::Right(0x1004),
+            ),
+        ];
+        for contradiction in contradictions {
+            assert_eq!(
+                msvc_gs_exact_ltl_candidate(&[signed_equality.clone(), contradiction]),
+                None,
+            );
+        }
     }
 
     #[test]
