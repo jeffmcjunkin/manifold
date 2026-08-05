@@ -205,6 +205,11 @@ pub struct DecompileDB {
     // Runtime-indexed stack arrays: array local id -> (element MemoryChunk, element count), so arr + i strides by element size.
     pub stack_array_buffers: HashMap<Address, HashMap<RTLReg, (crate::x86::types::MemoryChunk, usize)>>,
     pub binary_path: Option<std::path::PathBuf>,
+    // Authenticated original<->synthetic COFF identity retained alongside the
+    // decoder relations.  Semantic artifact exporters use this to prove that a
+    // decoded direct transfer is backed by one exact relocation rather than by
+    // display text or an inferred target address alone.
+    pub coff_address_map: Option<crate::decompile::disassembly::coff::CoffAddressMap>,
     // Exact private image bytes used by disassembly.  For COFF these contain
     // deterministic section VAs and applied relocations; later passes must use
     // this view instead of reopening the zero-based relocatable input.
@@ -241,6 +246,7 @@ impl Default for DecompileDB {
             stack_struct_buffers: Default::default(),
             stack_array_buffers: Default::default(),
             binary_path: None,
+            coff_address_map: None,
             loaded_binary_data: None,
             trace_enabled: false,
             skip_function_names: HashSet::new(),
@@ -629,6 +635,7 @@ impl DecompileDB {
                         sub_db.target_abi = self.target_abi.clone();
                         sub_db.measure_rule_times = self.measure_rule_times;
                         sub_db.binary_path = self.binary_path.clone();
+                        sub_db.coff_address_map = self.coff_address_map.clone();
                         sub_db.loaded_binary_data = self.loaded_binary_data.clone();
                         sub_db.trace_enabled = self.trace_enabled;
                         sub_db.relations = cloned;

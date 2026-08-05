@@ -5,6 +5,7 @@ pub mod cfg;
 pub mod coff;
 pub mod function;
 pub mod instruction;
+pub mod machine_state;
 pub mod operand;
 pub mod pe;
 pub mod symbol;
@@ -36,6 +37,9 @@ pub fn load_from_binary(
     // every downstream analysis can keep using the standard object API.
     let coff_image = coff::prepare_image(&mut bin_data)
         .unwrap_or_else(|e| panic!("Failed to prepare COFF binary {:?}: {}", binary_path, e));
+    db.coff_address_map = coff_image
+        .as_ref()
+        .map(|image| image.address_map.clone());
     let bin_data = std::sync::Arc::new(bin_data);
     db.loaded_binary_data = Some(std::sync::Arc::clone(&bin_data));
     let obj = object::File::parse(&**bin_data)

@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 
-pub const CLIGHT_EXPORT_SCHEMA_ID: &str = "manifold-clight-v2";
+pub const CLIGHT_EXPORT_SCHEMA_ID: &str = "manifold-clight-v3";
 pub const PARTIAL_SUPPRESSION_CERTIFICATE_ID: &str =
     "atomic-unsupported-address-suppression-v1";
 
@@ -407,6 +407,32 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         .map(|func| serialize_function(func, &id_to_name))
         .collect();
 
+    // C cannot express non-ABI live register state at a tail transfer.  Keep
+    // that independent machine contract beside Clight only when the structured
+    // decoder, CFG, function ownership, and original COFF relocation all agree.
+    // The raw generated C remains unchanged and remains the ordinary fallback.
+    let machine_state_stubs = db
+        .coff_address_map
+        .as_ref()
+        .map(|map| {
+            crate::decompile::disassembly::machine_state::recognize_machine_state_stubs(
+                db, map,
+            )
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|stub| {
+            let Ok(address) = u64::from_str_radix(
+                stub.function.address.trim_start_matches("0x"),
+                16,
+            ) else {
+                return false;
+            };
+            emitted_addresses.contains(&address)
+                && provider_names.get(&address) == Some(&stub.function.name)
+        })
+        .collect::<Vec<_>>();
+
     let program = json!({
         "compcert_clight": true,
         "manifold_clight_schema": CLIGHT_EXPORT_SCHEMA_ID,
@@ -417,6 +443,7 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         "functions": functions_json,
         "unsupported_functions": unsupported_functions,
         "partial_functions": partial_functions,
+        "machine_state_stubs": machine_state_stubs,
     });
 
     let file = std::fs::File::create(output_path)
@@ -1266,6 +1293,7 @@ mod tests {
             }],
             "unsupported_functions": [],
             "partial_functions": [],
+            "machine_state_stubs": [],
         });
 
         let first = compact_bytes(&program);
