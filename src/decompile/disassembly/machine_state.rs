@@ -1195,6 +1195,9 @@ fn recognize_guarded_indirect_forward_tail(
         return None;
     }
 
+    // Capstone sees the loader-patched image, so retain the decoded signed
+    // REL32 displacement and authenticate it against the COFF map below.
+    let guard_displacement = only(indirects.get(guard.4)?.iter().copied())?.4;
     if !exact_operand_register(sub.5, "RSP", registers, immediates, indirects)
         || !exact_operand_immediate(sub.4, 72, registers, immediates, indirects)
         || !exact_operand_register(save_rdx.4, "RDX", registers, immediates, indirects)
@@ -1271,7 +1274,7 @@ fn recognize_guarded_indirect_forward_tail(
         || !exact_operand_register(load_target.5, "RCX", registers, immediates, indirects)
         || !exact_operand_memory(
             guard.4,
-            ("NONE", "RIP", "NONE", 1, 0, 8),
+            ("NONE", "RIP", "NONE", 1, guard_displacement, 8),
             registers,
             immediates,
             indirects,
@@ -1409,6 +1412,12 @@ fn recognize_guarded_indirect_forward_tail(
         })
         .collect();
     let section = only(sections)?;
+    let encoded_guard_displacement =
+        i64::from(u32::try_from(relocation.encoded_value).ok()? as i32);
+    let decoded_guard_target = guard
+        .0
+        .checked_add(guard.1 as u64)?
+        .checked_add_signed(guard_displacement)?;
     if relocation.section_name != section.name
         || relocation.mapped_field_va != guard.0 + 2
         || relocation.section_offset
@@ -1418,7 +1427,8 @@ fn recognize_guarded_indirect_forward_tail(
                 .checked_add(2)?
         || relocation.relocation_type != "IMAGE_REL_AMD64_REL32"
         || relocation.width_bits != 32
-        || relocation.encoded_value != 0
+        || guard_displacement != encoded_guard_displacement
+        || decoded_guard_target != relocation.target_mapped_address
     {
         return None;
     }
@@ -2181,6 +2191,9 @@ mod tests {
             addresses.push(cursor);
             cursor += size as u64;
         }
+        let guard_target: Address = 0x1000_3000;
+        let guard_displacement =
+            i32::try_from(guard_target - (addresses[8] + 6)).expect("guard target fits rel32");
         let rows: Vec<Instruction> = vec![
             (addresses[0], 4, "", "SUB", IMM72, RSP, NONE, NONE, 0, 0),
             (addresses[1], 5, "", "MOV", RDX, RSP40, NONE, NONE, 0, 0),
@@ -2252,7 +2265,15 @@ mod tests {
                 (RCX0, "NONE", "RCX", "NONE", 1, 0, 8),
                 (RCX32, "NONE", "RCX", "NONE", 1, 32, 8),
                 (R10DISP, "NONE", "R10", "NONE", 1, displacement, 8),
-                (RIP0, "NONE", "RIP", "NONE", 1, 0, 8),
+                (
+                    RIP0,
+                    "NONE",
+                    "RIP",
+                    "NONE",
+                    1,
+                    i64::from(guard_displacement),
+                    8,
+                ),
             ])
             .into_iter()
             .collect::<ascent::boxcar::Vec<_>>(),
@@ -2365,7 +2386,6 @@ mod tests {
             .collect::<ascent::boxcar::Vec<_>>(),
         );
 
-        let guard_target: Address = 0x1000_3000;
         let size = cursor - entry;
         let guard_field = addresses[8] + 2;
         let map = CoffAddressMap {
@@ -2417,7 +2437,7 @@ mod tests {
                 width_bits: 32,
                 target_original_name: "unrelated_guard_pointer".into(),
                 target_mapped_address: guard_target,
-                encoded_value: 0,
+                encoded_value: u64::from(guard_displacement as u32),
             }],
         };
         (db, map)
@@ -2450,6 +2470,19 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_loader_applied_guard_rel32() {
+        let (db, map) = guarded_fixture(0x218);
+        assert_ne!(map.relocations[0].encoded_value, 0);
+
+        let result = recognize_machine_state_stubs(&db, &map);
+        let stub = guarded_stub(&result);
+        assert_eq!(
+            stub.guard.target_address,
+            format!("0x{:x}", map.relocations[0].target_mapped_address)
+        );
+    }
+
+    #[test]
     fn guarded_forward_tail_fails_closed_on_effect_cfg_and_relocation_ambiguity() {
         let (mut db, map) = guarded_fixture(0x218);
         db.rel_push("decoded_reg_use", (0x1000_001f_u64, Mreg::R11));
@@ -2468,6 +2501,15 @@ mod tests {
 
         let (db, mut map) = guarded_fixture(0x218);
         map.externs[0].kind = CoffExternalKind::Data;
+        assert!(recognize_machine_state_stubs(&db, &map).is_empty());
+
+        let (db, mut map) = guarded_fixture(0x218);
+        map.relocations[0].encoded_value += 1;
+        assert!(recognize_machine_state_stubs(&db, &map).is_empty());
+
+        let (db, mut map) = guarded_fixture(0x218);
+        map.relocations[0].target_mapped_address += 1;
+        map.externs[0].synthetic_address += 1;
         assert!(recognize_machine_state_stubs(&db, &map).is_empty());
 
         let (db, map) = guarded_fixture(25);
