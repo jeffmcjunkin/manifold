@@ -311,6 +311,44 @@ fn exact_or_empty<T: Copy + Ord>(
     facts.get(&node).cloned().unwrap_or_default() == expected
 }
 
+fn exact_or_authenticated_padding_fallthrough(
+    cfg: &BTreeMap<Node, BTreeSet<(Address, Symbol)>>,
+    padding: Node,
+    function: &CoffFunctionMap,
+    map: &CoffAddressMap,
+) -> bool {
+    // CFG construction is section-wide, so an alignment NOP at an authenticated
+    // COFF boundary may acquire a synthetic fallthrough into the next function
+    // even though decoder `next` deliberately stops at that boundary.
+    let actual = cfg.get(&padding).cloned().unwrap_or_default();
+    if actual.is_empty() {
+        return true;
+    }
+    if actual != BTreeSet::from([(function.mapped_end, "fallthrough")]) {
+        return false;
+    }
+
+    let Some(original_end) = function.section_offset.checked_add(function.original_size) else {
+        return false;
+    };
+    let Some(section) = only(
+        map.sections
+            .iter()
+            .filter(|section| section.index == function.section_index),
+    ) else {
+        return false;
+    };
+    only(map.functions.iter().filter(|successor| {
+        successor.section_index == function.section_index
+            && successor.section_offset == original_end
+            && successor.mapped_entry == function.mapped_end
+            && successor.mapped_entry < successor.mapped_end
+            && successor.section_offset < section.original_offset_end
+            && successor.mapped_entry < section.mapped_va_end
+    }))
+    .is_some()
+}
+
 /// Recognize the exact sequence
 ///
 /// ```text
@@ -893,6 +931,12 @@ fn recognize_win64_syscall_variant(
     let mask = u8::try_from(mask).ok()?;
     let test_operand = only(indirects.get(test.5)?.iter().copied())?;
     let dispatch_address = u64::try_from(test_operand.4).ok()?;
+    // Capstone releases disagree on whether TEST's read-only r/m operand is
+    // reported as ReadOnly or conservatively as ReadWrite.  Accept only those
+    // two presentations of this already-authenticated operand; any different
+    // or additional write still fails closed.
+    let exact_test_memory_effect = exact_or_empty(memory_writes, test.0, [])
+        || exact_or_empty(memory_writes, test.0, [test.5]);
     if !exact_indirect_operand(
         test.5,
         ("NONE", "NONE", "NONE", 1, test_operand.4, 1),
@@ -902,7 +946,7 @@ fn recognize_win64_syscall_variant(
     ) || !exact_or_empty(decoded_defs, test.0, [])
         || !exact_or_empty(decoded_uses, test.0, [])
         || !exact_or_empty(memory_reads, test.0, [test.5])
-        || !exact_or_empty(memory_writes, test.0, [])
+        || !exact_test_memory_effect
     {
         return None;
     }
@@ -930,6 +974,8 @@ fn recognize_win64_syscall_variant(
     if !exact_indirect_operand(padding.4, nop_operand, registers, immediates, indirects) {
         return None;
     }
+    let exact_padding_cfg =
+        exact_or_authenticated_padding_fallthrough(cfg, padding.0, function, map);
 
     for (index, row) in rows.iter().copied().enumerate() {
         if owners.get(&row.0) != Some(&BTreeSet::from([function.mapped_entry]))
@@ -940,7 +986,11 @@ fn recognize_win64_syscall_variant(
             )
             || !exact_or_empty(direct_calls, row.0, [])
             || (row.0 != branch.0 && !exact_or_empty(direct_jumps, row.0, []))
-            || (row.0 != branch.0 && row.0 != native_transfer.0 && !exact_or_empty(cfg, row.0, []))
+            || (row.0 != branch.0
+                && row.0 != native_transfer.0
+                && row.0 != padding.0
+                && !exact_or_empty(cfg, row.0, []))
+            || (row.0 == padding.0 && !exact_padding_cfg)
             || (row.0 != test.0 && !exact_or_empty(flags_and_jumps, row.0, []))
         {
             return None;
@@ -1494,6 +1544,8 @@ mod tests {
     use crate::decompile::disassembly::coff::{
         CoffExternalMap, CoffFunctionMap, CoffRelocationMap, CoffSectionMap, CoffSymbolMap,
     };
+    use crate::decompile::passes::asm_pass::AsmPass;
+    use crate::decompile::passes::pass::IRPass;
 
     const NONE: Symbol = "0";
     const IMM: Symbol = "machine_state_test_imm";
@@ -1524,14 +1576,13 @@ mod tests {
         let entry = 0x1000_0000;
         let jump = entry + 6;
         let target = 0x1000_2000;
+        let rows: Vec<Instruction> = vec![
+            (entry, 6, "", "MOV", IMM, DST, NONE, NONE, 0, 0),
+            (jump, 5, "", "JMP", TARGET, NONE, NONE, NONE, 0, 0),
+        ];
         db.rel_set(
             "unrefinedinstruction",
-            vec![
-                (entry, 6, "", "MOV", IMM, DST, NONE, NONE, 0, 0),
-                (jump, 5, "", "JMP", TARGET, NONE, NONE, NONE, 0, 0),
-            ]
-            .into_iter()
-            .collect::<ascent::boxcar::Vec<_>>(),
+            rows.into_iter().collect::<ascent::boxcar::Vec<_>>(),
         );
         db.rel_set(
             "op_register",
@@ -1802,7 +1853,15 @@ mod tests {
             .into_iter()
             .collect::<ascent::boxcar::Vec<_>>(),
         );
-        let mut indirects = vec![(TEST_MEMORY, "NONE", "NONE", "NONE", 1, 0x7ffe_0308, 1usize)];
+        let mut indirects: Vec<(
+            Symbol,
+            &'static str,
+            &'static str,
+            &'static str,
+            i64,
+            i64,
+            usize,
+        )> = vec![(TEST_MEMORY, "NONE", "NONE", "NONE", 1, 0x7ffe_0308, 1)];
         if home_count == 0 {
             indirects.push((PADDING_MEMORY, "NONE", "RAX", "RAX", 1, 0, 4));
         } else {
@@ -1946,6 +2005,78 @@ mod tests {
         (db, map)
     }
 
+    fn push_coff_section_header(
+        bytes: &mut Vec<u8>,
+        name: &[u8],
+        size: u32,
+        raw_offset: u32,
+        characteristics: u32,
+    ) {
+        let mut padded_name = [0u8; 8];
+        padded_name[..name.len()].copy_from_slice(name);
+        bytes.extend_from_slice(&padded_name);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&size.to_le_bytes());
+        bytes.extend_from_slice(&raw_offset.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&characteristics.to_le_bytes());
+    }
+
+    fn push_coff_function_symbol(bytes: &mut Vec<u8>, name: &[u8], value: u32) {
+        let mut padded_name = [0u8; 8];
+        padded_name[..name.len()].copy_from_slice(name);
+        bytes.extend_from_slice(&padded_name);
+        bytes.extend_from_slice(&value.to_le_bytes());
+        bytes.extend_from_slice(&1i16.to_le_bytes());
+        let function_type =
+            object::pe::IMAGE_SYM_DTYPE_FUNCTION << object::pe::IMAGE_SYM_DTYPE_SHIFT;
+        bytes.extend_from_slice(&function_type.to_le_bytes());
+        bytes.push(object::pe::IMAGE_SYM_CLASS_EXTERNAL);
+        bytes.push(0);
+    }
+
+    fn adjacent_syscall_coff_fixture() -> Vec<u8> {
+        let mut text = Vec::new();
+        for service_number in [0x4000u32, 0x4001] {
+            text.extend_from_slice(&[0x4c, 0x8b, 0xd1]);
+            text.push(0xb8);
+            text.extend_from_slice(&service_number.to_le_bytes());
+            text.extend_from_slice(&[
+                0xf6, 0x04, 0x25, 0x08, 0x03, 0xfe, 0x7f, 0x01, 0x75, 0x03, 0x0f, 0x05, 0xc3, 0xcd,
+                0x2e, 0xc3, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]);
+        }
+        assert_eq!(text.len(), 64);
+
+        const SYMBOL_COUNT: u32 = 2;
+        let raw_offset = 20 + 40;
+        let symbol_offset = raw_offset + text.len() as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&object::pe::IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&symbol_offset.to_le_bytes());
+        bytes.extend_from_slice(&SYMBOL_COUNT.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        push_coff_section_header(
+            &mut bytes,
+            b".text",
+            text.len() as u32,
+            raw_offset,
+            0x6000_0020,
+        );
+        bytes.extend_from_slice(&text);
+        push_coff_function_symbol(&mut bytes, b"stub_a", 0);
+        push_coff_function_symbol(&mut bytes, b"stub_b", 32);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn recognizes_exact_arbitrary_named_stub() {
         let (db, map) = fixture();
@@ -1984,6 +2115,68 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_real_decoder_facts_for_adjacent_coff_syscalls() {
+        std::thread::Builder::new()
+            .name("machine-state-syscall-coff-fixture".into())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                static FIXTURE_ID: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let path = std::env::temp_dir().join(format!(
+                    "manifold-machine-state-syscall-{}-{}.obj",
+                    std::process::id(),
+                    FIXTURE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                ));
+                std::fs::write(&path, adjacent_syscall_coff_fixture()).unwrap();
+
+                let mut db = DecompileDB::default();
+                let map = crate::decompile::disassembly::load_from_binary(&mut db, &path).unwrap();
+                let _ = std::fs::remove_file(&path);
+                AsmPass.run(&mut db);
+
+                assert_eq!(map.functions.len(), 2);
+                for function in &map.functions {
+                    let test = function.mapped_entry + 8;
+                    let reads: BTreeSet<_> = db
+                        .rel_iter::<(Node, Symbol)>("decoded_memory_read_operand")
+                        .filter_map(|(node, operand)| (*node == test).then_some(*operand))
+                        .collect();
+                    let writes: BTreeSet<_> = db
+                        .rel_iter::<(Node, Symbol)>("decoded_memory_write_operand")
+                        .filter_map(|(node, operand)| (*node == test).then_some(*operand))
+                        .collect();
+                    assert_eq!(reads.len(), 1);
+                    assert_eq!(writes, reads);
+                }
+
+                let first_padding = map.functions[0].mapped_entry + 24;
+                assert_eq!(
+                    db.rel_iter::<(Node, Address, Symbol)>("ddisasm_cfg_edge")
+                        .filter(|(source, _, _)| *source == first_padding)
+                        .copied()
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from([
+                        (first_padding, map.functions[1].mapped_entry, "fallthrough",)
+                    ]),
+                );
+
+                let result = recognize_machine_state_stubs(&db, &map);
+                assert_eq!(result.len(), 2);
+                let service_numbers: BTreeSet<_> = result
+                    .iter()
+                    .map(|record| match record {
+                        MachineStateStubRecord::Win64Syscall(stub) => stub.service_number.value,
+                        other => panic!("expected Win64 syscall record, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(service_numbers, BTreeSet::from([0x4000, 0x4001]));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn rejects_syscall_home_control_relocation_and_padding_ambiguity() {
         let (mut db, map) = syscall_fixture(4);
         let malformed_indirects = db
@@ -2010,7 +2203,7 @@ mod tests {
         let (mut db, map) = syscall_fixture(0);
         db.rel_set(
             "flags_and_jump_pair",
-            vec![(0x1000_1008, 0x1000_1010, "e")]
+            vec![(0x1000_1008_u64, 0x1000_1010_u64, "e")]
                 .into_iter()
                 .collect::<ascent::boxcar::Vec<_>>(),
         );
@@ -2045,7 +2238,21 @@ mod tests {
         assert!(recognize_machine_state_stubs(&db, &map).is_empty());
 
         let (mut db, map) = syscall_fixture(0);
-        db.rel_push("decoded_reg_def", (0x1000_1012, Mreg::R11));
+        db.rel_push("decoded_reg_def", (0x1000_1012_u64, Mreg::R11));
+        assert!(recognize_machine_state_stubs(&db, &map).is_empty());
+
+        let (mut db, map) = syscall_fixture(0);
+        db.rel_push(
+            "decoded_memory_write_operand",
+            (0x1000_1008_u64, "unexpected_test_write"),
+        );
+        assert!(recognize_machine_state_stubs(&db, &map).is_empty());
+
+        let (mut db, map) = syscall_fixture(0);
+        db.rel_push(
+            "ddisasm_cfg_edge",
+            (0x1000_1018_u64, 0x1000_1020_u64, "fallthrough"),
+        );
         assert!(recognize_machine_state_stubs(&db, &map).is_empty());
     }
 
@@ -2061,44 +2268,44 @@ mod tests {
         assert!(recognize_machine_state_stubs(&db, &map).is_empty());
 
         let (mut db, map) = fixture();
-        db.rel_push("decoded_reg_def", (0x1000_0000, Mreg::R11));
+        db.rel_push("decoded_reg_def", (0x1000_0000_u64, Mreg::R11));
         assert!(recognize_machine_state_stubs(&db, &map).is_empty());
 
         let (mut db, mut map) = fixture();
         map.functions[0].mapped_end += 1;
         map.functions[0].original_size += 1;
         map.functions[0].manifold_size += 1;
-        db.rel_push(
-            "unrefinedinstruction",
-            (0x1000_000b, 1, "", "NOP", NONE, NONE, NONE, NONE, 0, 0),
-        );
+        let extra: Instruction = (0x1000_000b, 1, "", "NOP", NONE, NONE, NONE, NONE, 0, 0);
+        db.rel_push("unrefinedinstruction", extra);
         assert!(recognize_machine_state_stubs(&db, &map).is_empty());
     }
 
     #[test]
     fn rejects_conditional_indirect_and_multiple_exit_shapes() {
         let (mut db, map) = fixture();
-        let jump = 0x1000_0006;
+        let jump: Address = 0x1000_0006;
+        let conditional_rows: Vec<Instruction> = vec![
+            (0x1000_0000, 6, "", "MOV", IMM, DST, NONE, NONE, 0, 0),
+            (jump, 5, "", "JNE", TARGET, NONE, NONE, NONE, 0, 0),
+        ];
         db.rel_set(
             "unrefinedinstruction",
-            vec![
-                (0x1000_0000, 6, "", "MOV", IMM, DST, NONE, NONE, 0, 0),
-                (jump, 5, "", "JNE", TARGET, NONE, NONE, NONE, 0, 0),
-            ]
-            .into_iter()
-            .collect::<ascent::boxcar::Vec<_>>(),
+            conditional_rows
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
         );
         assert!(recognize_machine_state_stubs(&db, &map).is_empty());
 
         let (mut db, map) = fixture();
+        let indirect_rows: Vec<Instruction> = vec![
+            (0x1000_0000, 6, "", "MOV", IMM, DST, NONE, NONE, 0, 0),
+            (jump, 5, "", "JMP", INDIRECT, NONE, NONE, NONE, 0, 0),
+        ];
         db.rel_set(
             "unrefinedinstruction",
-            vec![
-                (0x1000_0000, 6, "", "MOV", IMM, DST, NONE, NONE, 0, 0),
-                (jump, 5, "", "JMP", INDIRECT, NONE, NONE, NONE, 0, 0),
-            ]
-            .into_iter()
-            .collect::<ascent::boxcar::Vec<_>>(),
+            indirect_rows
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
         );
         db.rel_set(
             "op_register",
@@ -2114,7 +2321,7 @@ mod tests {
         );
         db.rel_set(
             "ddisasm_cfg_edge",
-            vec![(jump, 0, "indirect")]
+            vec![(jump, 0_u64, "indirect")]
                 .into_iter()
                 .collect::<ascent::boxcar::Vec<_>>(),
         );
@@ -2127,7 +2334,7 @@ mod tests {
         assert!(recognize_machine_state_stubs(&db, &map).is_empty());
 
         let (mut db, map) = fixture();
-        db.rel_push("ddisasm_cfg_edge", (jump, 0x1000_3000, "branch"));
+        db.rel_push("ddisasm_cfg_edge", (jump, 0x1000_3000_u64, "branch"));
         assert!(recognize_machine_state_stubs(&db, &map).is_empty());
     }
 
