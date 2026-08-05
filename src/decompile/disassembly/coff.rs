@@ -9,6 +9,8 @@
 //! file on disk is never modified.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use capstone::prelude::*;
@@ -62,6 +64,12 @@ struct FunctionBoundary {
     section_name: String,
     section_offset: u64,
     size: u64,
+}
+
+#[derive(Debug)]
+struct LoadedFunctionBoundaries {
+    document: FunctionBoundaryDocument,
+    sidecar_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,6 +142,8 @@ pub struct CoffAddressMap {
     pub loader_id: &'static str,
     pub architecture: &'static str,
     pub image_base: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_boundary_sidecar_sha256: Option<String>,
     pub sections: Vec<CoffSectionMap>,
     pub functions: Vec<CoffFunctionMap>,
     pub symbols: Vec<CoffSymbolMap>,
@@ -309,7 +319,7 @@ pub fn prepare_image_with_function_boundaries(
 
 fn prepare_image_inner(
     data: &mut Vec<u8>,
-    function_boundaries: Option<&FunctionBoundaryDocument>,
+    function_boundaries: Option<&LoadedFunctionBoundaries>,
 ) -> Result<Option<CoffImage>, String> {
     let (mut patches, image) = {
         let obj = object::File::parse(&data[..])
@@ -346,7 +356,7 @@ fn prepare_image_inner(
 fn load_function_boundaries(
     path: &Path,
     target_data: &[u8],
-) -> Result<FunctionBoundaryDocument, String> {
+) -> Result<LoadedFunctionBoundaries, String> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|e| format!("failed to inspect function-boundary sidecar {}: {e}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -362,14 +372,34 @@ fn load_function_boundaries(
             metadata.len()
         ));
     }
-    let bytes = std::fs::read(path)
+    let mut stream = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open function-boundary sidecar {}: {e}", path.display()))?;
+    let opened = stream.metadata()
+        .map_err(|e| format!("failed to inspect opened function-boundary sidecar {}: {e}", path.display()))?;
+    let identity = |value: &std::fs::Metadata| {
+        (
+            value.dev(), value.ino(), value.len(), value.mtime(), value.mtime_nsec(),
+            value.ctime(), value.ctime_nsec(),
+        )
+    };
+    if !opened.is_file() || identity(&opened) != identity(&metadata) {
+        return Err(format!(
+            "function-boundary sidecar {} changed before being read",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    stream.read_to_end(&mut bytes)
         .map_err(|e| format!("failed to read function-boundary sidecar {}: {e}", path.display()))?;
-    if bytes.len() as u64 != metadata.len() {
+    let after = stream.metadata()
+        .map_err(|e| format!("failed to inspect read function-boundary sidecar {}: {e}", path.display()))?;
+    if bytes.len() as u64 != opened.len() || identity(&after) != identity(&opened) {
         return Err(format!(
             "function-boundary sidecar {} changed while being read",
             path.display()
         ));
     }
+    let sidecar_sha256 = sha256_hex(&bytes);
     let document: FunctionBoundaryDocument = serde_json::from_slice(&bytes).map_err(|e| {
         format!(
             "invalid function-boundary sidecar {}: {e}",
@@ -377,7 +407,10 @@ fn load_function_boundaries(
         )
     })?;
     validate_function_boundaries(&document, target_data)?;
-    Ok(document)
+    Ok(LoadedFunctionBoundaries {
+        document,
+        sidecar_sha256,
+    })
 }
 
 fn validate_function_boundaries(
@@ -583,7 +616,7 @@ fn sha256_hex(data: &[u8]) -> String {
 fn plan_image(
     obj: &object::File<'_>,
     data: &[u8],
-    function_boundaries: Option<&FunctionBoundaryDocument>,
+    function_boundaries: Option<&LoadedFunctionBoundaries>,
 ) -> Result<(Vec<BytePatch>, CoffImage), String> {
     let va_field_offsets = section_va_field_offsets(obj, data)?;
     let mut cursor = COFF_IMAGE_BASE;
@@ -665,7 +698,7 @@ fn plan_image(
     promote_authenticated_untyped_functions(obj, &section_by_index, &mut symbols)?;
 
     if let Some(boundaries) = function_boundaries {
-        apply_function_boundaries(boundaries, &section_by_index, &mut symbols)?;
+        apply_function_boundaries(&boundaries.document, &section_by_index, &mut symbols)?;
     }
 
     // Classify undefined symbols from both their COFF type and their use.  Some
@@ -1056,6 +1089,8 @@ fn plan_image(
         loader_id: COFF_LOADER_ID,
         architecture: "x86_64-pc-windows-msvc",
         image_base: COFF_IMAGE_BASE,
+        function_boundary_sidecar_sha256: function_boundaries
+            .map(|boundaries| boundaries.sidecar_sha256.clone()),
         sections: section_maps,
         functions,
         symbols: symbol_maps,
@@ -1899,6 +1934,10 @@ mod tests {
         let image = prepare_image_with_function_boundaries(&mut private_image, &sidecar_path)
             .unwrap()
             .unwrap();
+        assert_eq!(
+            image.address_map.function_boundary_sidecar_sha256.as_deref(),
+            Some(sha256_hex(&sidecar_bytes).as_str()),
+        );
         let functions: BTreeMap<_, _> = image
             .address_map
             .functions
@@ -2003,6 +2042,7 @@ mod tests {
     fn provider_promotes_only_linkage_bounded_authenticated_code() {
         let mut fixture = classifier_fixture();
         let image = prepare_image(&mut fixture).unwrap().unwrap();
+        assert_eq!(image.address_map.function_boundary_sidecar_sha256, None);
         let functions: BTreeMap<_, _> = image
             .address_map
             .functions

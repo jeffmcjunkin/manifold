@@ -1644,6 +1644,7 @@ mod tests {
             loader_id: "amd64-coff-image-v1",
             architecture: "x86_64-pc-windows-msvc",
             image_base: entry,
+            function_boundary_sidecar_sha256: None,
             sections: vec![CoffSectionMap {
                 index: 1,
                 name: ".text$mn".into(),
@@ -1970,6 +1971,7 @@ mod tests {
             loader_id: "amd64-coff-image-v1",
             architecture: "x86_64-pc-windows-msvc",
             image_base: 0x1000_0000,
+            function_boundary_sidecar_sha256: None,
             sections: vec![CoffSectionMap {
                 index: 7,
                 name: ".text$arbitrary".into(),
@@ -2600,6 +2602,7 @@ mod tests {
             loader_id: "amd64-coff-image-v1",
             architecture: "x86_64-pc-windows-msvc",
             image_base: entry,
+            function_boundary_sidecar_sha256: None,
             sections: vec![CoffSectionMap {
                 index: 4,
                 name: ".text$guarded".into(),
