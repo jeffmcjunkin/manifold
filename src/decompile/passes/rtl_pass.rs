@@ -585,6 +585,7 @@ fn authenticated_msvc_gs_cfg_slice(
     authenticated_raw_only_nodes: &BTreeSet<Node>,
     mnemonics: &BTreeMap<Node, &'static str>,
     unresolved_indirect_sources: &BTreeSet<Node>,
+    authenticated_returning_indirect_calls: &BTreeSet<Node>,
 ) -> Option<BTreeSet<Node>> {
     if cfg
         .get(&ret)
@@ -607,7 +608,8 @@ fn authenticated_msvc_gs_cfg_slice(
             || !mnemonics
                 .get(&node)
                 .is_some_and(|mnemonic| !mnemonic.is_empty())
-            || unresolved_indirect_sources.contains(&node)
+            || (unresolved_indirect_sources.contains(&node)
+                && !authenticated_returning_indirect_calls.contains(&node))
         {
             return None;
         }
@@ -999,6 +1001,25 @@ fn byte_ranges_overlap(
     first_start < second_end && second_start < first_end
 }
 
+/// CALL's only in-frame machine write is its transient return-address push.
+/// A returning callee's arbitrary memory effects do not invalidate a /GS
+/// witness: modifying the protected slot is precisely the condition the
+/// epilogue check is designed to detect.  Authenticate the architectural push
+/// as disjoint instead of assuming the callee preserves the cookie value.
+fn msvc_gs_returning_call_push_is_disjoint(
+    frame_offset: i64,
+    cookie_start: i64,
+    cookie_end: i64,
+) -> bool {
+    if cookie_start >= cookie_end {
+        return false;
+    }
+    let Some(push_start) = frame_offset.checked_sub(8) else {
+        return false;
+    };
+    !byte_ranges_overlap(push_start, frame_offset, cookie_start, cookie_end)
+}
+
 fn msvc_gs_exact_nonmutating_jcc(mnemonic: &str) -> bool {
     matches!(
         mnemonic,
@@ -1245,6 +1266,39 @@ fn msvc_gs_instruction_effects_are_fully_modeled(
     operand_count: Option<usize>,
     control_flow_is_represented: bool,
 ) -> bool {
+    let decoded_defs = decoded_defs.cloned().unwrap_or_default();
+    let decoded_write_operands = decoded_write_operands.cloned().unwrap_or_default();
+    let Some(operand_count) = operand_count else {
+        return false;
+    };
+    let no_decoded_writes = decoded_write_operands.is_empty();
+    let no_decoded_defs = decoded_defs.is_empty();
+
+    // Some arithmetic instructions publish both a value lowering and a
+    // condition lowering for the immediately following Jcc.  That ambiguity
+    // is immaterial to the /GS alias proof when the decoder positively proves
+    // an exact, non-unknown register destination and no memory destination.
+    // Keep this to the closed x86 forms above; their remaining implicit effect
+    // is flags, never stack or memory.
+    if candidates.is_some_and(|rows| !rows.is_empty())
+        && no_decoded_writes
+        && msvc_gs_explicit_destination_mnemonic(mnemonic, operand_count)
+        && decoded_defs.len() == 1
+        && decoded_defs.iter().all(|reg| !reg.is_unknown())
+    {
+        return true;
+    }
+    if no_decoded_writes
+        && no_decoded_defs
+        && msvc_gs_lbranch_has_independent_effect_model(
+            mnemonic,
+            operand_count,
+            control_flow_is_represented,
+        )
+    {
+        return true;
+    }
+
     let Some(candidates) = candidates else {
         return false;
     };
@@ -1253,13 +1307,6 @@ fn msvc_gs_instruction_effects_are_fully_modeled(
     let Some(candidate) = msvc_gs_exact_ltl_candidate(candidates) else {
         return false;
     };
-    let decoded_defs = decoded_defs.cloned().unwrap_or_default();
-    let decoded_write_operands = decoded_write_operands.cloned().unwrap_or_default();
-    let Some(operand_count) = operand_count else {
-        return false;
-    };
-    let no_decoded_writes = decoded_write_operands.is_empty();
-    let no_decoded_defs = decoded_defs.is_empty();
 
     match &candidate {
         // These are genuine semantic lowerings, unlike the synthetic Lbranch.
@@ -1320,6 +1367,19 @@ fn msvc_gs_instruction_effects_are_fully_modeled(
             false
         }
     }
+}
+
+fn msvc_gs_exact_int2c_candidates(candidates: Option<&Vec<LTLInst>>) -> bool {
+    candidates.is_some_and(|rows| {
+        !rows.is_empty()
+            && rows.iter().all(|candidate| {
+                matches!(
+                    candidate,
+                    LTLInst::Lbuiltin(name, args, BuiltinArg::BAInt(0))
+                        if name == "__int2c" && args.is_empty()
+                )
+            })
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2279,6 +2339,8 @@ fn recognize_msvc_gs_cookie_guards(db: &DecompileDB) -> Vec<MsvcGsCookieGuardWit
 
             let mut writes_are_disjoint = true;
             let mut witnessed_spill_write = false;
+            let mut authenticated_body_effect_nodes = BTreeSet::new();
+            let mut authenticated_returning_calls = BTreeSet::new();
             'writes: for write in &write_scan_nodes {
                 if !claimants
                     .get(write)
@@ -2320,13 +2382,50 @@ fn recognize_msvc_gs_cookie_guards(db: &DecompileDB) -> Vec<MsvcGsCookieGuardWit
                     writes_are_disjoint = false;
                     break;
                 };
-                // The pushed return address is only CALL's decoder-visible
-                // write.  The callee itself has unknown memory effects and
-                // may modify the authenticated frame cell, so no ordinary
-                // body call is admissible on the spill-to-reload slice.
+                // A returning CALL may legitimately mutate the protected
+                // slot through a passed pointer: /GS must still reload that
+                // value and check it.  Its own transient return-address push
+                // is the only architectural stack write to authenticate here.
                 if matches!(mnemonic, "CALL" | "CALLQ") {
-                    writes_are_disjoint = false;
-                    break;
+                    let exact_return_site = call_return_sites
+                        .get(write)
+                        .is_some_and(|sites| sites.len() == 1);
+                    let call_frame_offset =
+                        unique_frame_offset(&frame_offsets, function, *write);
+                    if !call_nodes.contains(write)
+                        || call_targets_noreturn.contains(write)
+                        || operand_counts.get(write) != Some(&1)
+                        || !decoded_write_operands
+                            .get(write)
+                            .map_or(true, BTreeSet::is_empty)
+                        || !exact_return_site
+                        || !call_return_sites.get(write).is_some_and(|sites| {
+                            sites.iter().all(|site| {
+                                node_belongs_to_function(
+                                    &canonical_owners,
+                                    &claimants,
+                                    *site,
+                                    function,
+                                )
+                                    && cfg
+                                        .get(write)
+                                        .is_some_and(|successors| successors.contains(site))
+                            })
+                        })
+                        || !call_frame_offset.is_some_and(|offset| {
+                            msvc_gs_returning_call_push_is_disjoint(
+                                offset,
+                                spill_coordinate,
+                                cookie_end,
+                            )
+                        })
+                    {
+                        writes_are_disjoint = false;
+                        break;
+                    }
+                    authenticated_body_effect_nodes.insert(*write);
+                    authenticated_returning_calls.insert(*write);
+                    continue;
                 }
                 let write_operands = decoded_write_operands.get(write);
                 for write_operand in write_operands.into_iter().flatten() {
@@ -2421,7 +2520,24 @@ fn recognize_msvc_gs_cookie_guards(db: &DecompileDB) -> Vec<MsvcGsCookieGuardWit
                 // Accept only positive, complete effect evidence.  A missing
                 // lowering and LinearPass's generic Lbranch fallback are not
                 // semantic coverage for an arbitrary decoded instruction.
+                // VS2013's ASSERT intrinsic is one additional closed form:
+                // exact INT 2Ch lowered only as the argument-free __int2c
+                // builtin.  Like a returning CALL, an interrupt handler may
+                // alter the protected value—the terminal /GS check exists to
+                // detect exactly that—but the instruction has no explicit
+                // in-frame write or register/stack definition of its own.
+                let exact_int2c = mnemonic == "INT"
+                    && operand_counts.get(write) == Some(&1)
+                    && operands.get(write).is_some_and(|raw| {
+                        immediates
+                            .get(&raw[0])
+                            .is_some_and(|values| values == &BTreeSet::from([0x2c]))
+                    })
+                    && decoded_defs.get(write).map_or(true, BTreeSet::is_empty)
+                    && write_operands.map_or(true, BTreeSet::is_empty)
+                    && msvc_gs_exact_int2c_candidates(ltl_candidates.get(write));
                 if !authenticated_raw_only_control_nodes.contains(write)
+                    && !exact_int2c
                     && !msvc_gs_instruction_effects_are_fully_modeled(
                         mnemonic,
                         ltl_candidates.get(write),
@@ -2435,6 +2551,7 @@ fn recognize_msvc_gs_cookie_guards(db: &DecompileDB) -> Vec<MsvcGsCookieGuardWit
                     writes_are_disjoint = false;
                     break;
                 }
+                authenticated_body_effect_nodes.insert(*write);
             }
             if !writes_are_disjoint || !witnessed_spill_write {
                 continue;
@@ -2567,6 +2684,12 @@ fn recognize_msvc_gs_cookie_guards(db: &DecompileDB) -> Vec<MsvcGsCookieGuardWit
             authenticated_raw_only_nodes
                 .extend(authenticated_raw_only_frame_allocations.iter().copied());
             authenticated_raw_only_nodes.extend(
+                authenticated_body_effect_nodes
+                    .iter()
+                    .filter(|node| !unique_ltl_nodes.contains(node))
+                    .copied(),
+            );
+            authenticated_raw_only_nodes.extend(
                 terminal_raw_only_nodes
                     .into_iter()
                     .filter(|node| {
@@ -2589,6 +2712,7 @@ fn recognize_msvc_gs_cookie_guards(db: &DecompileDB) -> Vec<MsvcGsCookieGuardWit
                 &authenticated_raw_only_nodes,
                 &mnemonics,
                 &unresolved_indirect_sources,
+                &authenticated_returning_calls,
             )
             .is_none()
             {
@@ -19716,6 +19840,96 @@ mod encoding_tests {
     }
 
     #[test]
+    fn gs_returning_call_authenticates_only_its_disjoint_stack_push() {
+        // VS2013 /GS example: SUB RSP,88h; cookie at [RSP+70h].
+        assert!(msvc_gs_returning_call_push_is_disjoint(
+            -0x88,
+            -0x18,
+            -0x10,
+        ));
+        // A malformed witness that overlaps CALL's pushed return address is
+        // rejected, as are empty/reversed and overflowing ranges.
+        assert!(!msvc_gs_returning_call_push_is_disjoint(
+            -0x18,
+            -0x20,
+            -0x18,
+        ));
+        assert!(!msvc_gs_returning_call_push_is_disjoint(-0x18, -8, -8));
+        assert!(!msvc_gs_returning_call_push_is_disjoint(
+            i64::MIN,
+            -0x18,
+            -0x10,
+        ));
+    }
+
+    #[test]
+    fn gs_register_only_effect_proof_tolerates_value_condition_ambiguity() {
+        let candidates = vec![
+            LTLInst::Lop(Operation::Oandimm(-2), Arc::new(vec![Mreg::AX]), Mreg::AX),
+            LTLInst::Lop(
+                Operation::Oandlimm(0xffff_fffe),
+                Arc::new(vec![Mreg::AX]),
+                Mreg::AX,
+            ),
+            LTLInst::Lcond(
+                Condition::Ccompimm(Comparison::Ceq, 0),
+                Arc::new(vec![Mreg::AX]),
+                Either::Right(0x2000),
+                Either::Right(0x1004),
+            ),
+        ];
+        let decoded_defs = BTreeSet::from([Mreg::AX]);
+        let no_writes = BTreeSet::new();
+        assert!(msvc_gs_instruction_effects_are_fully_modeled(
+            "AND",
+            Some(&candidates),
+            Some(&decoded_defs),
+            Some(&no_writes),
+            Some(2),
+            true,
+        ));
+        assert!(!msvc_gs_instruction_effects_are_fully_modeled(
+            "AND",
+            Some(&candidates),
+            Some(&BTreeSet::from([Mreg::Unknown])),
+            Some(&no_writes),
+            Some(2),
+            true,
+        ));
+        assert!(!msvc_gs_instruction_effects_are_fully_modeled(
+            "AND",
+            Some(&candidates),
+            Some(&decoded_defs),
+            Some(&BTreeSet::from(["memory"])),
+            Some(2),
+            true,
+        ));
+    }
+
+    #[test]
+    fn gs_int2c_candidate_proof_is_exact_and_argument_free() {
+        let exact = LTLInst::Lbuiltin(
+            "__int2c".to_owned(),
+            vec![],
+            BuiltinArg::BAInt(0),
+        );
+        assert!(msvc_gs_exact_int2c_candidates(Some(&vec![
+            exact.clone(),
+            exact,
+        ])));
+        assert!(!msvc_gs_exact_int2c_candidates(Some(&vec![
+            LTLInst::Lbuiltin("__int2d".to_owned(), vec![], BuiltinArg::BAInt(0)),
+        ])));
+        assert!(!msvc_gs_exact_int2c_candidates(Some(&vec![
+            LTLInst::Lbuiltin(
+                "__int2c".to_owned(),
+                vec![BuiltinArg::BAInt(1)],
+                BuiltinArg::BAInt(0),
+            ),
+        ])));
+    }
+
+    #[test]
     fn gs_normalization_uses_witnessed_cx_identity_among_stale_aliases() {
         let mut db = DecompileDB::default();
         let owner: Address = 0x1000;
@@ -19970,6 +20184,7 @@ mod encoding_tests {
                 &BTreeSet::from([function]),
                 &mnemonics,
                 &unresolved,
+                &BTreeSet::new(),
             ),
             Some(raw_nodes.clone())
         );
@@ -19987,8 +20202,27 @@ mod encoding_tests {
                 &BTreeSet::new(),
                 &mnemonics,
                 &unresolved,
+                &BTreeSet::new(),
             ),
             None
+        );
+        assert_eq!(
+            authenticated_msvc_gs_cfg_slice(
+                function,
+                ret,
+                function,
+                &cfg,
+                &reverse_cfg,
+                &canonical_owners,
+                &claimants,
+                &raw_nodes,
+                &ltl_nodes,
+                &BTreeSet::from([function]),
+                &mnemonics,
+                &BTreeSet::from([function]),
+                &BTreeSet::from([function]),
+            ),
+            Some(raw_nodes)
         );
     }
 
