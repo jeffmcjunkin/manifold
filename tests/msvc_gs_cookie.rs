@@ -66,6 +66,8 @@ arbitrary_result_sink:
         .extern opaque_guard_alias
         .extern opaque_guard_frame_low
         .extern opaque_guard_frame_high
+        .extern opaque_guard_body_call
+        .extern opaque_returning_body
         .extern competing_slot_target
         .extern invalid_restore_target
         .extern partial_terminal_target
@@ -260,6 +262,24 @@ gs_frame_upper_boundary:
         movq 48(%rsp), %rcx
         xorq %rsp, %rcx
         callq opaque_guard_frame_high
+        addq $56, %rsp
+        retq
+
+        # A returning body call has arbitrary callee memory effects, but CALL's
+        # own stack push is disjoint from the protected slot.  A later exact AX
+        # definition supplies the wrapper result before the authenticated guard.
+        .globl gs_returning_body_call
+        .def gs_returning_body_call; .scl 2; .type 32; .endef
+gs_returning_body_call:
+        subq $56, %rsp
+        movq arbitrary_process_cookie(%rip), %rax
+        xorq %rsp, %rax
+        movq %rax, 40(%rsp)
+        callq opaque_returning_body
+        movl $61, %eax
+        movq 40(%rsp), %rcx
+        xorq %rsp, %rcx
+        callq opaque_guard_body_call
         addq $56, %rsp
         retq
 
@@ -471,11 +491,12 @@ balanced_call_overlap:
 balanced_overlap_helper:
         retq
 
-        # Even when CALL's pushed return address is disjoint from the cookie,
-        # the called body has unknown memory effects and can clobber it.
-        .globl body_call_unknown_clobber
-        .def body_call_unknown_clobber; .scl 2; .type 32; .endef
-body_call_unknown_clobber:
+        # A same-object returning body call may mutate protected storage, which
+        # is why the terminal /GS reload and check must remain.  Its own stack
+        # push is disjoint and the later constant is the wrapper result.
+        .globl gs_returning_local_body_call
+        .def gs_returning_local_body_call; .scl 2; .type 32; .endef
+gs_returning_local_body_call:
         subq $56, %rsp
         movq arbitrary_process_cookie(%rip), %rax
         xorq %rsp, %rax
@@ -1157,6 +1178,8 @@ fn structural_external_guards_are_exact_per_call_and_ax_transparent() {
             "gs_alias_disjoint",
             "gs_frame_lower_boundary",
             "gs_frame_upper_boundary",
+            "gs_returning_body_call",
+            "gs_returning_local_body_call",
         ];
         assert_eq!(
             facts.len(),
@@ -1172,7 +1195,14 @@ fn structural_external_guards_are_exact_per_call_and_ax_transparent() {
                 .collect();
             assert_eq!(rows.len(), 1, "{name} did not emit one exact fact");
             assert_exact_guard_call(&db, rows[0]);
-            if matches!(name, "gs_nonvoid" | "gs_multiarm" | "gs_vs2013_shape") {
+            if matches!(
+                name,
+                "gs_nonvoid"
+                    | "gs_multiarm"
+                    | "gs_vs2013_shape"
+                    | "gs_returning_body_call"
+                    | "gs_returning_local_body_call"
+            ) {
                 assert_pre_call_ax_is_returned(&db, rows[0]);
             }
             if name == "gs_multiarm" {
@@ -1195,7 +1225,6 @@ fn structural_external_guards_are_exact_per_call_and_ax_transparent() {
             "unknown_base_write",
             "balanced_push_overlap",
             "balanced_call_overlap",
-            "body_call_unknown_clobber",
             "branch_entry_bypass",
             "dead_noreturn_epilogue",
             "implicit_string_overlap",
