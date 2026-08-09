@@ -10,13 +10,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use crate::decompile::disassembly::coff::{CoffAddressMap, CoffExternalKind, CoffFunctionMap};
+use crate::decompile::disassembly::coff::{
+    CoffAddressMap, CoffExternalKind, CoffExternalMap, CoffFunctionMap, CoffRelocationMap,
+};
 use crate::decompile::elevator::DecompileDB;
 use crate::mreg::Mreg;
 use crate::x86::types::{Address, Node, Symbol};
 
 pub const MACHINE_STATE_STUB_SCHEMA_ID: &str = "manifold.machine-state-stub.set-imm32-tail-jump.v1";
 pub const WIN64_SYSCALL_STUB_SCHEMA_ID: &str = "manifold.machine-state-stub.win64-syscall.v1";
+pub const WIN64_KERNEL_SERVICE_STUB_SCHEMA_ID: &str =
+    "manifold.machine-state-stub.win64-kernel-service.v1";
 pub const GUARDED_INDIRECT_FORWARD_TAIL_SCHEMA_ID: &str =
     "manifold.machine-state-stub.guarded-indirect-forward-tail.v1";
 
@@ -223,10 +227,70 @@ pub struct Win64SyscallStub {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MachineStateInterruptControl {
+    pub instruction_address: String,
+    pub kind: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MachineStateStackAdjustment {
+    pub instruction_address: String,
+    pub register: &'static str,
+    pub operation: &'static str,
+    pub width_bits: u8,
+    pub amount_bytes: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MachineStateStackPush {
+    pub instruction_address: String,
+    pub kind: &'static str,
+    pub stack_width_bits: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_register: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub immediate_value: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub immediate_width_bits: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MachineStateRelocatedAddressLoad {
+    pub instruction_address: String,
+    pub kind: &'static str,
+    pub destination_register: &'static str,
+    pub width_bits: u8,
+    pub target_address: String,
+    pub target_original_name: String,
+    pub target_provider_name: String,
+    pub target_kind: &'static str,
+    pub relocation: MachineStateRelocationIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Win64KernelServiceStub {
+    pub schema: &'static str,
+    pub kind: &'static str,
+    pub function: MachineStateCoffFunctionIdentity,
+    pub abi: Win64AbiState,
+    pub entry_stack_pointer: MachineStateRegisterCopy,
+    pub interrupt_control: MachineStateInterruptControl,
+    pub stack_adjustment: MachineStateStackAdjustment,
+    pub pushes: Vec<MachineStateStackPush>,
+    pub linkage: MachineStateRelocatedAddressLoad,
+    pub service_number: MachineStateImmediateWrite,
+    pub dispatcher: MachineStateTailTransfer,
+    pub return_instruction_address: String,
+    pub return_kind: &'static str,
+    pub padding: MachineStatePadding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum MachineStateStubRecord {
     SetImm32DirectTailJump(MachineStateStub),
     Win64Syscall(Win64SyscallStub),
+    Win64KernelService(Win64KernelServiceStub),
     GuardedIndirectForwardTail(GuardedIndirectForwardTailStub),
 }
 
@@ -235,6 +299,7 @@ impl MachineStateStubRecord {
         match self {
             Self::SetImm32DirectTailJump(stub) => &stub.function.name,
             Self::Win64Syscall(stub) => &stub.function.name,
+            Self::Win64KernelService(stub) => &stub.function.name,
             Self::GuardedIndirectForwardTail(stub) => &stub.function.name,
         }
     }
@@ -243,6 +308,7 @@ impl MachineStateStubRecord {
         match self {
             Self::SetImm32DirectTailJump(stub) => &stub.function.address,
             Self::Win64Syscall(stub) => &stub.function.address,
+            Self::Win64KernelService(stub) => &stub.function.address,
             Self::GuardedIndirectForwardTail(stub) => &stub.function.address,
         }
     }
@@ -484,6 +550,25 @@ pub fn recognize_machine_state_stubs(
             &flags_and_jumps,
         ) {
             result.push(MachineStateStubRecord::Win64Syscall(stub));
+        }
+        if let Some(stub) = recognize_win64_kernel_service(
+            function,
+            map,
+            &instructions,
+            &registers,
+            &immediates,
+            &indirects,
+            &owners,
+            &next,
+            &direct_jumps,
+            &direct_calls,
+            &cfg,
+            &decoded_defs,
+            &decoded_uses,
+            &memory_reads,
+            &memory_writes,
+        ) {
+            result.push(MachineStateStubRecord::Win64KernelService(stub));
         }
         if let Some(stub) = recognize_guarded_indirect_forward_tail(
             function,
@@ -1164,6 +1249,404 @@ fn exact_instruction_header(
             .all(|operand| *operand == "0")
 }
 
+fn exact_undefined_function_external<'a>(
+    map: &'a CoffAddressMap,
+    relocation: &CoffRelocationMap,
+) -> Option<&'a CoffExternalMap> {
+    // OR matching makes duplicate names and aliased synthetic addresses
+    // ambiguous instead of letting either half hide the other.
+    let external = only(map.externs.iter().filter(|external| {
+        external.original_name == relocation.target_original_name
+            || external.synthetic_address == relocation.target_mapped_address
+    }))?;
+    let symbol = only(map.symbols.iter().filter(|symbol| {
+        symbol.original_name == relocation.target_original_name
+            || symbol.mapped_address == relocation.target_mapped_address
+    }))?;
+    (external.original_name == relocation.target_original_name
+        && external.synthetic_address == relocation.target_mapped_address
+        && external.kind == CoffExternalKind::Function
+        && symbol.original_name == relocation.target_original_name
+        && symbol.provider_name == external.provider_name
+        && symbol.mapped_address == relocation.target_mapped_address
+        && symbol.kind == "function"
+        && !symbol.defined
+        && symbol.section_index.is_none()
+        && symbol.section_offset.is_none())
+    .then_some(external)
+}
+
+/// Recognize one closed, 64-byte Win64 privileged service wrapper.  Selection
+/// uses only structured operands/effects, exact ownership and CFG, and two
+/// original COFF REL32 identities; names, addresses, bytes, and corpus keys do
+/// not participate.
+#[allow(clippy::too_many_arguments)]
+fn recognize_win64_kernel_service(
+    function: &CoffFunctionMap,
+    map: &CoffAddressMap,
+    instructions: &BTreeMap<Address, Vec<Instruction>>,
+    registers: &BTreeMap<Symbol, BTreeSet<&'static str>>,
+    immediates: &BTreeMap<Symbol, BTreeSet<i64>>,
+    indirects: &BTreeMap<Symbol, BTreeSet<IndirectOperand>>,
+    owners: &BTreeMap<Node, BTreeSet<Address>>,
+    next: &BTreeMap<Node, BTreeSet<Node>>,
+    direct_jumps: &BTreeMap<Node, BTreeSet<Address>>,
+    direct_calls: &BTreeMap<Node, BTreeSet<Address>>,
+    cfg: &BTreeMap<Node, BTreeSet<(Address, Symbol)>>,
+    decoded_defs: &BTreeMap<Node, BTreeSet<Mreg>>,
+    decoded_uses: &BTreeMap<Node, BTreeSet<Mreg>>,
+    memory_reads: &BTreeMap<Node, BTreeSet<Symbol>>,
+    memory_writes: &BTreeMap<Node, BTreeSet<Symbol>>,
+) -> Option<Win64KernelServiceStub> {
+    const SIZE: u64 = 64;
+    if map.schema != "manifold.coff-address-map.v1"
+        || map.loader_id != "amd64-coff-image-v1"
+        || map.architecture != "x86_64-pc-windows-msvc"
+        || function.original_size != SIZE
+        || function.manifold_size != SIZE
+        || function.mapped_end != function.mapped_entry.checked_add(SIZE)?
+        || function.mapped_entry % SIZE != 0
+    {
+        return None;
+    }
+    let section = only(
+        map.sections
+            .iter()
+            .filter(|section| section.index == function.section_index),
+    )?;
+    if section.kind != "Text"
+        || function
+            .section_offset
+            .checked_sub(section.original_offset_start)?
+            % SIZE
+            != 0
+        || function.mapped_entry < section.mapped_va_start
+        || function.mapped_end > section.mapped_va_end
+        || function.section_offset.checked_add(SIZE)? > section.original_offset_end
+    {
+        return None;
+    }
+
+    let rows: [Instruction; 16] = instructions
+        .range(function.mapped_entry..function.mapped_end)
+        .flat_map(|(_, rows)| rows.iter().copied())
+        .collect::<Vec<_>>()
+        .try_into()
+        .ok()?;
+    let [h0, h1, h2, h3, copy, cli, sub, push_sp, pushfq, push_sel, lea, push_lea, service, jump, ret, pad] =
+        rows;
+    let headers = [
+        (h0, 5, "MOV", 2),
+        (h1, 5, "MOV", 2),
+        (h2, 5, "MOV", 2),
+        (h3, 5, "MOV", 2),
+        (copy, 3, "MOV", 2),
+        (cli, 1, "CLI", 0),
+        (sub, 4, "SUB", 2),
+        (push_sp, 1, "PUSH", 1),
+        (pushfq, 1, "PUSHFQ", 0),
+        (push_sel, 2, "PUSH", 1),
+        (lea, 7, "LEA", 2),
+        (push_lea, 1, "PUSH", 1),
+        (service, 5, "MOV", 2),
+        (jump, 5, "JMP", 1),
+        (ret, 1, "RET", 0),
+        (pad, 13, "NOP", 1),
+    ];
+    if h0.0 != function.mapped_entry
+        || headers.into_iter().any(|(row, size, mnemonic, count)| {
+            !exact_instruction_header(row, size, mnemonic, count)
+        })
+        || rows
+            .windows(2)
+            .any(|pair| pair[0].0.checked_add(pair[0].1 as u64) != Some(pair[1].0))
+        || pad.0.checked_add(pad.1 as u64) != Some(function.mapped_end)
+    {
+        return None;
+    }
+
+    let home_specs = [
+        (h0, "RCX", "rcx", Mreg::CX, 8u8),
+        (h1, "RDX", "rdx", Mreg::DX, 16u8),
+        (h2, "R8", "r8", Mreg::R8, 24u8),
+        (h3, "R9", "r9", Mreg::R9, 32u8),
+    ];
+    let mut home_stores = Vec::with_capacity(4);
+    for (row, decoded, wire, _, offset) in home_specs {
+        if !exact_operand_register(row.4, decoded, registers, immediates, indirects)
+            || !exact_operand_memory(
+                row.5,
+                ("NONE", "RSP", "NONE", 1, i64::from(offset), 8),
+                registers,
+                immediates,
+                indirects,
+            )
+        {
+            return None;
+        }
+        home_stores.push(Win64HomeStore {
+            instruction_address: format!("0x{:x}", row.0),
+            source_register: wire,
+            stack_offset: offset,
+            width_bits: 64,
+        });
+    }
+    let lea_disp = only(indirects.get(lea.4)?.iter().copied())?.4;
+    if !exact_operand_register(copy.4, "RSP", registers, immediates, indirects)
+        || !exact_operand_register(copy.5, "RAX", registers, immediates, indirects)
+        || !exact_operand_immediate(sub.4, 16, registers, immediates, indirects)
+        || !exact_operand_register(sub.5, "RSP", registers, immediates, indirects)
+        || !exact_operand_register(push_sp.4, "RAX", registers, immediates, indirects)
+        || !exact_operand_immediate(push_sel.4, 16, registers, immediates, indirects)
+        || !exact_operand_memory(
+            lea.4,
+            ("NONE", "RIP", "NONE", 1, lea_disp, 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_register(lea.5, "RAX", registers, immediates, indirects)
+        || !exact_operand_register(push_lea.4, "RAX", registers, immediates, indirects)
+        || !exact_operand_register(service.5, "EAX", registers, immediates, indirects)
+        || !exact_operand_memory(
+            pad.4,
+            ("NONE", "RAX", "RAX", 1, 0, 2),
+            registers,
+            immediates,
+            indirects,
+        )
+    {
+        return None;
+    }
+    let service_number = reinterpret_imm32(exact_immediate_operand(
+        service.4, registers, immediates, indirects,
+    )?)?;
+
+    let memory: [(Option<Symbol>, Option<Symbol>); 16] = [
+        (None, Some(h0.5)),
+        (None, Some(h1.5)),
+        (None, Some(h2.5)),
+        (None, Some(h3.5)),
+        (None, None),
+        (None, None),
+        (None, None),
+        (None, None),
+        (None, None),
+        (None, None),
+        (Some(lea.4), None),
+        (None, None),
+        (None, None),
+        (None, None),
+        (None, None),
+        (None, None),
+    ];
+    let registers_expected: [(&[Mreg], &[Mreg]); 16] = [
+        (&[], &[Mreg::SP, Mreg::CX]),
+        (&[], &[Mreg::SP, Mreg::DX]),
+        (&[], &[Mreg::SP, Mreg::R8]),
+        (&[], &[Mreg::SP, Mreg::R9]),
+        (&[Mreg::AX], &[Mreg::SP]),
+        (&[], &[]),
+        (&[Mreg::SP], &[Mreg::SP]),
+        (&[Mreg::SP], &[Mreg::SP, Mreg::AX]),
+        (&[Mreg::SP], &[Mreg::SP]),
+        (&[Mreg::SP], &[Mreg::SP]),
+        (&[Mreg::AX], &[]),
+        (&[Mreg::SP], &[Mreg::SP, Mreg::AX]),
+        (&[Mreg::AX], &[]),
+        (&[], &[]),
+        (&[Mreg::SP], &[Mreg::SP]),
+        (&[], &[]),
+    ];
+    for ((row, (read, write)), (defs, uses)) in rows.iter().zip(memory).zip(registers_expected) {
+        if !exact_symbol_set(
+            memory_reads.get(&row.0),
+            &read.into_iter().collect::<Vec<_>>(),
+        ) || !exact_symbol_set(
+            memory_writes.get(&row.0),
+            &write.into_iter().collect::<Vec<_>>(),
+        ) || !exact_register_effects(row.0, defs, uses, decoded_defs, decoded_uses)
+        {
+            return None;
+        }
+    }
+
+    let jump_target = u64::try_from(exact_immediate_operand(
+        jump.4, registers, immediates, indirects,
+    )?)
+    .ok()?;
+    let lea_target = lea
+        .0
+        .checked_add(lea.1 as u64)?
+        .checked_add_signed(lea_disp)?;
+    let pad_cfg = exact_or_authenticated_padding_fallthrough(cfg, pad.0, function, map);
+    for (index, row) in rows.iter().copied().enumerate() {
+        let row_cfg = cfg.get(&row.0).cloned().unwrap_or_default();
+        if owners.get(&row.0) != Some(&BTreeSet::from([function.mapped_entry]))
+            || !exact_or_empty(next, row.0, rows.get(index + 1).map(|next| next.0))
+            || !exact_or_empty(direct_calls, row.0, [])
+            || (row.0 == jump.0
+                && (direct_jumps.get(&row.0) != Some(&BTreeSet::from([jump_target]))
+                    || row_cfg != BTreeSet::from([(jump_target, "branch")])))
+            || (row.0 != jump.0 && !exact_or_empty(direct_jumps, row.0, []))
+            || (row.0 != jump.0 && row.0 != pad.0 && !row_cfg.is_empty())
+            || (row.0 == pad.0 && !pad_cfg)
+        {
+            return None;
+        }
+    }
+
+    let original_end = function.section_offset.checked_add(SIZE)?;
+    let relocations: Vec<_> = map
+        .relocations
+        .iter()
+        .filter(|relocation| {
+            if relocation.section_index != function.section_index {
+                return false;
+            }
+            let width = u64::from(relocation.width_bits).div_ceil(8).max(1);
+            (relocation.section_offset < original_end
+                && relocation.section_offset.saturating_add(width) > function.section_offset)
+                || (relocation.mapped_field_va < function.mapped_end
+                    && relocation.mapped_field_va.saturating_add(width) > function.mapped_entry)
+        })
+        .collect();
+    if relocations.len() != 2 {
+        return None;
+    }
+    let lea_reloc = only(
+        relocations
+            .iter()
+            .copied()
+            .filter(|r| r.mapped_field_va == lea.0 + 3),
+    )?;
+    let jump_reloc = only(
+        relocations
+            .iter()
+            .copied()
+            .filter(|r| r.mapped_field_va == jump.0 + 1),
+    )?;
+    let validate_reloc = |relocation: &CoffRelocationMap,
+                          instruction: Instruction,
+                          field_offset: u64,
+                          target: Address,
+                          decoded_disp: Option<i64>|
+     -> Option<()> {
+        let next = instruction.0.checked_add(instruction.1 as u64)?;
+        let displacement = i32::try_from(i128::from(target) - i128::from(next)).ok()?;
+        let encoded = i64::from(u32::try_from(relocation.encoded_value).ok()? as i32);
+        let section_offset = function
+            .section_offset
+            .checked_add(instruction.0.checked_sub(function.mapped_entry)?)?
+            .checked_add(field_offset)?;
+        (relocation.section_name == section.name
+            && relocation.section_offset == section_offset
+            && relocation.mapped_field_va == instruction.0.checked_add(field_offset)?
+            && relocation.relocation_type == "IMAGE_REL_AMD64_REL32"
+            && relocation.width_bits == 32
+            && relocation.target_mapped_address == target
+            && encoded == i64::from(displacement)
+            && decoded_disp.map_or(true, |value| value == i64::from(displacement)))
+        .then_some(())
+    };
+    validate_reloc(lea_reloc, lea, 3, lea_target, Some(lea_disp))?;
+    validate_reloc(jump_reloc, jump, 1, jump_target, None)?;
+    let linkage = exact_undefined_function_external(map, lea_reloc)?;
+    let dispatcher = exact_undefined_function_external(map, jump_reloc)?;
+    let relocation_identity = |relocation: &CoffRelocationMap| MachineStateRelocationIdentity {
+        section_index: relocation.section_index,
+        section_name: relocation.section_name.clone(),
+        section_offset: relocation.section_offset,
+        relocation_type: relocation.relocation_type.clone(),
+        width_bits: relocation.width_bits,
+    };
+    let push = |row: Instruction, kind, source_register, immediate_value, immediate_width_bits| {
+        MachineStateStackPush {
+            instruction_address: format!("0x{:x}", row.0),
+            kind,
+            stack_width_bits: 64,
+            source_register,
+            immediate_value,
+            immediate_width_bits,
+        }
+    };
+
+    Some(Win64KernelServiceStub {
+        schema: WIN64_KERNEL_SERVICE_STUB_SCHEMA_ID,
+        kind: "win64_kernel_service",
+        function: MachineStateCoffFunctionIdentity {
+            name: function.provider_name.clone(),
+            address: format!("0x{:x}", function.mapped_entry),
+            size: SIZE,
+            section_index: function.section_index,
+            section_name: section.name.clone(),
+            section_offset: function.section_offset,
+        },
+        abi: Win64AbiState {
+            name: "win64",
+            argument_registers: ["rcx", "rdx", "r8", "r9"],
+            home_kind: "four_register_arguments",
+            home_stores,
+        },
+        entry_stack_pointer: MachineStateRegisterCopy {
+            instruction_address: format!("0x{:x}", copy.0),
+            source_register: "rsp",
+            destination_register: "rax",
+            width_bits: 64,
+        },
+        interrupt_control: MachineStateInterruptControl {
+            instruction_address: format!("0x{:x}", cli.0),
+            kind: "disable_maskable_interrupts",
+        },
+        stack_adjustment: MachineStateStackAdjustment {
+            instruction_address: format!("0x{:x}", sub.0),
+            register: "rsp",
+            operation: "subtract",
+            width_bits: 64,
+            amount_bytes: 16,
+        },
+        pushes: vec![
+            push(push_sp, "register_value", Some("rax"), None, None),
+            push(pushfq, "flags", None, None, None),
+            push(push_sel, "immediate", None, Some(16), Some(8)),
+            push(push_lea, "register_value", Some("rax"), None, None),
+        ],
+        linkage: MachineStateRelocatedAddressLoad {
+            instruction_address: format!("0x{:x}", lea.0),
+            kind: "rip_relative_address",
+            destination_register: "rax",
+            width_bits: 64,
+            target_address: format!("0x{lea_target:x}"),
+            target_original_name: linkage.original_name.clone(),
+            target_provider_name: linkage.provider_name.clone(),
+            target_kind: "function",
+            relocation: relocation_identity(lea_reloc),
+        },
+        service_number: MachineStateImmediateWrite {
+            instruction_address: format!("0x{:x}", service.0),
+            register: "eax",
+            width_bits: 32,
+            value: service_number,
+        },
+        dispatcher: MachineStateTailTransfer {
+            instruction_address: format!("0x{:x}", jump.0),
+            kind: "direct_tail_jump",
+            target_address: format!("0x{jump_target:x}"),
+            target_original_name: dispatcher.original_name.clone(),
+            target_provider_name: dispatcher.provider_name.clone(),
+            relocation: relocation_identity(jump_reloc),
+        },
+        return_instruction_address: format!("0x{:x}", ret.0),
+        return_kind: "near_return",
+        padding: MachineStatePadding {
+            instruction_address: format!("0x{:x}", pad.0),
+            kind: "nop_alignment",
+            boundary: SIZE as u8,
+            size: pad.1 as u8,
+        },
+    })
+}
+
 /// Recognize one complete Win64 forwarding contract whose indirect target is
 /// checked through a relocation-backed pointer and then tail-transferred with
 /// the four incoming volatile integer registers restored.
@@ -1570,6 +2053,33 @@ mod tests {
     const LEGACY_TARGET: Symbol = "syscall_legacy_target";
     const LEGACY_VECTOR: Symbol = "syscall_legacy_vector";
     const PADDING_MEMORY: Symbol = "syscall_padding_memory";
+
+    const KH0: Symbol = "kernel_home_0";
+    const KH1: Symbol = "kernel_home_1";
+    const KH2: Symbol = "kernel_home_2";
+    const KH3: Symbol = "kernel_home_3";
+    const KM0: Symbol = "kernel_mem_0";
+    const KM1: Symbol = "kernel_mem_1";
+    const KM2: Symbol = "kernel_mem_2";
+    const KM3: Symbol = "kernel_mem_3";
+    const KRSP: Symbol = "kernel_rsp";
+    const KRAX: Symbol = "kernel_rax";
+    const KEAX: Symbol = "kernel_eax";
+    const KSUB: Symbol = "kernel_sub";
+    const KSEL: Symbol = "kernel_selector";
+    const KLEA: Symbol = "kernel_lea";
+    const KSVC: Symbol = "kernel_service";
+    const KJMP: Symbol = "kernel_jump";
+    const KPAD: Symbol = "kernel_padding";
+
+    macro_rules! set_rows {
+        ($db:expr, $relation:literal, $rows:expr) => {
+            $db.rel_set(
+                $relation,
+                $rows.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+            )
+        };
+    }
 
     fn fixture() -> (DecompileDB, CoffAddressMap) {
         let mut db = DecompileDB::default();
@@ -2007,6 +2517,328 @@ mod tests {
         (db, map)
     }
 
+    fn kernel_service_fixture() -> (DecompileDB, CoffAddressMap) {
+        let mut db = DecompileDB::default();
+        let entry = 0x1000_0000_u64;
+        let link_target = 0x1000_8010_u64;
+        let dispatch_target = 0x1000_8000_u64;
+        let ins = |offset, size, mnemonic, op1, op2| -> Instruction {
+            (
+                entry + offset,
+                size,
+                "",
+                mnemonic,
+                op1,
+                op2,
+                NONE,
+                NONE,
+                0,
+                0,
+            )
+        };
+        let rows = [
+            ins(0x00, 5, "MOV", KH0, KM0),
+            ins(0x05, 5, "MOV", KH1, KM1),
+            ins(0x0a, 5, "MOV", KH2, KM2),
+            ins(0x0f, 5, "MOV", KH3, KM3),
+            ins(0x14, 3, "MOV", KRSP, KRAX),
+            ins(0x17, 1, "CLI", NONE, NONE),
+            ins(0x18, 4, "SUB", KSUB, KRSP),
+            ins(0x1c, 1, "PUSH", KRAX, NONE),
+            ins(0x1d, 1, "PUSHFQ", NONE, NONE),
+            ins(0x1e, 2, "PUSH", KSEL, NONE),
+            ins(0x20, 7, "LEA", KLEA, KRAX),
+            ins(0x27, 1, "PUSH", KRAX, NONE),
+            ins(0x28, 5, "MOV", KSVC, KEAX),
+            ins(0x2d, 5, "JMP", KJMP, NONE),
+            ins(0x32, 1, "RET", NONE, NONE),
+            ins(0x33, 13, "NOP", KPAD, NONE),
+        ];
+        let addresses = rows.map(|row| row.0);
+        let link_disp = i64::try_from(link_target - (entry + 0x27)).unwrap();
+        let dispatch_disp = i64::try_from(dispatch_target - (entry + 0x32)).unwrap();
+
+        set_rows!(db, "unrefinedinstruction", rows);
+        set_rows!(
+            db,
+            "op_register",
+            [
+                (KH0, "RCX"),
+                (KH1, "RDX"),
+                (KH2, "R8"),
+                (KH3, "R9"),
+                (KRSP, "RSP"),
+                (KRAX, "RAX"),
+                (KEAX, "EAX"),
+            ]
+        );
+        set_rows!(
+            db,
+            "op_immediate",
+            [
+                (KSUB, 16, 0_usize),
+                (KSEL, 16, 0),
+                (KSVC, 0x89ab_cdef_i64, 0),
+                (KJMP, dispatch_target as i64, 0)
+            ]
+        );
+        set_rows!(
+            db,
+            "op_indirect",
+            [
+                (KM0, "NONE", "RSP", "NONE", 1_i64, 8, 8_usize),
+                (KM1, "NONE", "RSP", "NONE", 1, 16, 8),
+                (KM2, "NONE", "RSP", "NONE", 1, 24, 8),
+                (KM3, "NONE", "RSP", "NONE", 1, 32, 8),
+                (KLEA, "NONE", "RIP", "NONE", 1, link_disp, 8),
+                (KPAD, "NONE", "RAX", "RAX", 1, 0, 2),
+            ]
+        );
+        set_rows!(
+            db,
+            "instr_in_function",
+            addresses.map(|address| (address, entry))
+        );
+        set_rows!(
+            db,
+            "next",
+            addresses.windows(2).map(|pair| (pair[0], pair[1]))
+        );
+        set_rows!(db, "direct_jump", [(entry + 0x2d, dispatch_target)]);
+        set_rows!(db, "direct_call", Vec::<(Node, Address)>::new());
+        set_rows!(
+            db,
+            "ddisasm_cfg_edge",
+            [(entry + 0x2d, dispatch_target, "branch")]
+        );
+        set_rows!(db, "decoded_memory_read_operand", [(entry + 0x20, KLEA)]);
+        set_rows!(
+            db,
+            "decoded_memory_write_operand",
+            [
+                (entry, KM0),
+                (entry + 5, KM1),
+                (entry + 10, KM2),
+                (entry + 15, KM3)
+            ]
+        );
+        set_rows!(
+            db,
+            "decoded_reg_def",
+            [
+                (entry + 0x14, Mreg::AX),
+                (entry + 0x18, Mreg::SP),
+                (entry + 0x1c, Mreg::SP),
+                (entry + 0x1d, Mreg::SP),
+                (entry + 0x1e, Mreg::SP),
+                (entry + 0x20, Mreg::AX),
+                (entry + 0x27, Mreg::SP),
+                (entry + 0x28, Mreg::AX),
+                (entry + 0x32, Mreg::SP),
+            ]
+        );
+        set_rows!(
+            db,
+            "decoded_reg_use",
+            [
+                (entry, Mreg::SP),
+                (entry, Mreg::CX),
+                (entry + 5, Mreg::SP),
+                (entry + 5, Mreg::DX),
+                (entry + 10, Mreg::SP),
+                (entry + 10, Mreg::R8),
+                (entry + 15, Mreg::SP),
+                (entry + 15, Mreg::R9),
+                (entry + 0x14, Mreg::SP),
+                (entry + 0x18, Mreg::SP),
+                (entry + 0x1c, Mreg::SP),
+                (entry + 0x1c, Mreg::AX),
+                (entry + 0x1d, Mreg::SP),
+                (entry + 0x1e, Mreg::SP),
+                (entry + 0x27, Mreg::SP),
+                (entry + 0x27, Mreg::AX),
+                (entry + 0x32, Mreg::SP),
+            ]
+        );
+
+        let external_symbol = |original: &str, provider: &str, address| CoffSymbolMap {
+            original_name: original.into(),
+            provider_name: provider.into(),
+            kind: "function".into(),
+            defined: false,
+            section_index: None,
+            section_offset: None,
+            mapped_address: address,
+        };
+        let external = |original: &str, provider: &str, address| CoffExternalMap {
+            original_name: original.into(),
+            provider_name: provider.into(),
+            kind: CoffExternalKind::Function,
+            synthetic_address: address,
+        };
+        let relocation = |offset, original: &str, target, encoded| CoffRelocationMap {
+            section_index: 1,
+            section_name: ".text$generic".into(),
+            section_offset: offset,
+            mapped_field_va: entry + offset,
+            relocation_type: "IMAGE_REL_AMD64_REL32".into(),
+            width_bits: 32,
+            target_original_name: original.into(),
+            target_mapped_address: target,
+            encoded_value: encoded as u64,
+        };
+        let map = CoffAddressMap {
+            schema: "manifold.coff-address-map.v1",
+            loader_id: "amd64-coff-image-v1",
+            architecture: "x86_64-pc-windows-msvc",
+            image_base: entry,
+            function_boundary_sidecar_sha256: None,
+            sections: vec![CoffSectionMap {
+                index: 1,
+                name: ".text$generic".into(),
+                kind: "Text".into(),
+                original_file_offset: Some(0x100),
+                original_offset_start: 0,
+                original_offset_end: 64,
+                mapped_va_start: entry,
+                mapped_va_end: entry + 64,
+            }],
+            functions: vec![CoffFunctionMap {
+                original_name: "arbitrary_original".into(),
+                provider_name: "coff_fn_arbitrary_provider".into(),
+                section_index: 1,
+                section_offset: 0,
+                original_size: 64,
+                manifold_size: 64,
+                mapped_entry: entry,
+                mapped_end: entry + 64,
+            }],
+            symbols: vec![
+                CoffSymbolMap {
+                    original_name: "arbitrary_original".into(),
+                    provider_name: "coff_fn_arbitrary_provider".into(),
+                    kind: "function".into(),
+                    defined: true,
+                    section_index: Some(1),
+                    section_offset: Some(0),
+                    mapped_address: entry,
+                },
+                external_symbol("arbitrary_link", "coff_ext_arbitrary_link", link_target),
+                external_symbol(
+                    "arbitrary_dispatch",
+                    "coff_ext_arbitrary_dispatch",
+                    dispatch_target,
+                ),
+            ],
+            externs: vec![
+                external("arbitrary_link", "coff_ext_arbitrary_link", link_target),
+                external(
+                    "arbitrary_dispatch",
+                    "coff_ext_arbitrary_dispatch",
+                    dispatch_target,
+                ),
+            ],
+            relocations: vec![
+                relocation(0x23, "arbitrary_link", link_target, link_disp),
+                relocation(0x2e, "arbitrary_dispatch", dispatch_target, dispatch_disp),
+            ],
+        };
+        (db, map)
+    }
+
+    fn rewrite_instruction(
+        db: &mut DecompileDB,
+        address: Address,
+        rewrite: impl Fn(Instruction) -> Instruction,
+    ) {
+        let mut count = 0;
+        let rows = db
+            .rel_iter::<Instruction>("unrefinedinstruction")
+            .map(|row| {
+                if row.0 == address {
+                    count += 1;
+                    rewrite(*row)
+                } else {
+                    *row
+                }
+            })
+            .collect::<ascent::boxcar::Vec<_>>();
+        assert_eq!(count, 1);
+        db.rel_set("unrefinedinstruction", rows);
+    }
+
+    fn replace_register(db: &mut DecompileDB, operand: Symbol, value: &'static str) {
+        let mut count = 0;
+        let rows = db
+            .rel_iter::<(Symbol, &'static str)>("op_register")
+            .map(|row| {
+                if row.0 == operand {
+                    count += 1;
+                    (row.0, value)
+                } else {
+                    *row
+                }
+            })
+            .collect::<ascent::boxcar::Vec<_>>();
+        assert_eq!(count, 1);
+        db.rel_set("op_register", rows);
+    }
+
+    fn replace_immediate(db: &mut DecompileDB, operand: Symbol, value: i64) {
+        let mut count = 0;
+        let rows = db
+            .rel_iter::<(Symbol, i64, usize)>("op_immediate")
+            .map(|row| {
+                if row.0 == operand {
+                    count += 1;
+                    (row.0, value, row.2)
+                } else {
+                    *row
+                }
+            })
+            .collect::<ascent::boxcar::Vec<_>>();
+        assert_eq!(count, 1);
+        db.rel_set("op_immediate", rows);
+    }
+
+    fn replace_indirect(db: &mut DecompileDB, operand: Symbol, value: IndirectOperand) {
+        type Row = (
+            Symbol,
+            &'static str,
+            &'static str,
+            &'static str,
+            i64,
+            i64,
+            usize,
+        );
+        let mut count = 0;
+        let rows = db
+            .rel_iter::<Row>("op_indirect")
+            .map(|row| {
+                if row.0 == operand {
+                    count += 1;
+                    (row.0, value.0, value.1, value.2, value.3, value.4, value.5)
+                } else {
+                    *row
+                }
+            })
+            .collect::<ascent::boxcar::Vec<_>>();
+        assert_eq!(count, 1);
+        db.rel_set("op_indirect", rows);
+    }
+
+    fn rejects_kernel_service(
+        label: &str,
+        mutation: impl Fn(&mut DecompileDB, &mut CoffAddressMap),
+    ) {
+        let (mut db, mut map) = kernel_service_fixture();
+        mutation(&mut db, &mut map);
+        assert!(
+            recognize_machine_state_stubs(&db, &map).is_empty(),
+            "{label}"
+        );
+    }
+
     fn push_coff_section_header(
         bytes: &mut Vec<u8>,
         name: &[u8],
@@ -2114,6 +2946,183 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn recognizes_arbitrary_named_win64_kernel_service_contract() {
+        let (db, map) = kernel_service_fixture();
+        let result = recognize_machine_state_stubs(&db, &map);
+        assert_eq!(result.len(), 1);
+        let MachineStateStubRecord::Win64KernelService(stub) = &result[0] else {
+            panic!("expected kernel-service machine-state record")
+        };
+        assert_eq!(stub.schema, WIN64_KERNEL_SERVICE_STUB_SCHEMA_ID);
+        assert_eq!(stub.function.name, "coff_fn_arbitrary_provider");
+        assert_eq!((stub.function.size, stub.function.section_offset), (64, 0));
+        assert_eq!(
+            stub.abi
+                .home_stores
+                .iter()
+                .map(|home| { (home.source_register, home.stack_offset, home.width_bits) })
+                .collect::<Vec<_>>(),
+            [
+                ("rcx", 8, 64),
+                ("rdx", 16, 64),
+                ("r8", 24, 64),
+                ("r9", 32, 64)
+            ]
+        );
+        assert_eq!(
+            (
+                stub.entry_stack_pointer.source_register,
+                stub.entry_stack_pointer.destination_register,
+                stub.interrupt_control.kind,
+                stub.stack_adjustment.amount_bytes
+            ),
+            ("rsp", "rax", "disable_maskable_interrupts", 16)
+        );
+        assert_eq!(
+            stub.pushes
+                .iter()
+                .map(|push| {
+                    (
+                        push.kind,
+                        push.source_register,
+                        push.immediate_value,
+                        push.immediate_width_bits,
+                        push.stack_width_bits,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            [
+                ("register_value", Some("rax"), None, None, 64),
+                ("flags", None, None, None, 64),
+                ("immediate", None, Some(16), Some(8), 64),
+                ("register_value", Some("rax"), None, None, 64),
+            ]
+        );
+        assert_eq!(stub.linkage.target_original_name, "arbitrary_link");
+        assert_eq!(stub.linkage.target_kind, "function");
+        assert_eq!(stub.linkage.relocation.section_offset, 0x23);
+        assert_eq!(stub.service_number.value, 0x89ab_cdef);
+        assert_eq!(stub.dispatcher.target_original_name, "arbitrary_dispatch");
+        assert_eq!(stub.dispatcher.relocation.section_offset, 0x2e);
+        assert_eq!(stub.return_kind, "near_return");
+        assert_eq!((stub.padding.boundary, stub.padding.size), (64, 13));
+    }
+
+    #[test]
+    fn win64_kernel_service_mutations_fail_closed() {
+        const E: Address = 0x1000_0000;
+        rejects_kernel_service("instruction width", |db, _| {
+            rewrite_instruction(db, E, |mut row| {
+                row.1 = 4;
+                row
+            });
+        });
+        rejects_kernel_service("operand width", |db, _| {
+            replace_indirect(db, KM0, ("NONE", "RSP", "NONE", 1, 8, 4));
+        });
+        rejects_kernel_service("register width", |db, _| replace_register(db, KH0, "ECX"));
+        rejects_kernel_service("wrong register", |db, _| replace_register(db, KRSP, "RBP"));
+        rejects_kernel_service("instruction order", |db, _| {
+            rewrite_instruction(db, E + 0x1c, |mut row| {
+                row.3 = "PUSHFQ";
+                row.4 = NONE;
+                row
+            });
+            rewrite_instruction(db, E + 0x1d, |mut row| {
+                row.3 = "PUSH";
+                row.4 = KRAX;
+                row
+            });
+        });
+        rejects_kernel_service("home offset", |db, _| {
+            replace_indirect(db, KM1, ("NONE", "RSP", "NONE", 1, 24, 8));
+        });
+        rejects_kernel_service("linkage base", |db, map| {
+            let disp = i64::from(map.relocations[0].encoded_value as u32 as i32);
+            replace_indirect(db, KLEA, ("NONE", "RAX", "NONE", 1, disp, 8));
+        });
+        rejects_kernel_service("stack immediate", |db, _| replace_immediate(db, KSUB, 8));
+        rejects_kernel_service("selector immediate", |db, _| replace_immediate(db, KSEL, 8));
+        rejects_kernel_service("non-imm32 service", |db, _| {
+            replace_immediate(db, KSVC, 0x1_0000_0000)
+        });
+        rejects_kernel_service("missing relocation", |_, map| {
+            map.relocations.remove(0);
+        });
+        rejects_kernel_service("ambiguous relocation", |_, map| {
+            map.relocations.push(map.relocations[0].clone());
+        });
+        rejects_kernel_service("extra relocation", |_, map| {
+            let mut relocation = map.relocations[0].clone();
+            relocation.section_offset = 0x32;
+            relocation.mapped_field_va = E + 0x32;
+            map.relocations.push(relocation);
+        });
+        rejects_kernel_service("relocation type", |_, map| {
+            map.relocations[0].relocation_type = "IMAGE_REL_AMD64_REL32_1".into();
+        });
+        rejects_kernel_service("relocation width", |_, map| {
+            map.relocations[0].width_bits = 64
+        });
+        rejects_kernel_service("relocation field", |_, map| {
+            map.relocations[0].mapped_field_va += 1
+        });
+        rejects_kernel_service("relocation offset", |_, map| {
+            map.relocations[0].section_offset += 1
+        });
+        rejects_kernel_service("relocation addend", |_, map| {
+            map.relocations[0].encoded_value += 1
+        });
+        rejects_kernel_service("missing external", |_, map| {
+            map.externs.remove(0);
+        });
+        rejects_kernel_service("ambiguous external", |_, map| {
+            map.externs.push(map.externs[0].clone());
+        });
+        rejects_kernel_service("external kind", |_, map| {
+            map.externs[0].kind = CoffExternalKind::Data;
+        });
+        rejects_kernel_service("missing symbol", |_, map| {
+            map.symbols.remove(1);
+        });
+        rejects_kernel_service("ambiguous symbol", |_, map| {
+            map.symbols.push(map.symbols[1].clone());
+        });
+        rejects_kernel_service("symbol kind", |_, map| map.symbols[1].kind = "data".into());
+        rejects_kernel_service("defined symbol", |_, map| map.symbols[1].defined = true);
+        rejects_kernel_service("extra instruction", |db, _| {
+            let extra: Instruction = (E + 0x34, 1, "", "NOP", NONE, NONE, NONE, NONE, 0, 0);
+            db.rel_push("unrefinedinstruction", extra);
+        });
+        rejects_kernel_service("extra CFG edge", |db, _| {
+            db.rel_push("ddisasm_cfg_edge", (E + 0x18, E + 0x28, "branch"));
+        });
+        rejects_kernel_service("extra direct edge", |db, _| {
+            db.rel_push("direct_call", (E + 0x17, E + 0x1000));
+        });
+        rejects_kernel_service("extra owner", |db, _| {
+            db.rel_push("instr_in_function", (E + 0x17, E + 0x1000));
+        });
+        rejects_kernel_service("extra effect", |db, _| {
+            db.rel_push("decoded_reg_def", (E + 0x17, Mreg::R11));
+        });
+        rejects_kernel_service("padding size", |db, _| {
+            rewrite_instruction(db, E + 0x33, |mut row| {
+                row.1 = 12;
+                row
+            });
+        });
+        rejects_kernel_service("padding shape", |db, _| {
+            replace_indirect(db, KPAD, ("NONE", "RAX", "RAX", 1, 0, 4));
+        });
+        rejects_kernel_service("original size", |_, map| {
+            map.functions[0].original_size = 63
+        });
+        rejects_kernel_service("mapped size", |_, map| map.functions[0].manifold_size = 63);
+        rejects_kernel_service("alignment", |_, map| map.functions[0].section_offset = 1);
     }
 
     #[test]
