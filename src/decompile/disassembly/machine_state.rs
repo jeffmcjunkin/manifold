@@ -21,6 +21,8 @@ pub const MACHINE_STATE_STUB_SCHEMA_ID: &str = "manifold.machine-state-stub.set-
 pub const WIN64_SYSCALL_STUB_SCHEMA_ID: &str = "manifold.machine-state-stub.win64-syscall.v1";
 pub const WIN64_KERNEL_SERVICE_STUB_SCHEMA_ID: &str =
     "manifold.machine-state-stub.win64-kernel-service.v1";
+pub const WIN64_DWORD_OUT_GETTER_STUB_SCHEMA_ID: &str =
+    "manifold.machine-state-stub.win64-dword-out-getter.v1";
 pub const GUARDED_INDIRECT_FORWARD_TAIL_SCHEMA_ID: &str =
     "manifold.machine-state-stub.guarded-indirect-forward-tail.v1";
 
@@ -286,11 +288,53 @@ pub struct Win64KernelServiceStub {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MachineStateRegisterZero {
+    pub instruction_address: String,
+    pub register: &'static str,
+    pub width_bits: u8,
+    pub kind: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MachineStateDwordFieldCopy {
+    pub load_instruction_address: String,
+    pub source_base_register: &'static str,
+    pub source_displacement: i64,
+    pub source_displacement_encoding_bits: u8,
+    pub temporary_register: &'static str,
+    pub store_instruction_address: String,
+    pub destination_base_register: &'static str,
+    pub destination_displacement: i64,
+    pub width_bits: u8,
+}
+
+/// A complete relocation-free Win64 dword out-getter contract.  The explicit
+/// displacement encoding retains the distinction between its 25-byte disp8
+/// and 28-byte disp32 forms without retaining original instruction bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Win64DwordOutGetterStub {
+    pub schema: &'static str,
+    pub kind: &'static str,
+    pub function: MachineStateCoffFunctionIdentity,
+    pub abi: Win64AbiState,
+    pub entry_stack_pointer: MachineStateRegisterCopy,
+    pub register_copies: Vec<MachineStateRegisterCopy>,
+    pub result_zero: MachineStateRegisterZero,
+    pub home_base_register: &'static str,
+    pub field_copy: MachineStateDwordFieldCopy,
+    pub return_instruction_address: String,
+    pub return_kind: &'static str,
+    pub padding: MachineStatePadding,
+    pub relocations: Vec<MachineStateRelocationIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum MachineStateStubRecord {
     SetImm32DirectTailJump(MachineStateStub),
     Win64Syscall(Win64SyscallStub),
     Win64KernelService(Win64KernelServiceStub),
+    Win64DwordOutGetter(Win64DwordOutGetterStub),
     GuardedIndirectForwardTail(GuardedIndirectForwardTailStub),
 }
 
@@ -300,6 +344,7 @@ impl MachineStateStubRecord {
             Self::SetImm32DirectTailJump(stub) => &stub.function.name,
             Self::Win64Syscall(stub) => &stub.function.name,
             Self::Win64KernelService(stub) => &stub.function.name,
+            Self::Win64DwordOutGetter(stub) => &stub.function.name,
             Self::GuardedIndirectForwardTail(stub) => &stub.function.name,
         }
     }
@@ -309,6 +354,7 @@ impl MachineStateStubRecord {
             Self::SetImm32DirectTailJump(stub) => &stub.function.address,
             Self::Win64Syscall(stub) => &stub.function.address,
             Self::Win64KernelService(stub) => &stub.function.address,
+            Self::Win64DwordOutGetter(stub) => &stub.function.address,
             Self::GuardedIndirectForwardTail(stub) => &stub.function.address,
         }
     }
@@ -569,6 +615,27 @@ pub fn recognize_machine_state_stubs(
             &memory_writes,
         ) {
             result.push(MachineStateStubRecord::Win64KernelService(stub));
+        }
+        if let Some(stub) = recognize_win64_dword_out_getter(
+            db,
+            function,
+            map,
+            &instructions,
+            &registers,
+            &immediates,
+            &indirects,
+            &owners,
+            &next,
+            &direct_jumps,
+            &direct_calls,
+            &cfg,
+            &decoded_defs,
+            &decoded_uses,
+            &memory_reads,
+            &memory_writes,
+            &flags_and_jumps,
+        ) {
+            result.push(MachineStateStubRecord::Win64DwordOutGetter(stub));
         }
         if let Some(stub) = recognize_guarded_indirect_forward_tail(
             function,
@@ -1647,6 +1714,413 @@ fn recognize_win64_kernel_service(
     })
 }
 
+fn exact_win64_dword_out_getter_encoding(
+    db: &DecompileDB,
+    section: &crate::decompile::disassembly::coff::CoffSectionMap,
+    function: &CoffFunctionMap,
+    source_displacement: i64,
+    source_displacement_encoding_bits: u8,
+) -> bool {
+    let Some(section_file_offset) = section.original_file_offset else {
+        return false;
+    };
+    let Some(function_section_delta) = function
+        .section_offset
+        .checked_sub(section.original_offset_start)
+    else {
+        return false;
+    };
+    let Some(file_start) = section_file_offset.checked_add(function_section_delta) else {
+        return false;
+    };
+    let Some(file_end) = file_start.checked_add(function.original_size) else {
+        return false;
+    };
+    let (Ok(file_start), Ok(file_end)) = (usize::try_from(file_start), usize::try_from(file_end))
+    else {
+        return false;
+    };
+    let Some(bytes) = db
+        .loaded_binary_data
+        .as_deref()
+        .and_then(|data| data.get(file_start..file_end))
+    else {
+        return false;
+    };
+
+    // These are opcode-form witnesses, not reconstruction data: the semantic
+    // record continues to carry only decoded state.  Checking the original
+    // relocation-free COFF bytes closes same-semantics opcode-direction and
+    // redundant-REX alternatives which instruction width alone cannot prove.
+    const PREFIX: &[u8] = &[
+        0x4c, 0x8b, 0xdc, // mov r11, rsp
+        0x48, 0x8b, 0xc1, // mov rax, rcx
+        0x48, 0x8b, 0xc2, // mov rax, rdx
+        0x33, 0xc0, // xor eax, eax
+        0x49, 0x89, 0x53, 0x10, // mov [r11+10h], rdx
+        0x49, 0x89, 0x4b, 0x08, // mov [r11+8], rcx
+    ];
+    const SUFFIX: &[u8] = &[0x89, 0x0a, 0xc3]; // mov [rdx], ecx; ret
+    if !bytes.starts_with(PREFIX) || !bytes.ends_with(SUFFIX) {
+        return false;
+    }
+    let load = &bytes[PREFIX.len()..bytes.len() - SUFFIX.len()];
+    match source_displacement_encoding_bits {
+        8 => {
+            let Ok(displacement) = i8::try_from(source_displacement) else {
+                return false;
+            };
+            load == [0x8b, 0x49, displacement as u8]
+        }
+        32 => {
+            let Ok(displacement) = i32::try_from(source_displacement) else {
+                return false;
+            };
+            load.len() == 6 && load[..2] == [0x8b, 0x89] && load[2..] == displacement.to_le_bytes()
+        }
+        _ => false,
+    }
+}
+
+/// Recognize one closed Win64 dword out-getter.  Selection uses decoded
+/// operands/effects, exact linear ownership/CFG, the original COFF map, and an
+/// exact non-serialized opcode-form witness from the relocation-free input.
+/// Names, mapped addresses, and corpus membership do not participate.  The
+/// accepted source displacement is signed, and its decoded instruction width
+/// must prove the canonical disp8 or disp32 encoding.
+#[allow(clippy::too_many_arguments)]
+fn recognize_win64_dword_out_getter(
+    db: &DecompileDB,
+    function: &CoffFunctionMap,
+    map: &CoffAddressMap,
+    instructions: &BTreeMap<Address, Vec<Instruction>>,
+    registers: &BTreeMap<Symbol, BTreeSet<&'static str>>,
+    immediates: &BTreeMap<Symbol, BTreeSet<i64>>,
+    indirects: &BTreeMap<Symbol, BTreeSet<IndirectOperand>>,
+    owners: &BTreeMap<Node, BTreeSet<Address>>,
+    next: &BTreeMap<Node, BTreeSet<Node>>,
+    direct_jumps: &BTreeMap<Node, BTreeSet<Address>>,
+    direct_calls: &BTreeMap<Node, BTreeSet<Address>>,
+    cfg: &BTreeMap<Node, BTreeSet<(Address, Symbol)>>,
+    decoded_defs: &BTreeMap<Node, BTreeSet<Mreg>>,
+    decoded_uses: &BTreeMap<Node, BTreeSet<Mreg>>,
+    memory_reads: &BTreeMap<Node, BTreeSet<Symbol>>,
+    memory_writes: &BTreeMap<Node, BTreeSet<Symbol>>,
+    flags_and_jumps: &BTreeMap<Node, BTreeSet<(Node, &'static str)>>,
+) -> Option<Win64DwordOutGetterStub> {
+    if map.schema != "manifold.coff-address-map.v1"
+        || map.loader_id != "amd64-coff-image-v1"
+        || map.architecture != "x86_64-pc-windows-msvc"
+        || !matches!(function.original_size, 25 | 28)
+        || function.manifold_size != function.original_size
+        || function.mapped_end != function.mapped_entry.checked_add(function.original_size)?
+    {
+        return None;
+    }
+
+    // Reject aliased or duplicated ownership identities instead of choosing a
+    // convenient name/address half of an ambiguous COFF mapping.
+    let mapped_function = only(map.functions.iter().filter(|candidate| {
+        candidate.provider_name == function.provider_name
+            || candidate.mapped_entry == function.mapped_entry
+            || (candidate.section_index == function.section_index
+                && candidate.section_offset == function.section_offset)
+    }))?;
+    if !std::ptr::eq(mapped_function, function) {
+        return None;
+    }
+    let section = only(
+        map.sections
+            .iter()
+            .filter(|section| section.index == function.section_index),
+    )?;
+    let original_section_size = section
+        .original_offset_end
+        .checked_sub(section.original_offset_start)?;
+    let mapped_section_size = section.mapped_va_end.checked_sub(section.mapped_va_start)?;
+    let original_function_delta = function
+        .section_offset
+        .checked_sub(section.original_offset_start)?;
+    let mapped_function_delta = function.mapped_entry.checked_sub(section.mapped_va_start)?;
+    if section.kind != "Text"
+        || original_section_size != mapped_section_size
+        || original_function_delta != mapped_function_delta
+        || function
+            .section_offset
+            .checked_add(function.original_size)?
+            > section.original_offset_end
+        || function.mapped_end > section.mapped_va_end
+    {
+        return None;
+    }
+    let function_symbol = only(map.symbols.iter().filter(|symbol| {
+        symbol.original_name == function.original_name
+            || symbol.provider_name == function.provider_name
+            || symbol.mapped_address == function.mapped_entry
+    }))?;
+    if function_symbol.original_name != function.original_name
+        || function_symbol.provider_name != function.provider_name
+        || function_symbol.kind != "function"
+        || !function_symbol.defined
+        || function_symbol.section_index != Some(function.section_index)
+        || function_symbol.section_offset != Some(function.section_offset)
+        || function_symbol.mapped_address != function.mapped_entry
+    {
+        return None;
+    }
+
+    let original_end = function
+        .section_offset
+        .checked_add(function.original_size)?;
+    if map.relocations.iter().any(|relocation| {
+        let width = u64::from(relocation.width_bits).div_ceil(8).max(1);
+        let Some(mapped_relocation_end) = relocation.mapped_field_va.checked_add(width) else {
+            return true;
+        };
+        if relocation.mapped_field_va < function.mapped_end
+            && mapped_relocation_end > function.mapped_entry
+        {
+            return true;
+        }
+        if relocation.section_index != function.section_index {
+            return false;
+        }
+        if relocation.section_name != section.name {
+            return true;
+        }
+        let Some(original_relocation_end) = relocation.section_offset.checked_add(width) else {
+            return true;
+        };
+        relocation.section_offset < original_end
+            && original_relocation_end > function.section_offset
+    }) {
+        return None;
+    }
+
+    let rows: [Instruction; 9] = instructions
+        .range(function.mapped_entry..function.mapped_end)
+        .flat_map(|(_, rows)| rows.iter().copied())
+        .collect::<Vec<_>>()
+        .try_into()
+        .ok()?;
+    let [entry_sp, copy_rcx, copy_rdx, zero, home_rdx, home_rcx, load, store, ret] = rows;
+    let source_operand = only(indirects.get(load.4)?.iter().copied())?;
+    let source_displacement = source_operand.4;
+    let source_displacement_encoding_bits = match load.1 {
+        3 if source_displacement != 0 && i8::try_from(source_displacement).is_ok() => 8,
+        6 if i32::try_from(source_displacement).is_ok()
+            && i8::try_from(source_displacement).is_err() =>
+        {
+            32
+        }
+        _ => return None,
+    };
+    if function.original_size != 22 + load.1 as u64 {
+        return None;
+    }
+    if !exact_win64_dword_out_getter_encoding(
+        db,
+        section,
+        function,
+        source_displacement,
+        source_displacement_encoding_bits,
+    ) {
+        return None;
+    }
+    let headers = [
+        (entry_sp, 3, "MOV", 2),
+        (copy_rcx, 3, "MOV", 2),
+        (copy_rdx, 3, "MOV", 2),
+        (zero, 2, "XOR", 2),
+        (home_rdx, 4, "MOV", 2),
+        (home_rcx, 4, "MOV", 2),
+        (load, load.1, "MOV", 2),
+        (store, 2, "MOV", 2),
+        (ret, 1, "RET", 0),
+    ];
+    if entry_sp.0 != function.mapped_entry
+        || headers.into_iter().any(|(row, size, mnemonic, count)| {
+            !exact_instruction_header(row, size, mnemonic, count)
+        })
+        || rows
+            .windows(2)
+            .any(|pair| pair[0].0.checked_add(pair[0].1 as u64) != Some(pair[1].0))
+        || ret.0.checked_add(ret.1 as u64) != Some(function.mapped_end)
+    {
+        return None;
+    }
+
+    if !exact_operand_register(entry_sp.4, "RSP", registers, immediates, indirects)
+        || !exact_operand_register(entry_sp.5, "R11", registers, immediates, indirects)
+        || !exact_operand_register(copy_rcx.4, "RCX", registers, immediates, indirects)
+        || !exact_operand_register(copy_rcx.5, "RAX", registers, immediates, indirects)
+        || !exact_operand_register(copy_rdx.4, "RDX", registers, immediates, indirects)
+        || !exact_operand_register(copy_rdx.5, "RAX", registers, immediates, indirects)
+        || !exact_operand_register(zero.4, "EAX", registers, immediates, indirects)
+        || !exact_operand_register(zero.5, "EAX", registers, immediates, indirects)
+        || !exact_operand_register(home_rdx.4, "RDX", registers, immediates, indirects)
+        || !exact_operand_memory(
+            home_rdx.5,
+            ("NONE", "R11", "NONE", 1, 16, 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_register(home_rcx.4, "RCX", registers, immediates, indirects)
+        || !exact_operand_memory(
+            home_rcx.5,
+            ("NONE", "R11", "NONE", 1, 8, 8),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_memory(
+            load.4,
+            ("NONE", "RCX", "NONE", 1, source_displacement, 4),
+            registers,
+            immediates,
+            indirects,
+        )
+        || !exact_operand_register(load.5, "ECX", registers, immediates, indirects)
+        || !exact_operand_register(store.4, "ECX", registers, immediates, indirects)
+        || !exact_operand_memory(
+            store.5,
+            ("NONE", "RDX", "NONE", 1, 0, 4),
+            registers,
+            immediates,
+            indirects,
+        )
+    {
+        return None;
+    }
+
+    let memory: [(Option<Symbol>, Option<Symbol>); 9] = [
+        (None, None),
+        (None, None),
+        (None, None),
+        (None, None),
+        (None, Some(home_rdx.5)),
+        (None, Some(home_rcx.5)),
+        (Some(load.4), None),
+        (None, Some(store.5)),
+        (None, None),
+    ];
+    let register_effects: [(&[Mreg], &[Mreg]); 9] = [
+        (&[Mreg::R11], &[Mreg::SP]),
+        (&[Mreg::AX], &[Mreg::CX]),
+        (&[Mreg::AX], &[Mreg::DX]),
+        (&[Mreg::AX], &[]),
+        (&[], &[Mreg::R11, Mreg::DX]),
+        (&[], &[Mreg::R11, Mreg::CX]),
+        (&[Mreg::CX], &[Mreg::CX]),
+        (&[], &[Mreg::DX, Mreg::CX]),
+        (&[Mreg::SP], &[Mreg::SP]),
+    ];
+    for ((row, (read, write)), (defs, uses)) in rows.iter().zip(memory).zip(register_effects) {
+        if !exact_symbol_set(
+            memory_reads.get(&row.0),
+            &read.into_iter().collect::<Vec<_>>(),
+        ) || !exact_symbol_set(
+            memory_writes.get(&row.0),
+            &write.into_iter().collect::<Vec<_>>(),
+        ) || !exact_register_effects(row.0, defs, uses, decoded_defs, decoded_uses)
+        {
+            return None;
+        }
+    }
+
+    for (index, row) in rows.iter().copied().enumerate() {
+        if owners.get(&row.0) != Some(&BTreeSet::from([function.mapped_entry]))
+            || !exact_or_empty(next, row.0, rows.get(index + 1).map(|next| next.0))
+            || !exact_or_empty(direct_jumps, row.0, [])
+            || !exact_or_empty(direct_calls, row.0, [])
+            || !exact_or_empty(cfg, row.0, [])
+            || !exact_or_empty(flags_and_jumps, row.0, [])
+        {
+            return None;
+        }
+    }
+
+    Some(Win64DwordOutGetterStub {
+        schema: WIN64_DWORD_OUT_GETTER_STUB_SCHEMA_ID,
+        kind: "win64_dword_out_getter",
+        function: MachineStateCoffFunctionIdentity {
+            name: function.provider_name.clone(),
+            address: format!("0x{:x}", function.mapped_entry),
+            size: function.original_size,
+            section_index: function.section_index,
+            section_name: section.name.clone(),
+            section_offset: function.section_offset,
+        },
+        abi: Win64AbiState {
+            name: "win64",
+            argument_registers: ["rcx", "rdx", "r8", "r9"],
+            home_kind: "first_two_register_arguments_via_entry_sp_alias",
+            home_stores: vec![
+                Win64HomeStore {
+                    instruction_address: format!("0x{:x}", home_rdx.0),
+                    source_register: "rdx",
+                    stack_offset: 16,
+                    width_bits: 64,
+                },
+                Win64HomeStore {
+                    instruction_address: format!("0x{:x}", home_rcx.0),
+                    source_register: "rcx",
+                    stack_offset: 8,
+                    width_bits: 64,
+                },
+            ],
+        },
+        entry_stack_pointer: MachineStateRegisterCopy {
+            instruction_address: format!("0x{:x}", entry_sp.0),
+            source_register: "rsp",
+            destination_register: "r11",
+            width_bits: 64,
+        },
+        register_copies: vec![
+            MachineStateRegisterCopy {
+                instruction_address: format!("0x{:x}", copy_rcx.0),
+                source_register: "rcx",
+                destination_register: "rax",
+                width_bits: 64,
+            },
+            MachineStateRegisterCopy {
+                instruction_address: format!("0x{:x}", copy_rdx.0),
+                source_register: "rdx",
+                destination_register: "rax",
+                width_bits: 64,
+            },
+        ],
+        result_zero: MachineStateRegisterZero {
+            instruction_address: format!("0x{:x}", zero.0),
+            register: "eax",
+            width_bits: 32,
+            kind: "xor_self",
+        },
+        home_base_register: "r11",
+        field_copy: MachineStateDwordFieldCopy {
+            load_instruction_address: format!("0x{:x}", load.0),
+            source_base_register: "rcx",
+            source_displacement,
+            source_displacement_encoding_bits,
+            temporary_register: "ecx",
+            store_instruction_address: format!("0x{:x}", store.0),
+            destination_base_register: "rdx",
+            destination_displacement: 0,
+            width_bits: 32,
+        },
+        return_instruction_address: format!("0x{:x}", ret.0),
+        return_kind: "near_return",
+        padding: MachineStatePadding {
+            instruction_address: format!("0x{:x}", function.mapped_end),
+            kind: "none",
+            boundary: 1,
+            size: 0,
+        },
+        relocations: Vec::new(),
+    })
+}
+
 /// Recognize one complete Win64 forwarding contract whose indirect target is
 /// checked through a relocation-backed pointer and then tail-transferred with
 /// the four incoming volatile integer registers restored.
@@ -2071,6 +2545,18 @@ mod tests {
     const KSVC: Symbol = "kernel_service";
     const KJMP: Symbol = "kernel_jump";
     const KPAD: Symbol = "kernel_padding";
+
+    const ORSP: Symbol = "out_getter_rsp";
+    const OR11: Symbol = "out_getter_r11";
+    const ORCX: Symbol = "out_getter_rcx";
+    const ORDX: Symbol = "out_getter_rdx";
+    const ORAX: Symbol = "out_getter_rax";
+    const OEAX: Symbol = "out_getter_eax";
+    const OECX: Symbol = "out_getter_ecx";
+    const OHOME16: Symbol = "out_getter_home_16";
+    const OHOME8: Symbol = "out_getter_home_8";
+    const OFIELD: Symbol = "out_getter_field";
+    const OOUT: Symbol = "out_getter_out";
 
     macro_rules! set_rows {
         ($db:expr, $relation:literal, $rows:expr) => {
@@ -2746,6 +3232,194 @@ mod tests {
         (db, map)
     }
 
+    fn dword_out_getter_fixture(
+        source_displacement: i64,
+        displacement_encoding_bits: u8,
+    ) -> (DecompileDB, CoffAddressMap) {
+        let mut db = DecompileDB::default();
+        let entry = 0x1000_0000_u64;
+        let load_size = match displacement_encoding_bits {
+            8 => 3,
+            32 => 6,
+            _ => panic!("fixture displacement encoding must be disp8 or disp32"),
+        };
+        let function_size = 22 + load_size as u64;
+        let mut loaded_binary_data = vec![0_u8; 0x200];
+        loaded_binary_data.extend_from_slice(&[
+            0x4c, 0x8b, 0xdc, 0x48, 0x8b, 0xc1, 0x48, 0x8b, 0xc2, 0x33, 0xc0, 0x49, 0x89, 0x53,
+            0x10, 0x49, 0x89, 0x4b, 0x08,
+        ]);
+        match displacement_encoding_bits {
+            8 => loaded_binary_data.extend_from_slice(&[0x8b, 0x49, source_displacement as u8]),
+            32 => {
+                loaded_binary_data.extend_from_slice(&[0x8b, 0x89]);
+                loaded_binary_data.extend_from_slice(&(source_displacement as i32).to_le_bytes());
+            }
+            _ => unreachable!(),
+        }
+        loaded_binary_data.extend_from_slice(&[0x89, 0x0a, 0xc3]);
+        assert_eq!(loaded_binary_data.len(), 0x200 + function_size as usize);
+        db.loaded_binary_data = Some(std::sync::Arc::new(loaded_binary_data));
+        let load_address = entry + 19;
+        let store_address = load_address + load_size as u64;
+        let return_address = store_address + 2;
+        let ins = |offset, size, mnemonic, op1, op2| -> Instruction {
+            (
+                entry + offset,
+                size,
+                "",
+                mnemonic,
+                op1,
+                op2,
+                NONE,
+                NONE,
+                0,
+                0,
+            )
+        };
+        let rows = [
+            ins(0, 3, "MOV", ORSP, OR11),
+            ins(3, 3, "MOV", ORCX, ORAX),
+            ins(6, 3, "MOV", ORDX, ORAX),
+            ins(9, 2, "XOR", OEAX, OEAX),
+            ins(11, 4, "MOV", ORDX, OHOME16),
+            ins(15, 4, "MOV", ORCX, OHOME8),
+            ins(19, load_size, "MOV", OFIELD, OECX),
+            ins(19 + load_size as u64, 2, "MOV", OECX, OOUT),
+            ins(21 + load_size as u64, 1, "RET", NONE, NONE),
+        ];
+        let addresses = rows.map(|row| row.0);
+        set_rows!(db, "unrefinedinstruction", rows);
+        set_rows!(
+            db,
+            "op_register",
+            [
+                (ORSP, "RSP"),
+                (OR11, "R11"),
+                (ORCX, "RCX"),
+                (ORDX, "RDX"),
+                (ORAX, "RAX"),
+                (OEAX, "EAX"),
+                (OECX, "ECX"),
+            ]
+        );
+        set_rows!(
+            db,
+            "op_indirect",
+            [
+                (OHOME16, "NONE", "R11", "NONE", 1_i64, 16, 8_usize),
+                (OHOME8, "NONE", "R11", "NONE", 1, 8, 8),
+                (OFIELD, "NONE", "RCX", "NONE", 1, source_displacement, 4,),
+                (OOUT, "NONE", "RDX", "NONE", 1, 0, 4),
+            ]
+        );
+        set_rows!(
+            db,
+            "instr_in_function",
+            addresses.map(|address| (address, entry))
+        );
+        set_rows!(
+            db,
+            "next",
+            addresses.windows(2).map(|pair| (pair[0], pair[1]))
+        );
+        set_rows!(db, "direct_jump", Vec::<(Node, Address)>::new());
+        set_rows!(db, "direct_call", Vec::<(Node, Address)>::new());
+        set_rows!(
+            db,
+            "ddisasm_cfg_edge",
+            Vec::<(Node, Address, Symbol)>::new()
+        );
+        set_rows!(db, "decoded_memory_read_operand", [(load_address, OFIELD)]);
+        set_rows!(
+            db,
+            "decoded_memory_write_operand",
+            [
+                (entry + 11, OHOME16),
+                (entry + 15, OHOME8),
+                (store_address, OOUT),
+            ]
+        );
+        set_rows!(
+            db,
+            "decoded_reg_def",
+            [
+                (entry, Mreg::R11),
+                (entry + 3, Mreg::AX),
+                (entry + 6, Mreg::AX),
+                (entry + 9, Mreg::AX),
+                (load_address, Mreg::CX),
+                (return_address, Mreg::SP),
+            ]
+        );
+        set_rows!(
+            db,
+            "decoded_reg_use",
+            [
+                (entry, Mreg::SP),
+                (entry + 3, Mreg::CX),
+                (entry + 6, Mreg::DX),
+                (entry + 11, Mreg::R11),
+                (entry + 11, Mreg::DX),
+                (entry + 15, Mreg::R11),
+                (entry + 15, Mreg::CX),
+                (load_address, Mreg::CX),
+                (store_address, Mreg::DX),
+                (store_address, Mreg::CX),
+                (return_address, Mreg::SP),
+            ]
+        );
+
+        let map = CoffAddressMap {
+            schema: "manifold.coff-address-map.v1",
+            loader_id: "amd64-coff-image-v1",
+            architecture: "x86_64-pc-windows-msvc",
+            image_base: entry,
+            function_boundary_sidecar_sha256: None,
+            sections: vec![CoffSectionMap {
+                index: 5,
+                name: ".text$generic".into(),
+                kind: "Text".into(),
+                original_file_offset: Some(0x200),
+                original_offset_start: 0x40,
+                original_offset_end: 0x40 + function_size,
+                mapped_va_start: entry,
+                mapped_va_end: entry + function_size,
+            }],
+            functions: vec![CoffFunctionMap {
+                original_name: "arbitrary_original_out_getter".into(),
+                provider_name: "coff_fn_arbitrary_out_getter".into(),
+                section_index: 5,
+                section_offset: 0x40,
+                original_size: function_size,
+                manifold_size: function_size,
+                mapped_entry: entry,
+                mapped_end: entry + function_size,
+            }],
+            symbols: vec![CoffSymbolMap {
+                original_name: "arbitrary_original_out_getter".into(),
+                provider_name: "coff_fn_arbitrary_out_getter".into(),
+                kind: "function".into(),
+                defined: true,
+                section_index: Some(5),
+                section_offset: Some(0x40),
+                mapped_address: entry,
+            }],
+            externs: Vec::new(),
+            relocations: Vec::new(),
+        };
+        (db, map)
+    }
+
+    fn rewrite_dword_out_getter_input_byte(db: &mut DecompileDB, offset: usize, value: u8) {
+        let data = std::sync::Arc::make_mut(
+            db.loaded_binary_data
+                .as_mut()
+                .expect("dword out-getter fixture input bytes"),
+        );
+        data[0x200 + offset] = value;
+    }
+
     fn rewrite_instruction(
         db: &mut DecompileDB,
         address: Address,
@@ -2827,11 +3501,51 @@ mod tests {
         db.rel_set("op_indirect", rows);
     }
 
+    fn remove_register_effect(
+        db: &mut DecompileDB,
+        relation: &'static str,
+        node: Node,
+        register: Mreg,
+    ) {
+        let rows = db
+            .rel_iter::<(Node, Mreg)>(relation)
+            .filter(|row| **row != (node, register))
+            .copied()
+            .collect::<ascent::boxcar::Vec<_>>();
+        db.rel_set(relation, rows);
+    }
+
+    fn remove_memory_effect(
+        db: &mut DecompileDB,
+        relation: &'static str,
+        node: Node,
+        operand: Symbol,
+    ) {
+        let rows = db
+            .rel_iter::<(Node, Symbol)>(relation)
+            .filter(|row| **row != (node, operand))
+            .copied()
+            .collect::<ascent::boxcar::Vec<_>>();
+        db.rel_set(relation, rows);
+    }
+
     fn rejects_kernel_service(
         label: &str,
         mutation: impl Fn(&mut DecompileDB, &mut CoffAddressMap),
     ) {
         let (mut db, mut map) = kernel_service_fixture();
+        mutation(&mut db, &mut map);
+        assert!(
+            recognize_machine_state_stubs(&db, &map).is_empty(),
+            "{label}"
+        );
+    }
+
+    fn rejects_dword_out_getter(
+        label: &str,
+        mutation: impl Fn(&mut DecompileDB, &mut CoffAddressMap),
+    ) {
+        let (mut db, mut map) = dword_out_getter_fixture(0x24, 8);
         mutation(&mut db, &mut map);
         assert!(
             recognize_machine_state_stubs(&db, &map).is_empty(),
@@ -2907,6 +3621,68 @@ mod tests {
         bytes.extend_from_slice(&text);
         push_coff_function_symbol(&mut bytes, b"stub_a", 0);
         push_coff_function_symbol(&mut bytes, b"stub_b", 32);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes
+    }
+
+    fn adjacent_dword_out_getter_coff_fixture() -> Vec<u8> {
+        const DISP8: &[u8] = &[
+            0x4c, 0x8b, 0xdc, 0x48, 0x8b, 0xc1, 0x48, 0x8b, 0xc2, 0x33, 0xc0, 0x49, 0x89, 0x53,
+            0x10, 0x49, 0x89, 0x4b, 0x08, 0x8b, 0x49, 0x24, 0x89, 0x0a, 0xc3,
+        ];
+        // Same decoded nine-instruction semantics and length as DISP8, but XOR
+        // uses the alternate 31 /r opcode form.  It is an adjacent-owner
+        // control, not reconstruction material.
+        const ALTERNATE_XOR_CONTROL: &[u8] = &[
+            0x4c, 0x8b, 0xdc, 0x48, 0x8b, 0xc1, 0x48, 0x8b, 0xc2, 0x31, 0xc0, 0x49, 0x89, 0x53,
+            0x10, 0x49, 0x89, 0x4b, 0x08, 0x8b, 0x49, 0x24, 0x89, 0x0a, 0xc3,
+        ];
+        const REDUNDANT_REX_CONTROL: &[u8] = &[
+            0x4c, 0x8b, 0xdc, 0x48, 0x8b, 0xc1, 0x48, 0x8b, 0xc2, 0x40, 0x33, 0xc0, 0x49, 0x89,
+            0x53, 0x10, 0x49, 0x89, 0x4b, 0x08, 0x8b, 0x49, 0x24, 0x89, 0x0a, 0xc3,
+        ];
+        const DISP32: &[u8] = &[
+            0x4c, 0x8b, 0xdc, 0x48, 0x8b, 0xc1, 0x48, 0x8b, 0xc2, 0x33, 0xc0, 0x49, 0x89, 0x53,
+            0x10, 0x49, 0x89, 0x4b, 0x08, 0x8b, 0x89, 0xcc, 0xed, 0xff, 0xff, 0x89, 0x0a, 0xc3,
+        ];
+        let mut text = Vec::new();
+        text.extend_from_slice(DISP8);
+        text.extend_from_slice(ALTERNATE_XOR_CONTROL);
+        text.extend_from_slice(REDUNDANT_REX_CONTROL);
+        text.extend_from_slice(DISP32);
+        assert_eq!(text.len(), 104);
+
+        const SYMBOL_COUNT: u32 = 4;
+        let raw_offset = 20 + 40;
+        let symbol_offset = raw_offset + text.len() as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&object::pe::IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&symbol_offset.to_le_bytes());
+        bytes.extend_from_slice(&SYMBOL_COUNT.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        push_coff_section_header(
+            &mut bytes,
+            b".text$og",
+            text.len() as u32,
+            raw_offset,
+            0x6000_0020,
+        );
+        bytes.extend_from_slice(&text);
+        push_coff_function_symbol(&mut bytes, b"disp8", 0);
+        push_coff_function_symbol(&mut bytes, b"alt_xor", DISP8.len() as u32);
+        push_coff_function_symbol(
+            &mut bytes,
+            b"rex_ctrl",
+            (DISP8.len() + ALTERNATE_XOR_CONTROL.len()) as u32,
+        );
+        push_coff_function_symbol(
+            &mut bytes,
+            b"disp32",
+            (DISP8.len() + ALTERNATE_XOR_CONTROL.len() + REDUNDANT_REX_CONTROL.len()) as u32,
+        );
         bytes.extend_from_slice(&4u32.to_le_bytes());
         bytes
     }
@@ -3123,6 +3899,537 @@ mod tests {
         });
         rejects_kernel_service("mapped size", |_, map| map.functions[0].manifold_size = 63);
         rejects_kernel_service("alignment", |_, map| map.functions[0].section_offset = 1);
+    }
+
+    #[test]
+    fn recognizes_arbitrary_named_win64_dword_out_getters_with_signed_displacements() {
+        for (displacement, encoding_bits, size) in [
+            (0x24, 8, 25),
+            (-0x24, 8, 25),
+            (0x1234, 32, 28),
+            (-0x1234, 32, 28),
+        ] {
+            let (db, map) = dword_out_getter_fixture(displacement, encoding_bits);
+            let result = recognize_machine_state_stubs(&db, &map);
+            assert_eq!(result.len(), 1, "displacement={displacement}");
+            let MachineStateStubRecord::Win64DwordOutGetter(stub) = &result[0] else {
+                panic!("expected dword out-getter machine-state record")
+            };
+            assert_eq!(stub.schema, WIN64_DWORD_OUT_GETTER_STUB_SCHEMA_ID);
+            assert_eq!(stub.function.name, "coff_fn_arbitrary_out_getter");
+            assert_eq!(
+                (stub.function.size, stub.function.section_offset),
+                (size, 0x40)
+            );
+            assert_eq!(stub.entry_stack_pointer.source_register, "rsp");
+            assert_eq!(stub.entry_stack_pointer.destination_register, "r11");
+            assert_eq!(
+                stub.register_copies
+                    .iter()
+                    .map(|copy| (copy.source_register, copy.destination_register))
+                    .collect::<Vec<_>>(),
+                [("rcx", "rax"), ("rdx", "rax")]
+            );
+            assert_eq!(
+                (stub.result_zero.kind, stub.result_zero.register),
+                ("xor_self", "eax")
+            );
+            assert_eq!(stub.home_base_register, "r11");
+            assert_eq!(
+                stub.abi
+                    .home_stores
+                    .iter()
+                    .map(|home| (home.source_register, home.stack_offset, home.width_bits))
+                    .collect::<Vec<_>>(),
+                [("rdx", 16, 64), ("rcx", 8, 64)]
+            );
+            assert_eq!(stub.field_copy.source_displacement, displacement);
+            assert_eq!(
+                stub.field_copy.source_displacement_encoding_bits,
+                encoding_bits
+            );
+            assert_eq!(stub.field_copy.width_bits, 32);
+            assert_eq!(stub.field_copy.destination_displacement, 0);
+            assert_eq!(stub.return_kind, "near_return");
+            assert_eq!((stub.padding.kind, stub.padding.size), ("none", 0));
+            assert!(stub.relocations.is_empty());
+            assert_eq!(
+                serde_json::to_value(stub).unwrap()["field_copy"]["source_displacement"].as_i64(),
+                Some(displacement)
+            );
+        }
+    }
+
+    #[test]
+    fn win64_dword_out_getter_instruction_and_operand_mutations_fail_closed() {
+        const E: Address = 0x1000_0000;
+        let addresses = [
+            E,
+            E + 3,
+            E + 6,
+            E + 9,
+            E + 11,
+            E + 15,
+            E + 19,
+            E + 22,
+            E + 24,
+        ];
+        for address in addresses {
+            rejects_dword_out_getter("instruction width", move |db, _| {
+                rewrite_instruction(db, address, |mut row| {
+                    row.1 += 1;
+                    row
+                });
+            });
+            rejects_dword_out_getter("instruction mnemonic", move |db, _| {
+                rewrite_instruction(db, address, |mut row| {
+                    row.3 = "NOP";
+                    row
+                });
+            });
+        }
+        rejects_dword_out_getter("instruction prefix", |db, _| {
+            rewrite_instruction(db, E, |mut row| {
+                row.2 = "LOCK";
+                row
+            });
+        });
+        rejects_dword_out_getter("extra operand", |db, _| {
+            rewrite_instruction(db, E + 3, |mut row| {
+                row.6 = ORDX;
+                row
+            });
+        });
+        rejects_dword_out_getter("nonzero instruction metadata", |db, _| {
+            rewrite_instruction(db, E + 6, |mut row| {
+                row.8 = 1;
+                row
+            });
+        });
+        rejects_dword_out_getter("instruction gap", |db, _| {
+            rewrite_instruction(db, E + 9, |mut row| {
+                row.0 += 1;
+                row
+            });
+        });
+        rejects_dword_out_getter("missing instruction", |db, _| {
+            let rows = db
+                .rel_iter::<Instruction>("unrefinedinstruction")
+                .filter(|row| row.0 != E + 9)
+                .copied()
+                .collect::<ascent::boxcar::Vec<_>>();
+            db.rel_set("unrefinedinstruction", rows);
+        });
+        rejects_dword_out_getter("extra instruction", |db, _| {
+            let extra: Instruction = (E + 1, 1, "", "NOP", NONE, NONE, NONE, NONE, 0, 0);
+            db.rel_push("unrefinedinstruction", extra);
+        });
+        rejects_dword_out_getter("home-store order", |db, _| {
+            rewrite_instruction(db, E + 11, |mut row| {
+                row.4 = ORCX;
+                row.5 = OHOME8;
+                row
+            });
+            rewrite_instruction(db, E + 15, |mut row| {
+                row.4 = ORDX;
+                row.5 = OHOME16;
+                row
+            });
+        });
+
+        for (operand, replacement) in [
+            (ORSP, "RBP"),
+            (OR11, "R10"),
+            (ORCX, "ECX"),
+            (ORDX, "EDX"),
+            (ORAX, "R10"),
+            (OEAX, "RAX"),
+            (OECX, "CX"),
+        ] {
+            rejects_dword_out_getter("register/width", move |db, _| {
+                replace_register(db, operand, replacement)
+            });
+        }
+        for (operand, replacement) in [
+            (OHOME16, ("NONE", "R11", "NONE", 1, 8, 8)),
+            (OHOME8, ("NONE", "R11", "NONE", 1, 16, 8)),
+            (OHOME16, ("NONE", "R10", "NONE", 1, 16, 8)),
+            (OHOME16, ("FS", "R11", "NONE", 1, 16, 8)),
+            (OHOME16, ("NONE", "R11", "RCX", 1, 16, 8)),
+            (OHOME16, ("NONE", "R11", "NONE", 2, 16, 8)),
+            (OHOME16, ("NONE", "R11", "NONE", 1, 16, 4)),
+            (OFIELD, ("NONE", "RCX", "NONE", 1, 0x24, 8)),
+            (OFIELD, ("NONE", "RCX", "NONE", 1, 0x24, 1)),
+            (OFIELD, ("NONE", "RDX", "NONE", 1, 0x24, 4)),
+            (OFIELD, ("NONE", "RCX", "RAX", 1, 0x24, 4)),
+            (OOUT, ("NONE", "RDX", "NONE", 1, 4, 4)),
+            (OOUT, ("NONE", "RDX", "NONE", 1, 0, 8)),
+            (OOUT, ("NONE", "RDX", "NONE", 1, 0, 1)),
+        ] {
+            rejects_dword_out_getter("memory shape/width", move |db, _| {
+                replace_indirect(db, operand, replacement)
+            });
+        }
+        rejects_dword_out_getter("ambiguous register operand", |db, _| {
+            db.rel_push("op_register", (ORSP, "RBP"));
+        });
+        rejects_dword_out_getter("register/immediate operand ambiguity", |db, _| {
+            db.rel_push("op_immediate", (OEAX, 0_i64, 0_usize));
+        });
+        rejects_dword_out_getter("zero displacement cannot be disp8", |db, _| {
+            replace_indirect(db, OFIELD, ("NONE", "RCX", "NONE", 1, 0, 4));
+        });
+        rejects_dword_out_getter("disp8 overflow", |db, _| {
+            replace_indirect(db, OFIELD, ("NONE", "RCX", "NONE", 1, 128, 4));
+        });
+        rejects_dword_out_getter("missing original encoding evidence", |db, _| {
+            db.loaded_binary_data = None;
+        });
+        rejects_dword_out_getter("alternate xor opcode form", |db, _| {
+            rewrite_dword_out_getter_input_byte(db, 9, 0x31);
+        });
+        rejects_dword_out_getter("alternate mov opcode direction", |db, _| {
+            rewrite_dword_out_getter_input_byte(db, 4, 0x89);
+            rewrite_dword_out_getter_input_byte(db, 5, 0xc8);
+        });
+
+        for displacement in [0_i64, 0x7f, -0x80] {
+            let (db, map) = dword_out_getter_fixture(displacement, 32);
+            assert!(
+                recognize_machine_state_stubs(&db, &map).is_empty(),
+                "noncanonical disp32 displacement={displacement}"
+            );
+        }
+        for displacement in [0x80_i64, -0x81, i64::from(i32::MAX) + 1] {
+            let (db, map) = dword_out_getter_fixture(displacement, 8);
+            assert!(
+                recognize_machine_state_stubs(&db, &map).is_empty(),
+                "invalid disp8 displacement={displacement}"
+            );
+        }
+        for displacement in [i64::from(i32::MAX) + 1, i64::from(i32::MIN) - 1] {
+            let (db, map) = dword_out_getter_fixture(displacement, 32);
+            assert!(
+                recognize_machine_state_stubs(&db, &map).is_empty(),
+                "disp32 overflow displacement={displacement}"
+            );
+        }
+    }
+
+    #[test]
+    fn win64_dword_out_getter_effect_cfg_and_coff_mutations_fail_closed() {
+        const E: Address = 0x1000_0000;
+        rejects_dword_out_getter("missing register definition", |db, _| {
+            remove_register_effect(db, "decoded_reg_def", E + 9, Mreg::AX)
+        });
+        rejects_dword_out_getter("missing register use", |db, _| {
+            remove_register_effect(db, "decoded_reg_use", E + 19, Mreg::CX)
+        });
+        rejects_dword_out_getter("extra register definition", |db, _| {
+            db.rel_push("decoded_reg_def", (E + 11, Mreg::AX));
+        });
+        rejects_dword_out_getter("extra register use", |db, _| {
+            db.rel_push("decoded_reg_use", (E + 3, Mreg::DX));
+        });
+        rejects_dword_out_getter("missing memory read", |db, _| {
+            remove_memory_effect(db, "decoded_memory_read_operand", E + 19, OFIELD)
+        });
+        rejects_dword_out_getter("missing memory write", |db, _| {
+            remove_memory_effect(db, "decoded_memory_write_operand", E + 22, OOUT)
+        });
+        rejects_dword_out_getter("extra memory effect", |db, _| {
+            db.rel_push("decoded_memory_write_operand", (E + 19, OFIELD));
+        });
+        rejects_dword_out_getter("missing owner", |db, _| {
+            let rows = db
+                .rel_iter::<(Node, Address)>("instr_in_function")
+                .filter(|row| row.0 != E + 9)
+                .copied()
+                .collect::<ascent::boxcar::Vec<_>>();
+            db.rel_set("instr_in_function", rows);
+        });
+        rejects_dword_out_getter("ambiguous owner", |db, _| {
+            db.rel_push("instr_in_function", (E + 9, E + 0x1000));
+        });
+        rejects_dword_out_getter("missing next edge", |db, _| {
+            let rows = db
+                .rel_iter::<(Node, Node)>("next")
+                .filter(|row| **row != (E + 9, E + 11))
+                .copied()
+                .collect::<ascent::boxcar::Vec<_>>();
+            db.rel_set("next", rows);
+        });
+        rejects_dword_out_getter("extra next edge", |db, _| {
+            db.rel_push("next", (E + 9, E + 19));
+        });
+        rejects_dword_out_getter("ret fallthrough", |db, _| {
+            db.rel_push("next", (E + 24, E + 25));
+        });
+        rejects_dword_out_getter("direct jump", |db, _| {
+            db.rel_push("direct_jump", (E + 9, E + 19));
+        });
+        rejects_dword_out_getter("direct call", |db, _| {
+            db.rel_push("direct_call", (E + 9, E + 0x1000));
+        });
+        rejects_dword_out_getter("CFG edge", |db, _| {
+            db.rel_push("ddisasm_cfg_edge", (E + 9, E + 19, "branch"));
+        });
+        rejects_dword_out_getter("flags consumer", |db, _| {
+            db.rel_push("flags_and_jump_pair", (E + 9, E + 19, "e"));
+        });
+
+        rejects_dword_out_getter("map schema", |_, map| map.schema = "wrong");
+        rejects_dword_out_getter("loader", |_, map| map.loader_id = "wrong");
+        rejects_dword_out_getter("architecture", |_, map| map.architecture = "wrong");
+        rejects_dword_out_getter("original size", |_, map| {
+            map.functions[0].original_size = 24
+        });
+        rejects_dword_out_getter("manifold size", |_, map| {
+            map.functions[0].manifold_size = 24
+        });
+        rejects_dword_out_getter("mapped end", |_, map| map.functions[0].mapped_end -= 1);
+        rejects_dword_out_getter("function section", |_, map| {
+            map.functions[0].section_index = 6
+        });
+        rejects_dword_out_getter("function section offset", |_, map| {
+            map.functions[0].section_offset += 1
+        });
+        rejects_dword_out_getter("ambiguous function", |_, map| {
+            map.functions.push(map.functions[0].clone())
+        });
+        rejects_dword_out_getter("missing section", |_, map| map.sections.clear());
+        rejects_dword_out_getter("ambiguous section", |_, map| {
+            map.sections.push(map.sections[0].clone())
+        });
+        rejects_dword_out_getter("section kind", |_, map| {
+            map.sections[0].kind = "Data".into()
+        });
+        rejects_dword_out_getter("mapped section lower bound", |_, map| {
+            map.sections[0].mapped_va_start += 1
+        });
+        rejects_dword_out_getter("mapped section upper bound", |_, map| {
+            map.sections[0].mapped_va_end -= 1
+        });
+        rejects_dword_out_getter("original section lower bound", |_, map| {
+            map.sections[0].original_offset_start += 1
+        });
+        rejects_dword_out_getter("original section upper bound", |_, map| {
+            map.sections[0].original_offset_end -= 1
+        });
+        rejects_dword_out_getter("unequal in-bounds section spans", |_, map| {
+            map.sections[0].original_offset_start = 0x20;
+            map.sections[0].original_offset_end = 0x80;
+            map.sections[0].mapped_va_start = E - 0x20;
+            map.sections[0].mapped_va_end = E + 0x41;
+        });
+        rejects_dword_out_getter("in-bounds section mapping misalignment", |_, map| {
+            map.sections[0].original_offset_start = 0x20;
+            map.sections[0].original_offset_end = 0x80;
+            map.sections[0].mapped_va_start = E - 0x10;
+            map.sections[0].mapped_va_end = E + 0x50;
+        });
+        rejects_dword_out_getter("in-bounds function mapping misalignment", |_, map| {
+            map.sections[0].original_offset_start = 0x20;
+            map.sections[0].original_offset_end = 0x80;
+            map.sections[0].mapped_va_start = E - 0x20;
+            map.sections[0].mapped_va_end = E + 0x40;
+            map.functions[0].section_offset += 1;
+            map.symbols[0].section_offset = Some(map.functions[0].section_offset);
+        });
+        rejects_dword_out_getter("missing function symbol", |_, map| map.symbols.clear());
+        rejects_dword_out_getter("ambiguous function symbol", |_, map| {
+            map.symbols.push(map.symbols[0].clone())
+        });
+        rejects_dword_out_getter("function symbol original name", |_, map| {
+            map.symbols[0].original_name = "different".into()
+        });
+        rejects_dword_out_getter("function symbol provider name", |_, map| {
+            map.symbols[0].provider_name = "different".into()
+        });
+        rejects_dword_out_getter("function symbol address", |_, map| {
+            map.symbols[0].mapped_address += 1
+        });
+        rejects_dword_out_getter("function symbol kind", |_, map| {
+            map.symbols[0].kind = "data".into()
+        });
+        rejects_dword_out_getter("undefined function symbol", |_, map| {
+            map.symbols[0].defined = false
+        });
+        rejects_dword_out_getter("function symbol section", |_, map| {
+            map.symbols[0].section_index = None
+        });
+        rejects_dword_out_getter("function symbol offset", |_, map| {
+            map.symbols[0].section_offset = Some(0x41)
+        });
+        rejects_dword_out_getter("function relocation", |_, map| {
+            map.relocations.push(CoffRelocationMap {
+                section_index: 5,
+                section_name: ".text$generic".into(),
+                section_offset: 0x50,
+                mapped_field_va: E + 0x10,
+                relocation_type: "IMAGE_REL_AMD64_ADDR32".into(),
+                width_bits: 32,
+                target_original_name: "unrelated".into(),
+                target_mapped_address: E + 0x1000,
+                encoded_value: 0,
+            });
+        });
+        rejects_dword_out_getter("wrong-section mapped relocation overlap", |_, map| {
+            map.relocations.push(CoffRelocationMap {
+                section_index: 6,
+                section_name: ".other".into(),
+                section_offset: 0,
+                mapped_field_va: E + 0x10,
+                relocation_type: "IMAGE_REL_AMD64_ADDR32".into(),
+                width_bits: 32,
+                target_original_name: "unrelated".into(),
+                target_mapped_address: E + 0x1000,
+                encoded_value: 0,
+            });
+        });
+        rejects_dword_out_getter("same-index relocation section-name mismatch", |_, map| {
+            map.relocations.push(CoffRelocationMap {
+                section_index: 5,
+                section_name: ".wrong".into(),
+                section_offset: 0x100,
+                mapped_field_va: E + 0x100,
+                relocation_type: "IMAGE_REL_AMD64_ADDR32".into(),
+                width_bits: 32,
+                target_original_name: "unrelated".into(),
+                target_mapped_address: E + 0x1000,
+                encoded_value: 0,
+            });
+        });
+
+        let (db, mut map) = dword_out_getter_fixture(0x24, 8);
+        map.relocations.push(CoffRelocationMap {
+            section_index: 6,
+            section_name: ".other".into(),
+            section_offset: 0,
+            mapped_field_va: E + 0x100,
+            relocation_type: "IMAGE_REL_AMD64_ADDR32".into(),
+            width_bits: 32,
+            target_original_name: "unrelated".into(),
+            target_mapped_address: E + 0x1000,
+            encoded_value: 0,
+        });
+        assert_eq!(
+            recognize_machine_state_stubs(&db, &map).len(),
+            1,
+            "a nonoverlapping relocation in another section contaminated the owner"
+        );
+    }
+
+    #[test]
+    fn win64_dword_out_getter_recognizes_real_decoder_asm_and_adjacent_owners() {
+        std::thread::Builder::new()
+            .name("machine-state-dword-out-getter-coff-fixture".into())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                static FIXTURE_ID: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let path = std::env::temp_dir().join(format!(
+                    "manifold-machine-state-dword-out-getter-{}-{}.obj",
+                    std::process::id(),
+                    FIXTURE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                ));
+                std::fs::write(&path, adjacent_dword_out_getter_coff_fixture()).unwrap();
+
+                let mut db = DecompileDB::default();
+                let map = crate::decompile::disassembly::load_from_binary(&mut db, &path).unwrap();
+                let _ = std::fs::remove_file(&path);
+                assert!(
+                    db.loaded_binary_data.is_some(),
+                    "real COFF loader did not retain its exact decoder input"
+                );
+                AsmPass.run(&mut db);
+
+                assert_eq!(map.functions.len(), 4);
+                assert!(map.relocations.is_empty());
+                let section = &map.sections[0];
+                assert_eq!(
+                    section
+                        .original_offset_end
+                        .checked_sub(section.original_offset_start),
+                    section.mapped_va_end.checked_sub(section.mapped_va_start),
+                );
+                for function in &map.functions {
+                    assert_eq!(
+                        function
+                            .section_offset
+                            .checked_sub(section.original_offset_start),
+                        function.mapped_entry.checked_sub(section.mapped_va_start),
+                    );
+                    let instruction_addresses: Vec<_> = db
+                        .rel_iter::<Instruction>("unrefinedinstruction")
+                        .filter_map(|row| {
+                            (function.mapped_entry <= row.0 && row.0 < function.mapped_end)
+                                .then_some(row.0)
+                        })
+                        .collect();
+                    assert_eq!(instruction_addresses.len(), 9, "{function:?}");
+                    for address in instruction_addresses {
+                        assert_eq!(
+                            db.rel_iter::<(Node, Address)>("instr_in_function")
+                                .filter_map(|(node, owner)| {
+                                    (*node == address).then_some(*owner)
+                                })
+                                .collect::<BTreeSet<_>>(),
+                            BTreeSet::from([function.mapped_entry]),
+                            "adjacent function ownership leaked at 0x{address:x}",
+                        );
+                    }
+                }
+
+                let result = recognize_machine_state_stubs(&db, &map);
+                assert_eq!(result.len(), 2, "unexpected records: {result:#?}");
+                let recognized: BTreeMap<_, _> = result
+                    .iter()
+                    .map(|record| {
+                        let MachineStateStubRecord::Win64DwordOutGetter(stub) = record else {
+                            panic!("expected dword out-getter record, got {record:?}")
+                        };
+                        (
+                            stub.function.address.clone(),
+                            (
+                                stub.field_copy.source_displacement,
+                                stub.field_copy.source_displacement_encoding_bits,
+                            ),
+                        )
+                    })
+                    .collect();
+                let function_by_original: BTreeMap<_, _> = map
+                    .functions
+                    .iter()
+                    .map(|function| (function.original_name.as_str(), function))
+                    .collect();
+                assert_eq!(
+                    recognized.get(&format!(
+                        "0x{:x}",
+                        function_by_original["disp8"].mapped_entry
+                    )),
+                    Some(&(0x24, 8)),
+                );
+                assert_eq!(
+                    recognized.get(&format!(
+                        "0x{:x}",
+                        function_by_original["disp32"].mapped_entry
+                    )),
+                    Some(&(-0x1234, 32)),
+                );
+                for control in ["alt_xor", "rex_ctrl"] {
+                    assert!(
+                        !recognized.contains_key(&format!(
+                            "0x{:x}",
+                            function_by_original[control].mapped_entry
+                        )),
+                        "same-semantics encoding control {control} was accepted",
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
