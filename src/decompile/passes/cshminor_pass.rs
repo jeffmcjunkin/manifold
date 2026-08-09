@@ -410,6 +410,51 @@ fn materialize_win64_home_backing(db: &mut DecompileDB) {
     );
 }
 
+/// Retain a CR8 byte marker only when the final pre-Csh type evidence can
+/// still represent its intrinsic result as unsigned 64-bit.  A pointer fact or
+/// any candidate which outranks Xlongunsigned would otherwise change the
+/// assignment before the comparison-local cast can preserve the machine bits.
+/// If one value at an ambiguous node conflicts, reject that whole node rather
+/// than filtering ambiguity into an apparently unique marker.
+fn filter_cr8_byte_compares_with_incompatible_types(db: &mut DecompileDB) {
+    let markers: Vec<(Node, RTLReg)> = db
+        .rel_iter::<(Node, RTLReg)>("cr8_byte_compare")
+        .copied()
+        .collect();
+    if markers.is_empty() {
+        return;
+    }
+    let marker_values: BTreeSet<RTLReg> = markers.iter().map(|(_, value)| *value).collect();
+    let threshold =
+        crate::decompile::passes::clight_pass::xtype_refine_priority(&XType::Xlongunsigned);
+    let mut incompatible_values: BTreeSet<RTLReg> = db
+        .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+        .filter_map(|(value, xtype)| {
+            (marker_values.contains(value)
+                && crate::decompile::passes::clight_pass::xtype_refine_priority(xtype) > threshold)
+                .then_some(*value)
+        })
+        .collect();
+    incompatible_values.extend(
+        db.rel_iter::<(RTLReg,)>("is_ptr")
+            .filter_map(|(value,)| marker_values.contains(value).then_some(*value)),
+    );
+    if incompatible_values.is_empty() {
+        return;
+    }
+    let blocked_nodes: BTreeSet<Node> = markers
+        .iter()
+        .filter_map(|(node, value)| incompatible_values.contains(value).then_some(*node))
+        .collect();
+    db.rel_set(
+        "cr8_byte_compare",
+        markers
+            .into_iter()
+            .filter(|(node, _)| !blocked_nodes.contains(node))
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+}
+
 ascent_par! {
     #![measure_rule_times]
 
@@ -419,6 +464,9 @@ ascent_par! {
 
     relation cminor_stmt(Node, CminorStmt);
     relation trim_jump_table_impl(Node);
+    // RTLOptimize's post-rewrite proof that one exact CR8 condition consumes
+    // the matching low byte of its still-64-bit intrinsic result.
+    relation cr8_byte_compare(Node, RTLReg);
 
     #[local] relation active_cminor_stmt(Node, CminorStmt);
     active_cminor_stmt(node, stmt.clone()) <--
@@ -782,8 +830,72 @@ ascent_par! {
         let converted_res = csharp_builtin_arg_from(&res),
         let stmt = CsharpminorStmt::Sbuiltin(dst.clone(), name.clone(), converted_args, converted_res);
 
+    #[local] relation cr8_byte_condition_row_count(Node, usize);
+    cr8_byte_condition_row_count(*node, count) <--
+        cr8_byte_compare(node, _),
+        agg count = ascent::aggregators::count() in active_cminor_stmt(node, _);
+
+    // A marker is usable only when it identifies one value at this condition.
+    // Competing marker rows retain the ordinary 32-bit condition rendering.
+    #[local] relation cr8_byte_marker_count(Node, usize);
+    cr8_byte_marker_count(*node, count) <--
+        cr8_byte_compare(node, _),
+        agg count = ascent::aggregators::count() in cr8_byte_compare(node, _);
+
+    #[local] relation cr8_byte_condition_resolved(Node);
+    cr8_byte_condition_resolved(*node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sbranch(cond, regs, _, _)),
+        cr8_byte_compare(node, value),
+        cr8_byte_condition_row_count(node, 1),
+        cr8_byte_marker_count(node, 1),
+        if matches!(cond, Condition::Ccompuimm(_, 1)),
+        if regs.as_slice() == [*value];
+
+    cr8_byte_condition_resolved(*node) <--
+        active_cminor_stmt(node, ?CminorStmt::Sifthenelse(cond, regs, _, _)),
+        cr8_byte_compare(node, value),
+        cr8_byte_condition_row_count(node, 1),
+        cr8_byte_marker_count(node, 1),
+        if matches!(cond, Condition::Ccompuimm(_, 1)),
+        if regs.as_slice() == [*value];
+
+    // The intrinsic result stays unsigned 64-bit; only this resolved source
+    // expression is narrowed below. Xlongunsigned outranks stale compare-
+    // derived Xint candidates during deterministic declaration selection.
+    emit_var_type_candidate(*value, XType::Xlongunsigned) <--
+        cr8_byte_condition_resolved(node),
+        cr8_byte_compare(node, value),
+        cr8_byte_marker_count(node, 1);
+
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Sbranch(cond, regs, ifso, ifnot)),
+        cr8_byte_compare(node, value),
+        cr8_byte_condition_row_count(node, 1),
+        cr8_byte_marker_count(node, 1),
+        if matches!(cond, Condition::Ccompuimm(_, 1)),
+        if regs.as_slice() == [*value],
+        let converted_args = vec![CsharpminorExpr::Eunop(
+            CminorUnop::Ocast8unsigned,
+            Box::new(CsharpminorExpr::Evar(*value)),
+        )],
+        let stmt = CsharpminorStmt::Scond(cond.clone(), converted_args, *ifso, *ifnot);
+
+    csharp_stmt_candidate(node, stmt) <--
+        active_cminor_stmt(node, ?CminorStmt::Sifthenelse(cond, regs, ifso, ifnot)),
+        cr8_byte_compare(node, value),
+        cr8_byte_condition_row_count(node, 1),
+        cr8_byte_marker_count(node, 1),
+        if matches!(cond, Condition::Ccompuimm(_, 1)),
+        if regs.as_slice() == [*value],
+        let converted_args = vec![CsharpminorExpr::Eunop(
+            CminorUnop::Ocast8unsigned,
+            Box::new(CsharpminorExpr::Evar(*value)),
+        )],
+        let stmt = CsharpminorStmt::Scond(cond.clone(), converted_args, *ifso, *ifnot);
+
+    csharp_stmt_candidate(node, stmt) <--
+        active_cminor_stmt(node, ?CminorStmt::Sbranch(cond, regs, ifso, ifnot)),
+        !cr8_byte_condition_resolved(node),
         let converted_args = regs
             .iter()
             .map(|r| CsharpminorExpr::Evar(*r))
@@ -792,6 +904,7 @@ ascent_par! {
 
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Sifthenelse(cond, regs, ifso, ifnot)),
+        !cr8_byte_condition_resolved(node),
         let converted_args = regs.iter().map(|r| CsharpminorExpr::Evar(*r)).collect(),
         let stmt = CsharpminorStmt::Scond(cond.clone(), converted_args, *ifso, *ifnot);
 
@@ -1432,6 +1545,7 @@ impl IRPass for CshminorPass {
     }
 
     fn run(&self, db: &mut DecompileDB) {
+        filter_cr8_byte_compares_with_incompatible_types(db);
         Self::prepare_jump_tables(db);
 
         run_pass!(db, CshminorPassProgram);
@@ -1445,10 +1559,142 @@ impl IRPass for CshminorPass {
             "jump_table_cmp",
             "jump_table_index_reg",
             "reg_rtl",
+            "is_ptr",
             "win64_home_backing_access",
             "win64_home_backing_selected_candidate",
         ]
     }
 
     declare_io_from!(CshminorPassProgram);
+}
+
+#[cfg(test)]
+mod cr8_byte_condition_tests {
+    use super::*;
+    use crate::x86::op::Comparison;
+
+    const CONDITION: Node = 0x1010;
+    const TAKEN: Node = 0x1020;
+    const FALLTHROUGH: Node = 0x1030;
+    const VALUE: RTLReg = 0x8000_0000_0000_1010;
+
+    fn condition_db(
+        markers: &[RTLReg],
+        competing_condition: bool,
+        incompatible_type: Option<(RTLReg, XType)>,
+        is_pointer: bool,
+    ) -> DecompileDB {
+        let mut db = DecompileDB::default();
+        let condition = CminorStmt::Sbranch(
+            Condition::Ccompuimm(Comparison::Cle, 1),
+            Arc::new(vec![VALUE]),
+            TAKEN,
+            FALLTHROUGH,
+        );
+        db.rel_push("cminor_stmt", (CONDITION, condition));
+        if competing_condition {
+            db.rel_push(
+                "cminor_stmt",
+                (
+                    CONDITION,
+                    CminorStmt::Sbranch(
+                        Condition::Ccompuimm(Comparison::Cle, 1),
+                        Arc::new(vec![VALUE]),
+                        FALLTHROUGH,
+                        TAKEN,
+                    ),
+                ),
+            );
+        }
+        for value in markers {
+            db.rel_push("cr8_byte_compare", (CONDITION, *value));
+        }
+        db.rel_push("emit_var_type_candidate", (VALUE, XType::Xint));
+        if let Some((value, xtype)) = incompatible_type {
+            db.rel_push("emit_var_type_candidate", (value, xtype));
+        }
+        if is_pointer {
+            db.rel_push("is_ptr", (VALUE,));
+        }
+        CshminorPass.run(&mut db);
+        db
+    }
+
+    fn condition_args(db: &DecompileDB) -> Vec<Vec<CsharpminorExpr>> {
+        db.rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt_candidate")
+            .filter_map(|(node, stmt)| match stmt {
+                CsharpminorStmt::Scond(_, args, _, _) if *node == CONDITION => Some(args.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has_cr8_long_type(db: &DecompileDB, value: RTLReg) -> bool {
+        db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .any(|(reg, xtype)| *reg == value && *xtype == XType::Xlongunsigned)
+    }
+
+    #[test]
+    fn unique_cr8_marker_narrows_only_the_condition_expression() {
+        let db = condition_db(&[VALUE], false, None, false);
+        assert_eq!(
+            condition_args(&db),
+            vec![vec![CsharpminorExpr::Eunop(
+                CminorUnop::Ocast8unsigned,
+                Box::new(CsharpminorExpr::Evar(VALUE)),
+            )]]
+        );
+        assert!(has_cr8_long_type(&db, VALUE));
+    }
+
+    #[test]
+    fn competing_cr8_marker_values_fail_closed_to_generic_condition() {
+        let db = condition_db(&[VALUE, VALUE + 1], false, None, false);
+        assert_eq!(
+            condition_args(&db),
+            vec![vec![CsharpminorExpr::Evar(VALUE)]]
+        );
+        assert!(!has_cr8_long_type(&db, VALUE));
+    }
+
+    #[test]
+    fn unresolved_or_competing_condition_rows_fail_closed_to_generic_condition() {
+        let mismatched = condition_db(&[VALUE + 1], false, None, false);
+        assert_eq!(
+            condition_args(&mismatched),
+            vec![vec![CsharpminorExpr::Evar(VALUE)]]
+        );
+        assert!(!has_cr8_long_type(&mismatched, VALUE));
+
+        let competing = condition_db(&[VALUE], true, None, false);
+        let args = condition_args(&competing);
+        assert!(!args.is_empty());
+        assert!(args
+            .iter()
+            .all(|row| row.as_slice() == [CsharpminorExpr::Evar(VALUE)]));
+        assert!(!has_cr8_long_type(&competing, VALUE));
+    }
+
+    #[test]
+    fn incompatible_final_type_or_pointer_evidence_rejects_the_marker() {
+        for db in [
+            condition_db(&[VALUE], false, Some((VALUE, XType::Xfloat)), false),
+            condition_db(&[VALUE], false, None, true),
+            condition_db(
+                &[VALUE, VALUE + 1],
+                false,
+                Some((VALUE + 1, XType::Xfloat)),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                condition_args(&db),
+                vec![vec![CsharpminorExpr::Evar(VALUE)]]
+            );
+            assert!(!has_cr8_long_type(&db, VALUE));
+            assert!(!db
+                .rel_iter::<(Node, RTLReg)>("cr8_byte_compare")
+                .any(|(node, _)| *node == CONDITION));
+        }
+    }
 }

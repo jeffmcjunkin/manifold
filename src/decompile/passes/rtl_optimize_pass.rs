@@ -1,5 +1,6 @@
 // RTLOptimizePass: imperative finalization of RTL candidates (disambiguation, copy-prop, DSE, nop collapse, inline-temp discovery), split out so the RTL pass proper stays pure Ascent.
 
+use crate::decompile::disassembly::operand::NO_OP;
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
 use crate::x86::op::{Comparison, Condition, Operation};
@@ -9,6 +10,375 @@ use log::info;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+
+type Cr8RawInstruction = (
+    usize,
+    &'static str,
+    &'static str,
+    Symbol,
+    Symbol,
+    Symbol,
+    Symbol,
+    usize,
+    usize,
+);
+
+fn exact_raw_operand_count(row: &Cr8RawInstruction) -> Option<usize> {
+    let operands = [row.3, row.4, row.5, row.6];
+    let mut count = 0;
+    let mut reached_padding = false;
+    for operand in operands {
+        if operand == NO_OP {
+            reached_padding = true;
+        } else if reached_padding {
+            return None;
+        } else {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+fn low_byte_register(full: &str) -> Option<(&'static str, usize)> {
+    match full {
+        "RAX" => Some(("AL", 2)),
+        "RBX" => Some(("BL", 3)),
+        "RCX" => Some(("CL", 3)),
+        "RDX" => Some(("DL", 3)),
+        "RSI" => Some(("SIL", 4)),
+        "RDI" => Some(("DIL", 4)),
+        "R8" => Some(("R8B", 4)),
+        "R9" => Some(("R9B", 4)),
+        "R10" => Some(("R10B", 4)),
+        "R11" => Some(("R11B", 4)),
+        "R12" => Some(("R12B", 4)),
+        "R13" => Some(("R13B", 4)),
+        "R14" => Some(("R14B", 4)),
+        "R15" => Some(("R15B", 4)),
+        _ => None,
+    }
+}
+
+fn rtl_definition(inst: &RTLInst) -> Option<RTLReg> {
+    match inst {
+        RTLInst::Iop(_, _, destination) | RTLInst::Iload(_, _, _, destination) => {
+            Some(*destination)
+        }
+        RTLInst::Icall(_, _, _, destination, _) => *destination,
+        RTLInst::Ibuiltin(_, _, BuiltinArg::BA(destination)) => Some(*destination),
+        _ => None,
+    }
+}
+
+/// Recover the one width fact which the Mach condition algebra cannot carry:
+/// an x64 CR8 read compared through its matching low byte.  This is deliberately
+/// expression-local.  The CR8 result remains a 64-bit intrinsic result, while
+/// only the authenticated comparison operand receives an unsigned-byte cast.
+///
+/// Every accepted site is tied independently to immutable decoder evidence and
+/// to the post-optimization RTL value.  Ambiguous raw operands, ownership,
+/// blocks, LTL interpretations, or final RTL instructions all fail closed.  A
+/// function with multiple otherwise-valid sites is also left unchanged: this
+/// initial rule never chooses among repeated CR8 assignments.
+fn materialize_cr8_byte_compares(db: &mut DecompileDB) {
+    let empty = || ascent::boxcar::Vec::<(Node, RTLReg)>::new();
+    if !db.abi().uses_shared_arg_slots() {
+        db.rel_set("cr8_byte_compare", empty());
+        return;
+    }
+
+    let mut registers: BTreeMap<Symbol, BTreeSet<&'static str>> = BTreeMap::new();
+    for (operand, register) in db.rel_iter::<(Symbol, &'static str)>("op_register") {
+        registers.entry(*operand).or_default().insert(*register);
+    }
+    if !registers.values().any(|rows| rows.contains("CR8")) {
+        db.rel_set("cr8_byte_compare", empty());
+        return;
+    }
+
+    let mut next: BTreeMap<Node, BTreeSet<Node>> = BTreeMap::new();
+    for (src, dst) in db.rel_iter::<(Node, Node)>("next") {
+        next.entry(*src).or_default().insert(*dst);
+    }
+    let mut blocks: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for (node, block) in db.rel_iter::<(Node, Address)>("code_in_block") {
+        blocks.entry(*node).or_default().insert(*block);
+    }
+    let mut owners: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for (node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        owners.entry(*node).or_default().insert(*function);
+    }
+    let mut immediates: BTreeMap<Symbol, BTreeSet<(i64, usize)>> = BTreeMap::new();
+    for (operand, value, width) in db.rel_iter::<(Symbol, i64, usize)>("op_immediate") {
+        immediates
+            .entry(*operand)
+            .or_default()
+            .insert((*value, *width));
+    }
+    let indirect_operands: BTreeSet<Symbol> = db
+        .rel_iter::<(
+            Symbol,
+            &'static str,
+            &'static str,
+            &'static str,
+            i64,
+            i64,
+            usize,
+        )>("op_indirect")
+        .map(|row| row.0)
+        .collect();
+    let mut raw: BTreeMap<Node, Vec<Cr8RawInstruction>> = BTreeMap::new();
+    for (node, size, prefix, mnemonic, op1, op2, op3, op4, metadata0, metadata1) in
+        db.rel_iter::<(
+            Node,
+            usize,
+            &'static str,
+            &'static str,
+            Symbol,
+            Symbol,
+            Symbol,
+            Symbol,
+            usize,
+            usize,
+        )>("unrefinedinstruction")
+    {
+        raw.entry(*node).or_default().push((
+            *size, *prefix, *mnemonic, *op1, *op2, *op3, *op4, *metadata0, *metadata1,
+        ));
+    }
+    let mut decoded: BTreeMap<Node, Vec<Cr8RawInstruction>> = BTreeMap::new();
+    for (node, size, prefix, mnemonic, op1, op2, op3, op4, metadata0, metadata1) in
+        db.rel_iter::<(
+            Node,
+            usize,
+            &'static str,
+            &'static str,
+            Symbol,
+            Symbol,
+            Symbol,
+            Symbol,
+            usize,
+            usize,
+        )>("instruction")
+    {
+        decoded.entry(*node).or_default().push((
+            *size, *prefix, *mnemonic, *op1, *op2, *op3, *op4, *metadata0, *metadata1,
+        ));
+    }
+    let mut ltl: BTreeMap<Node, Vec<LTLInst>> = BTreeMap::new();
+    for (node, inst) in db.rel_iter::<(Node, LTLInst)>("ltl_inst") {
+        ltl.entry(*node).or_default().push(inst.clone());
+    }
+    let mut final_rtl: BTreeMap<Node, Vec<RTLInst>> = BTreeMap::new();
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        final_rtl.entry(*node).or_default().push(inst.clone());
+    }
+    let mut definitions: BTreeMap<RTLReg, Vec<Node>> = BTreeMap::new();
+    for (node, rows) in &final_rtl {
+        for inst in rows {
+            if let Some(value) = rtl_definition(inst) {
+                definitions.entry(value).or_default().push(*node);
+            }
+        }
+    }
+
+    let exact_register = |operand: Symbol, wanted: &str| {
+        registers.get(&operand).is_some_and(|rows| {
+            rows.len() == 1 && rows.iter().next().is_some_and(|name| *name == wanted)
+        }) && !immediates.contains_key(&operand)
+            && !indirect_operands.contains(&operand)
+    };
+    let exact_immediate_one = |operand: Symbol| {
+        immediates
+            .get(&operand)
+            .is_some_and(|rows| rows == &BTreeSet::from([(1_i64, 0_usize)]))
+            && !registers.contains_key(&operand)
+            && !indirect_operands.contains(&operand)
+    };
+
+    let mut authenticated_reads = BTreeSet::new();
+    let mut candidates = BTreeSet::new();
+    for (&read, read_rows) in &raw {
+        if read_rows.len() != 1 {
+            continue;
+        }
+        let read_row = &read_rows[0];
+        let Some(decoded_read) = decoded
+            .get(&read)
+            .filter(|rows| rows.len() == 1 && rows.first() == Some(read_row))
+            .and_then(|rows| rows.first())
+        else {
+            continue;
+        };
+        if read_row.0 != 4
+            || read_row.1 != ""
+            || read_row.2 != "MOV"
+            || read_row.7 != 0
+            || read_row.8 != 0
+            || exact_raw_operand_count(read_row) != Some(2)
+            || !exact_register(read_row.3, "CR8")
+        {
+            continue;
+        }
+        let Some(full_register) = registers
+            .get(&read_row.4)
+            .filter(|rows| rows.len() == 1)
+            .and_then(|rows| rows.iter().next().copied())
+        else {
+            continue;
+        };
+        let Some((low_register, compare_size)) = low_byte_register(full_register) else {
+            continue;
+        };
+        if !exact_register(read_row.4, full_register) {
+            continue;
+        }
+        let Some(read_blocks) = blocks.get(&read).filter(|rows| rows.len() == 1) else {
+            continue;
+        };
+        let Some(read_owners) = owners.get(&read).filter(|rows| rows.len() == 1) else {
+            continue;
+        };
+        let function = *read_owners
+            .iter()
+            .next()
+            .expect("len()==1 guard: one function owner");
+        authenticated_reads.insert((function, read));
+
+        let Some(compare) = next
+            .get(&read)
+            .filter(|rows| rows.len() == 1)
+            .and_then(|rows| rows.iter().next().copied())
+        else {
+            continue;
+        };
+        if Address::try_from(read_row.0)
+            .ok()
+            .and_then(|size| read.checked_add(size))
+            != Some(compare)
+            || Address::try_from(decoded_read.0)
+                .ok()
+                .and_then(|size| read.checked_add(size))
+                != Some(compare)
+        {
+            continue;
+        }
+        let Some(compare_blocks) = blocks.get(&compare).filter(|rows| rows.len() == 1) else {
+            continue;
+        };
+        let Some(compare_owners) = owners.get(&compare).filter(|rows| rows.len() == 1) else {
+            continue;
+        };
+        if read_blocks != compare_blocks || read_owners != compare_owners {
+            continue;
+        }
+
+        let Some(compare_rows) = raw.get(&compare).filter(|rows| rows.len() == 1) else {
+            continue;
+        };
+        let compare_row = &compare_rows[0];
+        if !decoded
+            .get(&compare)
+            .is_some_and(|rows| rows.len() == 1 && rows.first() == Some(compare_row))
+        {
+            continue;
+        }
+        if compare_row.0 != compare_size
+            || compare_row.1 != ""
+            || compare_row.2 != "CMP"
+            || compare_row.7 != 0
+            || compare_row.8 != 0
+            || exact_raw_operand_count(compare_row) != Some(2)
+            || !exact_immediate_one(compare_row.3)
+            || !exact_register(compare_row.4, low_register)
+        {
+            continue;
+        }
+
+        let Some(read_ltl) = ltl
+            .get(&read)
+            .filter(|rows| rows.len() == 1)
+            .and_then(|rows| rows.first())
+        else {
+            continue;
+        };
+        let Some(compare_ltl) = ltl
+            .get(&compare)
+            .filter(|rows| rows.len() == 1)
+            .and_then(|rows| rows.first())
+        else {
+            continue;
+        };
+        let LTLInst::Lbuiltin(read_name, read_args, BuiltinArg::BA(read_mreg)) = read_ltl else {
+            continue;
+        };
+        let LTLInst::Lcond(Condition::Ccompuimm(_, 1), compare_args, _, _) = compare_ltl else {
+            continue;
+        };
+        let raw_result_mreg = crate::mreg::Mreg::x86(full_register);
+        if raw_result_mreg.is_unknown()
+            || *read_mreg != raw_result_mreg
+            || read_name != "__readcr8"
+            || !read_args.is_empty()
+            || compare_args.as_slice() != [*read_mreg]
+        {
+            continue;
+        }
+
+        let Some(read_rtl) = final_rtl
+            .get(&read)
+            .filter(|rows| rows.len() == 1)
+            .and_then(|rows| rows.first())
+        else {
+            continue;
+        };
+        let Some(compare_rtl) = final_rtl
+            .get(&compare)
+            .filter(|rows| rows.len() == 1)
+            .and_then(|rows| rows.first())
+        else {
+            continue;
+        };
+        let RTLInst::Ibuiltin(read_name, read_args, BuiltinArg::BA(value)) = read_rtl else {
+            continue;
+        };
+        let RTLInst::Icond(Condition::Ccompuimm(_, 1), compare_args, _, _) = compare_rtl else {
+            continue;
+        };
+        if read_name != "__readcr8" || !read_args.is_empty() || compare_args.as_slice() != [*value]
+        {
+            continue;
+        }
+        if !definitions
+            .get(value)
+            .is_some_and(|nodes| nodes.as_slice() == [read])
+        {
+            continue;
+        }
+        candidates.insert((function, compare, *value));
+    }
+
+    let mut read_counts: BTreeMap<Address, usize> = BTreeMap::new();
+    for (function, _) in &authenticated_reads {
+        *read_counts.entry(*function).or_default() += 1;
+    }
+    let mut candidate_counts: BTreeMap<Address, usize> = BTreeMap::new();
+    for (function, _, _) in &candidates {
+        *candidate_counts.entry(*function).or_default() += 1;
+    }
+    let output: BTreeSet<(Node, RTLReg)> = candidates
+        .into_iter()
+        .filter_map(|(function, compare, value)| {
+            (read_counts.get(&function) == Some(&1) && candidate_counts.get(&function) == Some(&1))
+                .then_some((compare, value))
+        })
+        .collect();
+
+    db.rel_set(
+        "cr8_byte_compare",
+        output.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+}
 
 #[cfg(debug_assertions)]
 use ascent::ascent_par;
@@ -970,6 +1340,7 @@ impl IRPass for RTLOptimizePass {
                 );
             }
         }
+        materialize_cr8_byte_compares(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -1002,6 +1373,7 @@ impl IRPass for RTLOptimizePass {
             "call_arg_mapping",
             "call_arg",
             "call_args_collected_candidate",
+            "cr8_byte_compare",
             // Static-eq branch folding can retype a function void; these signal that to the signature reconciliation pass.
             "emit_function_void_candidate",
             "emit_function_has_return_candidate",
@@ -1022,6 +1394,16 @@ impl IRPass for RTLOptimizePass {
             "jump_table_target",
             "slot_escaped_canonical",
             "win64_home_escaped",
+            // Immutable decoder/LTL evidence used to recover the comparison-
+            // local byte width after final RTL register rewriting.
+            "next",
+            "code_in_block",
+            "ltl_inst",
+            "op_register",
+            "op_immediate",
+            "op_indirect",
+            "instruction",
+            "unrefinedinstruction",
         ]
     }
 }
@@ -2330,6 +2712,367 @@ pub(crate) fn find_inline_temps(
     }
 
     result
+}
+
+#[cfg(test)]
+mod cr8_byte_compare_tests {
+    use super::*;
+    use crate::mreg::Mreg;
+
+    const FUNCTION: Address = 0x1000;
+    const READ: Node = 0x1010;
+    const COMPARE: Node = 0x1014;
+    const TAKEN: Node = 0x1020;
+    const FALLTHROUGH: Node = 0x1018;
+    const VALUE: RTLReg = 0x8000_0000_0000_1010;
+    const SECOND_READ: Node = 0x1030;
+    const SECOND_COMPARE: Node = 0x1034;
+    const SECOND_VALUE: RTLReg = 0x8000_0000_0000_1030;
+    const PADDING: Symbol = NO_OP;
+    const CR8: Symbol = "cr8_width_cr8";
+    const RAX: Symbol = "cr8_width_rax";
+    const AL: Symbol = "cr8_width_al";
+    const ONE: Symbol = "cr8_width_one";
+
+    fn raw(
+        node: Node,
+        size: usize,
+        mnemonic: &'static str,
+        op1: Symbol,
+        op2: Symbol,
+    ) -> (
+        Node,
+        usize,
+        &'static str,
+        &'static str,
+        Symbol,
+        Symbol,
+        Symbol,
+        Symbol,
+        usize,
+        usize,
+    ) {
+        (node, size, "", mnemonic, op1, op2, PADDING, PADDING, 0, 0)
+    }
+
+    fn valid_db_at(compare: Node) -> DecompileDB {
+        let condition = Condition::Ccompuimm(Comparison::Cle, 1);
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        db.rel_push("next", (READ, compare));
+        db.rel_push("code_in_block", (READ, FUNCTION));
+        db.rel_push("code_in_block", (compare, FUNCTION));
+        db.rel_push("instr_in_function", (READ, FUNCTION));
+        db.rel_push("instr_in_function", (compare, FUNCTION));
+        db.rel_push("op_register", (CR8, "CR8"));
+        db.rel_push("op_register", (RAX, "RAX"));
+        db.rel_push("op_register", (AL, "AL"));
+        db.rel_push("op_immediate", (ONE, 1_i64, 0_usize));
+        db.rel_push("unrefinedinstruction", raw(READ, 4, "MOV", CR8, RAX));
+        db.rel_push("instruction", raw(READ, 4, "MOV", CR8, RAX));
+        db.rel_push("unrefinedinstruction", raw(compare, 2, "CMP", ONE, AL));
+        db.rel_push("instruction", raw(compare, 2, "CMP", ONE, AL));
+        db.rel_push(
+            "ltl_inst",
+            (
+                READ,
+                LTLInst::Lbuiltin("__readcr8".to_string(), vec![], BuiltinArg::BA(Mreg::AX)),
+            ),
+        );
+        db.rel_push(
+            "ltl_inst",
+            (
+                compare,
+                LTLInst::Lcond(
+                    condition.clone(),
+                    Arc::new(vec![Mreg::AX]),
+                    Either::Right(TAKEN),
+                    Either::Right(FALLTHROUGH),
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                READ,
+                RTLInst::Ibuiltin("__readcr8".to_string(), vec![], BuiltinArg::BA(VALUE)),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                compare,
+                RTLInst::Icond(
+                    condition,
+                    Arc::new(vec![VALUE]),
+                    Either::Right(TAKEN),
+                    Either::Right(FALLTHROUGH),
+                ),
+            ),
+        );
+        db
+    }
+
+    fn valid_db() -> DecompileDB {
+        valid_db_at(COMPARE)
+    }
+
+    fn markers(db: &DecompileDB) -> BTreeSet<(Node, RTLReg)> {
+        db.rel_iter::<(Node, RTLReg)>("cr8_byte_compare")
+            .copied()
+            .collect()
+    }
+
+    fn add_second_valid_site(db: &mut DecompileDB) {
+        let condition = Condition::Ccompuimm(Comparison::Cle, 1);
+        db.rel_push("next", (SECOND_READ, SECOND_COMPARE));
+        db.rel_push("code_in_block", (SECOND_READ, FUNCTION));
+        db.rel_push("code_in_block", (SECOND_COMPARE, FUNCTION));
+        db.rel_push("instr_in_function", (SECOND_READ, FUNCTION));
+        db.rel_push("instr_in_function", (SECOND_COMPARE, FUNCTION));
+        db.rel_push("unrefinedinstruction", raw(SECOND_READ, 4, "MOV", CR8, RAX));
+        db.rel_push("instruction", raw(SECOND_READ, 4, "MOV", CR8, RAX));
+        db.rel_push(
+            "unrefinedinstruction",
+            raw(SECOND_COMPARE, 2, "CMP", ONE, AL),
+        );
+        db.rel_push("instruction", raw(SECOND_COMPARE, 2, "CMP", ONE, AL));
+        db.rel_push(
+            "ltl_inst",
+            (
+                SECOND_READ,
+                LTLInst::Lbuiltin("__readcr8".to_string(), vec![], BuiltinArg::BA(Mreg::AX)),
+            ),
+        );
+        db.rel_push(
+            "ltl_inst",
+            (
+                SECOND_COMPARE,
+                LTLInst::Lcond(
+                    condition.clone(),
+                    Arc::new(vec![Mreg::AX]),
+                    Either::Right(TAKEN),
+                    Either::Right(FALLTHROUGH),
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                SECOND_READ,
+                RTLInst::Ibuiltin(
+                    "__readcr8".to_string(),
+                    vec![],
+                    BuiltinArg::BA(SECOND_VALUE),
+                ),
+            ),
+        );
+        db.rel_push(
+            "rtl_inst",
+            (
+                SECOND_COMPARE,
+                RTLInst::Icond(
+                    condition,
+                    Arc::new(vec![SECOND_VALUE]),
+                    Either::Right(TAKEN),
+                    Either::Right(FALLTHROUGH),
+                ),
+            ),
+        );
+    }
+
+    #[test]
+    fn exact_cr8_low_byte_compare_is_materialized() {
+        let mut db = valid_db();
+        materialize_cr8_byte_compares(&mut db);
+        assert_eq!(markers(&db), BTreeSet::from([(COMPARE, VALUE)]));
+    }
+
+    #[test]
+    fn ambiguous_or_competing_evidence_fails_closed() {
+        let mut wrong_abi = valid_db();
+        wrong_abi.target_abi = Some(crate::abi::AbiConfig::sysv_x86_64());
+        materialize_cr8_byte_compares(&mut wrong_abi);
+        assert!(markers(&wrong_abi).is_empty());
+
+        let mut competing_next = valid_db();
+        competing_next.rel_push("next", (READ, FALLTHROUGH));
+        materialize_cr8_byte_compares(&mut competing_next);
+        assert!(markers(&competing_next).is_empty());
+
+        let mut forged_nonadjacent_next = valid_db_at(COMPARE + 8);
+        materialize_cr8_byte_compares(&mut forged_nonadjacent_next);
+        assert!(markers(&forged_nonadjacent_next).is_empty());
+
+        let mut competing_owner = valid_db();
+        competing_owner.rel_push("instr_in_function", (COMPARE, 0x2000 as Address));
+        materialize_cr8_byte_compares(&mut competing_owner);
+        assert!(markers(&competing_owner).is_empty());
+
+        let mut competing_register = valid_db();
+        competing_register.rel_push("op_register", (AL, "CL"));
+        materialize_cr8_byte_compares(&mut competing_register);
+        assert!(markers(&competing_register).is_empty());
+
+        let mut competing_immediate = valid_db();
+        competing_immediate.rel_push("op_immediate", (ONE, 2_i64, 0_usize));
+        materialize_cr8_byte_compares(&mut competing_immediate);
+        assert!(markers(&competing_immediate).is_empty());
+
+        let mut non_compare = valid_db();
+        let non_compare_rows = vec![
+            raw(READ, 4, "MOV", CR8, RAX),
+            raw(COMPARE, 2, "ADD", ONE, AL),
+        ];
+        non_compare.rel_set(
+            "unrefinedinstruction",
+            non_compare_rows
+                .clone()
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        non_compare.rel_set(
+            "instruction",
+            non_compare_rows
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        materialize_cr8_byte_compares(&mut non_compare);
+        assert!(markers(&non_compare).is_empty());
+
+        let mut extra_operand = valid_db();
+        let extra_compare = (
+            COMPARE, 2, "", "CMP", ONE, AL, RAX, PADDING, 0_usize, 0_usize,
+        );
+        let extra_operand_rows = vec![raw(READ, 4, "MOV", CR8, RAX), extra_compare];
+        extra_operand.rel_set(
+            "unrefinedinstruction",
+            extra_operand_rows
+                .clone()
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        extra_operand.rel_set(
+            "instruction",
+            extra_operand_rows
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        materialize_cr8_byte_compares(&mut extra_operand);
+        assert!(markers(&extra_operand).is_empty());
+
+        let mut competing_indirect = valid_db();
+        competing_indirect.rel_push(
+            "op_indirect",
+            (AL, "NONE", "RAX", "NONE", 1_i64, 0_i64, 1_usize),
+        );
+        materialize_cr8_byte_compares(&mut competing_indirect);
+        assert!(markers(&competing_indirect).is_empty());
+
+        let mut competing_ltl = valid_db();
+        competing_ltl.rel_push("ltl_inst", (COMPARE, LTLInst::Lreturn));
+        materialize_cr8_byte_compares(&mut competing_ltl);
+        assert!(markers(&competing_ltl).is_empty());
+
+        let mut mismatched_ltl_register = valid_db();
+        mismatched_ltl_register.rel_set(
+            "ltl_inst",
+            vec![
+                (
+                    READ,
+                    LTLInst::Lbuiltin("__readcr8".to_string(), vec![], BuiltinArg::BA(Mreg::CX)),
+                ),
+                (
+                    COMPARE,
+                    LTLInst::Lcond(
+                        Condition::Ccompuimm(Comparison::Cle, 1),
+                        Arc::new(vec![Mreg::CX]),
+                        Either::Right(TAKEN),
+                        Either::Right(FALLTHROUGH),
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        materialize_cr8_byte_compares(&mut mismatched_ltl_register);
+        assert!(markers(&mismatched_ltl_register).is_empty());
+
+        let mut competing_rtl = valid_db();
+        competing_rtl.rel_push("rtl_inst", (READ, RTLInst::Inop));
+        materialize_cr8_byte_compares(&mut competing_rtl);
+        assert!(markers(&competing_rtl).is_empty());
+
+        let mut duplicate_raw = valid_db();
+        duplicate_raw.rel_push("unrefinedinstruction", raw(READ, 4, "MOV", CR8, RAX));
+        materialize_cr8_byte_compares(&mut duplicate_raw);
+        assert!(markers(&duplicate_raw).is_empty());
+
+        let mut duplicate_decoded = valid_db();
+        duplicate_decoded.rel_push("instruction", raw(READ, 4, "MOV", CR8, RAX));
+        materialize_cr8_byte_compares(&mut duplicate_decoded);
+        assert!(markers(&duplicate_decoded).is_empty());
+
+        let mut duplicate_final_definition = valid_db();
+        duplicate_final_definition.rel_push(
+            "rtl_inst",
+            (
+                READ,
+                RTLInst::Ibuiltin("__readcr8".to_string(), vec![], BuiltinArg::BA(VALUE)),
+            ),
+        );
+        materialize_cr8_byte_compares(&mut duplicate_final_definition);
+        assert!(markers(&duplicate_final_definition).is_empty());
+
+        let mut redefined_value = valid_db();
+        redefined_value.rel_push(
+            "rtl_inst",
+            (
+                SECOND_READ,
+                RTLInst::Iop(Operation::Omove, Arc::new(vec![VALUE + 1]), VALUE),
+            ),
+        );
+        materialize_cr8_byte_compares(&mut redefined_value);
+        assert!(markers(&redefined_value).is_empty());
+
+        let mut second_incomplete_read = valid_db();
+        second_incomplete_read.rel_push("code_in_block", (SECOND_READ, FUNCTION));
+        second_incomplete_read.rel_push("instr_in_function", (SECOND_READ, FUNCTION));
+        second_incomplete_read
+            .rel_push("unrefinedinstruction", raw(SECOND_READ, 4, "MOV", CR8, RAX));
+        second_incomplete_read.rel_push("instruction", raw(SECOND_READ, 4, "MOV", CR8, RAX));
+        materialize_cr8_byte_compares(&mut second_incomplete_read);
+        assert!(markers(&second_incomplete_read).is_empty());
+
+        let mut repeated_sites = valid_db();
+        add_second_valid_site(&mut repeated_sites);
+        materialize_cr8_byte_compares(&mut repeated_sites);
+        assert!(markers(&repeated_sites).is_empty());
+
+        let mut mismatched_value = valid_db();
+        mismatched_value.rel_set(
+            "rtl_inst",
+            vec![
+                (
+                    READ,
+                    RTLInst::Ibuiltin("__readcr8".to_string(), vec![], BuiltinArg::BA(VALUE)),
+                ),
+                (
+                    COMPARE,
+                    RTLInst::Icond(
+                        Condition::Ccompuimm(Comparison::Cle, 1),
+                        Arc::new(vec![VALUE + 1]),
+                        Either::Right(TAKEN),
+                        Either::Right(FALLTHROUGH),
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        materialize_cr8_byte_compares(&mut mismatched_value);
+        assert!(markers(&mismatched_value).is_empty());
+    }
 }
 
 #[cfg(test)]
