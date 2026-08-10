@@ -222,6 +222,7 @@ fn main() {
         }
     }
 
+    let mut clight_export_succeeded = true;
     if dump_clight_json {
         let canonical = crate::decompile::passes::clight_select::derive_canonical_path(
             out_file_path.to_str().unwrap_or("output.light.c"),
@@ -229,7 +230,10 @@ fn main() {
         let json_path = crate::decompile::passes::clight_select::derive_with_suffix(&canonical, ".clight.json");
         match crate::debug::clight_export::export_clight_json(&prog, &json_path) {
             Ok(()) => println!("Clight IR exported to: {}", json_path),
-            Err(e) => eprintln!("Failed to export Clight JSON: {}", e),
+            Err(e) => {
+                clight_export_succeeded = false;
+                eprintln!("Failed to export Clight JSON: {}", e);
+            }
         }
     }
 
@@ -294,12 +298,25 @@ fn main() {
         )
         .into_iter()
         .collect();
+    let source_alternative_exclusions = if !clight_export_succeeded {
+        crate::decompile::postselect::source_alternatives::SourceAlternativeExclusions::suppress_all()
+    } else if prog.cast_source_alternatives_overflowed
+        || prog.cast_source_alternatives.is_empty()
+    {
+        Default::default()
+    } else {
+        crate::decompile::postselect::source_alternatives::final_source_alternative_exclusions(
+            &prog,
+            &exact_function_identities,
+        )
+    };
 
     if let Err(err) = write_outputs(
         raw_tu,
         optimized_tu,
         &prog.cast_source_alternatives,
         prog.cast_source_alternatives_overflowed,
+        &source_alternative_exclusions,
         &exact_function_identities,
         prog.abi().format,
         out_file_str,
@@ -330,6 +347,7 @@ fn write_outputs(
     optimized_tu: &crate::decompile::passes::c_pass::TranslationUnit,
     source_alternatives: &[crate::decompile::postselect::source_alternatives::SourceAlternativeSnapshot],
     source_alternatives_overflowed: bool,
+    source_alternative_exclusions: &crate::decompile::postselect::source_alternatives::SourceAlternativeExclusions,
     exact_function_identities: &[(String, u64)],
     binary_format: crate::abi::BinaryFormat,
     output_path: &str,
@@ -383,6 +401,7 @@ fn write_outputs(
             optimized_tu,
             source_alternatives,
             source_alternatives_overflowed,
+            source_alternative_exclusions,
             exact_function_identities,
             &optimized_c_source,
             binary_format,

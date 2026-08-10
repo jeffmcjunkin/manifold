@@ -114,6 +114,19 @@ pub(crate) struct PartialUnsupportedValidation {
     pub(crate) unknown_details: BTreeSet<(Address, Address, Symbol)>,
 }
 
+impl PartialUnsupportedValidation {
+    /// The Clight diagnostic artifact is atomic: orphaned or unknown rows make
+    /// the entire classification bundle invalid, not merely one function.
+    pub(crate) fn artifact_bundle_is_valid(&self) -> bool {
+        self.orphan_certificates.is_empty()
+            && self.orphan_provenance_sites.is_empty()
+            && self.orphan_budget_functions.is_empty()
+            && self.orphan_details.is_empty()
+            && self.unknown_reasons.is_empty()
+            && self.unknown_details.is_empty()
+    }
+}
+
 /// Validate the complete partial-function certificate as one fail-closed
 /// object. The producer relations are intentionally redundant: diagnostics,
 /// per-site certificates and provenance, and the function-wide budget must
@@ -357,7 +370,9 @@ pub(crate) fn validate_partial_unsupported_functions(
     }
 }
 
-fn unsupported_functions_requiring_omission(db: &DecompileDB) -> HashSet<Address> {
+pub(crate) fn unsupported_functions_requiring_omission_from_validation(
+    validation: &PartialUnsupportedValidation,
+) -> HashSet<Address> {
     let PartialUnsupportedValidation {
         diagnosed_functions,
         partial_functions,
@@ -367,31 +382,36 @@ fn unsupported_functions_requiring_omission(db: &DecompileDB) -> HashSet<Address
         orphan_details,
         unknown_reasons,
         unknown_details,
-        ..
-    } = validate_partial_unsupported_functions(db);
+    } = validation;
     let mut omitted: HashSet<Address> = diagnosed_functions
-        .into_iter()
+        .iter()
         .filter(|function| !partial_functions.contains_key(function))
+        .copied()
         .collect();
     omitted.extend(
         orphan_certificates
-            .into_iter()
-            .map(|(function, _, _)| function),
+            .iter()
+            .map(|(function, _, _)| *function),
     );
     omitted.extend(
         orphan_provenance_sites
-            .into_iter()
-            .map(|(function, _)| function),
+            .iter()
+            .map(|(function, _)| *function),
     );
-    omitted.extend(orphan_budget_functions);
+    omitted.extend(orphan_budget_functions.iter().copied());
     omitted.extend(
         orphan_details
-            .into_iter()
-            .chain(unknown_reasons)
-            .chain(unknown_details)
-            .map(|(function, _, _)| function),
+            .iter()
+            .chain(unknown_reasons.iter())
+            .chain(unknown_details.iter())
+            .map(|(function, _, _)| *function),
     );
     omitted
+}
+
+pub(crate) fn unsupported_functions_requiring_omission(db: &DecompileDB) -> HashSet<Address> {
+    let validation = validate_partial_unsupported_functions(db);
+    unsupported_functions_requiring_omission_from_validation(&validation)
 }
 
 pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, String> {

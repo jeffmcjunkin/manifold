@@ -11,6 +11,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 use crate::abi::BinaryFormat;
+use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::c_pass::types::{
     CBlockItem, CExpr, CStmt, FuncDef, TopLevelDecl, TranslationUnit,
 };
@@ -21,6 +22,89 @@ pub const MAX_SOURCE_ALTERNATIVES_PER_FUNCTION: usize = 2;
 pub const MAX_TOTAL_SOURCE_ALTERNATIVES: usize = 4096;
 pub const MAX_SOURCE_ALTERNATIVE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_SOURCE_ALTERNATIVE_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
+
+/// Final provider classifications whose ordinary C remains available only as
+/// fallback or is omitted altogether.  An alternative source form must never
+/// compete with the structured partial/unsupported/machine-state artifact for
+/// the same function.
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+pub struct SourceAlternativeExclusions {
+    suppress_all: bool,
+    partial_functions: HashSet<u64>,
+    unsupported_functions: HashSet<u64>,
+    omitted_functions: HashSet<u64>,
+    machine_state_functions: HashSet<(u64, String)>,
+}
+
+impl SourceAlternativeExclusions {
+    pub fn suppress_all() -> Self {
+        Self {
+            suppress_all: true,
+            ..Default::default()
+        }
+    }
+
+    fn excludes(&self, name: &str, address: u64) -> bool {
+        self.partial_functions.contains(&address)
+            || self.unsupported_functions.contains(&address)
+            || self.omitted_functions.contains(&address)
+            || self
+                .machine_state_functions
+                .iter()
+                .any(|(stub_address, stub_name)| {
+                    *stub_address == address && stub_name == name
+                })
+    }
+}
+
+/// Derive source-alternative eligibility from the same authenticated provider
+/// classifiers used by Clight selection/export.  No printed JSON, function
+/// spelling, or downstream score participates in this decision.
+pub fn final_source_alternative_exclusions(
+    db: &DecompileDB,
+    exact_function_identities: &[(String, u64)],
+) -> SourceAlternativeExclusions {
+    let validation =
+        crate::decompile::passes::clight_select::select::validate_partial_unsupported_functions(db);
+    let suppress_all = !validation.artifact_bundle_is_valid();
+    let partial_functions: HashSet<u64> = validation.partial_functions.keys().copied().collect();
+    let unsupported_functions: HashSet<u64> = validation
+        .diagnosed_functions
+        .iter()
+        .filter(|function| !partial_functions.contains(function))
+        .copied()
+        .collect();
+    let omitted_functions = crate::decompile::passes::clight_select::select::
+        unsupported_functions_requiring_omission_from_validation(&validation);
+    let exact_function_identities: HashSet<(u64, &str)> = exact_function_identities
+        .iter()
+        .map(|(name, address)| (*address, name.as_str()))
+        .collect();
+    let machine_state_functions = db
+        .coff_address_map
+        .as_ref()
+        .map(|map| {
+            crate::decompile::disassembly::machine_state::recognize_machine_state_stubs(db, map)
+                .into_iter()
+                .filter_map(|record| {
+                    let address = record.function_address_value()?;
+                    let name = record.function_name();
+                    exact_function_identities
+                        .contains(&(address, name))
+                        .then(|| (address, name.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    SourceAlternativeExclusions {
+        suppress_all,
+        partial_functions,
+        unsupported_functions,
+        omitted_functions,
+        machine_state_functions,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SourceAlternativeBoundary {
@@ -488,6 +572,7 @@ pub fn render_manifest(
     final_tu: &TranslationUnit,
     snapshots: &[SourceAlternativeSnapshot],
     capture_overflowed: bool,
+    exclusions: &SourceAlternativeExclusions,
     exact_function_identities: &[(String, u64)],
     canonical_translation_unit_source: &str,
     format: BinaryFormat,
@@ -496,6 +581,7 @@ pub fn render_manifest(
         final_tu,
         snapshots,
         capture_overflowed,
+        exclusions,
         exact_function_identities,
         canonical_translation_unit_source,
         format,
@@ -509,6 +595,7 @@ fn render_manifest_with_limits(
     final_tu: &TranslationUnit,
     snapshots: &[SourceAlternativeSnapshot],
     capture_overflowed: bool,
+    exclusions: &SourceAlternativeExclusions,
     exact_function_identities: &[(String, u64)],
     canonical_translation_unit_source: &str,
     format: BinaryFormat,
@@ -516,7 +603,7 @@ fn render_manifest_with_limits(
     max_source_bytes: usize,
     max_manifest_bytes: usize,
 ) -> serde_json::Result<Option<String>> {
-    if capture_overflowed {
+    if capture_overflowed || exclusions.suppress_all {
         return Ok(None);
     }
     let reproduced_source =
@@ -550,6 +637,9 @@ fn render_manifest_with_limits(
         .collect();
     let mut ordered: Vec<(usize, &SourceAlternativeSnapshot)> = snapshots
         .iter()
+        .filter(|snapshot| {
+            !exclusions.excludes(&snapshot.manifold_name, snapshot.manifold_address)
+        })
         .filter_map(|snapshot| {
             wire_ordinal_by_declaration
                 .get(&snapshot.declaration_index)
@@ -687,6 +777,14 @@ mod tests {
             local_vars: Vec::new(),
             loc: SourceLoc::unknown(),
         }
+    }
+
+    fn seed_decoded_owned(db: &mut DecompileDB, function: u64, node: u64) {
+        db.rel_push("instr_in_function", (node, function));
+        db.rel_push(
+            "instruction",
+            (node, 1usize, "", "nop", "", "", "", "", 0usize, 0usize),
+        );
     }
 
     #[test]
@@ -908,6 +1006,7 @@ mod tests {
             &final_tu,
             &snapshots,
             false,
+            &SourceAlternativeExclusions::default(),
             &[("f".to_string(), 0x1000)],
             &canonical,
             BinaryFormat::Pe,
@@ -946,6 +1045,271 @@ mod tests {
         assert_eq!(parsed["max_per_function"], 2);
         assert_eq!(parsed["truncated"], false);
         assert_eq!(final_tu, final_tu_before);
+    }
+
+    #[test]
+    fn manifest_rejects_each_final_ineligible_function_class() {
+        let final_function = function("f", CStmt::Return(Some(CExpr::int(2))));
+        let alternative = function("f", CStmt::Return(Some(CExpr::int(1))));
+        let mut final_tu = TranslationUnit::new();
+        final_tu.add_function(final_function.clone());
+        let snapshot = snapshot_if_changed(
+            0,
+            0x1000,
+            SourceAlternativeBoundary::PreForLoop,
+            &alternative,
+            &final_function,
+        )
+        .unwrap();
+        let canonical = crate::decompile::passes::c_pass::print_translation_unit_for_format(
+            &final_tu,
+            BinaryFormat::Pe,
+        );
+        let identities = [("f".to_string(), 0x1000)];
+
+        assert!(render_manifest(
+            &final_tu,
+            &[snapshot.clone()],
+            false,
+            &SourceAlternativeExclusions::default(),
+            &identities,
+            &canonical,
+            BinaryFormat::Pe,
+        )
+        .unwrap()
+        .is_some());
+
+        for exclusions in [
+            SourceAlternativeExclusions {
+                partial_functions: HashSet::from([0x1000]),
+                ..Default::default()
+            },
+            SourceAlternativeExclusions {
+                unsupported_functions: HashSet::from([0x1000]),
+                ..Default::default()
+            },
+            SourceAlternativeExclusions {
+                omitted_functions: HashSet::from([0x1000]),
+                ..Default::default()
+            },
+            SourceAlternativeExclusions {
+                machine_state_functions: HashSet::from([(0x1000, "f".to_string())]),
+                ..Default::default()
+            },
+        ] {
+            assert!(render_manifest(
+                &final_tu,
+                &[snapshot.clone()],
+                false,
+                &exclusions,
+                &identities,
+                &canonical,
+                BinaryFormat::Pe,
+            )
+            .unwrap()
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn final_exclusions_use_authenticated_partial_and_omission_relations() {
+        const PARTIAL_FUNCTION: u64 = 0x1000;
+        const PARTIAL_ACCESS: u64 = 0x1010;
+        let mut partial = DecompileDB::default();
+        partial.rel_push(
+            "unsupported_stack_address",
+            (
+                PARTIAL_FUNCTION,
+                PARTIAL_ACCESS,
+                "unsupported-stack-address",
+            ),
+        );
+        partial.rel_push(
+            "suppressed_unsupported_address",
+            (
+                PARTIAL_FUNCTION,
+                PARTIAL_ACCESS,
+                "unsupported-stack-address",
+            ),
+        );
+        partial.rel_push(
+            "suppressed_unsupported_address_node",
+            (PARTIAL_FUNCTION, PARTIAL_ACCESS, PARTIAL_ACCESS),
+        );
+        partial.rel_push(
+            "partial_unsupported_function",
+            (PARTIAL_FUNCTION, 1usize, 8usize),
+        );
+        for node in PARTIAL_ACCESS..PARTIAL_ACCESS + 8 {
+            seed_decoded_owned(&mut partial, PARTIAL_FUNCTION, node);
+        }
+        let partial_exclusions = final_source_alternative_exclusions(&partial, &[]);
+        assert!(partial_exclusions
+            .partial_functions
+            .contains(&PARTIAL_FUNCTION));
+        assert!(!partial_exclusions
+            .unsupported_functions
+            .contains(&PARTIAL_FUNCTION));
+        assert!(!partial_exclusions
+            .omitted_functions
+            .contains(&PARTIAL_FUNCTION));
+        assert!(partial_exclusions.excludes("partial", PARTIAL_FUNCTION));
+
+        const UNSUPPORTED_FUNCTION: u64 = 0x2000;
+        const UNSUPPORTED_ACCESS: u64 = 0x2010;
+        let mut unsupported = DecompileDB::default();
+        unsupported.rel_push(
+            "unsupported_stack_address",
+            (
+                UNSUPPORTED_FUNCTION,
+                UNSUPPORTED_ACCESS,
+                "unsupported-stack-address",
+            ),
+        );
+        let unsupported_exclusions = final_source_alternative_exclusions(&unsupported, &[]);
+        assert!(!unsupported_exclusions
+            .partial_functions
+            .contains(&UNSUPPORTED_FUNCTION));
+        assert!(unsupported_exclusions
+            .unsupported_functions
+            .contains(&UNSUPPORTED_FUNCTION));
+        assert!(unsupported_exclusions
+            .omitted_functions
+            .contains(&UNSUPPORTED_FUNCTION));
+        assert!(unsupported_exclusions.excludes("unsupported", UNSUPPORTED_FUNCTION));
+    }
+
+    #[test]
+    fn invalid_partial_artifact_atomically_suppresses_clean_sibling_sidecar() {
+        let mut invalid = DecompileDB::default();
+        invalid.rel_push(
+            "suppressed_unsupported_address",
+            (0x9000u64, 0x9010u64, "unsupported-stack-address"),
+        );
+        let identities = [("clean".to_string(), 0x5000u64)];
+        let exclusions = final_source_alternative_exclusions(&invalid, &identities);
+        assert!(exclusions.suppress_all);
+
+        let final_function = function("clean", CStmt::Return(Some(CExpr::int(2))));
+        let alternative = function("clean", CStmt::Return(Some(CExpr::int(1))));
+        let mut final_tu = TranslationUnit::new();
+        final_tu.add_function(final_function.clone());
+        let snapshot = snapshot_if_changed(
+            0,
+            0x5000,
+            SourceAlternativeBoundary::PreForLoop,
+            &alternative,
+            &final_function,
+        )
+        .unwrap();
+        let canonical = crate::decompile::passes::c_pass::print_translation_unit_for_format(
+            &final_tu,
+            BinaryFormat::Pe,
+        );
+        assert!(render_manifest(
+            &final_tu,
+            &[snapshot],
+            false,
+            &exclusions,
+            &identities,
+            &canonical,
+            BinaryFormat::Pe,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn machine_state_exclusion_requires_exact_name_and_address() {
+        let final_function = function("f", CStmt::Return(Some(CExpr::int(2))));
+        let alternative = function("f", CStmt::Return(Some(CExpr::int(1))));
+        let mut final_tu = TranslationUnit::new();
+        final_tu.add_function(final_function.clone());
+        let snapshot = snapshot_if_changed(
+            0,
+            0x1000,
+            SourceAlternativeBoundary::PreForLoop,
+            &alternative,
+            &final_function,
+        )
+        .unwrap();
+        let canonical = crate::decompile::passes::c_pass::print_translation_unit_for_format(
+            &final_tu,
+            BinaryFormat::Pe,
+        );
+        let exclusions = SourceAlternativeExclusions {
+            machine_state_functions: HashSet::from([(0x1000, "other".to_string())]),
+            ..Default::default()
+        };
+        assert!(render_manifest(
+            &final_tu,
+            &[snapshot],
+            false,
+            &exclusions,
+            &[("f".to_string(), 0x1000)],
+            &canonical,
+            BinaryFormat::Pe,
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[test]
+    fn final_ineligible_functions_do_not_suppress_clean_same_tu_sibling() {
+        let cases = [
+            ("partial", 0x1000),
+            ("unsupported", 0x2000),
+            ("omitted", 0x3000),
+            ("machine_state", 0x4000),
+            ("clean", 0x5000),
+        ];
+        let mut final_tu = TranslationUnit::new();
+        let mut snapshots = Vec::new();
+        let mut identities = Vec::new();
+        for (declaration_index, (name, address)) in cases.into_iter().enumerate() {
+            let final_function = function(name, CStmt::Return(Some(CExpr::int(2))));
+            let alternative = function(name, CStmt::Return(Some(CExpr::int(1))));
+            snapshots.push(
+                snapshot_if_changed(
+                    declaration_index,
+                    address,
+                    SourceAlternativeBoundary::PreForLoop,
+                    &alternative,
+                    &final_function,
+                )
+                .unwrap(),
+            );
+            final_tu.add_function(final_function);
+            identities.push((name.to_string(), address));
+        }
+        let exclusions = SourceAlternativeExclusions {
+            suppress_all: false,
+            partial_functions: HashSet::from([0x1000]),
+            unsupported_functions: HashSet::from([0x2000]),
+            omitted_functions: HashSet::from([0x3000]),
+            machine_state_functions: HashSet::from([(0x4000, "machine_state".to_string())]),
+        };
+        let canonical = crate::decompile::passes::c_pass::print_translation_unit_for_format(
+            &final_tu,
+            BinaryFormat::Pe,
+        );
+        let rendered = render_manifest(
+            &final_tu,
+            &snapshots,
+            false,
+            &exclusions,
+            &identities,
+            &canonical,
+            BinaryFormat::Pe,
+        )
+        .unwrap()
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let records = parsed["alternatives"].as_array().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["manifold_name"], "clean");
+        assert_eq!(records[0]["manifold_address"], "0x5000");
+        assert_eq!(records[0]["function_ordinal"], 4);
     }
 
     #[test]
@@ -997,6 +1361,7 @@ mod tests {
             &final_tu,
             &[snapshot],
             false,
+            &SourceAlternativeExclusions::default(),
             &[("target".to_string(), 0x3000)],
             &full_source,
             BinaryFormat::Pe,
@@ -1075,6 +1440,7 @@ mod tests {
                 &final_tu,
                 &snapshots,
                 false,
+                &SourceAlternativeExclusions::default(),
                 &identities,
                 &canonical,
                 BinaryFormat::Pe,
@@ -1107,6 +1473,7 @@ mod tests {
             &final_tu,
             &[snapshot.clone()],
             false,
+            &SourceAlternativeExclusions::default(),
             &[("f".to_string(), 0x1000)],
             &canonical,
             BinaryFormat::Pe,
@@ -1118,6 +1485,7 @@ mod tests {
             &final_tu,
             &[snapshot],
             false,
+            &SourceAlternativeExclusions::default(),
             &[("f".to_string(), 0x1000)],
             "stale canonical source\n",
             BinaryFormat::Pe,
@@ -1147,6 +1515,7 @@ mod tests {
             &final_tu,
             &[snapshot],
             false,
+            &SourceAlternativeExclusions::default(),
             &[("f".to_string(), 0x1000)],
             &canonical,
             BinaryFormat::Pe,
@@ -1168,6 +1537,7 @@ mod tests {
             )
             .unwrap()],
             false,
+            &SourceAlternativeExclusions::default(),
             &[("f".to_string(), 0x1000)],
             &canonical,
             BinaryFormat::Pe,

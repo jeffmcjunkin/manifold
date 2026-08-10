@@ -135,13 +135,7 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         .collect();
 
     let partial_validation = validate_partial_unsupported_functions(db);
-    if !partial_validation.orphan_certificates.is_empty()
-        || !partial_validation.orphan_provenance_sites.is_empty()
-        || !partial_validation.orphan_budget_functions.is_empty()
-        || !partial_validation.orphan_details.is_empty()
-        || !partial_validation.unknown_reasons.is_empty()
-        || !partial_validation.unknown_details.is_empty()
-    {
+    if !partial_validation.artifact_bundle_is_valid() {
         return Err(format!(
             "invalid partial-suppression relation bundle: orphan certificates={:?}, provenance={:?}, budgets={:?}, details={:?}; unknown reason codes={:?}, unknown details={:?}",
             partial_validation.orphan_certificates,
@@ -419,9 +413,7 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         .unwrap_or_default()
         .into_iter()
         .filter(|stub| {
-            let Ok(address) =
-                u64::from_str_radix(stub.function_address().trim_start_matches("0x"), 16)
-            else {
+            let Some(address) = stub.function_address_value() else {
                 return false;
             };
             emitted_addresses.contains(&address)

@@ -385,6 +385,13 @@ impl MachineStateStubRecord {
         }
     }
 
+    /// Recover the authenticated numeric function address carried by every
+    /// machine-state record.  Keep this parsing in one place so all artifact
+    /// consumers use the same closed identity boundary.
+    pub(crate) fn function_address_value(&self) -> Option<Address> {
+        u64::from_str_radix(self.function_address().strip_prefix("0x")?, 16).ok()
+    }
+
     fn sort_key(&self) -> (&str, &str) {
         (self.function_address(), self.function_name())
     }
