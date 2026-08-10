@@ -287,10 +287,20 @@ fn main() {
         .cast_optimized_translation_unit
         .as_ref()
         .expect("ClightEmitPass must produce cast_optimized_translation_unit");
+    let exact_function_identities: Vec<_> =
+        crate::decompile::postselect::source_alternatives::exact_function_addresses(
+            &prog.cast_selected_functions,
+            &prog.cast_id_to_name,
+        )
+        .into_iter()
+        .collect();
 
     if let Err(err) = write_outputs(
         raw_tu,
         optimized_tu,
+        &prog.cast_source_alternatives,
+        prog.cast_source_alternatives_overflowed,
+        &exact_function_identities,
         prog.abi().format,
         out_file_str,
         explicit_output,
@@ -318,6 +328,9 @@ fn main() {
 fn write_outputs(
     raw_tu: &crate::decompile::passes::c_pass::TranslationUnit,
     optimized_tu: &crate::decompile::passes::c_pass::TranslationUnit,
+    source_alternatives: &[crate::decompile::postselect::source_alternatives::SourceAlternativeSnapshot],
+    source_alternatives_overflowed: bool,
+    exact_function_identities: &[(String, u64)],
     binary_format: crate::abi::BinaryFormat,
     output_path: &str,
     explicit_output: bool,
@@ -358,6 +371,30 @@ fn write_outputs(
         file.flush()?;
     }
     println!("Optimized C source written to: {}", optimized_c_path);
+
+    let alternatives_path = format!("{optimized_c_path}.source-alternatives.json");
+    match std::fs::remove_file(&alternatives_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let alternatives =
+        crate::decompile::postselect::source_alternatives::render_manifest(
+            optimized_tu,
+            source_alternatives,
+            source_alternatives_overflowed,
+            exact_function_identities,
+            &optimized_c_source,
+            binary_format,
+        )
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if let Some(alternatives) = alternatives {
+        let mut file = File::create(&alternatives_path)?;
+        file.write_all(alternatives.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        println!("Source alternatives written to: {}", alternatives_path);
+    }
 
     Ok(())
 }

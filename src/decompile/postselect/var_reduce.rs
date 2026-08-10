@@ -1792,42 +1792,73 @@ impl IRPass for VarReducePass {
     }
 
     fn run(&self, db: &mut DecompileDB) {
-        let tu = match db.cast_optimized_translation_unit.as_mut() {
-            Some(tu) => tu,
-            None => return,
-        };
+        if db.cast_optimized_translation_unit.is_none() {
+            return;
+        }
+        let mut alternatives = std::mem::take(&mut db.cast_source_alternatives);
+        let mut alternatives_overflowed = db.cast_source_alternatives_overflowed;
+        let function_addresses = super::source_alternatives::exact_function_addresses(
+            &db.cast_selected_functions,
+            &db.cast_id_to_name,
+        );
         let mut total = 0usize;
         let mut merged = 0usize;
         let mut split_total = 0usize;
-        for decl in tu.decls.iter_mut() {
-            if let TopLevelDecl::FuncDef(f) = decl {
-                // 0) Split initializers -> fold/coalesce candidates (VR-3a); re-fused at end.
-                let split = split_scalar_inits(f);
-                split_total += split.len();
-                // 1) Fold single-use temporaries first, so coalescing operates on real variables (and its casts don't block any folds). fixpoint so chained temps (t1=*p; t2=t1->f; x=t2) collapse.
-                loop {
-                    let n = reduce_function(f);
-                    total += n;
-                    if n == 0 {
-                        break;
+        {
+            let tu = match db.cast_optimized_translation_unit.as_mut() {
+                Some(tu) => tu,
+                None => unreachable!("translation unit checked above"),
+            };
+            for (declaration_index, decl) in tu.decls.iter_mut().enumerate() {
+                if let TopLevelDecl::FuncDef(f) = decl {
+                    let before_function = (!alternatives_overflowed).then(|| f.clone());
+                    // 0) Split initializers -> fold/coalesce candidates (VR-3a); re-fused at end.
+                    let split = split_scalar_inits(f);
+                    split_total += split.len();
+                    // 1) Fold single-use temporaries first, so coalescing operates on real variables (and its casts don't block any folds). fixpoint so chained temps (t1=*p; t2=t1->f; x=t2) collapse.
+                    loop {
+                        let n = reduce_function(f);
+                        total += n;
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    // 2) Merge non-interfering locals (live-range coalescing) + drop identity copies.
+                    merged += run_coalesce(f);
+                    // 3) Mop up any temporaries coalescing newly made single-use.
+                    loop {
+                        let n = reduce_function(f);
+                        total += n;
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    // 4) Re-fuse surviving split initializers (cosmetic identity inverse of 0).
+                    refuse_scalar_inits(f, &split);
+                    // 5) Retype pointer locals used as integer countdown counters to `long` (UB-safe at -O2).
+                    demote_pointer_counters(f);
+                    if let Some(alternative) = before_function.as_ref().and_then(|before| {
+                        function_addresses.get(&f.name).and_then(|address| {
+                            super::source_alternatives::snapshot_if_changed(
+                                declaration_index,
+                                *address,
+                                super::source_alternatives::SourceAlternativeBoundary::PreVarReduce,
+                                before,
+                                f,
+                            )
+                        })
+                    }) {
+                        super::source_alternatives::record_bounded_snapshot(
+                            &mut alternatives,
+                            &mut alternatives_overflowed,
+                            alternative,
+                        );
                     }
                 }
-                // 2) Merge non-interfering locals (live-range coalescing) + drop identity copies.
-                merged += run_coalesce(f);
-                // 3) Mop up any temporaries coalescing newly made single-use.
-                loop {
-                    let n = reduce_function(f);
-                    total += n;
-                    if n == 0 {
-                        break;
-                    }
-                }
-                // 4) Re-fuse surviving split initializers (cosmetic identity inverse of 0).
-                refuse_scalar_inits(f, &split);
-                // 5) Retype pointer locals used as integer countdown counters to `long` (UB-safe at -O2).
-                demote_pointer_counters(f);
             }
         }
+        db.cast_source_alternatives = alternatives;
+        db.cast_source_alternatives_overflowed = alternatives_overflowed;
         log::info!(
             "var_reduce: coalesced {} locals, folded {} single-use temporaries, split {} initializers",
             merged,

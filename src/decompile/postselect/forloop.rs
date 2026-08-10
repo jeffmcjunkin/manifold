@@ -777,49 +777,80 @@ impl IRPass for ForLoopPass {
 
     fn run(&self, db: &mut DecompileDB) {
         // Always on (gate removed 2026-06-10): corpus A/B showed goto_per_func -27%, var_exact +18%, recompile_mean_errors flat; only cost is cc_ratio +3% (each recovered loop adds one cyclomatic unit).
-        let tu = match db.cast_optimized_translation_unit.as_mut() {
-            Some(tu) => tu,
-            None => return,
-        };
+        if db.cast_optimized_translation_unit.is_none() {
+            return;
+        }
+        let mut alternatives = std::mem::take(&mut db.cast_source_alternatives);
+        let mut alternatives_overflowed = db.cast_source_alternatives_overflowed;
+        let function_addresses = super::source_alternatives::exact_function_addresses(
+            &db.cast_selected_functions,
+            &db.cast_id_to_name,
+        );
         let mut improved = 0usize;
         let mut removed = 0usize;
         let (mut tot_g, mut kept_g) = (0usize, 0usize);
-        for decl in tu.decls.iter_mut() {
-            if let TopLevelDecl::FuncDef(f) = decl {
-                if !has_goto_or_label(&f.body) {
-                    continue;
-                }
-                let before = count_gotos(&f.body);
-                let loops_before = count_loops(&f.body);
-                tot_g += before;
+        {
+            let tu = match db.cast_optimized_translation_unit.as_mut() {
+                Some(tu) => tu,
+                None => unreachable!("translation unit checked above"),
+            };
+            for (declaration_index, decl) in tu.decls.iter_mut().enumerate() {
+                if let TopLevelDecl::FuncDef(f) = decl {
+                    if !has_goto_or_label(&f.body) {
+                        continue;
+                    }
+                    let before_function = (!alternatives_overflowed).then(|| f.clone());
+                    let before = count_gotos(&f.body);
+                    let loops_before = count_loops(&f.body);
+                    tot_g += before;
 
-                // 1) Inline single-ref labeled blocks at their goto site.
-                let mut cand = f.body.clone();
-                inline_gotos(&mut cand);
+                    // 1) Inline single-ref labeled blocks at their goto site.
+                    let mut cand = f.body.clone();
+                    inline_gotos(&mut cand);
 
-                // 2) Recover loops + if-bodies (counts recomputed after inlining).
-                let mut tgts = Vec::new();
-                collect_goto_targets(&cand, &mut tgts);
-                let mut refs: HashMap<String, usize> = HashMap::new();
-                for t in tgts {
-                    *refs.entry(t).or_insert(0) += 1;
-                }
-                let cand = recover(cand, &refs);
+                    // 2) Recover loops + if-bodies (counts recomputed after inlining).
+                    let mut tgts = Vec::new();
+                    collect_goto_targets(&cand, &mut tgts);
+                    let mut refs: HashMap<String, usize> = HashMap::new();
+                    for t in tgts {
+                        *refs.entry(t).or_insert(0) += 1;
+                    }
+                    let cand = recover(cand, &refs);
 
-                // 3) CF-7 runs last so while(1) loops formed in step 2 also get their exit gotos converted.
-                let cand = break_convert(cand);
-                let after = count_gotos(&cand);
-                if after < before
-                    && count_loops(&cand) >= loops_before
-                    && all_gotos_resolve(&cand)
-                {
-                    f.body = cand;
-                    improved += 1;
-                    removed += before - after;
+                    // 3) CF-7 runs last so while(1) loops formed in step 2 also get their exit gotos converted.
+                    let cand = break_convert(cand);
+                    let after = count_gotos(&cand);
+                    if after < before
+                        && count_loops(&cand) >= loops_before
+                        && all_gotos_resolve(&cand)
+                    {
+                        f.body = cand;
+                        if let Some(alternative) = before_function.as_ref().and_then(|before| {
+                            function_addresses.get(&f.name).and_then(|address| {
+                                super::source_alternatives::snapshot_if_changed(
+                                    declaration_index,
+                                    *address,
+                                    super::source_alternatives::SourceAlternativeBoundary::PreForLoop,
+                                    before,
+                                    f,
+                                )
+                            })
+                        }) {
+                            super::source_alternatives::record_bounded_snapshot(
+                                &mut alternatives,
+                                &mut alternatives_overflowed,
+                                alternative,
+                            );
+                        }
+                        improved += 1;
+                        removed += before - after;
+                    }
+                    kept_g += count_gotos(&f.body);
                 }
-                kept_g += count_gotos(&f.body);
             }
         }
+        db.cast_source_alternatives = alternatives;
+        db.cast_source_alternatives_overflowed = alternatives_overflowed;
         log::info!(
             "forloop: improved {} funcs, removed {} of {} gotos ({} residual)",
             improved, removed, tot_g, kept_g

@@ -904,19 +904,6 @@ impl Printer {
         let mut indices: Vec<usize> = (0..tu.decls.len()).collect();
         indices.sort_by_key(|&i| order(&tu.decls[i]));
 
-        fn is_effectively_empty_body(stmt: &CStmt) -> bool {
-            match stmt {
-                CStmt::Empty => true,
-                CStmt::Expr(e) => !e.has_side_effects(),
-                CStmt::Block(items) => items.iter().all(|item| match item {
-                    CBlockItem::Stmt(s) => is_effectively_empty_body(s),
-                    CBlockItem::Decl(decls) => decls.is_empty(),
-                }),
-                CStmt::Sequence(stmts) => stmts.iter().all(is_effectively_empty_body),
-                _ => false,
-            }
-        }
-
         let mut first = true;
         for i in indices {
             let decl = &tu.decls[i];
@@ -929,7 +916,7 @@ impl Printer {
                 continue;
             }
             if let TopLevelDecl::FuncDef(f) = decl {
-                if is_effectively_empty_body(&f.body) && f.local_vars.is_empty() {
+                if !is_emitted_func_def(f) {
                     continue;
                 }
             }
@@ -940,6 +927,29 @@ impl Printer {
             self.print_top_level(decl);
         }
     }
+}
+
+/// Whether `print_translation_unit` emits a function definition.  Keep this
+/// shared with authenticated source-alternative ordinals: an effectively empty
+/// definition is deliberately absent from both the canonical source and its
+/// printed-function index.
+pub(crate) fn is_emitted_func_def(function: &FuncDef) -> bool {
+    fn is_effectively_empty_body(stmt: &CStmt) -> bool {
+        match stmt {
+            CStmt::Empty => true,
+            CStmt::Expr(expr) => !expr.has_side_effects(),
+            CStmt::Block(items) => items.iter().all(|item| match item {
+                CBlockItem::Stmt(stmt) => is_effectively_empty_body(stmt),
+                CBlockItem::Decl(decls) => decls.is_empty(),
+            }),
+            CStmt::Sequence(statements) => {
+                statements.iter().all(is_effectively_empty_body)
+            }
+            _ => false,
+        }
+    }
+
+    !function.local_vars.is_empty() || !is_effectively_empty_body(&function.body)
 }
 
 
