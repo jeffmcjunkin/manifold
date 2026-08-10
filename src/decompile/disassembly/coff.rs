@@ -998,7 +998,7 @@ fn plan_image(
                 format!("COFF relocation references missing symbol {}", symbol_index.0)
             })?;
             let target = if let Some(default_index) =
-                raw_coff_weak_alias_default(obj, symbol_index)?
+                raw_coff_weak_default(obj, symbol_index)?
             {
                 let default = symbols.get(&default_index.0).ok_or_else(|| {
                     format!(
@@ -1294,7 +1294,7 @@ fn raw_coff_symbol_fields(
     }
 }
 
-fn raw_coff_weak_alias_default(
+fn raw_coff_weak_default(
     obj: &object::File<'_>,
     index: SymbolIndex,
 ) -> Result<Option<SymbolIndex>, String> {
@@ -1322,7 +1322,16 @@ fn raw_coff_weak_alias_default(
             .aux_weak_external(index)
             .map_err(|error| format!("invalid COFF weak external {}: {error}", index.0))?;
         let search_type = auxiliary.weak_search_type.get(LE);
-        if search_type != object::pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS {
+        // PE/COFF Auxiliary Format 3 resolves the weak symbol to its declared
+        // default whenever no definition of the weak name is linked.  This
+        // loader links one object and performs no library search, so both
+        // search modes take that fallback; ALIAS names it unconditionally.
+        if !matches!(
+            search_type,
+            object::pe::IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY
+                | object::pe::IMAGE_WEAK_EXTERN_SEARCH_LIBRARY
+                | object::pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS
+        ) {
             return Err(format!(
                 "unsupported COFF weak external search type {search_type} for symbol {}",
                 index.0
@@ -2279,40 +2288,43 @@ mod tests {
 
     #[test]
     fn weak_external_alias_relocations_bind_only_the_declared_definition() {
-        let (mut fixture, rdata_offset) = weak_alias_fixture(
+        for search_type in [
+            object::pe::IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY,
+            object::pe::IMAGE_WEAK_EXTERN_SEARCH_LIBRARY,
             object::pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS,
-            0,
-        );
-        let image = prepare_image(&mut fixture).unwrap().unwrap();
-        let definition = image
-            .address_map
-            .symbols
-            .iter()
-            .find(|symbol| symbol.original_name == "def_fn")
-            .unwrap();
-        assert!(!image
-            .address_map
-            .symbols
-            .iter()
-            .any(|symbol| symbol.original_name == "alias"));
-        assert!(!image
-            .address_map
-            .externs
-            .iter()
-            .any(|external| external.original_name == "alias"));
-        assert_eq!(image.address_map.relocations.len(), 1);
-        let relocation = &image.address_map.relocations[0];
-        assert_eq!(relocation.target_original_name, "def_fn");
-        assert_eq!(relocation.target_mapped_address, definition.mapped_address);
-        assert_eq!(
-            u64::from_le_bytes(
-                fixture[rdata_offset..rdata_offset + 8].try_into().unwrap(),
-            ),
-            definition.mapped_address,
-        );
+        ] {
+            let (mut fixture, rdata_offset) = weak_alias_fixture(search_type, 0);
+            let image = prepare_image(&mut fixture).unwrap().unwrap();
+            let definition = image
+                .address_map
+                .symbols
+                .iter()
+                .find(|symbol| symbol.original_name == "def_fn")
+                .unwrap();
+            assert!(!image
+                .address_map
+                .symbols
+                .iter()
+                .any(|symbol| symbol.original_name == "alias"));
+            assert!(!image
+                .address_map
+                .externs
+                .iter()
+                .any(|external| external.original_name == "alias"));
+            assert_eq!(image.address_map.relocations.len(), 1);
+            let relocation = &image.address_map.relocations[0];
+            assert_eq!(relocation.target_original_name, "def_fn");
+            assert_eq!(relocation.target_mapped_address, definition.mapped_address);
+            assert_eq!(
+                u64::from_le_bytes(
+                    fixture[rdata_offset..rdata_offset + 8].try_into().unwrap(),
+                ),
+                definition.mapped_address,
+            );
+        }
 
         for (search_type, default_symbol, message) in [
-            (object::pe::IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY, 0, "search type"),
+            (object::pe::IMAGE_WEAK_EXTERN_ANTI_DEPENDENCY, 0, "search type"),
             (object::pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS, 1, "aliases itself"),
             (object::pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS, 99, "missing default symbol"),
         ] {
