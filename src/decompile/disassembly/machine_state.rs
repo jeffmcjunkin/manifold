@@ -23,6 +23,8 @@ pub const WIN64_KERNEL_SERVICE_STUB_SCHEMA_ID: &str =
     "manifold.machine-state-stub.win64-kernel-service.v1";
 pub const WIN64_DWORD_OUT_GETTER_STUB_SCHEMA_ID: &str =
     "manifold.machine-state-stub.win64-dword-out-getter.v1";
+pub const WIN64_TYPED_OUT_GETTER_STUB_SCHEMA_ID: &str =
+    "manifold.machine-state-stub.win64-typed-out-getter.v1";
 pub const GUARDED_INDIRECT_FORWARD_TAIL_SCHEMA_ID: &str =
     "manifold.machine-state-stub.guarded-indirect-forward-tail.v1";
 
@@ -328,6 +330,27 @@ pub struct Win64DwordOutGetterStub {
     pub relocations: Vec<MachineStateRelocationIdentity>,
 }
 
+/// A complete relocation-free Win64 byte or qword out-getter contract.  The
+/// width and displacement encoding jointly retain the exact 25/28-byte byte or
+/// 27/30-byte qword form without retaining original instruction bytes.  Dword
+/// records deliberately remain on their legacy v1 schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Win64TypedOutGetterStub {
+    pub schema: &'static str,
+    pub kind: &'static str,
+    pub function: MachineStateCoffFunctionIdentity,
+    pub abi: Win64AbiState,
+    pub entry_stack_pointer: MachineStateRegisterCopy,
+    pub register_copies: Vec<MachineStateRegisterCopy>,
+    pub result_zero: MachineStateRegisterZero,
+    pub home_base_register: &'static str,
+    pub field_copy: MachineStateDwordFieldCopy,
+    pub return_instruction_address: String,
+    pub return_kind: &'static str,
+    pub padding: MachineStatePadding,
+    pub relocations: Vec<MachineStateRelocationIdentity>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum MachineStateStubRecord {
@@ -335,6 +358,7 @@ pub enum MachineStateStubRecord {
     Win64Syscall(Win64SyscallStub),
     Win64KernelService(Win64KernelServiceStub),
     Win64DwordOutGetter(Win64DwordOutGetterStub),
+    Win64TypedOutGetter(Win64TypedOutGetterStub),
     GuardedIndirectForwardTail(GuardedIndirectForwardTailStub),
 }
 
@@ -345,6 +369,7 @@ impl MachineStateStubRecord {
             Self::Win64Syscall(stub) => &stub.function.name,
             Self::Win64KernelService(stub) => &stub.function.name,
             Self::Win64DwordOutGetter(stub) => &stub.function.name,
+            Self::Win64TypedOutGetter(stub) => &stub.function.name,
             Self::GuardedIndirectForwardTail(stub) => &stub.function.name,
         }
     }
@@ -355,6 +380,7 @@ impl MachineStateStubRecord {
             Self::Win64Syscall(stub) => &stub.function.address,
             Self::Win64KernelService(stub) => &stub.function.address,
             Self::Win64DwordOutGetter(stub) => &stub.function.address,
+            Self::Win64TypedOutGetter(stub) => &stub.function.address,
             Self::GuardedIndirectForwardTail(stub) => &stub.function.address,
         }
     }
@@ -636,6 +662,33 @@ pub fn recognize_machine_state_stubs(
             &flags_and_jumps,
         ) {
             result.push(MachineStateStubRecord::Win64DwordOutGetter(stub));
+        }
+        let typed_out_getters = [Win64OutGetterWidth::Byte, Win64OutGetterWidth::Qword]
+            .into_iter()
+            .filter_map(|width| {
+                recognize_win64_typed_out_getter_width(
+                    width,
+                    db,
+                    function,
+                    map,
+                    &instructions,
+                    &registers,
+                    &immediates,
+                    &indirects,
+                    &owners,
+                    &next,
+                    &direct_jumps,
+                    &direct_calls,
+                    &cfg,
+                    &decoded_defs,
+                    &decoded_uses,
+                    &memory_reads,
+                    &memory_writes,
+                    &flags_and_jumps,
+                )
+            });
+        if let Some(stub) = only(typed_out_getters) {
+            result.push(MachineStateStubRecord::Win64TypedOutGetter(stub));
         }
         if let Some(stub) = recognize_guarded_indirect_forward_tail(
             function,
@@ -1714,7 +1767,130 @@ fn recognize_win64_kernel_service(
     })
 }
 
-fn exact_win64_dword_out_getter_encoding(
+/// The sealed width descriptor for the one authenticated out-getter shape.
+/// Width 32 is routed only through the legacy dword v1 wrapper; the new typed
+/// wrapper enumerates only Byte and Qword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Win64OutGetterWidth {
+    Byte,
+    Dword,
+    Qword,
+}
+
+impl Win64OutGetterWidth {
+    fn width_bits(self) -> u8 {
+        match self {
+            Self::Byte => 8,
+            Self::Dword => 32,
+            Self::Qword => 64,
+        }
+    }
+
+    fn memory_width(self) -> usize {
+        match self {
+            Self::Byte => 1,
+            Self::Dword => 4,
+            Self::Qword => 8,
+        }
+    }
+
+    fn temporary_operand_register(self) -> &'static str {
+        match self {
+            Self::Byte => "CL",
+            Self::Dword => "ECX",
+            Self::Qword => "RCX",
+        }
+    }
+
+    fn temporary_wire_register(self) -> &'static str {
+        match self {
+            Self::Byte => "cl",
+            Self::Dword => "ecx",
+            Self::Qword => "rcx",
+        }
+    }
+
+    fn load_size(self, displacement_encoding_bits: u8) -> Option<usize> {
+        match (self, displacement_encoding_bits) {
+            (Self::Byte | Self::Dword, 8) => Some(3),
+            (Self::Byte | Self::Dword, 32) => Some(6),
+            (Self::Qword, 8) => Some(4),
+            (Self::Qword, 32) => Some(7),
+            _ => None,
+        }
+    }
+
+    fn store_size(self) -> usize {
+        match self {
+            Self::Byte | Self::Dword => 2,
+            Self::Qword => 3,
+        }
+    }
+
+    fn function_size(self, displacement_encoding_bits: u8) -> Option<u64> {
+        let load_size = u64::try_from(self.load_size(displacement_encoding_bits)?).ok()?;
+        let store_size = u64::try_from(self.store_size()).ok()?;
+        19_u64
+            .checked_add(load_size)?
+            .checked_add(store_size)?
+            .checked_add(1)
+    }
+}
+
+struct AuthenticatedWin64OutGetter {
+    function: MachineStateCoffFunctionIdentity,
+    abi: Win64AbiState,
+    entry_stack_pointer: MachineStateRegisterCopy,
+    register_copies: Vec<MachineStateRegisterCopy>,
+    result_zero: MachineStateRegisterZero,
+    home_base_register: &'static str,
+    field_copy: MachineStateDwordFieldCopy,
+    return_instruction_address: String,
+    return_kind: &'static str,
+    padding: MachineStatePadding,
+    relocations: Vec<MachineStateRelocationIdentity>,
+}
+
+impl AuthenticatedWin64OutGetter {
+    fn into_legacy_dword(self) -> Win64DwordOutGetterStub {
+        Win64DwordOutGetterStub {
+            schema: WIN64_DWORD_OUT_GETTER_STUB_SCHEMA_ID,
+            kind: "win64_dword_out_getter",
+            function: self.function,
+            abi: self.abi,
+            entry_stack_pointer: self.entry_stack_pointer,
+            register_copies: self.register_copies,
+            result_zero: self.result_zero,
+            home_base_register: self.home_base_register,
+            field_copy: self.field_copy,
+            return_instruction_address: self.return_instruction_address,
+            return_kind: self.return_kind,
+            padding: self.padding,
+            relocations: self.relocations,
+        }
+    }
+
+    fn into_typed(self) -> Win64TypedOutGetterStub {
+        Win64TypedOutGetterStub {
+            schema: WIN64_TYPED_OUT_GETTER_STUB_SCHEMA_ID,
+            kind: "win64_typed_out_getter",
+            function: self.function,
+            abi: self.abi,
+            entry_stack_pointer: self.entry_stack_pointer,
+            register_copies: self.register_copies,
+            result_zero: self.result_zero,
+            home_base_register: self.home_base_register,
+            field_copy: self.field_copy,
+            return_instruction_address: self.return_instruction_address,
+            return_kind: self.return_kind,
+            padding: self.padding,
+            relocations: self.relocations,
+        }
+    }
+}
+
+fn exact_win64_out_getter_encoding(
+    width: Win64OutGetterWidth,
     db: &DecompileDB,
     section: &crate::decompile::disassembly::coff::CoffSectionMap,
     function: &CoffFunctionMap,
@@ -1748,10 +1924,9 @@ fn exact_win64_dword_out_getter_encoding(
         return false;
     };
 
-    // These are opcode-form witnesses, not reconstruction data: the semantic
-    // record continues to carry only decoded state.  Checking the original
-    // relocation-free COFF bytes closes same-semantics opcode-direction and
-    // redundant-REX alternatives which instruction width alone cannot prove.
+    // These are opcode-form witnesses, not reconstruction data.  Checking the
+    // original relocation-free COFF closes same-semantics direction, width,
+    // and missing/redundant REX alternatives.
     const PREFIX: &[u8] = &[
         0x4c, 0x8b, 0xdc, // mov r11, rsp
         0x48, 0x8b, 0xc1, // mov rax, rcx
@@ -1760,36 +1935,64 @@ fn exact_win64_dword_out_getter_encoding(
         0x49, 0x89, 0x53, 0x10, // mov [r11+10h], rdx
         0x49, 0x89, 0x4b, 0x08, // mov [r11+8], rcx
     ];
-    const SUFFIX: &[u8] = &[0x89, 0x0a, 0xc3]; // mov [rdx], ecx; ret
-    if !bytes.starts_with(PREFIX) || !bytes.ends_with(SUFFIX) {
+    let suffix: &[u8] = match width {
+        Win64OutGetterWidth::Byte => &[0x88, 0x0a, 0xc3],
+        Win64OutGetterWidth::Dword => &[0x89, 0x0a, 0xc3],
+        Win64OutGetterWidth::Qword => &[0x48, 0x89, 0x0a, 0xc3],
+    };
+    if !bytes.starts_with(PREFIX) || !bytes.ends_with(suffix) {
         return false;
     }
-    let load = &bytes[PREFIX.len()..bytes.len() - SUFFIX.len()];
-    match source_displacement_encoding_bits {
-        8 => {
+    let load = &bytes[PREFIX.len()..bytes.len() - suffix.len()];
+    match (width, source_displacement_encoding_bits) {
+        (Win64OutGetterWidth::Byte, 8) => {
+            let Ok(displacement) = i8::try_from(source_displacement) else {
+                return false;
+            };
+            load == [0x8a, 0x49, displacement as u8]
+        }
+        (Win64OutGetterWidth::Dword, 8) => {
             let Ok(displacement) = i8::try_from(source_displacement) else {
                 return false;
             };
             load == [0x8b, 0x49, displacement as u8]
         }
-        32 => {
+        (Win64OutGetterWidth::Qword, 8) => {
+            let Ok(displacement) = i8::try_from(source_displacement) else {
+                return false;
+            };
+            load == [0x48, 0x8b, 0x49, displacement as u8]
+        }
+        (Win64OutGetterWidth::Byte, 32) => {
+            let Ok(displacement) = i32::try_from(source_displacement) else {
+                return false;
+            };
+            load.len() == 6 && load[..2] == [0x8a, 0x89] && load[2..] == displacement.to_le_bytes()
+        }
+        (Win64OutGetterWidth::Dword, 32) => {
             let Ok(displacement) = i32::try_from(source_displacement) else {
                 return false;
             };
             load.len() == 6 && load[..2] == [0x8b, 0x89] && load[2..] == displacement.to_le_bytes()
         }
+        (Win64OutGetterWidth::Qword, 32) => {
+            let Ok(displacement) = i32::try_from(source_displacement) else {
+                return false;
+            };
+            load.len() == 7
+                && load[..3] == [0x48, 0x8b, 0x89]
+                && load[3..] == displacement.to_le_bytes()
+        }
         _ => false,
     }
 }
 
-/// Recognize one closed Win64 dword out-getter.  Selection uses decoded
-/// operands/effects, exact linear ownership/CFG, the original COFF map, and an
-/// exact non-serialized opcode-form witness from the relocation-free input.
-/// Names, mapped addresses, and corpus membership do not participate.  The
-/// accepted source displacement is signed, and its decoded instruction width
-/// must prove the canonical disp8 or disp32 encoding.
+/// Authenticate the shared nine-instruction Win64 out-getter shape for one
+/// sealed width descriptor.  Names, mapped addresses, and corpus membership do
+/// not participate.
 #[allow(clippy::too_many_arguments)]
-fn recognize_win64_dword_out_getter(
+fn authenticate_win64_out_getter(
+    width: Win64OutGetterWidth,
     db: &DecompileDB,
     function: &CoffFunctionMap,
     map: &CoffAddressMap,
@@ -1807,19 +2010,19 @@ fn recognize_win64_dword_out_getter(
     memory_reads: &BTreeMap<Node, BTreeSet<Symbol>>,
     memory_writes: &BTreeMap<Node, BTreeSet<Symbol>>,
     flags_and_jumps: &BTreeMap<Node, BTreeSet<(Node, &'static str)>>,
-) -> Option<Win64DwordOutGetterStub> {
+) -> Option<AuthenticatedWin64OutGetter> {
     if map.schema != "manifold.coff-address-map.v1"
         || map.loader_id != "amd64-coff-image-v1"
         || map.architecture != "x86_64-pc-windows-msvc"
-        || !matches!(function.original_size, 25 | 28)
+        || ![8_u8, 32]
+            .into_iter()
+            .any(|encoding| width.function_size(encoding) == Some(function.original_size))
         || function.manifold_size != function.original_size
         || function.mapped_end != function.mapped_entry.checked_add(function.original_size)?
     {
         return None;
     }
 
-    // Reject aliased or duplicated ownership identities instead of choosing a
-    // convenient name/address half of an ambiguous COFF mapping.
     let mapped_function = only(map.functions.iter().filter(|candidate| {
         candidate.provider_name == function.provider_name
             || candidate.mapped_entry == function.mapped_entry
@@ -1873,8 +2076,9 @@ fn recognize_win64_dword_out_getter(
         .section_offset
         .checked_add(function.original_size)?;
     if map.relocations.iter().any(|relocation| {
-        let width = u64::from(relocation.width_bits).div_ceil(8).max(1);
-        let Some(mapped_relocation_end) = relocation.mapped_field_va.checked_add(width) else {
+        let relocation_width = u64::from(relocation.width_bits).div_ceil(8).max(1);
+        let Some(mapped_relocation_end) = relocation.mapped_field_va.checked_add(relocation_width)
+        else {
             return true;
         };
         if relocation.mapped_field_va < function.mapped_end
@@ -1888,7 +2092,8 @@ fn recognize_win64_dword_out_getter(
         if relocation.section_name != section.name {
             return true;
         }
-        let Some(original_relocation_end) = relocation.section_offset.checked_add(width) else {
+        let Some(original_relocation_end) = relocation.section_offset.checked_add(relocation_width)
+        else {
             return true;
         };
         relocation.section_offset < original_end
@@ -1906,25 +2111,29 @@ fn recognize_win64_dword_out_getter(
     let [entry_sp, copy_rcx, copy_rdx, zero, home_rdx, home_rcx, load, store, ret] = rows;
     let source_operand = only(indirects.get(load.4)?.iter().copied())?;
     let source_displacement = source_operand.4;
-    let source_displacement_encoding_bits = match load.1 {
-        3 if source_displacement != 0 && i8::try_from(source_displacement).is_ok() => 8,
-        6 if i32::try_from(source_displacement).is_ok()
-            && i8::try_from(source_displacement).is_err() =>
-        {
-            32
-        }
-        _ => return None,
-    };
-    if function.original_size != 22 + load.1 as u64 {
+    let source_displacement_encoding_bits = if load.1 == width.load_size(8)?
+        && source_displacement != 0
+        && i8::try_from(source_displacement).is_ok()
+    {
+        8
+    } else if load.1 == width.load_size(32)?
+        && i32::try_from(source_displacement).is_ok()
+        && i8::try_from(source_displacement).is_err()
+    {
+        32
+    } else {
         return None;
-    }
-    if !exact_win64_dword_out_getter_encoding(
-        db,
-        section,
-        function,
-        source_displacement,
-        source_displacement_encoding_bits,
-    ) {
+    };
+    if function.original_size != width.function_size(source_displacement_encoding_bits)?
+        || !exact_win64_out_getter_encoding(
+            width,
+            db,
+            section,
+            function,
+            source_displacement,
+            source_displacement_encoding_bits,
+        )
+    {
         return None;
     }
     let headers = [
@@ -1935,7 +2144,7 @@ fn recognize_win64_dword_out_getter(
         (home_rdx, 4, "MOV", 2),
         (home_rcx, 4, "MOV", 2),
         (load, load.1, "MOV", 2),
-        (store, 2, "MOV", 2),
+        (store, width.store_size(), "MOV", 2),
         (ret, 1, "RET", 0),
     ];
     if entry_sp.0 != function.mapped_entry
@@ -1950,6 +2159,8 @@ fn recognize_win64_dword_out_getter(
         return None;
     }
 
+    let memory_width = width.memory_width();
+    let temporary_register = width.temporary_operand_register();
     if !exact_operand_register(entry_sp.4, "RSP", registers, immediates, indirects)
         || !exact_operand_register(entry_sp.5, "R11", registers, immediates, indirects)
         || !exact_operand_register(copy_rcx.4, "RCX", registers, immediates, indirects)
@@ -1976,16 +2187,22 @@ fn recognize_win64_dword_out_getter(
         )
         || !exact_operand_memory(
             load.4,
-            ("NONE", "RCX", "NONE", 1, source_displacement, 4),
+            ("NONE", "RCX", "NONE", 1, source_displacement, memory_width),
             registers,
             immediates,
             indirects,
         )
-        || !exact_operand_register(load.5, "ECX", registers, immediates, indirects)
-        || !exact_operand_register(store.4, "ECX", registers, immediates, indirects)
+        || !exact_operand_register(load.5, temporary_register, registers, immediates, indirects)
+        || !exact_operand_register(
+            store.4,
+            temporary_register,
+            registers,
+            immediates,
+            indirects,
+        )
         || !exact_operand_memory(
             store.5,
-            ("NONE", "RDX", "NONE", 1, 0, 4),
+            ("NONE", "RDX", "NONE", 1, 0, memory_width),
             registers,
             immediates,
             indirects,
@@ -2041,9 +2258,7 @@ fn recognize_win64_dword_out_getter(
         }
     }
 
-    Some(Win64DwordOutGetterStub {
-        schema: WIN64_DWORD_OUT_GETTER_STUB_SCHEMA_ID,
-        kind: "win64_dword_out_getter",
+    Some(AuthenticatedWin64OutGetter {
         function: MachineStateCoffFunctionIdentity {
             name: function.provider_name.clone(),
             address: format!("0x{:x}", function.mapped_entry),
@@ -2103,11 +2318,11 @@ fn recognize_win64_dword_out_getter(
             source_base_register: "rcx",
             source_displacement,
             source_displacement_encoding_bits,
-            temporary_register: "ecx",
+            temporary_register: width.temporary_wire_register(),
             store_instruction_address: format!("0x{:x}", store.0),
             destination_base_register: "rdx",
             destination_displacement: 0,
-            width_bits: 32,
+            width_bits: width.width_bits(),
         },
         return_instruction_address: format!("0x{:x}", ret.0),
         return_kind: "near_return",
@@ -2119,6 +2334,98 @@ fn recognize_win64_dword_out_getter(
         },
         relocations: Vec::new(),
     })
+}
+
+/// Preserve the legacy dword v1 route while sharing only the authenticated
+/// width-parameterized proof above.
+#[allow(clippy::too_many_arguments)]
+fn recognize_win64_dword_out_getter(
+    db: &DecompileDB,
+    function: &CoffFunctionMap,
+    map: &CoffAddressMap,
+    instructions: &BTreeMap<Address, Vec<Instruction>>,
+    registers: &BTreeMap<Symbol, BTreeSet<&'static str>>,
+    immediates: &BTreeMap<Symbol, BTreeSet<i64>>,
+    indirects: &BTreeMap<Symbol, BTreeSet<IndirectOperand>>,
+    owners: &BTreeMap<Node, BTreeSet<Address>>,
+    next: &BTreeMap<Node, BTreeSet<Node>>,
+    direct_jumps: &BTreeMap<Node, BTreeSet<Address>>,
+    direct_calls: &BTreeMap<Node, BTreeSet<Address>>,
+    cfg: &BTreeMap<Node, BTreeSet<(Address, Symbol)>>,
+    decoded_defs: &BTreeMap<Node, BTreeSet<Mreg>>,
+    decoded_uses: &BTreeMap<Node, BTreeSet<Mreg>>,
+    memory_reads: &BTreeMap<Node, BTreeSet<Symbol>>,
+    memory_writes: &BTreeMap<Node, BTreeSet<Symbol>>,
+    flags_and_jumps: &BTreeMap<Node, BTreeSet<(Node, &'static str)>>,
+) -> Option<Win64DwordOutGetterStub> {
+    authenticate_win64_out_getter(
+        Win64OutGetterWidth::Dword,
+        db,
+        function,
+        map,
+        instructions,
+        registers,
+        immediates,
+        indirects,
+        owners,
+        next,
+        direct_jumps,
+        direct_calls,
+        cfg,
+        decoded_defs,
+        decoded_uses,
+        memory_reads,
+        memory_writes,
+        flags_and_jumps,
+    )
+    .map(AuthenticatedWin64OutGetter::into_legacy_dword)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recognize_win64_typed_out_getter_width(
+    width: Win64OutGetterWidth,
+    db: &DecompileDB,
+    function: &CoffFunctionMap,
+    map: &CoffAddressMap,
+    instructions: &BTreeMap<Address, Vec<Instruction>>,
+    registers: &BTreeMap<Symbol, BTreeSet<&'static str>>,
+    immediates: &BTreeMap<Symbol, BTreeSet<i64>>,
+    indirects: &BTreeMap<Symbol, BTreeSet<IndirectOperand>>,
+    owners: &BTreeMap<Node, BTreeSet<Address>>,
+    next: &BTreeMap<Node, BTreeSet<Node>>,
+    direct_jumps: &BTreeMap<Node, BTreeSet<Address>>,
+    direct_calls: &BTreeMap<Node, BTreeSet<Address>>,
+    cfg: &BTreeMap<Node, BTreeSet<(Address, Symbol)>>,
+    decoded_defs: &BTreeMap<Node, BTreeSet<Mreg>>,
+    decoded_uses: &BTreeMap<Node, BTreeSet<Mreg>>,
+    memory_reads: &BTreeMap<Node, BTreeSet<Symbol>>,
+    memory_writes: &BTreeMap<Node, BTreeSet<Symbol>>,
+    flags_and_jumps: &BTreeMap<Node, BTreeSet<(Node, &'static str)>>,
+) -> Option<Win64TypedOutGetterStub> {
+    if width == Win64OutGetterWidth::Dword {
+        return None;
+    }
+    authenticate_win64_out_getter(
+        width,
+        db,
+        function,
+        map,
+        instructions,
+        registers,
+        immediates,
+        indirects,
+        owners,
+        next,
+        direct_jumps,
+        direct_calls,
+        cfg,
+        decoded_defs,
+        decoded_uses,
+        memory_reads,
+        memory_writes,
+        flags_and_jumps,
+    )
+    .map(AuthenticatedWin64OutGetter::into_typed)
 }
 
 /// Recognize one complete Win64 forwarding contract whose indirect target is
@@ -3411,11 +3718,253 @@ mod tests {
         (db, map)
     }
 
+    fn typed_out_getter_fixture(
+        width: Win64OutGetterWidth,
+        source_displacement: i64,
+        displacement_encoding_bits: u8,
+    ) -> (DecompileDB, CoffAddressMap) {
+        let mut db = DecompileDB::default();
+        let entry = 0x1000_0000_u64;
+        let load_size = width
+            .load_size(displacement_encoding_bits)
+            .expect("typed fixture displacement encoding");
+        let store_size = width.store_size();
+        let function_size = width
+            .function_size(displacement_encoding_bits)
+            .expect("typed fixture function size");
+        let mut loaded_binary_data = vec![0_u8; 0x200];
+        loaded_binary_data.extend_from_slice(&[
+            0x4c, 0x8b, 0xdc, 0x48, 0x8b, 0xc1, 0x48, 0x8b, 0xc2, 0x33, 0xc0, 0x49, 0x89, 0x53,
+            0x10, 0x49, 0x89, 0x4b, 0x08,
+        ]);
+        match (width, displacement_encoding_bits) {
+            (Win64OutGetterWidth::Byte, 8) => {
+                loaded_binary_data.extend_from_slice(&[0x8a, 0x49, source_displacement as u8])
+            }
+            (Win64OutGetterWidth::Byte, 32) => {
+                loaded_binary_data.extend_from_slice(&[0x8a, 0x89]);
+                loaded_binary_data.extend_from_slice(&(source_displacement as i32).to_le_bytes());
+            }
+            (Win64OutGetterWidth::Qword, 8) => {
+                loaded_binary_data.extend_from_slice(&[0x48, 0x8b, 0x49, source_displacement as u8])
+            }
+            (Win64OutGetterWidth::Qword, 32) => {
+                loaded_binary_data.extend_from_slice(&[0x48, 0x8b, 0x89]);
+                loaded_binary_data.extend_from_slice(&(source_displacement as i32).to_le_bytes());
+            }
+            _ => unreachable!(),
+        }
+        match width {
+            Win64OutGetterWidth::Byte => loaded_binary_data.extend_from_slice(&[0x88, 0x0a, 0xc3]),
+            Win64OutGetterWidth::Qword => {
+                loaded_binary_data.extend_from_slice(&[0x48, 0x89, 0x0a, 0xc3])
+            }
+            Win64OutGetterWidth::Dword => unreachable!(),
+        }
+        assert_eq!(loaded_binary_data.len(), 0x200 + function_size as usize);
+        db.loaded_binary_data = Some(std::sync::Arc::new(loaded_binary_data));
+
+        let load_address = entry + 19;
+        let store_address = load_address + load_size as u64;
+        let return_address = store_address + store_size as u64;
+        let ins = |offset, size, mnemonic, op1, op2| -> Instruction {
+            (
+                entry + offset,
+                size,
+                "",
+                mnemonic,
+                op1,
+                op2,
+                NONE,
+                NONE,
+                0,
+                0,
+            )
+        };
+        let rows = [
+            ins(0, 3, "MOV", ORSP, OR11),
+            ins(3, 3, "MOV", ORCX, ORAX),
+            ins(6, 3, "MOV", ORDX, ORAX),
+            ins(9, 2, "XOR", OEAX, OEAX),
+            ins(11, 4, "MOV", ORDX, OHOME16),
+            ins(15, 4, "MOV", ORCX, OHOME8),
+            ins(19, load_size, "MOV", OFIELD, OECX),
+            ins(19 + load_size as u64, store_size, "MOV", OECX, OOUT),
+            ins(
+                19 + load_size as u64 + store_size as u64,
+                1,
+                "RET",
+                NONE,
+                NONE,
+            ),
+        ];
+        let addresses = rows.map(|row| row.0);
+        set_rows!(db, "unrefinedinstruction", rows);
+        set_rows!(
+            db,
+            "op_register",
+            [
+                (ORSP, "RSP"),
+                (OR11, "R11"),
+                (ORCX, "RCX"),
+                (ORDX, "RDX"),
+                (ORAX, "RAX"),
+                (OEAX, "EAX"),
+                (OECX, width.temporary_operand_register()),
+            ]
+        );
+        set_rows!(
+            db,
+            "op_indirect",
+            [
+                (OHOME16, "NONE", "R11", "NONE", 1_i64, 16, 8_usize),
+                (OHOME8, "NONE", "R11", "NONE", 1, 8, 8),
+                (
+                    OFIELD,
+                    "NONE",
+                    "RCX",
+                    "NONE",
+                    1,
+                    source_displacement,
+                    width.memory_width(),
+                ),
+                (OOUT, "NONE", "RDX", "NONE", 1, 0, width.memory_width(),),
+            ]
+        );
+        set_rows!(
+            db,
+            "instr_in_function",
+            addresses.map(|address| (address, entry))
+        );
+        set_rows!(
+            db,
+            "next",
+            addresses.windows(2).map(|pair| (pair[0], pair[1]))
+        );
+        set_rows!(db, "direct_jump", Vec::<(Node, Address)>::new());
+        set_rows!(db, "direct_call", Vec::<(Node, Address)>::new());
+        set_rows!(
+            db,
+            "ddisasm_cfg_edge",
+            Vec::<(Node, Address, Symbol)>::new()
+        );
+        set_rows!(db, "decoded_memory_read_operand", [(load_address, OFIELD)]);
+        set_rows!(
+            db,
+            "decoded_memory_write_operand",
+            [
+                (entry + 11, OHOME16),
+                (entry + 15, OHOME8),
+                (store_address, OOUT),
+            ]
+        );
+        set_rows!(
+            db,
+            "decoded_reg_def",
+            [
+                (entry, Mreg::R11),
+                (entry + 3, Mreg::AX),
+                (entry + 6, Mreg::AX),
+                (entry + 9, Mreg::AX),
+                (load_address, Mreg::CX),
+                (return_address, Mreg::SP),
+            ]
+        );
+        set_rows!(
+            db,
+            "decoded_reg_use",
+            [
+                (entry, Mreg::SP),
+                (entry + 3, Mreg::CX),
+                (entry + 6, Mreg::DX),
+                (entry + 11, Mreg::R11),
+                (entry + 11, Mreg::DX),
+                (entry + 15, Mreg::R11),
+                (entry + 15, Mreg::CX),
+                (load_address, Mreg::CX),
+                (store_address, Mreg::DX),
+                (store_address, Mreg::CX),
+                (return_address, Mreg::SP),
+            ]
+        );
+
+        let map = CoffAddressMap {
+            schema: "manifold.coff-address-map.v1",
+            loader_id: "amd64-coff-image-v1",
+            architecture: "x86_64-pc-windows-msvc",
+            image_base: entry,
+            function_boundary_sidecar_sha256: None,
+            sections: vec![CoffSectionMap {
+                index: 5,
+                name: ".text$typed".into(),
+                kind: "Text".into(),
+                original_file_offset: Some(0x200),
+                original_offset_start: 0x40,
+                original_offset_end: 0x40 + function_size,
+                mapped_va_start: entry,
+                mapped_va_end: entry + function_size,
+            }],
+            functions: vec![CoffFunctionMap {
+                original_name: "arbitrary_original_typed_out_getter".into(),
+                provider_name: "coff_fn_arbitrary_typed_out_getter".into(),
+                section_index: 5,
+                section_offset: 0x40,
+                original_size: function_size,
+                manifold_size: function_size,
+                mapped_entry: entry,
+                mapped_end: entry + function_size,
+            }],
+            symbols: vec![CoffSymbolMap {
+                original_name: "arbitrary_original_typed_out_getter".into(),
+                provider_name: "coff_fn_arbitrary_typed_out_getter".into(),
+                kind: "function".into(),
+                defined: true,
+                section_index: Some(5),
+                section_offset: Some(0x40),
+                mapped_address: entry,
+            }],
+            externs: Vec::new(),
+            relocations: Vec::new(),
+        };
+        (db, map)
+    }
+
+    fn typed_out_getter_addresses(
+        width: Win64OutGetterWidth,
+        displacement_encoding_bits: u8,
+    ) -> [Address; 9] {
+        let entry = 0x1000_0000_u64;
+        let load_size = width
+            .load_size(displacement_encoding_bits)
+            .expect("typed test load size") as u64;
+        let store = entry + 19 + load_size;
+        [
+            entry,
+            entry + 3,
+            entry + 6,
+            entry + 9,
+            entry + 11,
+            entry + 15,
+            entry + 19,
+            store,
+            store + width.store_size() as u64,
+        ]
+    }
+
     fn rewrite_dword_out_getter_input_byte(db: &mut DecompileDB, offset: usize, value: u8) {
         let data = std::sync::Arc::make_mut(
             db.loaded_binary_data
                 .as_mut()
                 .expect("dword out-getter fixture input bytes"),
+        );
+        data[0x200 + offset] = value;
+    }
+
+    fn rewrite_typed_out_getter_input_byte(db: &mut DecompileDB, offset: usize, value: u8) {
+        let data = std::sync::Arc::make_mut(
+            db.loaded_binary_data
+                .as_mut()
+                .expect("typed out-getter fixture input bytes"),
         );
         data[0x200 + offset] = value;
     }
@@ -3553,6 +4102,20 @@ mod tests {
         );
     }
 
+    fn rejects_typed_out_getter(
+        label: &str,
+        mutation: impl Fn(Win64OutGetterWidth, &mut DecompileDB, &mut CoffAddressMap),
+    ) {
+        for width in [Win64OutGetterWidth::Byte, Win64OutGetterWidth::Qword] {
+            let (mut db, mut map) = typed_out_getter_fixture(width, 0x24, 8);
+            mutation(width, &mut db, &mut map);
+            assert!(
+                recognize_machine_state_stubs(&db, &map).is_empty(),
+                "{label}: width={width:?}"
+            );
+        }
+    }
+
     fn push_coff_section_header(
         bytes: &mut Vec<u8>,
         name: &[u8],
@@ -3683,6 +4246,74 @@ mod tests {
             b"disp32",
             (DISP8.len() + ALTERNATE_XOR_CONTROL.len() + REDUNDANT_REX_CONTROL.len()) as u32,
         );
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes
+    }
+
+    fn adjacent_typed_out_getter_coff_fixture() -> Vec<u8> {
+        const BYTE_DISP8: &[u8] = &[
+            0x4c, 0x8b, 0xdc, 0x48, 0x8b, 0xc1, 0x48, 0x8b, 0xc2, 0x33, 0xc0, 0x49, 0x89, 0x53,
+            0x10, 0x49, 0x89, 0x4b, 0x08, 0x8a, 0x49, 0x24, 0x88, 0x0a, 0xc3,
+        ];
+        const BYTE_DISP32: &[u8] = &[
+            0x4c, 0x8b, 0xdc, 0x48, 0x8b, 0xc1, 0x48, 0x8b, 0xc2, 0x33, 0xc0, 0x49, 0x89, 0x53,
+            0x10, 0x49, 0x89, 0x4b, 0x08, 0x8a, 0x89, 0xcc, 0xed, 0xff, 0xff, 0x88, 0x0a, 0xc3,
+        ];
+        const QWORD_DISP8: &[u8] = &[
+            0x4c, 0x8b, 0xdc, 0x48, 0x8b, 0xc1, 0x48, 0x8b, 0xc2, 0x33, 0xc0, 0x49, 0x89, 0x53,
+            0x10, 0x49, 0x89, 0x4b, 0x08, 0x48, 0x8b, 0x49, 0x24, 0x48, 0x89, 0x0a, 0xc3,
+        ];
+        const QWORD_DISP32: &[u8] = &[
+            0x4c, 0x8b, 0xdc, 0x48, 0x8b, 0xc1, 0x48, 0x8b, 0xc2, 0x33, 0xc0, 0x49, 0x89, 0x53,
+            0x10, 0x49, 0x89, 0x4b, 0x08, 0x48, 0x8b, 0x89, 0xcc, 0xed, 0xff, 0xff, 0x48, 0x89,
+            0x0a, 0xc3,
+        ];
+        // Redundant REX on a byte load and alternate XOR opcode are real
+        // decoder/owner controls with the same high-level operation.
+        const BYTE_REDUNDANT_REX_CONTROL: &[u8] = &[
+            0x4c, 0x8b, 0xdc, 0x48, 0x8b, 0xc1, 0x48, 0x8b, 0xc2, 0x33, 0xc0, 0x49, 0x89, 0x53,
+            0x10, 0x49, 0x89, 0x4b, 0x08, 0x40, 0x8a, 0x49, 0x24, 0x88, 0x0a, 0xc3,
+        ];
+        const QWORD_ALTERNATE_XOR_CONTROL: &[u8] = &[
+            0x4c, 0x8b, 0xdc, 0x48, 0x8b, 0xc1, 0x48, 0x8b, 0xc2, 0x31, 0xc0, 0x49, 0x89, 0x53,
+            0x10, 0x49, 0x89, 0x4b, 0x08, 0x48, 0x8b, 0x49, 0x24, 0x48, 0x89, 0x0a, 0xc3,
+        ];
+        let rows = [
+            (b"byte8".as_slice(), BYTE_DISP8),
+            (b"byte32".as_slice(), BYTE_DISP32),
+            (b"qword8".as_slice(), QWORD_DISP8),
+            (b"qword32".as_slice(), QWORD_DISP32),
+            (b"byte_rex".as_slice(), BYTE_REDUNDANT_REX_CONTROL),
+            (b"qword_x".as_slice(), QWORD_ALTERNATE_XOR_CONTROL),
+        ];
+        let mut text = Vec::new();
+        let mut symbols = Vec::new();
+        for (name, function) in rows {
+            symbols.push((name, text.len() as u32));
+            text.extend_from_slice(function);
+        }
+
+        let raw_offset = 20 + 40;
+        let symbol_offset = raw_offset + text.len() as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&object::pe::IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&symbol_offset.to_le_bytes());
+        bytes.extend_from_slice(&(symbols.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        push_coff_section_header(
+            &mut bytes,
+            b".text$to",
+            text.len() as u32,
+            raw_offset,
+            0x6000_0020,
+        );
+        bytes.extend_from_slice(&text);
+        for (name, offset) in symbols {
+            push_coff_function_symbol(&mut bytes, name, offset);
+        }
         bytes.extend_from_slice(&4u32.to_le_bytes());
         bytes
     }
@@ -3956,6 +4587,583 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(stub).unwrap()["field_copy"]["source_displacement"].as_i64(),
                 Some(displacement)
+            );
+        }
+    }
+
+    #[test]
+    fn win64_typed_out_getter_preserves_legacy_dword_v1_json() {
+        let (db, map) = dword_out_getter_fixture(0x24, 8);
+        let result = recognize_machine_state_stubs(&db, &map);
+        assert_eq!(result.len(), 1);
+        let MachineStateStubRecord::Win64DwordOutGetter(stub) = &result[0] else {
+            panic!("legacy dword record was rerouted: {result:#?}")
+        };
+        assert_eq!(
+            serde_json::to_value(stub).unwrap(),
+            serde_json::json!({
+                "schema": "manifold.machine-state-stub.win64-dword-out-getter.v1",
+                "kind": "win64_dword_out_getter",
+                "function": {
+                    "name": "coff_fn_arbitrary_out_getter",
+                    "address": "0x10000000",
+                    "size": 25,
+                    "section_index": 5,
+                    "section_name": ".text$generic",
+                    "section_offset": 64,
+                },
+                "abi": {
+                    "name": "win64",
+                    "argument_registers": ["rcx", "rdx", "r8", "r9"],
+                    "home_kind": "first_two_register_arguments_via_entry_sp_alias",
+                    "home_stores": [
+                        {
+                            "instruction_address": "0x1000000b",
+                            "source_register": "rdx",
+                            "stack_offset": 16,
+                            "width_bits": 64,
+                        },
+                        {
+                            "instruction_address": "0x1000000f",
+                            "source_register": "rcx",
+                            "stack_offset": 8,
+                            "width_bits": 64,
+                        },
+                    ],
+                },
+                "entry_stack_pointer": {
+                    "instruction_address": "0x10000000",
+                    "source_register": "rsp",
+                    "destination_register": "r11",
+                    "width_bits": 64,
+                },
+                "register_copies": [
+                    {
+                        "instruction_address": "0x10000003",
+                        "source_register": "rcx",
+                        "destination_register": "rax",
+                        "width_bits": 64,
+                    },
+                    {
+                        "instruction_address": "0x10000006",
+                        "source_register": "rdx",
+                        "destination_register": "rax",
+                        "width_bits": 64,
+                    },
+                ],
+                "result_zero": {
+                    "instruction_address": "0x10000009",
+                    "register": "eax",
+                    "width_bits": 32,
+                    "kind": "xor_self",
+                },
+                "home_base_register": "r11",
+                "field_copy": {
+                    "load_instruction_address": "0x10000013",
+                    "source_base_register": "rcx",
+                    "source_displacement": 36,
+                    "source_displacement_encoding_bits": 8,
+                    "temporary_register": "ecx",
+                    "store_instruction_address": "0x10000016",
+                    "destination_base_register": "rdx",
+                    "destination_displacement": 0,
+                    "width_bits": 32,
+                },
+                "return_instruction_address": "0x10000018",
+                "return_kind": "near_return",
+                "padding": {
+                    "instruction_address": "0x10000019",
+                    "kind": "none",
+                    "boundary": 1,
+                    "size": 0,
+                },
+                "relocations": [],
+            })
+        );
+    }
+
+    #[test]
+    fn recognizes_arbitrary_named_win64_typed_out_getters_with_signed_displacements() {
+        for (width, displacement, encoding_bits) in [
+            (Win64OutGetterWidth::Byte, 0x24, 8),
+            (Win64OutGetterWidth::Byte, -0x24, 8),
+            (Win64OutGetterWidth::Byte, 0x1234, 32),
+            (Win64OutGetterWidth::Byte, -0x1234, 32),
+            (Win64OutGetterWidth::Qword, 0x24, 8),
+            (Win64OutGetterWidth::Qword, -0x24, 8),
+            (Win64OutGetterWidth::Qword, 0x1234, 32),
+            (Win64OutGetterWidth::Qword, -0x1234, 32),
+        ] {
+            let (db, map) = typed_out_getter_fixture(width, displacement, encoding_bits);
+            let result = recognize_machine_state_stubs(&db, &map);
+            assert_eq!(
+                result.len(),
+                1,
+                "width={width:?}, displacement={displacement}"
+            );
+            let MachineStateStubRecord::Win64TypedOutGetter(stub) = &result[0] else {
+                panic!("typed out-getter was routed to another schema: {result:#?}")
+            };
+            assert_eq!(stub.schema, WIN64_TYPED_OUT_GETTER_STUB_SCHEMA_ID);
+            assert_eq!(stub.kind, "win64_typed_out_getter");
+            assert_eq!(
+                stub.function.size,
+                width.function_size(encoding_bits).unwrap()
+            );
+            assert_eq!(stub.function.name, "coff_fn_arbitrary_typed_out_getter");
+            assert_eq!(stub.field_copy.source_displacement, displacement);
+            assert_eq!(
+                stub.field_copy.source_displacement_encoding_bits,
+                encoding_bits
+            );
+            assert_eq!(stub.field_copy.width_bits, width.width_bits());
+            assert_eq!(
+                stub.field_copy.temporary_register,
+                width.temporary_wire_register()
+            );
+            assert_eq!(stub.field_copy.destination_displacement, 0);
+            assert_eq!(stub.return_kind, "near_return");
+            assert_eq!((stub.padding.kind, stub.padding.size), ("none", 0));
+            assert!(stub.relocations.is_empty());
+        }
+    }
+
+    #[test]
+    fn win64_typed_out_getter_instruction_operand_and_encoding_mutations_fail_closed() {
+        const E: Address = 0x1000_0000;
+        for index in 0..9 {
+            rejects_typed_out_getter("instruction width", move |width, db, _| {
+                let address = typed_out_getter_addresses(width, 8)[index];
+                rewrite_instruction(db, address, |mut row| {
+                    row.1 += 1;
+                    row
+                });
+            });
+            rejects_typed_out_getter("instruction mnemonic", move |width, db, _| {
+                let address = typed_out_getter_addresses(width, 8)[index];
+                rewrite_instruction(db, address, |mut row| {
+                    row.3 = "NOP";
+                    row
+                });
+            });
+        }
+        rejects_typed_out_getter("instruction prefix", |_, db, _| {
+            rewrite_instruction(db, E, |mut row| {
+                row.2 = "LOCK";
+                row
+            });
+        });
+        rejects_typed_out_getter("extra operand", |_, db, _| {
+            rewrite_instruction(db, E + 3, |mut row| {
+                row.6 = ORDX;
+                row
+            });
+        });
+        rejects_typed_out_getter("nonzero instruction metadata", |_, db, _| {
+            rewrite_instruction(db, E + 6, |mut row| {
+                row.8 = 1;
+                row
+            });
+        });
+        rejects_typed_out_getter("instruction gap", |_, db, _| {
+            rewrite_instruction(db, E + 9, |mut row| {
+                row.0 += 1;
+                row
+            });
+        });
+        rejects_typed_out_getter("missing instruction", |_, db, _| {
+            let rows = db
+                .rel_iter::<Instruction>("unrefinedinstruction")
+                .filter(|row| row.0 != E + 9)
+                .copied()
+                .collect::<ascent::boxcar::Vec<_>>();
+            db.rel_set("unrefinedinstruction", rows);
+        });
+        rejects_typed_out_getter("extra instruction", |_, db, _| {
+            let extra: Instruction = (E + 1, 1, "", "NOP", NONE, NONE, NONE, NONE, 0, 0);
+            db.rel_push("unrefinedinstruction", extra);
+        });
+        rejects_typed_out_getter("home-store order", |_, db, _| {
+            rewrite_instruction(db, E + 11, |mut row| {
+                row.4 = ORCX;
+                row.5 = OHOME8;
+                row
+            });
+            rewrite_instruction(db, E + 15, |mut row| {
+                row.4 = ORDX;
+                row.5 = OHOME16;
+                row
+            });
+        });
+
+        for (operand, replacement) in [
+            (ORSP, "RBP"),
+            (OR11, "R10"),
+            (ORCX, "ECX"),
+            (ORDX, "EDX"),
+            (ORAX, "R10"),
+            (OEAX, "RAX"),
+        ] {
+            rejects_typed_out_getter("register/width", move |_, db, _| {
+                replace_register(db, operand, replacement)
+            });
+        }
+        rejects_typed_out_getter("cross-width temporary", |width, db, _| {
+            let replacement = match width {
+                Win64OutGetterWidth::Byte => "RCX",
+                Win64OutGetterWidth::Qword => "CL",
+                Win64OutGetterWidth::Dword => unreachable!(),
+            };
+            replace_register(db, OECX, replacement);
+        });
+        rejects_typed_out_getter("home memory width", |_, db, _| {
+            replace_indirect(db, OHOME16, ("NONE", "R11", "NONE", 1, 16, 4))
+        });
+        rejects_typed_out_getter("field base", |width, db, _| {
+            replace_indirect(
+                db,
+                OFIELD,
+                ("NONE", "RDX", "NONE", 1, 0x24, width.memory_width()),
+            )
+        });
+        rejects_typed_out_getter("field index", |width, db, _| {
+            replace_indirect(
+                db,
+                OFIELD,
+                ("NONE", "RCX", "RAX", 1, 0x24, width.memory_width()),
+            )
+        });
+        rejects_typed_out_getter("field scale", |width, db, _| {
+            replace_indirect(
+                db,
+                OFIELD,
+                ("NONE", "RCX", "NONE", 2, 0x24, width.memory_width()),
+            )
+        });
+        rejects_typed_out_getter("field segment", |width, db, _| {
+            replace_indirect(
+                db,
+                OFIELD,
+                ("FS", "RCX", "NONE", 1, 0x24, width.memory_width()),
+            )
+        });
+        rejects_typed_out_getter("cross-width field memory", |width, db, _| {
+            let replacement_width = match width {
+                Win64OutGetterWidth::Byte => 8,
+                Win64OutGetterWidth::Qword => 1,
+                Win64OutGetterWidth::Dword => unreachable!(),
+            };
+            replace_indirect(
+                db,
+                OFIELD,
+                ("NONE", "RCX", "NONE", 1, 0x24, replacement_width),
+            )
+        });
+        rejects_typed_out_getter("output displacement", |width, db, _| {
+            replace_indirect(
+                db,
+                OOUT,
+                ("NONE", "RDX", "NONE", 1, 4, width.memory_width()),
+            )
+        });
+        rejects_typed_out_getter("cross-width output memory", |width, db, _| {
+            let replacement_width = match width {
+                Win64OutGetterWidth::Byte => 8,
+                Win64OutGetterWidth::Qword => 1,
+                Win64OutGetterWidth::Dword => unreachable!(),
+            };
+            replace_indirect(db, OOUT, ("NONE", "RDX", "NONE", 1, 0, replacement_width))
+        });
+        rejects_typed_out_getter("ambiguous register operand", |_, db, _| {
+            db.rel_push("op_register", (ORSP, "RBP"));
+        });
+        rejects_typed_out_getter("register/immediate ambiguity", |_, db, _| {
+            db.rel_push("op_immediate", (OEAX, 0_i64, 0_usize));
+        });
+        rejects_typed_out_getter("missing original encoding", |_, db, _| {
+            db.loaded_binary_data = None;
+        });
+        rejects_typed_out_getter("alternate xor opcode", |_, db, _| {
+            rewrite_typed_out_getter_input_byte(db, 9, 0x31);
+        });
+        rejects_typed_out_getter("alternate mov direction", |_, db, _| {
+            rewrite_typed_out_getter_input_byte(db, 4, 0x89);
+            rewrite_typed_out_getter_input_byte(db, 5, 0xc8);
+        });
+        rejects_typed_out_getter("cross-width load opcode/REX", |width, db, _| {
+            rewrite_typed_out_getter_input_byte(
+                db,
+                19,
+                match width {
+                    Win64OutGetterWidth::Byte => 0x8b,
+                    Win64OutGetterWidth::Qword => 0x40,
+                    Win64OutGetterWidth::Dword => unreachable!(),
+                },
+            );
+        });
+        rejects_typed_out_getter("cross-width store opcode/REX", |width, db, _| {
+            let store_offset = 19 + width.load_size(8).unwrap();
+            rewrite_typed_out_getter_input_byte(
+                db,
+                store_offset,
+                match width {
+                    Win64OutGetterWidth::Byte => 0x89,
+                    Win64OutGetterWidth::Qword => 0x40,
+                    Win64OutGetterWidth::Dword => unreachable!(),
+                },
+            );
+        });
+        rejects_typed_out_getter("wrong displacement opcode form", |width, db, _| {
+            let modrm_offset = match width {
+                Win64OutGetterWidth::Byte => 20,
+                Win64OutGetterWidth::Qword => 21,
+                Win64OutGetterWidth::Dword => unreachable!(),
+            };
+            rewrite_typed_out_getter_input_byte(db, modrm_offset, 0x89);
+        });
+
+        for width in [Win64OutGetterWidth::Byte, Win64OutGetterWidth::Qword] {
+            for displacement in [0_i64, 0x7f, -0x80] {
+                let (db, map) = typed_out_getter_fixture(width, displacement, 32);
+                assert!(
+                    recognize_machine_state_stubs(&db, &map).is_empty(),
+                    "noncanonical disp32: width={width:?}, displacement={displacement}"
+                );
+            }
+            for displacement in [0_i64, 0x80, -0x81, i64::from(i32::MAX) + 1] {
+                let (db, map) = typed_out_getter_fixture(width, displacement, 8);
+                assert!(
+                    recognize_machine_state_stubs(&db, &map).is_empty(),
+                    "invalid disp8: width={width:?}, displacement={displacement}"
+                );
+            }
+            for displacement in [i64::from(i32::MAX) + 1, i64::from(i32::MIN) - 1] {
+                let (db, map) = typed_out_getter_fixture(width, displacement, 32);
+                assert!(
+                    recognize_machine_state_stubs(&db, &map).is_empty(),
+                    "disp32 overflow: width={width:?}, displacement={displacement}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn win64_typed_out_getter_effect_cfg_and_coff_mutations_fail_closed() {
+        const E: Address = 0x1000_0000;
+        rejects_typed_out_getter("missing register definition", |_, db, _| {
+            remove_register_effect(db, "decoded_reg_def", E + 9, Mreg::AX)
+        });
+        rejects_typed_out_getter("missing register use", |_, db, _| {
+            remove_register_effect(db, "decoded_reg_use", E + 19, Mreg::CX)
+        });
+        rejects_typed_out_getter("extra register definition", |_, db, _| {
+            db.rel_push("decoded_reg_def", (E + 11, Mreg::AX));
+        });
+        rejects_typed_out_getter("extra register use", |_, db, _| {
+            db.rel_push("decoded_reg_use", (E + 3, Mreg::DX));
+        });
+        rejects_typed_out_getter("missing memory read", |_, db, _| {
+            remove_memory_effect(db, "decoded_memory_read_operand", E + 19, OFIELD)
+        });
+        rejects_typed_out_getter("missing memory write", |width, db, _| {
+            let store = typed_out_getter_addresses(width, 8)[7];
+            remove_memory_effect(db, "decoded_memory_write_operand", store, OOUT)
+        });
+        rejects_typed_out_getter("extra memory effect", |_, db, _| {
+            db.rel_push("decoded_memory_write_operand", (E + 19, OFIELD));
+        });
+        rejects_typed_out_getter("missing owner", |_, db, _| {
+            let rows = db
+                .rel_iter::<(Node, Address)>("instr_in_function")
+                .filter(|row| row.0 != E + 9)
+                .copied()
+                .collect::<ascent::boxcar::Vec<_>>();
+            db.rel_set("instr_in_function", rows);
+        });
+        rejects_typed_out_getter("ambiguous owner", |_, db, _| {
+            db.rel_push("instr_in_function", (E + 9, E + 0x1000));
+        });
+        rejects_typed_out_getter("missing next edge", |_, db, _| {
+            let rows = db
+                .rel_iter::<(Node, Node)>("next")
+                .filter(|row| **row != (E + 9, E + 11))
+                .copied()
+                .collect::<ascent::boxcar::Vec<_>>();
+            db.rel_set("next", rows);
+        });
+        rejects_typed_out_getter("extra next edge", |_, db, _| {
+            db.rel_push("next", (E + 9, E + 19));
+        });
+        rejects_typed_out_getter("ret fallthrough", |width, db, _| {
+            let ret = typed_out_getter_addresses(width, 8)[8];
+            db.rel_push("next", (ret, ret + 1));
+        });
+        rejects_typed_out_getter("direct jump", |_, db, _| {
+            db.rel_push("direct_jump", (E + 9, E + 19));
+        });
+        rejects_typed_out_getter("direct call", |_, db, _| {
+            db.rel_push("direct_call", (E + 9, E + 0x1000));
+        });
+        rejects_typed_out_getter("CFG edge", |_, db, _| {
+            db.rel_push("ddisasm_cfg_edge", (E + 9, E + 19, "branch"));
+        });
+        rejects_typed_out_getter("flags consumer", |_, db, _| {
+            db.rel_push("flags_and_jump_pair", (E + 9, E + 19, "e"));
+        });
+
+        rejects_typed_out_getter("map schema", |_, _, map| map.schema = "wrong");
+        rejects_typed_out_getter("loader", |_, _, map| map.loader_id = "wrong");
+        rejects_typed_out_getter("architecture", |_, _, map| map.architecture = "wrong");
+        rejects_typed_out_getter("original size", |_, _, map| {
+            map.functions[0].original_size -= 1
+        });
+        rejects_typed_out_getter("manifold size", |_, _, map| {
+            map.functions[0].manifold_size -= 1
+        });
+        rejects_typed_out_getter("mapped end", |_, _, map| map.functions[0].mapped_end -= 1);
+        rejects_typed_out_getter("function section", |_, _, map| {
+            map.functions[0].section_index = 6
+        });
+        rejects_typed_out_getter("function section offset", |_, _, map| {
+            map.functions[0].section_offset += 1
+        });
+        rejects_typed_out_getter("ambiguous function", |_, _, map| {
+            map.functions.push(map.functions[0].clone())
+        });
+        rejects_typed_out_getter("missing section", |_, _, map| map.sections.clear());
+        rejects_typed_out_getter("ambiguous section", |_, _, map| {
+            map.sections.push(map.sections[0].clone())
+        });
+        rejects_typed_out_getter("section kind", |_, _, map| {
+            map.sections[0].kind = "Data".into()
+        });
+        rejects_typed_out_getter("mapped section lower bound", |_, _, map| {
+            map.sections[0].mapped_va_start += 1
+        });
+        rejects_typed_out_getter("mapped section upper bound", |_, _, map| {
+            map.sections[0].mapped_va_end -= 1
+        });
+        rejects_typed_out_getter("original section lower bound", |_, _, map| {
+            map.sections[0].original_offset_start += 1
+        });
+        rejects_typed_out_getter("original section upper bound", |_, _, map| {
+            map.sections[0].original_offset_end -= 1
+        });
+        rejects_typed_out_getter("unequal in-bounds section spans", |_, _, map| {
+            map.sections[0].original_offset_start = 0x20;
+            map.sections[0].original_offset_end = 0x80;
+            map.sections[0].mapped_va_start = E - 0x20;
+            map.sections[0].mapped_va_end = E + 0x41;
+        });
+        rejects_typed_out_getter("in-bounds section mapping misalignment", |_, _, map| {
+            map.sections[0].original_offset_start = 0x20;
+            map.sections[0].original_offset_end = 0x80;
+            map.sections[0].mapped_va_start = E - 0x10;
+            map.sections[0].mapped_va_end = E + 0x50;
+        });
+        rejects_typed_out_getter("in-bounds function mapping misalignment", |_, _, map| {
+            map.sections[0].original_offset_start = 0x20;
+            map.sections[0].original_offset_end = 0x80;
+            map.sections[0].mapped_va_start = E - 0x20;
+            map.sections[0].mapped_va_end = E + 0x40;
+            map.functions[0].section_offset += 1;
+            map.symbols[0].section_offset = Some(map.functions[0].section_offset);
+        });
+        rejects_typed_out_getter("missing function symbol", |_, _, map| map.symbols.clear());
+        rejects_typed_out_getter("ambiguous function symbol", |_, _, map| {
+            map.symbols.push(map.symbols[0].clone())
+        });
+        rejects_typed_out_getter("function symbol original name", |_, _, map| {
+            map.symbols[0].original_name = "different".into()
+        });
+        rejects_typed_out_getter("function symbol provider name", |_, _, map| {
+            map.symbols[0].provider_name = "different".into()
+        });
+        rejects_typed_out_getter("function symbol address", |_, _, map| {
+            map.symbols[0].mapped_address += 1
+        });
+        rejects_typed_out_getter("function symbol kind", |_, _, map| {
+            map.symbols[0].kind = "data".into()
+        });
+        rejects_typed_out_getter("undefined function symbol", |_, _, map| {
+            map.symbols[0].defined = false
+        });
+        rejects_typed_out_getter("function symbol section", |_, _, map| {
+            map.symbols[0].section_index = None
+        });
+        rejects_typed_out_getter("function symbol offset", |_, _, map| {
+            map.symbols[0].section_offset = Some(0x41)
+        });
+        rejects_typed_out_getter("mapped relocation overlap", |_, _, map| {
+            map.relocations.push(CoffRelocationMap {
+                section_index: 6,
+                section_name: ".other".into(),
+                section_offset: 0,
+                mapped_field_va: E + 0x10,
+                relocation_type: "IMAGE_REL_AMD64_ADDR32".into(),
+                width_bits: 32,
+                target_original_name: "unrelated".into(),
+                target_mapped_address: E + 0x1000,
+                encoded_value: 0,
+            });
+        });
+        rejects_typed_out_getter("original relocation overlap", |_, _, map| {
+            map.relocations.push(CoffRelocationMap {
+                section_index: 5,
+                section_name: ".text$typed".into(),
+                section_offset: 0x50,
+                mapped_field_va: E + 0x100,
+                relocation_type: "IMAGE_REL_AMD64_ADDR32".into(),
+                width_bits: 32,
+                target_original_name: "unrelated".into(),
+                target_mapped_address: E + 0x1000,
+                encoded_value: 0,
+            });
+        });
+        rejects_typed_out_getter("same-index relocation section mismatch", |_, _, map| {
+            map.relocations.push(CoffRelocationMap {
+                section_index: 5,
+                section_name: ".wrong".into(),
+                section_offset: 0x100,
+                mapped_field_va: E + 0x100,
+                relocation_type: "IMAGE_REL_AMD64_ADDR32".into(),
+                width_bits: 32,
+                target_original_name: "unrelated".into(),
+                target_mapped_address: E + 0x1000,
+                encoded_value: 0,
+            });
+        });
+        rejects_typed_out_getter("relocation coordinate overflow", |_, _, map| {
+            map.relocations.push(CoffRelocationMap {
+                section_index: 6,
+                section_name: ".other".into(),
+                section_offset: u64::MAX,
+                mapped_field_va: u64::MAX,
+                relocation_type: "IMAGE_REL_AMD64_ADDR64".into(),
+                width_bits: 64,
+                target_original_name: "unrelated".into(),
+                target_mapped_address: E + 0x1000,
+                encoded_value: 0,
+            });
+        });
+
+        for width in [Win64OutGetterWidth::Byte, Win64OutGetterWidth::Qword] {
+            let (db, mut map) = typed_out_getter_fixture(width, 0x24, 8);
+            map.relocations.push(CoffRelocationMap {
+                section_index: 6,
+                section_name: ".other".into(),
+                section_offset: 0,
+                mapped_field_va: E + 0x100,
+                relocation_type: "IMAGE_REL_AMD64_ADDR32".into(),
+                width_bits: 32,
+                target_original_name: "unrelated".into(),
+                target_mapped_address: E + 0x1000,
+                encoded_value: 0,
+            });
+            assert_eq!(
+                recognize_machine_state_stubs(&db, &map).len(),
+                1,
+                "nonoverlapping other-section relocation: width={width:?}"
             );
         }
     }
@@ -4418,6 +5626,115 @@ mod tests {
                     Some(&(-0x1234, 32)),
                 );
                 for control in ["alt_xor", "rex_ctrl"] {
+                    assert!(
+                        !recognized.contains_key(&format!(
+                            "0x{:x}",
+                            function_by_original[control].mapped_entry
+                        )),
+                        "same-semantics encoding control {control} was accepted",
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn win64_typed_out_getter_recognizes_real_decoder_coff_and_adjacent_owners() {
+        std::thread::Builder::new()
+            .name("machine-state-typed-out-getter-coff-fixture".into())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                static FIXTURE_ID: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let path = std::env::temp_dir().join(format!(
+                    "manifold-machine-state-typed-out-getter-{}-{}.obj",
+                    std::process::id(),
+                    FIXTURE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                ));
+                std::fs::write(&path, adjacent_typed_out_getter_coff_fixture()).unwrap();
+
+                let mut db = DecompileDB::default();
+                let map = crate::decompile::disassembly::load_from_binary(&mut db, &path).unwrap();
+                let _ = std::fs::remove_file(&path);
+                assert!(db.loaded_binary_data.is_some());
+                AsmPass.run(&mut db);
+
+                assert_eq!(map.functions.len(), 6);
+                assert!(map.relocations.is_empty());
+                let section = &map.sections[0];
+                assert_eq!(
+                    section
+                        .original_offset_end
+                        .checked_sub(section.original_offset_start),
+                    section.mapped_va_end.checked_sub(section.mapped_va_start),
+                );
+                for function in &map.functions {
+                    assert_eq!(
+                        function
+                            .section_offset
+                            .checked_sub(section.original_offset_start),
+                        function.mapped_entry.checked_sub(section.mapped_va_start),
+                    );
+                    let instruction_addresses: Vec<_> = db
+                        .rel_iter::<Instruction>("unrefinedinstruction")
+                        .filter_map(|row| {
+                            (function.mapped_entry <= row.0 && row.0 < function.mapped_end)
+                                .then_some(row.0)
+                        })
+                        .collect();
+                    assert_eq!(instruction_addresses.len(), 9, "{function:?}");
+                    for address in instruction_addresses {
+                        assert_eq!(
+                            db.rel_iter::<(Node, Address)>("instr_in_function")
+                                .filter_map(|(node, owner)| {
+                                    (*node == address).then_some(*owner)
+                                })
+                                .collect::<BTreeSet<_>>(),
+                            BTreeSet::from([function.mapped_entry]),
+                            "adjacent function ownership leaked at 0x{address:x}",
+                        );
+                    }
+                }
+
+                let result = recognize_machine_state_stubs(&db, &map);
+                assert_eq!(result.len(), 4, "unexpected records: {result:#?}");
+                let recognized: BTreeMap<_, _> = result
+                    .iter()
+                    .map(|record| {
+                        let MachineStateStubRecord::Win64TypedOutGetter(stub) = record else {
+                            panic!("typed real COFF routed to another record: {record:?}")
+                        };
+                        (
+                            stub.function.address.clone(),
+                            (
+                                stub.field_copy.width_bits,
+                                stub.field_copy.source_displacement,
+                                stub.field_copy.source_displacement_encoding_bits,
+                                stub.function.size,
+                            ),
+                        )
+                    })
+                    .collect();
+                let function_by_original: BTreeMap<_, _> = map
+                    .functions
+                    .iter()
+                    .map(|function| (function.original_name.as_str(), function))
+                    .collect();
+                for (name, expected) in [
+                    ("byte8", (8, 0x24, 8, 25)),
+                    ("byte32", (8, -0x1234, 32, 28)),
+                    ("qword8", (64, 0x24, 8, 27)),
+                    ("qword32", (64, -0x1234, 32, 30)),
+                ] {
+                    assert_eq!(
+                        recognized.get(&format!("0x{:x}", function_by_original[name].mapped_entry)),
+                        Some(&expected),
+                        "real COFF positive {name}",
+                    );
+                }
+                for control in ["byte_rex", "qword_x"] {
                     assert!(
                         !recognized.contains_key(&format!(
                             "0x{:x}",
