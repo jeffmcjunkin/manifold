@@ -410,12 +410,11 @@ fn materialize_win64_home_backing(db: &mut DecompileDB) {
     );
 }
 
-/// Retain a CR8 byte marker only when the final pre-Csh type evidence can
-/// still represent its intrinsic result as unsigned 64-bit.  A pointer fact or
-/// any candidate which outranks Xlongunsigned would otherwise change the
-/// assignment before the comparison-local cast can preserve the machine bits.
-/// If one value at an ambiguous node conflicts, reject that whole node rather
-/// than filtering ambiguity into an apparently unique marker.
+/// Retain a CR8 byte marker only when final pre-Csh type evidence remains
+/// integral. A pointer fact or any candidate which outranks Xlongunsigned
+/// cannot safely receive the comparison-local byte cast. If one value at an
+/// ambiguous node conflicts, reject that whole node rather than filtering
+/// ambiguity into an apparently unique marker.
 fn filter_cr8_byte_compares_with_incompatible_types(db: &mut DecompileDB) {
     let markers: Vec<(Node, RTLReg)> = db
         .rel_iter::<(Node, RTLReg)>("cr8_byte_compare")
@@ -858,14 +857,6 @@ ascent_par! {
         cr8_byte_marker_count(node, 1),
         if matches!(cond, Condition::Ccompuimm(_, 1)),
         if regs.as_slice() == [*value];
-
-    // The intrinsic result stays unsigned 64-bit; only this resolved source
-    // expression is narrowed below. Xlongunsigned outranks stale compare-
-    // derived Xint candidates during deterministic declaration selection.
-    emit_var_type_candidate(*value, XType::Xlongunsigned) <--
-        cr8_byte_condition_resolved(node),
-        cr8_byte_compare(node, value),
-        cr8_byte_marker_count(node, 1);
 
     csharp_stmt_candidate(node, stmt) <--
         active_cminor_stmt(node, ?CminorStmt::Sbranch(cond, regs, ifso, ifnot)),
@@ -1644,7 +1635,7 @@ mod cr8_byte_condition_tests {
                 Box::new(CsharpminorExpr::Evar(VALUE)),
             )]]
         );
-        assert!(has_cr8_long_type(&db, VALUE));
+        assert!(!has_cr8_long_type(&db, VALUE));
     }
 
     #[test]

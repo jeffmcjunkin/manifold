@@ -392,12 +392,6 @@ fn real_coff_cr8_low_byte_compare_is_narrowed_only_at_the_proved_site() {
             .next_back()
             .expect("CR8 assignment has no destination");
         assert!(
-            positive_body
-                .lines()
-                .any(|line| line.contains("unsigned __int64") && line.contains(local)),
-            "retained CR8 local lost its unsigned-64 declaration:\n{positive_body}"
-        );
-        assert!(
             proved_condition.contains(&format!("(unsigned char){local}"))
                 && !proved_condition.contains("__readcr8()"),
             "retained CR8 local was not narrowed only at the proved condition:\n{positive_body}"

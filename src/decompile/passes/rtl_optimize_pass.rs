@@ -72,8 +72,11 @@ fn rtl_definition(inst: &RTLInst) -> Option<RTLReg> {
 
 /// Recover the one width fact which the Mach condition algebra cannot carry:
 /// an x64 CR8 read compared through its matching low byte.  This is deliberately
-/// expression-local.  The CR8 result remains a 64-bit intrinsic result, while
-/// only the authenticated comparison operand receives an unsigned-byte cast.
+/// expression-local.  The CR8 call keeps its 64-bit intrinsic declaration,
+/// while only the authenticated comparison operand receives an unsigned-byte
+/// cast.  The accepted RTL value must have that condition as its sole use, so
+/// later C variable coalescing may retain its ordinary integer type without
+/// losing any live high bits.
 ///
 /// Every accepted site is tied independently to immutable decoder evidence and
 /// to the post-optimization RTL value.  Ambiguous raw operands, ownership,
@@ -174,10 +177,14 @@ fn materialize_cr8_byte_compares(db: &mut DecompileDB) {
         final_rtl.entry(*node).or_default().push(inst.clone());
     }
     let mut definitions: BTreeMap<RTLReg, Vec<Node>> = BTreeMap::new();
+    let mut uses: BTreeMap<RTLReg, Vec<Node>> = BTreeMap::new();
     for (node, rows) in &final_rtl {
         for inst in rows {
             if let Some(value) = rtl_definition(inst) {
                 definitions.entry(value).or_default().push(*node);
+            }
+            for value in inst_def_use(inst).1 {
+                uses.entry(value).or_default().push(*node);
             }
         }
     }
@@ -352,6 +359,9 @@ fn materialize_cr8_byte_compares(db: &mut DecompileDB) {
         if !definitions
             .get(value)
             .is_some_and(|nodes| nodes.as_slice() == [read])
+            || !uses
+                .get(value)
+                .is_some_and(|nodes| nodes.as_slice() == [compare])
         {
             continue;
         }
@@ -3034,6 +3044,17 @@ mod cr8_byte_compare_tests {
         );
         materialize_cr8_byte_compares(&mut redefined_value);
         assert!(markers(&redefined_value).is_empty());
+
+        let mut value_used_after_compare = valid_db();
+        value_used_after_compare.rel_push(
+            "rtl_inst",
+            (
+                FALLTHROUGH,
+                RTLInst::Iop(Operation::Omove, Arc::new(vec![VALUE]), VALUE + 1),
+            ),
+        );
+        materialize_cr8_byte_compares(&mut value_used_after_compare);
+        assert!(markers(&value_used_after_compare).is_empty());
 
         let mut second_incomplete_read = valid_db();
         second_incomplete_read.rel_push("code_in_block", (SECOND_READ, FUNCTION));
