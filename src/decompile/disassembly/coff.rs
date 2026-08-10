@@ -14,6 +14,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use capstone::prelude::*;
+use object::endian::LittleEndian as LE;
 use object::read::coff::ImageSymbol as _;
 use object::{
     Architecture, BinaryFormat, Object, ObjectSection, ObjectSymbol, RelocationFlags,
@@ -714,6 +715,12 @@ fn plan_image(
         if !matches!(sym.section, SymbolSection::Undefined | SymbolSection::Common) {
             continue;
         }
+        // A COFF weak external is a linker alias, not an independent runtime
+        // external.  Relocation planning authenticates and resolves the exact
+        // auxiliary default symbol below.
+        if sym.storage_class == object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL {
+            continue;
+        }
         if sym.original_name.is_empty() {
             continue;
         }
@@ -748,6 +755,7 @@ fn plan_image(
             if let Some(sym) = symbols.get(&index.0) {
                 if matches!(sym.section, SymbolSection::Undefined | SymbolSection::Common)
                     && !sym.original_name.starts_with("__imp_")
+                    && sym.storage_class != object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL
                 {
                     merge_external_kind(
                         &mut undefined_kinds,
@@ -989,6 +997,26 @@ fn plan_image(
             let target = symbols.get(&symbol_index.0).ok_or_else(|| {
                 format!("COFF relocation references missing symbol {}", symbol_index.0)
             })?;
+            let target = if let Some(default_index) =
+                raw_coff_weak_alias_default(obj, symbol_index)?
+            {
+                let default = symbols.get(&default_index.0).ok_or_else(|| {
+                    format!(
+                        "COFF weak alias {:?} references missing default symbol {}",
+                        target.original_name, default_index.0
+                    )
+                })?;
+                if !matches!(default.section, SymbolSection::Section(_) | SymbolSection::Absolute)
+                {
+                    return Err(format!(
+                        "COFF weak alias {:?} default {:?} is not a definition",
+                        target.original_name, default.original_name
+                    ));
+                }
+                default
+            } else {
+                target
+            };
             let (target_address, target_section, target_section_offset) = match target.section {
                 SymbolSection::Section(idx) => {
                     let target_sec = section_by_index
@@ -1263,6 +1291,54 @@ fn raw_coff_symbol_fields(
             .ok()
             .map(|symbol| (symbol.typ(), symbol.storage_class())),
         _ => None,
+    }
+}
+
+fn raw_coff_weak_alias_default(
+    obj: &object::File<'_>,
+    index: SymbolIndex,
+) -> Result<Option<SymbolIndex>, String> {
+    fn from_table<'data, R, Coff>(
+        table: &object::read::coff::SymbolTable<'data, R, Coff>,
+        index: SymbolIndex,
+    ) -> Result<Option<SymbolIndex>, String>
+    where
+        R: object::read::ReadRef<'data>,
+        Coff: object::read::coff::CoffHeader,
+    {
+        let symbol = table
+            .symbol(index)
+            .map_err(|error| format!("invalid COFF symbol {}: {error}", index.0))?;
+        if symbol.storage_class() != object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL {
+            return Ok(None);
+        }
+        if symbol.number_of_aux_symbols() != 1 {
+            return Err(format!(
+                "COFF weak external {} must have exactly one auxiliary record",
+                index.0
+            ));
+        }
+        let auxiliary = table
+            .aux_weak_external(index)
+            .map_err(|error| format!("invalid COFF weak external {}: {error}", index.0))?;
+        let search_type = auxiliary.weak_search_type.get(LE);
+        if search_type != object::pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS {
+            return Err(format!(
+                "unsupported COFF weak external search type {search_type} for symbol {}",
+                index.0
+            ));
+        }
+        let default = auxiliary.default_symbol();
+        if default == index {
+            return Err(format!("COFF weak external {} aliases itself", index.0));
+        }
+        Ok(Some(default))
+    }
+
+    match obj {
+        object::File::Coff(file) => from_table(file.coff_symbol_table(), index),
+        object::File::CoffBig(file) => from_table(file.coff_symbol_table(), index),
+        _ => Ok(None),
     }
 }
 
@@ -1654,6 +1730,20 @@ mod tests {
         typ: u16,
         storage_class: u8,
     ) {
+        push_symbol_with_aux_count(
+            bytes, name, value, section, typ, storage_class, 0,
+        );
+    }
+
+    fn push_symbol_with_aux_count(
+        bytes: &mut Vec<u8>,
+        name: &[u8],
+        value: u32,
+        section: i16,
+        typ: u16,
+        storage_class: u8,
+        auxiliary_count: u8,
+    ) {
         let mut padded_name = [0u8; 8];
         padded_name[..name.len()].copy_from_slice(name);
         bytes.extend_from_slice(&padded_name);
@@ -1661,7 +1751,79 @@ mod tests {
         bytes.extend_from_slice(&section.to_le_bytes());
         bytes.extend_from_slice(&typ.to_le_bytes());
         bytes.push(storage_class);
-        bytes.push(0); // auxiliary symbols
+        bytes.push(auxiliary_count);
+    }
+
+    fn weak_alias_fixture(search_type: u32, default_symbol: u32) -> (Vec<u8>, usize) {
+        // A data pointer names a weak deleting-destructor-style alias whose
+        // IMAGE_AUX_SYMBOL declares a strong in-object function as its default.
+        // The relocation must bind the declared default rather than inventing
+        // a runtime external for the weak name.
+        let text = [0xc3u8];
+        let rdata = [0u8; 8];
+        const SECTION_COUNT: u16 = 2;
+        const SYMBOL_COUNT: u32 = 3; // two symbols plus the weak auxiliary row
+        const HEADER_SIZE: u32 = 20 + SECTION_COUNT as u32 * 40;
+        let text_offset = HEADER_SIZE;
+        let rdata_offset = text_offset + text.len() as u32;
+        let relocation_offset = rdata_offset + rdata.len() as u32;
+        let symbol_offset = relocation_offset + 10;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&object::pe::IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        bytes.extend_from_slice(&SECTION_COUNT.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&symbol_offset.to_le_bytes());
+        bytes.extend_from_slice(&SYMBOL_COUNT.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        push_section_header(
+            &mut bytes, b".text", text.len() as u32, text_offset, 0x6000_0020,
+        );
+
+        let mut name = [0u8; 8];
+        name[..6].copy_from_slice(b".rdata");
+        bytes.extend_from_slice(&name);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&(rdata.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&rdata_offset.to_le_bytes());
+        bytes.extend_from_slice(&relocation_offset.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0x4000_0040u32.to_le_bytes());
+
+        bytes.extend_from_slice(&text);
+        bytes.extend_from_slice(&rdata);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // weak alias symbol index
+        bytes.extend_from_slice(&object::pe::IMAGE_REL_AMD64_ADDR64.to_le_bytes());
+
+        let function_type =
+            object::pe::IMAGE_SYM_DTYPE_FUNCTION << object::pe::IMAGE_SYM_DTYPE_SHIFT;
+        push_symbol(
+            &mut bytes,
+            b"def_fn",
+            0,
+            1,
+            function_type,
+            object::pe::IMAGE_SYM_CLASS_EXTERNAL,
+        );
+        push_symbol_with_aux_count(
+            &mut bytes,
+            b"alias",
+            0,
+            0,
+            function_type,
+            object::pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL,
+            1,
+        );
+        bytes.extend_from_slice(&default_symbol.to_le_bytes());
+        bytes.extend_from_slice(&search_type.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 10]);
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        (bytes, rdata_offset as usize)
     }
 
     fn classifier_fixture() -> Vec<u8> {
@@ -2113,6 +2275,51 @@ mod tests {
         assert!(pointer_names.contains("coff_ext_slotcall"));
         assert!(!pointer_names.contains("coff_ext_directfn"));
         assert!(!pointer_names.contains("coff_ext_dataload"));
+    }
+
+    #[test]
+    fn weak_external_alias_relocations_bind_only_the_declared_definition() {
+        let (mut fixture, rdata_offset) = weak_alias_fixture(
+            object::pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS,
+            0,
+        );
+        let image = prepare_image(&mut fixture).unwrap().unwrap();
+        let definition = image
+            .address_map
+            .symbols
+            .iter()
+            .find(|symbol| symbol.original_name == "def_fn")
+            .unwrap();
+        assert!(!image
+            .address_map
+            .symbols
+            .iter()
+            .any(|symbol| symbol.original_name == "alias"));
+        assert!(!image
+            .address_map
+            .externs
+            .iter()
+            .any(|external| external.original_name == "alias"));
+        assert_eq!(image.address_map.relocations.len(), 1);
+        let relocation = &image.address_map.relocations[0];
+        assert_eq!(relocation.target_original_name, "def_fn");
+        assert_eq!(relocation.target_mapped_address, definition.mapped_address);
+        assert_eq!(
+            u64::from_le_bytes(
+                fixture[rdata_offset..rdata_offset + 8].try_into().unwrap(),
+            ),
+            definition.mapped_address,
+        );
+
+        for (search_type, default_symbol, message) in [
+            (object::pe::IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY, 0, "search type"),
+            (object::pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS, 1, "aliases itself"),
+            (object::pe::IMAGE_WEAK_EXTERN_SEARCH_ALIAS, 99, "missing default symbol"),
+        ] {
+            let (mut malformed, _) = weak_alias_fixture(search_type, default_symbol);
+            let error = prepare_image(&mut malformed).unwrap_err();
+            assert!(error.contains(message), "{error}");
+        }
     }
 
     #[test]
