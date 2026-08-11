@@ -2323,6 +2323,7 @@ mod tests {
             (CALL, Arc::new(vec![SCALAR_VALUE])),
         );
         db.rel_push("abi_int_arg_position", (Mreg::CX, 0usize));
+        db.rel_push("reg_rtl", (CALL, Mreg::CX, SCALAR_VALUE));
         db.rel_push(
             "rtl_inst",
             (
@@ -2401,9 +2402,16 @@ mod tests {
         );
         assert!(
             relation_set::<(Node, RTLInst)>(&authenticated, "rtl_inst")
-                .iter()
-                .any(|(node, inst)| *node == 0x1100 && matches!(inst, RTLInst::Icall(..))),
-            "the unprototyped call itself must survive reconciliation"
+                .contains(&(
+                    0x1100,
+                    RTLInst::Icall(
+                        Some(expected_signature),
+                        Either::Right(Either::Left(0x2000)),
+                        Arc::new(vec![SCALAR_VALUE]),
+                        None,
+                        0x1105,
+                    ),
+                ))
         );
     }
 
