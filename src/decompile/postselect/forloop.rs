@@ -821,16 +821,6 @@ impl IRPass for ForLoopPass {
         let mut removed = 0usize;
         let (mut tot_g, mut kept_g) = (0usize, 0usize);
         {
-            let feature_identities: HashSet<(String, u64)> = db
-                .cast_pending_scalar_lvalue_alternatives
-                .iter()
-                .map(|alternative| {
-                    (
-                        alternative.manifold_name.clone(),
-                        alternative.manifold_address,
-                    )
-                })
-                .collect();
             let tu = match db.cast_optimized_translation_unit.as_mut() {
                 Some(tu) => tu,
                 None => unreachable!("translation unit checked above"),
@@ -846,17 +836,13 @@ impl IRPass for ForLoopPass {
                     if let Some((before, after)) = recover_forloop_function(f) {
                         if let Some(alternative) = before_function.as_ref().and_then(|before| {
                             function_addresses.get(&f.name).and_then(|address| {
-                                (!feature_identities.contains(&(f.name.clone(), *address)))
-                                    .then(|| {
-                                        super::source_alternatives::snapshot_if_changed(
-                                            declaration_index,
-                                            *address,
-                                            super::source_alternatives::SourceAlternativeBoundary::PreForLoop,
-                                            before,
-                                            f,
-                                        )
-                                    })
-                                    .flatten()
+                                super::source_alternatives::snapshot_if_changed(
+                                    declaration_index,
+                                    *address,
+                                    super::source_alternatives::SourceAlternativeBoundary::PreForLoop,
+                                    before,
+                                    f,
+                                )
                             })
                         }) {
                             super::source_alternatives::record_bounded_snapshot(

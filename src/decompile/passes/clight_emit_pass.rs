@@ -8,7 +8,7 @@ use crate::decompile::passes::c_pass::types::{
 };
 use crate::decompile::passes::pass::IRPass;
 use crate::x86::types::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Known libc functions that take opaque struct pointer parameters; maps function_name -> Vec<(param_position, typedef_name)>.
@@ -1595,6 +1595,8 @@ impl IRPass for ClightSelectPass {
                 );
                 db.clight_selected_functions = result.canonical;
                 db.clight_scalar_lvalue_alternatives = result.scalar_lvalue_alternatives;
+                db.cast_feature_source_alternatives_overflowed |=
+                    result.feature_source_alternatives_overflowed;
             }
             Err(e) => {
                 log::warn!("ClightSelectPass: failed to select statements: {}", e);
@@ -1612,12 +1614,88 @@ impl IRPass for ClightSelectPass {
         &[
             "clight_selected_functions",
             "clight_scalar_lvalue_alternatives",
+            "cast_feature_source_alternatives_overflowed",
         ]
     }
 
     fn extra_reads(&self) -> &'static [&'static str] {
         CLIGHT_EMIT_EXTRA_READS
     }
+}
+
+fn scalar_feature_changed_type_regs(
+    canonical: &crate::decompile::passes::clight_select::select::SelectedFunction,
+    alternative: &crate::decompile::passes::clight_select::select::SelectedFunction,
+) -> BTreeSet<RTLReg> {
+    canonical
+        .var_types
+        .keys()
+        .chain(alternative.var_types.keys())
+        .chain(canonical.var_type_candidates.keys())
+        .chain(alternative.var_type_candidates.keys())
+        .chain(canonical.var_decl_idx.keys())
+        .chain(alternative.var_decl_idx.keys())
+        .copied()
+        .filter(|reg| {
+            canonical.var_types.get(reg) != alternative.var_types.get(reg)
+                || canonical.var_type_candidates.get(reg)
+                    != alternative.var_type_candidates.get(reg)
+                || canonical.var_decl_idx.get(reg) != alternative.var_decl_idx.get(reg)
+        })
+        .collect()
+}
+
+fn scalar_feature_types_valid(
+    canonical: &crate::decompile::passes::clight_select::select::SelectedFunction,
+    selected: &crate::decompile::passes::clight_select::select::ScalarLvalueSelectedAlternative,
+) -> bool {
+    use crate::decompile::passes::clight_select::select::ScalarSourceAlternativeFamily;
+    let changed = scalar_feature_changed_type_regs(canonical, &selected.function);
+    if matches!(
+        selected.family,
+        ScalarSourceAlternativeFamily::TypedLvalue
+            | ScalarSourceAlternativeFamily::FieldLvalue
+    ) {
+        return changed.is_empty()
+            && selected.authorized_type_changes.is_empty()
+            && selected.authenticated_load_nodes.is_empty();
+    }
+    !selected.authenticated_load_nodes.is_empty()
+        && changed == selected.authorized_type_changes
+        && changed.iter().all(|reg| {
+            !canonical.param_regs.contains(reg)
+                && selected.function.var_types.get(reg).is_some_and(|type_string| {
+                    matches!(
+                        type_string.as_str(),
+                        "int_I8"
+                            | "int_I8_unsigned"
+                            | "int_I16"
+                            | "int_I16_unsigned"
+                            | "int_I32"
+                            | "int_I32_unsigned"
+                            | "int_I64"
+                            | "int_I64_unsigned"
+                    ) && selected
+                        .function
+                        .var_type_candidates
+                        .get(reg)
+                        .is_some_and(|candidates| {
+                            candidates.as_slice() == std::slice::from_ref(type_string)
+                        })
+                        && selected.function.var_decl_idx.get(reg) == Some(&0)
+                })
+        })
+}
+
+fn scalar_extension_siblings_match(
+    per_use: &crate::decompile::passes::clight_select::select::ScalarLvalueSelectedAlternative,
+    hoisted: &crate::decompile::passes::clight_select::select::ScalarLvalueSelectedAlternative,
+) -> bool {
+    use crate::decompile::passes::clight_select::select::ScalarSourceAlternativeFamily;
+    per_use.family == ScalarSourceAlternativeFamily::ExtensionPerUse
+        && hoisted.family == ScalarSourceAlternativeFamily::ExtensionHoisted
+        && !per_use.authenticated_load_nodes.is_empty()
+        && per_use.authenticated_load_nodes == hoisted.authenticated_load_nodes
 }
 
 pub struct ClightEmitPass;
@@ -2236,73 +2314,160 @@ impl IRPass for ClightEmitPass {
 
         let stmt_map: HashMap<Node, CStmt> = all_statements.into_iter().collect();
 
-        // Assemble one TU-wide feature clone only when authenticated feature
-        // selections survived.  Every unaffected function reuses its exact
-        // canonical selected tree and converted statement; all feature nodes
-        // for one function are replaced together, never as a cross-product.
-        let mut feature_by_address: HashMap<Address, Vec<_>> = HashMap::new();
-        for alternative in scalar_lvalue_alternatives {
-            feature_by_address
-                .entry(alternative.function.address)
-                .or_default()
-                .push(alternative);
-        }
-        let mut feature_functions = db.cast_selected_functions.clone();
+        // Assemble one TU-wide clone per closed feature family. Unaffected
+        // functions reuse the exact canonical selected tree. A function may
+        // participate once in each family, but never twice within a family.
         let mut selected_address_counts: HashMap<Address, usize> = HashMap::new();
-        for function in &feature_functions {
+        for function in &db.cast_selected_functions {
             *selected_address_counts.entry(function.address).or_default() += 1;
         }
-        let mut feature_stmt_map = stmt_map.clone();
-        let mut feature_object_types = ctx.function_object_types().clone();
-        let mut accepted_feature_addresses = HashSet::new();
-        let mut feature_ctx =
-            crate::decompile::passes::c_pass::convert::from_relations::ConversionContext::new(
-                db.cast_id_to_name.clone(),
-            );
-        for function in &mut feature_functions {
-            let Some(alternatives) = feature_by_address.get(&function.address) else {
-                continue;
-            };
-            if alternatives.len() != 1
-                || selected_address_counts.get(&function.address) != Some(&1)
-                || alternatives[0].function.name != function.name
-                || alternatives[0].function.return_type != function.return_type
-                || alternatives[0].function.param_regs != function.param_regs
-                || alternatives[0].function.param_types != function.param_types
-                || alternatives[0].function.entry_node != function.entry_node
-                || alternatives[0].function.stack_size != function.stack_size
-                || alternatives[0].function.successors != function.successors
-                || alternatives[0].function.used_regs != function.used_regs
-                || alternatives[0].function.struct_fields != function.struct_fields
-                || alternatives[0].function.sseq_groups != function.sseq_groups
-                || alternatives[0].function.var_types != function.var_types
-                || alternatives[0].function.var_type_candidates != function.var_type_candidates
-                || alternatives[0].function.var_decl_idx != function.var_decl_idx
-                || alternatives[0].function.loop_headers != function.loop_headers
-                || alternatives[0].function.switch_heads != function.switch_heads
-                || alternatives[0].function.reg_struct_ids != function.reg_struct_ids
+        let feature_families = [
+            crate::decompile::passes::clight_select::select::ScalarSourceAlternativeFamily::TypedLvalue,
+            crate::decompile::passes::clight_select::select::ScalarSourceAlternativeFamily::FieldLvalue,
+            crate::decompile::passes::clight_select::select::ScalarSourceAlternativeFamily::ExtensionPerUse,
+            crate::decompile::passes::clight_select::select::ScalarSourceAlternativeFamily::ExtensionHoisted,
+        ];
+        let canonical_by_address: HashMap<_, _> = db
+            .cast_selected_functions
+            .iter()
+            .filter(|function| selected_address_counts.get(&function.address) == Some(&1))
+            .map(|function| (function.address, function))
+            .collect();
+        let mut admitted_by_family = BTreeMap::new();
+        for family in feature_families {
+            let mut feature_by_address: HashMap<Address, Vec<_>> = HashMap::new();
+            for alternative in scalar_lvalue_alternatives
+                .iter()
+                .filter(|alternative| alternative.family == family)
             {
+                feature_by_address
+                    .entry(alternative.function.address)
+                    .or_default()
+                    .push(alternative);
+            }
+            if feature_by_address.is_empty() {
                 continue;
             }
-            let alternative = &alternatives[0].function;
-            feature_stmt_map.retain(|node, _| {
-                node_to_func_addr.get(node).copied() != Some(function.address)
-            });
-            for (node, statement) in convert_selected_function_statements(
-                alternative,
-                &mut feature_ctx,
-                local_evar_ids.get(&alternative.address),
-                &string_map,
-                &rodata_const_map,
-            ) {
-                feature_stmt_map.insert(node, statement);
+            let mut admitted = BTreeMap::new();
+            for (address, alternatives) in feature_by_address {
+                let [selected] = alternatives.as_slice() else {
+                    continue;
+                };
+                let selected = *selected;
+                let Some(function) = canonical_by_address.get(&address).copied() else {
+                    continue;
+                };
+                let alternative = &selected.function;
+                let feature_types_valid = scalar_feature_types_valid(function, selected);
+                if alternative.name != function.name
+                    || alternative.return_type != function.return_type
+                    || alternative.param_regs != function.param_regs
+                    || alternative.param_types != function.param_types
+                    || alternative.entry_node != function.entry_node
+                    || alternative.stack_size != function.stack_size
+                    || alternative.successors != function.successors
+                    || alternative.used_regs != function.used_regs
+                    || alternative.struct_fields != function.struct_fields
+                    || alternative.sseq_groups != function.sseq_groups
+                    || alternative.loop_headers != function.loop_headers
+                    || alternative.switch_heads != function.switch_heads
+                    || alternative.reg_struct_ids != function.reg_struct_ids
+                    || !feature_types_valid
+                {
+                    continue;
+                }
+                admitted.insert(address, selected);
             }
-            *function = alternative.clone();
-            accepted_feature_addresses.insert(function.address);
+            if !admitted.is_empty() {
+                admitted_by_family.insert(family, admitted);
+            }
         }
-        for (address, object_types) in feature_ctx.function_object_types() {
-            if accepted_feature_addresses.contains(address) {
-                feature_object_types.insert(*address, object_types.clone());
+
+        // The extension comparison is a four-record superfamily downstream:
+        // determine its complete function set before any Clight-to-C
+        // conversion.  A dropped sibling therefore remains canonical in every
+        // function/type/identifier input of the retained family TU.
+        let per_use_family =
+            crate::decompile::passes::clight_select::select::ScalarSourceAlternativeFamily::ExtensionPerUse;
+        let hoisted_family =
+            crate::decompile::passes::clight_select::select::ScalarSourceAlternativeFamily::ExtensionHoisted;
+        let per_use_addresses: BTreeSet<_> = admitted_by_family
+            .get(&per_use_family)
+            .into_iter()
+            .flat_map(|rows| rows.keys().copied())
+            .collect();
+        let hoisted_addresses: BTreeSet<_> = admitted_by_family
+            .get(&hoisted_family)
+            .into_iter()
+            .flat_map(|rows| rows.keys().copied())
+            .collect();
+        let complete_extension_addresses: BTreeSet<_> = per_use_addresses
+            .intersection(&hoisted_addresses)
+            .filter(|address| {
+                admitted_by_family
+                    .get(&per_use_family)
+                    .and_then(|rows| rows.get(address))
+                    .zip(
+                        admitted_by_family
+                            .get(&hoisted_family)
+                            .and_then(|rows| rows.get(address)),
+                    )
+                    .is_some_and(|(per_use, hoisted)| {
+                        scalar_extension_siblings_match(per_use, hoisted)
+                    })
+            })
+            .copied()
+            .collect();
+        for family in [per_use_family, hoisted_family] {
+            if let Some(rows) = admitted_by_family.get_mut(&family) {
+                rows.retain(|address, _| complete_extension_addresses.contains(address));
+            }
+        }
+        admitted_by_family.retain(|_, rows| !rows.is_empty());
+
+        let mut feature_inputs = Vec::new();
+        for (family, admitted) in admitted_by_family {
+            let mut feature_functions = db.cast_selected_functions.clone();
+            let mut feature_stmt_map = stmt_map.clone();
+            let mut feature_object_types = ctx.function_object_types().clone();
+            let mut accepted_feature_addresses = HashSet::new();
+            let mut feature_ctx =
+                crate::decompile::passes::c_pass::convert::from_relations::ConversionContext::new(
+                    db.cast_id_to_name.clone(),
+                );
+            for function in &mut feature_functions {
+                let Some(selected) = admitted.get(&function.address) else {
+                    continue;
+                };
+                let alternative = &selected.function;
+                feature_stmt_map.retain(|node, _| {
+                    node_to_func_addr.get(node).copied() != Some(function.address)
+                });
+                for (node, statement) in convert_selected_function_statements(
+                    alternative,
+                    &mut feature_ctx,
+                    local_evar_ids.get(&alternative.address),
+                    &string_map,
+                    &rodata_const_map,
+                ) {
+                    feature_stmt_map.insert(node, statement);
+                }
+                *function = alternative.clone();
+                accepted_feature_addresses.insert(function.address);
+            }
+            for (address, object_types) in feature_ctx.function_object_types() {
+                if accepted_feature_addresses.contains(address) {
+                    feature_object_types.insert(*address, object_types.clone());
+                }
+            }
+            if !accepted_feature_addresses.is_empty() {
+                feature_inputs.push((
+                    family,
+                    feature_functions,
+                    feature_stmt_map,
+                    feature_object_types,
+                    accepted_feature_addresses,
+                ));
             }
         }
 
@@ -2324,20 +2489,37 @@ impl IRPass for ClightEmitPass {
             &node_to_func_addr,
             &field_types,
         );
-        let mut scalar_lvalue_tu = (!accepted_feature_addresses.is_empty()).then(|| {
-            crate::decompile::passes::c_pass::convert::build_translation_unit_from_stmt_map_with_types(
-                db,
-                &feature_functions,
-                &db.cast_globals,
-                &db.cast_id_to_name,
-                &feature_stmt_map,
-                &all_edges,
-                &db.cast_var_types_for_emission,
-                &feature_object_types,
-                &node_to_func_addr,
-                &field_types,
+        let mut scalar_feature_tus: Vec<_> = feature_inputs
+            .into_iter()
+            .map(
+                |(
+                    family,
+                    feature_functions,
+                    feature_stmt_map,
+                    feature_object_types,
+                    accepted_feature_addresses,
+                )| {
+                    let feature_tu = crate::decompile::passes::c_pass::convert::build_translation_unit_from_stmt_map_with_types(
+                        db,
+                        &feature_functions,
+                        &db.cast_globals,
+                        &db.cast_id_to_name,
+                        &feature_stmt_map,
+                        &all_edges,
+                        &db.cast_var_types_for_emission,
+                        &feature_object_types,
+                        &node_to_func_addr,
+                        &field_types,
+                    );
+                    (
+                        family,
+                        feature_functions,
+                        accepted_feature_addresses,
+                        feature_tu,
+                    )
+                },
             )
-        });
+            .collect();
         eprintln!(
             "[clight-emit] build_translation_unit (optimized TU): {:?}",
             t.elapsed()
@@ -2390,7 +2572,7 @@ impl IRPass for ClightEmitPass {
                         }
                     }
                 }
-                if let Some(feature_tu) = scalar_lvalue_tu.as_mut() {
+                for (_, _, _, feature_tu) in &mut scalar_feature_tus {
                     for decl in &mut feature_tu.decls {
                         if let TopLevelDecl::FuncDef(function) = decl {
                             rewrite_recovered_global_stmt(
@@ -2583,7 +2765,7 @@ impl IRPass for ClightEmitPass {
         // Rewrite suppressed structs: opaque -> TypedefName, unreferenced -> Void.
         if !suppressed_structs.is_empty() {
             rewrite_opaque_types_in_tu(&mut tu, &suppressed_structs);
-            if let Some(feature_tu) = scalar_lvalue_tu.as_mut() {
+            for (_, _, _, feature_tu) in &mut scalar_feature_tus {
                 rewrite_opaque_types_in_tu(feature_tu, &suppressed_structs);
             }
             for ty in db.cast_var_types_for_emission.values_mut() {
@@ -2592,7 +2774,9 @@ impl IRPass for ClightEmitPass {
         }
 
         db.cast_pending_scalar_lvalue_alternatives.clear();
-        if let Some(feature_tu) = scalar_lvalue_tu {
+        for (family, feature_functions, accepted_feature_addresses, feature_tu) in
+            scalar_feature_tus
+        {
             let canonical_functions: HashMap<&str, Vec<&FuncDef>> = tu
                 .decls
                 .iter()
@@ -2645,6 +2829,7 @@ impl IRPass for ClightEmitPass {
                     crate::decompile::postselect::source_alternatives::PendingScalarLvalueAlternative {
                         manifold_name: canonical.name.clone(),
                         manifold_address: selected.address,
+                        family,
                         function: alternative.clone(),
                     },
                 );
@@ -2682,6 +2867,94 @@ mod provider_identity_tests {
     use crate::decompile::passes::c_pass::convert::from_relations::{
         convert_expr, ConversionContext,
     };
+
+    fn scalar_type_fixture() ->
+        crate::decompile::passes::clight_select::select::SelectedFunction
+    {
+        crate::decompile::passes::clight_select::select::SelectedFunction {
+            address: 0x1000,
+            name: "fixture".to_string(),
+            entry_node: 0x1000,
+            return_type: ClightType::Tvoid,
+            param_regs: Vec::new(),
+            param_types: Vec::new(),
+            stack_size: 0,
+            statements: HashMap::new(),
+            successors: HashMap::new(),
+            used_regs: HashSet::new(),
+            struct_fields: HashMap::new(),
+            sseq_groups: HashMap::new(),
+            var_types: [
+                (9, "int_I64".to_string()),
+                (10, "int_I64".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            var_type_candidates: [
+                (9, vec!["int_I64".to_string()]),
+                (10, vec!["int_I64".to_string()]),
+            ]
+            .into_iter()
+            .collect(),
+            var_decl_idx: [(9, 0), (10, 0)].into_iter().collect(),
+            loop_headers: HashSet::new(),
+            switch_heads: HashSet::new(),
+            reg_struct_ids: HashMap::new(),
+            loop_info: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn scalar_feature_type_handoff_rejects_field_drift_and_unrelated_locals() {
+        use crate::decompile::passes::clight_select::select::{
+            ScalarLvalueSelectedAlternative, ScalarSourceAlternativeFamily,
+        };
+        let canonical = scalar_type_fixture();
+        let mut changed = canonical.clone();
+        changed.var_types.insert(9, "int_I8".to_string());
+        changed
+            .var_type_candidates
+            .insert(9, vec!["int_I8".to_string()]);
+        let extension = ScalarLvalueSelectedAlternative {
+            family: ScalarSourceAlternativeFamily::ExtensionPerUse,
+            function: changed.clone(),
+            authorized_type_changes: BTreeSet::from([9]),
+            authenticated_load_nodes: BTreeSet::from([0x1010]),
+        };
+        assert!(scalar_feature_types_valid(&canonical, &extension));
+        let mut matching_hoisted = extension.clone();
+        matching_hoisted.family = ScalarSourceAlternativeFamily::ExtensionHoisted;
+        assert!(scalar_extension_siblings_match(&extension, &matching_hoisted));
+        matching_hoisted.authenticated_load_nodes = BTreeSet::from([0x1020]);
+        assert!(!scalar_extension_siblings_match(&extension, &matching_hoisted));
+
+        let field_drift = ScalarLvalueSelectedAlternative {
+            family: ScalarSourceAlternativeFamily::FieldLvalue,
+            function: changed.clone(),
+            authorized_type_changes: BTreeSet::new(),
+            authenticated_load_nodes: BTreeSet::new(),
+        };
+        assert!(!scalar_feature_types_valid(&canonical, &field_drift));
+
+        changed.var_types.insert(10, "int_I16".to_string());
+        changed
+            .var_type_candidates
+            .insert(10, vec!["int_I16".to_string()]);
+        let forged_unrelated = ScalarLvalueSelectedAlternative {
+            family: ScalarSourceAlternativeFamily::ExtensionPerUse,
+            function: changed,
+            authorized_type_changes: BTreeSet::from([9]),
+            authenticated_load_nodes: BTreeSet::from([0x1010]),
+        };
+        assert!(!scalar_feature_types_valid(&canonical, &forged_unrelated));
+
+        let mut parameter_canonical = canonical.clone();
+        parameter_canonical.param_regs.push(9);
+        assert!(!scalar_feature_types_valid(
+            &parameter_canonical,
+            &extension,
+        ));
+    }
 
     #[test]
     fn scalar_lvalue_relations_are_explicit_shared_extra_reads() {

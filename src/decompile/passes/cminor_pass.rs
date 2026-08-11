@@ -98,15 +98,22 @@ ascent_par! {
     relation call_return_reg(Node, RTLReg);
     relation stack_var(Address, Address, i64, RTLReg);
     relation authenticated_scalar_memory_access(Node, ScalarMemoryAccessProof);
+    relation authenticated_scalar_memory_use_plan(Node, ScalarMemoryUsePlan);
 
     relation cminor_stmt(Node, CminorStmt);
     relation cminor_fallthrough(Node, Node);
     relation cminor_scalar_memory_access(Node, ScalarMemoryAccessProof);
+    relation cminor_scalar_memory_use_plan(Node, ScalarMemoryUsePlan);
 
     cminor_scalar_memory_access(node, proof.clone()) <--
         authenticated_scalar_memory_access(node, proof),
         cminor_stmt(node, stmt),
         if crate::decompile::passes::cminor_pass::scalar_memory_proof_matches_cminor(proof, stmt);
+
+    cminor_scalar_memory_use_plan(node, plan.clone()) <--
+        authenticated_scalar_memory_use_plan(node, plan),
+        authenticated_scalar_memory_access(node, proof),
+        if plan.is_closed_v1(proof);
 
     // Track nodes where Olea(Ainstack) was resolved to a stack address constant via stack_var.
     #[local] relation stack_addr_resolved(Node);
@@ -1209,6 +1216,8 @@ mod scalar_lvalue_memory_proof_tests {
             operand: "cminor_scalar_memory",
             direction: ScalarMemoryDirection::Read,
             extension: ScalarMemoryExtension::Plain,
+            encoded_destination_width: Some(4),
+            result_chain: Some(ScalarMemoryResultChain::Direct),
             address_size: 8,
             base_register: Mreg::CX,
             index_register: Some(Mreg::DX),
@@ -1275,6 +1284,8 @@ mod scalar_lvalue_memory_proof_tests {
 
         let mut store_proof = proof;
         store_proof.direction = ScalarMemoryDirection::Write;
+        store_proof.encoded_destination_width = None;
+        store_proof.result_chain = None;
         store_proof.downstream_value_width = None;
         let store = CminorStmt::Sstore(
             store_proof.chunk,

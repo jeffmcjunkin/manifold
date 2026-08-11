@@ -164,8 +164,9 @@ pub struct FunctionData {
     /// statement relation. Selection consumes this only through a private,
     /// bounded feature solve; canonical candidate ordering is unchanged.
     pub scalar_lvalue_proofs: HashMap<Node, Vec<ScalarMemoryAccessProof>>,
+    pub scalar_memory_use_plans: HashMap<Node, Vec<ScalarMemoryUsePlan>>,
     pub scalar_lvalue_source_candidates:
-        HashMap<Node, Vec<(ScalarLvalueSourceForm, ClightStmt)>>,
+        HashMap<Node, Vec<(ScalarLvalueSourceForm, ScalarLvaluePlacement, ClightStmt)>>,
 
     pub successors: HashMap<Node, Vec<Node>>,
 
@@ -270,6 +271,7 @@ impl FunctionData {
             stack_size,
             node_statements: HashMap::new(),
             scalar_lvalue_proofs: HashMap::new(),
+            scalar_memory_use_plans: HashMap::new(),
             scalar_lvalue_source_candidates: HashMap::new(),
             successors: HashMap::new(),
             used_regs: HashSet::new(),
@@ -287,6 +289,7 @@ impl FunctionData {
             callee_signatures: HashMap::new(),
         }
     }
+
 }
 
 /// Per-(function, reg) XType deduped from emit_function_param_type: int beats long-width placeholders, else highest priority wins; shared so extract_functions and extract_callee_signatures agree.
@@ -747,6 +750,27 @@ pub fn extract_functions(
         }
     }
 
+    // A use plan is private feature evidence and is admitted only after its
+    // exact function/node proof has survived the canonical owner checks above.
+    for (node, plan) in db.rel_iter::<(Node, ScalarMemoryUsePlan)>("scalar_memory_use_plan") {
+        let Some(function) = func_map.get_mut(&plan.function) else {
+            continue;
+        };
+        let Some(proofs) = function.scalar_lvalue_proofs.get(node) else {
+            continue;
+        };
+        if *node != plan.definition_node
+            || proofs.iter().filter(|proof| plan.is_closed_v1(proof)).count() != 1
+        {
+            continue;
+        }
+        let plans = function.scalar_memory_use_plans.entry(*node).or_default();
+        if !plans.contains(plan) {
+            plans.push(plan.clone());
+            plans.sort_unstable();
+        }
+    }
+
     // A feature statement may be attached only to the unique exact
     // proof/function identity established above.  This is independent of the
     // canonical statement vector, but it uses the same goto-label convention
@@ -764,9 +788,10 @@ pub fn extract_functions(
                 .or_insert(Some(*address));
         }
     }
-    for (node, form, candidate) in db.rel_iter::<(
+    for (node, form, placement, candidate) in db.rel_iter::<(
         Node,
         ScalarLvalueSourceForm,
+        ScalarLvaluePlacement,
         ClightStmt,
     )>("scalar_lvalue_source_candidate")
     {
@@ -789,9 +814,11 @@ pub fn extract_functions(
             .scalar_lvalue_source_candidates
             .entry(*node)
             .or_default();
-        if !tagged.contains(&(*form, candidate.clone())) {
-            tagged.push((*form, candidate));
-            tagged.sort_by_key(|(form, statement)| (*form, format!("{:?}", statement)));
+        if !tagged.contains(&(*form, *placement, candidate.clone())) {
+            tagged.push((*form, *placement, candidate));
+            tagged.sort_by_key(|(form, placement, statement)| {
+                (*form, *placement, format!("{:?}", statement))
+            });
         }
     }
 
@@ -3545,6 +3572,8 @@ mod tr3_tests {
             operand: "scalar_isolation_mem",
             direction: ScalarMemoryDirection::Read,
             extension: ScalarMemoryExtension::Plain,
+            encoded_destination_width: Some(4),
+            result_chain: Some(ScalarMemoryResultChain::Direct),
             address_size: 8,
             base_register: Mreg::CX,
             index_register: None,
@@ -3580,7 +3609,12 @@ mod tr3_tests {
         db.rel_push("scalar_lvalue_candidate", (NODE, proof));
         db.rel_push(
             "scalar_lvalue_source_candidate",
-            (NODE, ScalarLvalueSourceForm::RawByte, feature.clone()),
+            (
+                NODE,
+                ScalarLvalueSourceForm::RawByte,
+                ScalarLvaluePlacement::Plain,
+                feature.clone(),
+            ),
         );
 
         let (functions, _) = extract_functions(&db).expect("extract isolated candidates");
@@ -3591,7 +3625,11 @@ mod tr3_tests {
         assert_eq!(function.node_statements[&NODE], vec![canonical]);
         assert_eq!(
             function.scalar_lvalue_source_candidates[&NODE],
-            vec![(ScalarLvalueSourceForm::RawByte, feature)]
+            vec![(
+                ScalarLvalueSourceForm::RawByte,
+                ScalarLvaluePlacement::Plain,
+                feature,
+            )]
         );
     }
 

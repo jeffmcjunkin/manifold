@@ -197,6 +197,10 @@ pub struct DecompileDB {
     pub cast_raw_translation_unit: Option<TranslationUnit>,
     pub cast_optimized_translation_unit: Option<TranslationUnit>,
     pub cast_source_alternatives: Vec<SourceAlternativeSnapshot>,
+    /// Feature-only capture overflow. Unlike ordinary snapshot overflow, this
+    /// drops the cumulative scalar portfolio without suppressing valid Stage-1
+    /// control/call-result alternatives.
+    pub cast_feature_source_alternatives_overflowed: bool,
     pub cast_source_alternatives_overflowed: bool,
     pub cast_pending_scalar_lvalue_alternatives: Vec<PendingScalarLvalueAlternative>,
 
@@ -248,6 +252,7 @@ impl Default for DecompileDB {
             cast_raw_translation_unit: None,
             cast_optimized_translation_unit: None,
             cast_source_alternatives: Default::default(),
+            cast_feature_source_alternatives_overflowed: false,
             cast_source_alternatives_overflowed: false,
             cast_pending_scalar_lvalue_alternatives: Default::default(),
             decl_solve_field_int_veto: Default::default(),

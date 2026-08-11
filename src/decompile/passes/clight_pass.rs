@@ -44,7 +44,7 @@ fn scalar_int_type(width: usize, signed: bool) -> Option<ClightType> {
 fn scalar_access_types(proof: &ScalarMemoryAccessProof) -> Vec<ClightType> {
     let signed = match proof.extension {
         ScalarMemoryExtension::SignExtend => true,
-        ScalarMemoryExtension::ZeroExtend => false,
+        ScalarMemoryExtension::ZeroExtend | ScalarMemoryExtension::ImplicitZeroExtend => false,
         ScalarMemoryExtension::Plain => matches!(
             proof.chunk,
             MemoryChunk::MInt8Signed | MemoryChunk::MInt16Signed
@@ -54,9 +54,15 @@ fn scalar_access_types(proof: &ScalarMemoryAccessProof) -> Vec<ClightType> {
         return Vec::new();
     };
     let mut result = vec![primary];
-    // Plain MOV fixes width but not C signedness.  Keep the ambiguity bounded
-    // to the two scalar spellings rather than inventing a declaration type.
-    if proof.extension == ScalarMemoryExtension::Plain {
+    // Plain MOV fixes width but not C signedness. An EAX destination also
+    // authenticates upper-32 zeroing, but that architectural result still
+    // does not choose signed versus unsigned for the m32 source lvalue. Keep
+    // both isolated spellings; the closed final use plan deterministically
+    // selects one before either can enter a feature view.
+    if matches!(
+        proof.extension,
+        ScalarMemoryExtension::Plain | ScalarMemoryExtension::ImplicitZeroExtend
+    ) {
         if let Some(other) = scalar_int_type(proof.width, !signed) {
             if !result.contains(&other) {
                 result.push(other);
@@ -64,6 +70,37 @@ fn scalar_access_types(proof: &ScalarMemoryAccessProof) -> Vec<ClightType> {
         }
     }
     result
+}
+
+pub(crate) fn scalar_hoisted_load_value(
+    proof: &ScalarMemoryAccessProof,
+    lvalue: ClightExpr,
+) -> Option<ClightExpr> {
+    if proof.result_chain == Some(ScalarMemoryResultChain::ZeroUpper32) {
+        let encoded_signed = proof.extension == ScalarMemoryExtension::SignExtend;
+        let encoded_type = scalar_int_type(4, encoded_signed)?;
+        let unsigned32 = scalar_int_type(4, false)?;
+        let unsigned64 = scalar_int_type(8, false)?;
+        let encoded = ClightExpr::Ecast(Box::new(lvalue), encoded_type);
+        let zero_source = if encoded_signed {
+            ClightExpr::Ecast(Box::new(encoded), unsigned32)
+        } else {
+            encoded
+        };
+        return Some(ClightExpr::Ecast(Box::new(zero_source), unsigned64));
+    }
+    let signed = match proof.extension {
+        ScalarMemoryExtension::SignExtend => true,
+        ScalarMemoryExtension::ZeroExtend | ScalarMemoryExtension::ImplicitZeroExtend => false,
+        ScalarMemoryExtension::Plain => matches!(
+            proof.chunk,
+            MemoryChunk::MInt8Signed | MemoryChunk::MInt16Signed
+        ),
+    };
+    Some(ClightExpr::Ecast(
+        Box::new(lvalue),
+        scalar_int_type(proof.value_width, signed)?,
+    ))
 }
 
 fn scalar_long_constant_matches(expr: &CsharpminorExpr, expected: i64) -> bool {
@@ -278,7 +315,7 @@ fn scalar_memory_clight_candidates(
     proof: &ScalarMemoryAccessProof,
     statement: &CsharpminorStmt,
     all_var_types: &[(RTLReg, XType)],
-) -> Vec<(ScalarLvalueSourceForm, ClightStmt)> {
+) -> Vec<(ScalarLvalueSourceForm, ScalarLvaluePlacement, ClightStmt)> {
     if !proof.is_closed_v1() {
         return Vec::new();
     }
@@ -311,34 +348,51 @@ fn scalar_memory_clight_candidates(
                 lvalues.push((ScalarLvalueSourceForm::TypedScaled, scaled));
             }
             for (form, lvalue) in lvalues {
-                let statement = match stored_value {
+                let statements_with_placement = match stored_value {
+                    None
+                        if proof.extension == ScalarMemoryExtension::Plain
+                            && !matches!(proof.width, 1 | 2) =>
+                    {
+                        vec![(
+                            ScalarLvaluePlacement::Plain,
+                            ClightStmt::Sset(ident_from_reg(proof.value), lvalue),
+                        )]
+                    }
                     None => {
-                        let value = match proof.extension {
-                            ScalarMemoryExtension::Plain => lvalue,
-                            ScalarMemoryExtension::SignExtend => {
-                                let Some(result_type) = scalar_int_type(proof.value_width, true)
-                                else {
-                                    continue;
-                                };
-                                ClightExpr::Ecast(Box::new(lvalue), result_type)
-                            }
-                            ScalarMemoryExtension::ZeroExtend => {
-                                let Some(result_type) = scalar_int_type(proof.value_width, false)
-                                else {
-                                    continue;
-                                };
-                                ClightExpr::Ecast(Box::new(lvalue), result_type)
-                            }
+                        let Some(hoisted_value) =
+                            scalar_hoisted_load_value(proof, lvalue.clone())
+                        else {
+                            continue;
                         };
-                        ClightStmt::Sset(ident_from_reg(proof.value), value)
+                        vec![
+                            (
+                                ScalarLvaluePlacement::ExtensionPerUse,
+                                ClightStmt::Sset(ident_from_reg(proof.value), lvalue.clone()),
+                            ),
+                            (
+                                ScalarLvaluePlacement::ExtensionHoisted,
+                                ClightStmt::Sset(
+                                    ident_from_reg(proof.value),
+                                    hoisted_value,
+                                ),
+                            ),
+                        ]
                     }
                     Some(value) => {
                         let value = clight_expr_from_csharp_with_multi_types(value, var_types);
-                        ClightStmt::Sassign(lvalue, cast_expr_to_type(value, access_type.clone()))
+                        vec![(
+                            ScalarLvaluePlacement::Plain,
+                            ClightStmt::Sassign(
+                                lvalue,
+                                cast_expr_to_type(value, access_type.clone()),
+                            ),
+                        )]
                     }
                 };
-                if !statements.contains(&(form, statement.clone())) {
-                    statements.push((form, statement));
+                for (placement, statement) in statements_with_placement {
+                    if !statements.contains(&(form, placement, statement.clone())) {
+                        statements.push((form, placement, statement));
+                    }
                 }
             }
         }
@@ -387,7 +441,10 @@ ascent_par! {
     relation rtl_inst(Node, RTLInst);
     relation rtl_succ(Node, Node);
     relation scalar_lvalue_candidate(Node, ScalarMemoryAccessProof);
-    relation scalar_lvalue_source_candidate(Node, ScalarLvalueSourceForm, ClightStmt);
+    relation scalar_memory_use_plan(Node, ScalarMemoryUsePlan);
+    relation scalar_lvalue_source_candidate(
+        Node, ScalarLvalueSourceForm, ScalarLvaluePlacement, ClightStmt
+    );
     relation next(Address, Address);
     relation stack_var(Address, Address, i64, RTLReg);
     relation string_data(String, String, usize);
@@ -487,12 +544,23 @@ ascent_par! {
     // candidate pool, and widening it would make merely enabling the sidecar
     // change the primary source.  ClightSelect builds a separate fixed view
     // for the bounded feature solve.
-    scalar_lvalue_source_candidate(node, tagged.0, tagged.1.clone()) <--
+    scalar_lvalue_source_candidate(node, tagged.0, tagged.1, tagged.2.clone()) <--
         scalar_lvalue_candidate(node, proof),
         csharp_stmt(node, statement),
         all_var_types_global(all_var_types),
         let candidates = scalar_memory_clight_candidates(proof, statement, all_var_types),
-        for tagged in candidates.iter();
+        for tagged in candidates.iter(),
+        if tagged.1 == ScalarLvaluePlacement::Plain;
+
+    scalar_lvalue_source_candidate(node, tagged.0, tagged.1, tagged.2.clone()) <--
+        scalar_lvalue_candidate(node, proof),
+        scalar_memory_use_plan(node, plan),
+        if plan.is_closed_v1(proof),
+        csharp_stmt(node, statement),
+        all_var_types_global(all_var_types),
+        let candidates = scalar_memory_clight_candidates(proof, statement, all_var_types),
+        for tagged in candidates.iter(),
+        if tagged.1 != ScalarLvaluePlacement::Plain;
 
     clight_stmt_raw(node, stmt) <--
         clight_stmt(node, s),
@@ -5724,6 +5792,12 @@ mod scalar_lvalue_candidate_tests {
             operand: "scalar_candidate_memory",
             direction: ScalarMemoryDirection::Read,
             extension,
+            encoded_destination_width: Some(if extension == ScalarMemoryExtension::Plain {
+                width
+            } else {
+                8
+            }),
+            result_chain: Some(ScalarMemoryResultChain::Direct),
             address_size: 8,
             base_register: Mreg::CX,
             index_register: index.then_some(Mreg::DX),
@@ -5826,9 +5900,13 @@ mod scalar_lvalue_candidate_tests {
     }
 
     fn candidate_exprs(
-        candidate: &(ScalarLvalueSourceForm, ClightStmt),
+        candidate: &(
+            ScalarLvalueSourceForm,
+            ScalarLvaluePlacement,
+            ClightStmt,
+        ),
     ) -> Vec<&ClightExpr> {
-        exprs(&candidate.1)
+        exprs(&candidate.2)
     }
 
     fn contains_long(expr: &ClightExpr, expected: i64) -> bool {
@@ -5884,7 +5962,7 @@ mod scalar_lvalue_candidate_tests {
         assert!(!candidates.is_empty());
         assert!(candidates
             .iter()
-            .all(|(form, _)| *form == ScalarLvalueSourceForm::RawByte));
+            .all(|(form, _, _)| *form == ScalarLvalueSourceForm::RawByte));
         assert!(candidates
             .iter()
             .flat_map(candidate_exprs)
@@ -5904,10 +5982,10 @@ mod scalar_lvalue_candidate_tests {
         let candidates = scalar_memory_clight_candidates(&proof, &statement, &[]);
         assert!(candidates
             .iter()
-            .any(|(form, _)| *form == ScalarLvalueSourceForm::RawByte));
+            .any(|(form, _, _)| *form == ScalarLvalueSourceForm::RawByte));
         assert!(candidates
             .iter()
-            .any(|(form, _)| *form == ScalarLvalueSourceForm::TypedScaled));
+            .any(|(form, _, _)| *form == ScalarLvalueSourceForm::TypedScaled));
         assert!(candidates
             .iter()
             .flat_map(candidate_exprs)
@@ -5955,11 +6033,13 @@ mod scalar_lvalue_candidate_tests {
     fn scalar_store_keeps_the_exact_width_and_raw_byte_address() {
         let mut proof = proof(2, -6, false, ScalarMemoryExtension::Plain);
         proof.direction = ScalarMemoryDirection::Write;
+        proof.encoded_destination_width = None;
+        proof.result_chain = None;
         proof.downstream_value_width = None;
         let statement = store_stmt(&proof, csharp_address(CsharpminorExpr::Evar(BASE), &proof));
         let candidates = scalar_memory_clight_candidates(&proof, &statement, &[]);
         assert!(!candidates.is_empty());
-        assert!(candidates.iter().all(|(_, candidate)| matches!(
+        assert!(candidates.iter().all(|(_, _, candidate)| matches!(
             candidate,
             ClightStmt::Sassign(
                 ClightExpr::Ederef(_, ClightType::Tint(ClightIntSize::I16, _, _)),
@@ -5980,14 +6060,28 @@ mod scalar_lvalue_candidate_tests {
             let proof = proof(1, 0, false, extension);
             let statement = load_stmt(&proof, CsharpminorExpr::Evar(BASE));
             let candidates = scalar_memory_clight_candidates(&proof, &statement, &[]);
-            assert!(candidates
-                .iter()
-                .flat_map(candidate_exprs)
-                .all(|expression| matches!(
-                expression,
-                ClightExpr::Ecast(
-                    inner,
-                    ClightType::Tlong(result_sign, _)
+            assert_eq!(candidates.len(), 2);
+            assert!(candidates.iter().any(|(_, placement, statement)| matches!(
+                (placement, statement),
+                (
+                    ScalarLvaluePlacement::ExtensionPerUse,
+                    ClightStmt::Sset(
+                        _,
+                        ClightExpr::Ederef(
+                            _,
+                            ClightType::Tint(ClightIntSize::I8, source_sign, _)
+                        )
+                    )
+                ) if *source_sign == signedness
+            )));
+            assert!(candidates.iter().any(|(_, placement, statement)| matches!(
+                (placement, statement),
+                (
+                    ScalarLvaluePlacement::ExtensionHoisted,
+                    ClightStmt::Sset(
+                        _,
+                        ClightExpr::Ecast(inner, ClightType::Tlong(result_sign, _))
+                    )
                 ) if *result_sign == signedness
                     && matches!(
                         inner.as_ref(),
@@ -5998,6 +6092,58 @@ mod scalar_lvalue_candidate_tests {
                     )
             )));
         }
+    }
+
+    #[test]
+    fn implicit_eax_zeroing_keeps_both_source_signs_but_one_unsigned64_result() {
+        let mut proof = proof(
+            4,
+            0,
+            false,
+            ScalarMemoryExtension::ImplicitZeroExtend,
+        );
+        proof.encoded_destination_width = Some(4);
+        proof.result_chain = Some(ScalarMemoryResultChain::ZeroUpper32);
+        proof.value_width = 8;
+        proof.downstream_value_width = Some(8);
+        assert!(proof.is_closed_v1());
+        let statement = load_stmt(&proof, CsharpminorExpr::Evar(BASE));
+        let candidates = scalar_memory_clight_candidates(&proof, &statement, &[]);
+        let source_signs: std::collections::HashSet<_> = candidates
+            .iter()
+            .filter(|(_, placement, _)| {
+                *placement == ScalarLvaluePlacement::ExtensionHoisted
+            })
+            .filter_map(|(_, _, candidate)| match candidate {
+                ClightStmt::Sset(
+                    _,
+                    ClightExpr::Ecast(
+                        inner,
+                        ClightType::Tlong(ClightSignedness::Unsigned, _),
+                    ),
+                ) => {
+                    let mut inner = inner.as_ref();
+                    while let ClightExpr::Ecast(next, _) = inner {
+                        inner = next;
+                    }
+                    match inner {
+                        ClightExpr::Ederef(
+                            _,
+                            ClightType::Tint(ClightIntSize::I32, signedness, _),
+                        ) => Some(*signedness),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            source_signs,
+            std::collections::HashSet::from([
+                ClightSignedness::Signed,
+                ClightSignedness::Unsigned,
+            ]),
+        );
     }
 
     #[test]

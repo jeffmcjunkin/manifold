@@ -475,9 +475,40 @@ fn scalar_lvalue_integral_type_width(xtype: XType) -> Option<usize> {
     }
 }
 
+fn scalar_lvalue_integral_signedness(xtype: XType) -> Option<bool> {
+    match xtype {
+        XType::Xint8signed | XType::Xint16signed | XType::Xint | XType::Xlong => Some(true),
+        XType::Xint8unsigned
+        | XType::Xint16unsigned
+        | XType::Xintunsigned
+        | XType::Xlongunsigned => Some(false),
+        XType::Xany32
+        | XType::Xany64
+        | XType::Xbool
+        | XType::Xfloat
+        | XType::Xsingle
+        | XType::Xptr
+        | XType::Xcharptr
+        | XType::Xcharptrptr
+        | XType::Xintptr
+        | XType::Xfloatptr
+        | XType::Xsingleptr
+        | XType::Xfuncptr
+        | XType::Xvoid
+        | XType::XstructPtr(_) => None,
+    }
+}
+
 pub(crate) fn scalar_lvalue_extension_result_type(
     proof: &ScalarMemoryAccessProof,
 ) -> Option<XType> {
+    if proof.direction == ScalarMemoryDirection::Read
+        && proof.result_chain == Some(ScalarMemoryResultChain::ZeroUpper32)
+        && proof.encoded_destination_width == Some(4)
+        && proof.value_width == 8
+    {
+        return Some(XType::Xlongunsigned);
+    }
     match (proof.direction, proof.extension, proof.value_width) {
         (ScalarMemoryDirection::Read, ScalarMemoryExtension::SignExtend, 4) => Some(XType::Xint),
         (ScalarMemoryDirection::Read, ScalarMemoryExtension::ZeroExtend, 4) => {
@@ -487,6 +518,11 @@ pub(crate) fn scalar_lvalue_extension_result_type(
         (ScalarMemoryDirection::Read, ScalarMemoryExtension::ZeroExtend, 8) => {
             Some(XType::Xlongunsigned)
         }
+        (
+            ScalarMemoryDirection::Read,
+            ScalarMemoryExtension::ImplicitZeroExtend,
+            8,
+        ) => Some(XType::Xlongunsigned),
         _ => None,
     }
 }
@@ -531,7 +567,10 @@ pub(crate) fn scalar_lvalue_extension_type_rewrite(
     if pointer
         || !proof.is_closed_v1()
         || proof.direction != ScalarMemoryDirection::Read
-        || proof.extension == ScalarMemoryExtension::Plain
+        || matches!(
+            proof.extension,
+            ScalarMemoryExtension::Plain | ScalarMemoryExtension::ImplicitZeroExtend
+        )
         || types.is_empty()
     {
         return None;
@@ -541,6 +580,15 @@ pub(crate) fn scalar_lvalue_extension_type_rewrite(
     let mut transport_types = BTreeSet::from([selected]);
     if let Some(companion) = scalar_lvalue_extension_companion_type(proof) {
         transport_types.insert(companion);
+    }
+    if proof.result_chain == Some(ScalarMemoryResultChain::ZeroUpper32) {
+        transport_types.insert(match proof.extension {
+            ScalarMemoryExtension::SignExtend => XType::Xint,
+            ScalarMemoryExtension::ZeroExtend => XType::Xintunsigned,
+            ScalarMemoryExtension::Plain | ScalarMemoryExtension::ImplicitZeroExtend => {
+                return None;
+            }
+        });
     }
     types
         .iter()
@@ -574,6 +622,21 @@ fn filter_scalar_lvalues_with_final_types(db: &mut DecompileDB) {
     }
     proofs.sort();
     proofs.dedup();
+    let final_plan_context =
+        crate::decompile::passes::rtl_optimize_pass::ScalarMemoryFinalPlanContext::from_db(db);
+
+    let mut use_plans_by_proof: BTreeMap<
+        (Node, Address, RTLReg),
+        BTreeSet<ScalarMemoryUsePlan>,
+    > = BTreeMap::new();
+    for (node, plan) in
+        db.rel_iter::<(Node, ScalarMemoryUsePlan)>("cminor_scalar_memory_use_plan")
+    {
+        use_plans_by_proof
+            .entry((*node, plan.function, plan.value))
+            .or_default()
+            .insert(plan.clone());
+    }
 
     let pointer_values: BTreeSet<RTLReg> = db
         .rel_iter::<(RTLReg,)>("is_ptr")
@@ -610,10 +673,32 @@ fn filter_scalar_lvalues_with_final_types(db: &mut DecompileDB) {
     }
 
     let mut individually_valid = BTreeSet::new();
+    let mut accepted_plans = BTreeSet::new();
     let mut blocked_values = BTreeSet::new();
     let mut extension_rewrites: BTreeMap<RTLReg, ScalarExtensionTypeRewrite> = BTreeMap::new();
     for (node, proof) in &proofs {
         let types = types_by_value.get(&proof.value);
+        let plan = use_plans_by_proof
+            .get(&(*node, proof.function, proof.value))
+            .and_then(|plans| {
+                (plans.len() == 1)
+                    .then(|| plans.iter().next())
+                    .flatten()
+            })
+            .and_then(|plan| final_plan_context.finalized_plan(proof, plan))
+            .filter(|plan| {
+                std::iter::once(plan.value)
+                    .chain(plan.transports.iter().map(|transport| transport.output))
+                    .all(|value| {
+                        !pointer_values.contains(&value)
+                            && types_by_value.get(&value).is_some_and(|types| {
+                                !types.is_empty()
+                                    && types.iter().all(|xtype| {
+                                        scalar_lvalue_integral_type_width(*xtype).is_some()
+                                    })
+                            })
+                    })
+            });
         let valid = proof.is_closed_v1()
             && !pointer_values.contains(&proof.value)
             && types.is_some_and(|types| {
@@ -624,33 +709,65 @@ fn filter_scalar_lvalues_with_final_types(db: &mut DecompileDB) {
                     (ScalarMemoryDirection::Write, ScalarMemoryExtension::Plain) => types
                         .iter()
                         .all(|xtype| scalar_lvalue_integral_type_width(*xtype).is_some()),
+                    (ScalarMemoryDirection::Read, ScalarMemoryExtension::Plain)
+                        if matches!(proof.width, 1 | 2) =>
+                    {
+                        let expected_signed = matches!(
+                            proof.chunk,
+                            MemoryChunk::MInt8Signed | MemoryChunk::MInt16Signed
+                        );
+                        plan.is_some()
+                            && types.len() == 1
+                            && types.iter().all(|xtype| {
+                                scalar_lvalue_integral_type_width(*xtype)
+                                    .is_some_and(|width| width >= proof.width)
+                                    && scalar_lvalue_integral_signedness(*xtype)
+                                        == Some(expected_signed)
+                            })
+                    }
                     (ScalarMemoryDirection::Read, ScalarMemoryExtension::Plain) => {
                         types.iter().all(|xtype| {
                             scalar_lvalue_integral_type_width(*xtype) == Some(proof.value_width)
                         })
                     }
+                    (
+                        ScalarMemoryDirection::Read,
+                        ScalarMemoryExtension::ImplicitZeroExtend,
+                    ) => plan.is_some(),
                     (ScalarMemoryDirection::Read, _) => {
-                        signature_extensions.contains(&(*node, proof.clone()))
-                            && scalar_lvalue_extension_type_rewrite(proof, types, false).is_some()
-                            && returns_by_function
-                                .get(&proof.function)
-                                .map_or(true, |returns| {
-                                    !returns.contains(&proof.value)
-                                        || (returns == &BTreeSet::from([proof.value])
-                                            && final_returns_by_function.get(&proof.function)
-                                                == Some(&BTreeSet::from([
-                                                    scalar_lvalue_extension_result_type(proof)
-                                                        .expect("validated extension result"),
-                                                ])))
-                                })
+                        let legacy_signature_path =
+                            signature_extensions.contains(&(*node, proof.clone()));
+                        plan.is_some()
+                            || (legacy_signature_path
+                                && scalar_lvalue_extension_type_rewrite(proof, types, false)
+                                    .is_some()
+                                && returns_by_function
+                                    .get(&proof.function)
+                                    .map_or(true, |returns| {
+                                        !returns.contains(&proof.value)
+                                            || (returns == &BTreeSet::from([proof.value])
+                                                && final_returns_by_function.get(&proof.function)
+                                                    == Some(&BTreeSet::from([
+                                                        scalar_lvalue_extension_result_type(proof)
+                                                            .expect("validated extension result"),
+                                                    ])))
+                                    }))
                     }
                     (ScalarMemoryDirection::Write, _) => false,
                 }
             });
         if valid {
             individually_valid.insert((*node, proof.clone()));
+            if let Some(ref plan) = plan {
+                accepted_plans.insert((*node, plan.clone()));
+            }
             if proof.direction == ScalarMemoryDirection::Read
-                && proof.extension != ScalarMemoryExtension::Plain
+                && matches!(
+                    proof.extension,
+                    ScalarMemoryExtension::SignExtend | ScalarMemoryExtension::ZeroExtend
+                )
+                && signature_extensions.contains(&(*node, proof.clone()))
+                && plan.is_none()
             {
                 let rewrite = scalar_lvalue_extension_type_rewrite(
                     proof,
@@ -680,6 +797,13 @@ fn filter_scalar_lvalues_with_final_types(db: &mut DecompileDB) {
     db.rel_set(
         "cminor_scalar_memory_access",
         accepted.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+    accepted_plans.retain(|(_, plan)| !blocked_values.contains(&plan.value));
+    db.rel_set(
+        "cminor_scalar_memory_use_plan",
+        accepted_plans
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
     );
     if extension_rewrites.is_empty() {
         return;
@@ -712,6 +836,7 @@ ascent_par! {
 
     relation cminor_stmt(Node, CminorStmt);
     relation cminor_scalar_memory_access(Node, ScalarMemoryAccessProof);
+    relation cminor_scalar_memory_use_plan(Node, ScalarMemoryUsePlan);
     relation signature_scalar_extension_access(Node, ScalarMemoryAccessProof);
     relation trim_jump_table_impl(Node);
     // RTLOptimize's post-rewrite proof that one exact CR8 condition consumes
@@ -721,6 +846,7 @@ ascent_par! {
     // structuring pass intentionally selects one canonical statement per
     // node, while Clight may safely retain bounded source alternatives.
     relation scalar_lvalue_candidate(Node, ScalarMemoryAccessProof);
+    relation scalar_memory_use_plan(Node, ScalarMemoryUsePlan);
     #[local] relation scalar_lvalue_param_leaf_missing(Node);
 
     #[local] relation active_cminor_stmt(Node, CminorStmt);
@@ -742,6 +868,11 @@ ascent_par! {
         active_cminor_stmt(node, stmt),
         !scalar_lvalue_param_leaf_missing(node),
         if crate::decompile::passes::cminor_pass::scalar_memory_proof_matches_cminor(proof, stmt);
+
+    scalar_memory_use_plan(node, plan.clone()) <--
+        cminor_scalar_memory_use_plan(node, plan),
+        scalar_lvalue_candidate(node, proof),
+        if plan.is_closed_v1(proof);
 
     relation instr_in_function(Node, Address);
     relation rtl_succ(Node, Node);
@@ -1963,6 +2094,7 @@ mod cr8_byte_condition_tests {
 #[cfg(test)]
 mod scalar_lvalue_final_param_tests {
     use super::*;
+    use crate::x86::op::Comparison;
 
     const FUNCTION: Address = 0x2000;
     const NODE: Node = 0x2010;
@@ -1984,6 +2116,10 @@ mod scalar_lvalue_final_param_tests {
             operand: "scalar_final_param_memory",
             direction,
             extension,
+            encoded_destination_width: (direction == ScalarMemoryDirection::Read)
+                .then_some(value_width),
+            result_chain: (direction == ScalarMemoryDirection::Read)
+                .then_some(ScalarMemoryResultChain::Direct),
             address_size: 8,
             base_register: Mreg::CX,
             index_register: Some(Mreg::DX),
@@ -2049,6 +2185,62 @@ mod scalar_lvalue_final_param_tests {
         };
         db.rel_push("cminor_stmt", (NODE, statement));
         db.rel_push("cminor_scalar_memory_access", (NODE, proof.clone()));
+        if proof.direction == ScalarMemoryDirection::Read
+            && proof.extension == ScalarMemoryExtension::Plain
+            && matches!(proof.width, 1 | 2)
+        {
+            let use_node = NODE + 0x10;
+            let required_type = match proof.chunk {
+                MemoryChunk::MInt8Signed => ScalarMemoryUseType::Signed8,
+                MemoryChunk::MInt8Unsigned => ScalarMemoryUseType::Unsigned8,
+                MemoryChunk::MInt16Signed => ScalarMemoryUseType::Signed16,
+                MemoryChunk::MInt16Unsigned => ScalarMemoryUseType::Unsigned16,
+                _ => unreachable!("sealed narrow Plain fixture"),
+            };
+            db.rel_push(
+                "cminor_scalar_memory_use_plan",
+                (
+                    NODE,
+                    ScalarMemoryUsePlan {
+                        function: FUNCTION,
+                        definition_node: NODE,
+                        value: VALUE,
+                        transports: Arc::new(Vec::new()),
+                        sites: Arc::new(vec![ScalarMemoryUseSite {
+                            node: use_node,
+                            value: VALUE,
+                            required_type,
+                        }]),
+                    },
+                ),
+            );
+            db.rel_push(
+                "rtl_inst",
+                (
+                    NODE,
+                    RTLInst::Iload(
+                        proof.chunk,
+                        Addressing::Aindexed2scaled(4, 8),
+                        Arc::new(vec![BASE, INDEX]),
+                        VALUE,
+                    ),
+                ),
+            );
+            db.rel_push(
+                "rtl_inst",
+                (
+                    use_node,
+                    RTLInst::Istore(
+                        proof.chunk,
+                        Addressing::Aindexed(0),
+                        Arc::new(vec![BASE]),
+                        VALUE,
+                    ),
+                ),
+            );
+            db.rel_push("instr_in_function", (NODE, FUNCTION));
+            db.rel_push("instr_in_function", (use_node, FUNCTION));
+        }
         if signature_marker && proof.extension != ScalarMemoryExtension::Plain {
             db.rel_push("signature_scalar_extension_access", (NODE, proof));
         }
@@ -2073,6 +2265,112 @@ mod scalar_lvalue_final_param_tests {
         db.rel_iter::<(Node, ScalarMemoryAccessProof)>("scalar_lvalue_candidate")
             .filter(|(node, _)| *node == NODE)
             .count()
+    }
+
+    fn plan_backed_wide_movsx_case(
+        types: &[XType],
+        pointer: bool,
+        duplicate_plan: bool,
+    ) -> DecompileDB {
+        let mut extension = proof(
+            ScalarMemoryDirection::Read,
+            ScalarMemoryExtension::SignExtend,
+            1,
+            8,
+            MemoryChunk::MInt8Unsigned,
+        );
+        extension.encoded_destination_width = Some(4);
+        extension.result_chain = Some(ScalarMemoryResultChain::ZeroUpper32);
+        let condition = NODE + 0x10;
+        let store = NODE + 0x20;
+        let plan = ScalarMemoryUsePlan {
+            function: FUNCTION,
+            definition_node: NODE,
+            value: VALUE,
+            transports: Arc::new(Vec::new()),
+            sites: Arc::new(vec![
+                ScalarMemoryUseSite {
+                    node: condition,
+                    value: VALUE,
+                    required_type: ScalarMemoryUseType::Signed32,
+                },
+                ScalarMemoryUseSite {
+                    node: store,
+                    value: VALUE,
+                    required_type: ScalarMemoryUseType::Unsigned64,
+                },
+            ]),
+        };
+        let mut db = DecompileDB::default();
+        db.rel_push(
+            "cminor_stmt",
+            (
+                NODE,
+                CminorStmt::Sassign(
+                    VALUE,
+                    CminorExpr::Eload(
+                        extension.chunk,
+                        Addressing::Aindexed2scaled(4, 8),
+                        Arc::new(vec![BASE, INDEX]),
+                    ),
+                ),
+            ),
+        );
+        db.rel_push(
+            "cminor_scalar_memory_access",
+            (NODE, extension.clone()),
+        );
+        db.rel_push("cminor_scalar_memory_use_plan", (NODE, plan.clone()));
+        if duplicate_plan {
+            let mut competing = plan.clone();
+            let mut sites = competing.sites.as_ref().clone();
+            sites[0].required_type = ScalarMemoryUseType::Unsigned32;
+            competing.sites = Arc::new(sites);
+            db.rel_push("cminor_scalar_memory_use_plan", (NODE, competing));
+        }
+        for (node, instruction) in [
+            (
+                NODE,
+                RTLInst::Iload(
+                    extension.chunk,
+                    Addressing::Aindexed2scaled(4, 8),
+                    Arc::new(vec![BASE, INDEX]),
+                    VALUE,
+                ),
+            ),
+            (
+                condition,
+                RTLInst::Icond(
+                    Condition::Ccompimm(Comparison::Cge, 0),
+                    Arc::new(vec![VALUE]),
+                    either::Either::Right(condition + 4),
+                    either::Either::Right(condition + 8),
+                ),
+            ),
+            (
+                store,
+                RTLInst::Istore(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed(0),
+                    Arc::new(vec![BASE]),
+                    VALUE,
+                ),
+            ),
+        ] {
+            db.rel_push("rtl_inst", (node, instruction));
+            db.rel_push("instr_in_function", (node, FUNCTION));
+        }
+        for parameter in [BASE, INDEX] {
+            db.rel_push("emit_function_param", (FUNCTION, parameter));
+        }
+        for xtype in types {
+            db.rel_push("emit_var_type_candidate", (VALUE, *xtype));
+        }
+        if pointer {
+            db.rel_push("is_ptr", (VALUE,));
+        }
+        CshminorPass.run(&mut db);
+        db
     }
 
     fn plain_read_proof() -> ScalarMemoryAccessProof {
@@ -2118,6 +2416,72 @@ mod scalar_lvalue_final_param_tests {
     }
 
     #[test]
+    fn scalar_lvalue_plain_low_lane_requires_unique_matching_final_signedness() {
+        for (chunk, width, accepted, rejected) in [
+            (
+                MemoryChunk::MInt8Signed,
+                1,
+                XType::Xint8signed,
+                XType::Xint8unsigned,
+            ),
+            (
+                MemoryChunk::MInt8Unsigned,
+                1,
+                XType::Xint8unsigned,
+                XType::Xint8signed,
+            ),
+            (
+                MemoryChunk::MInt16Signed,
+                2,
+                XType::Xint16signed,
+                XType::Xint16unsigned,
+            ),
+            (
+                MemoryChunk::MInt16Unsigned,
+                2,
+                XType::Xint16unsigned,
+                XType::Xint16signed,
+            ),
+        ] {
+            let plain = proof(
+                ScalarMemoryDirection::Read,
+                ScalarMemoryExtension::Plain,
+                width,
+                width,
+                chunk,
+            );
+            assert_eq!(
+                candidate_count(&run_case(
+                    plain.clone(),
+                    &[BASE, INDEX],
+                    &[accepted],
+                    false,
+                )),
+                1,
+            );
+            assert_eq!(
+                candidate_count(&run_case(
+                    plain.clone(),
+                    &[BASE, INDEX],
+                    &[rejected],
+                    false,
+                )),
+                0,
+            );
+            assert_eq!(
+                candidate_count(&run_case(
+                    plain,
+                    &[BASE, INDEX],
+                    &[accepted, rejected],
+                    false,
+                )),
+                0,
+                "mixed late signedness must not be solver-selected",
+            );
+        }
+    }
+
+    #[test]
     fn scalar_lvalue_store_rejects_late_float_source_without_numeric_cast() {
         let store = proof(
             ScalarMemoryDirection::Write,
@@ -2128,6 +2492,34 @@ mod scalar_lvalue_final_param_tests {
         );
         let db = run_case(store, &[BASE, INDEX], &[XType::Xfloat], false);
         assert_eq!(candidate_count(&db), 0);
+    }
+
+    #[test]
+    fn scalar_lvalue_plan_backed_extension_preserves_canonical_types_and_rejects_ambiguity() {
+        let accepted = plan_backed_wide_movsx_case(&[XType::Xlong], false, false);
+        assert_eq!(candidate_count(&accepted), 1);
+        assert!(accepted
+            .rel_iter::<(Node, ScalarMemoryUsePlan)>("scalar_memory_use_plan")
+            .any(|(node, plan)| *node == NODE
+                && plan.sites.iter().any(|site| {
+                    site.required_type == ScalarMemoryUseType::Signed32
+                })
+                && plan.sites.iter().any(|site| {
+                    site.required_type == ScalarMemoryUseType::Unsigned64
+                })));
+        let types: BTreeSet<_> = accepted
+            .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .filter_map(|(value, xtype)| (*value == VALUE).then_some(*xtype))
+            .collect();
+        assert_eq!(types, BTreeSet::from([XType::Xlong]));
+
+        for rejected in [
+            plan_backed_wide_movsx_case(&[XType::Xfloat], false, false),
+            plan_backed_wide_movsx_case(&[XType::Xlong], true, false),
+            plan_backed_wide_movsx_case(&[XType::Xlong], false, true),
+        ] {
+            assert_eq!(candidate_count(&rejected), 0);
+        }
     }
 
     #[test]

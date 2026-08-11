@@ -2182,6 +2182,8 @@ mod tests {
             operand: "signature_scalar_memory",
             direction: ScalarMemoryDirection::Read,
             extension,
+            encoded_destination_width: Some(value_width),
+            result_chain: Some(ScalarMemoryResultChain::Direct),
             address_size: 8,
             base_register: Mreg::CX,
             index_register: Some(Mreg::DX),

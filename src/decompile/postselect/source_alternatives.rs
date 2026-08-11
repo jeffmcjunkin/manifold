@@ -15,10 +15,14 @@ use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::c_pass::types::{
     CBlockItem, CExpr, CStmt, FuncDef, TopLevelDecl, TranslationUnit,
 };
-use crate::decompile::passes::clight_select::select::SelectedFunction;
+use crate::decompile::passes::clight_select::select::{
+    ScalarSourceAlternativeFamily, SelectedFunction,
+};
 
-pub const SOURCE_ALTERNATIVES_SCHEMA: &str = "manifold-source-alternatives-v2";
-pub const MAX_SOURCE_ALTERNATIVES_PER_FUNCTION: usize = 2;
+pub const SOURCE_ALTERNATIVES_SCHEMA: &str = "manifold-source-alternatives-v3";
+/// Two ordinary rows plus at most two typed, two field, and four extension
+/// rows. No unused wire capacity is advertised.
+pub const MAX_SOURCE_ALTERNATIVES_PER_FUNCTION: usize = 10;
 pub const MAX_TOTAL_SOURCE_ALTERNATIVES: usize = 4096;
 pub const MAX_SOURCE_ALTERNATIVE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_SOURCE_ALTERNATIVE_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
@@ -112,6 +116,12 @@ pub enum SourceAlternativeBoundary {
     PreVarReduce,
     ScalarLvaluePreVarReduce,
     ScalarLvaluePostVarReduce,
+    ScalarFieldPreVarReduce,
+    ScalarFieldPostVarReduce,
+    ScalarExtensionPerUsePreVarReduce,
+    ScalarExtensionPerUsePostVarReduce,
+    ScalarExtensionHoistedPreVarReduce,
+    ScalarExtensionHoistedPostVarReduce,
 }
 
 impl SourceAlternativeBoundary {
@@ -121,6 +131,20 @@ impl SourceAlternativeBoundary {
             Self::PreVarReduce => "pre_var_reduce",
             Self::ScalarLvaluePreVarReduce => "scalar_lvalue_pre_var_reduce",
             Self::ScalarLvaluePostVarReduce => "scalar_lvalue_post_var_reduce",
+            Self::ScalarFieldPreVarReduce => "scalar_field_pre_var_reduce",
+            Self::ScalarFieldPostVarReduce => "scalar_field_post_var_reduce",
+            Self::ScalarExtensionPerUsePreVarReduce => {
+                "scalar_extension_per_use_pre_var_reduce"
+            }
+            Self::ScalarExtensionPerUsePostVarReduce => {
+                "scalar_extension_per_use_post_var_reduce"
+            }
+            Self::ScalarExtensionHoistedPreVarReduce => {
+                "scalar_extension_hoisted_pre_var_reduce"
+            }
+            Self::ScalarExtensionHoistedPostVarReduce => {
+                "scalar_extension_hoisted_post_var_reduce"
+            }
         }
     }
 }
@@ -141,11 +165,12 @@ pub struct SourceAlternativeSnapshot {
 /// Provider-owned typed-lvalue function assembled through the same Clight/C
 /// path as the canonical definition.  It is kept private until the two
 /// destructive post-selection boundaries have run; only then can the exact
-/// pre/post forms be admitted to the v2 wire manifest.
+/// pre/post forms be admitted to the current family-atomic wire manifest.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingScalarLvalueAlternative {
     pub manifold_name: String,
     pub manifold_address: u64,
+    pub family: ScalarSourceAlternativeFamily,
     pub function: FuncDef,
 }
 
@@ -467,7 +492,13 @@ pub fn snapshot_if_changed(
         SourceAlternativeBoundary::PreForLoop => vec!["control_layout"],
         SourceAlternativeBoundary::PreVarReduce => vec!["local_lifetime"],
         SourceAlternativeBoundary::ScalarLvaluePreVarReduce
-        | SourceAlternativeBoundary::ScalarLvaluePostVarReduce => return None,
+        | SourceAlternativeBoundary::ScalarLvaluePostVarReduce
+        | SourceAlternativeBoundary::ScalarFieldPreVarReduce
+        | SourceAlternativeBoundary::ScalarFieldPostVarReduce
+        | SourceAlternativeBoundary::ScalarExtensionPerUsePreVarReduce
+        | SourceAlternativeBoundary::ScalarExtensionPerUsePostVarReduce
+        | SourceAlternativeBoundary::ScalarExtensionHoistedPreVarReduce
+        | SourceAlternativeBoundary::ScalarExtensionHoistedPostVarReduce => return None,
     };
     match boundary {
         SourceAlternativeBoundary::PreForLoop => {
@@ -489,7 +520,13 @@ pub fn snapshot_if_changed(
             }
         }
         SourceAlternativeBoundary::ScalarLvaluePreVarReduce
-        | SourceAlternativeBoundary::ScalarLvaluePostVarReduce => unreachable!(),
+        | SourceAlternativeBoundary::ScalarLvaluePostVarReduce
+        | SourceAlternativeBoundary::ScalarFieldPreVarReduce
+        | SourceAlternativeBoundary::ScalarFieldPostVarReduce
+        | SourceAlternativeBoundary::ScalarExtensionPerUsePreVarReduce
+        | SourceAlternativeBoundary::ScalarExtensionPerUsePostVarReduce
+        | SourceAlternativeBoundary::ScalarExtensionHoistedPreVarReduce
+        | SourceAlternativeBoundary::ScalarExtensionHoistedPostVarReduce => unreachable!(),
     }
     kinds.sort_unstable();
     kinds.dedup();
@@ -503,9 +540,122 @@ pub fn snapshot_if_changed(
     })
 }
 
-/// Atomically construct the two v2 typed-lvalue forms.  A caller cannot
-/// publish only one boundary: any identity/signature/equality failure rejects
-/// the pair before it reaches the bounded snapshot store.
+fn scalar_feature_boundary_data(
+    family: ScalarSourceAlternativeFamily,
+) -> [
+    (
+        SourceAlternativeBoundary,
+        Vec<&'static str>,
+    );
+    2
+] {
+    match family {
+        ScalarSourceAlternativeFamily::TypedLvalue => [
+            (
+                SourceAlternativeBoundary::ScalarLvaluePreVarReduce,
+                vec!["local_lifetime", "typed_lvalue"],
+            ),
+            (
+                SourceAlternativeBoundary::ScalarLvaluePostVarReduce,
+                vec!["typed_lvalue"],
+            ),
+        ],
+        ScalarSourceAlternativeFamily::FieldLvalue => [
+            (
+                SourceAlternativeBoundary::ScalarFieldPreVarReduce,
+                vec!["local_lifetime", "typed_lvalue", "field_lvalue"],
+            ),
+            (
+                SourceAlternativeBoundary::ScalarFieldPostVarReduce,
+                vec!["typed_lvalue", "field_lvalue"],
+            ),
+        ],
+        ScalarSourceAlternativeFamily::ExtensionPerUse => [
+            (
+                SourceAlternativeBoundary::ScalarExtensionPerUsePreVarReduce,
+                vec!["local_lifetime", "typed_lvalue", "per_use_extension"],
+            ),
+            (
+                SourceAlternativeBoundary::ScalarExtensionPerUsePostVarReduce,
+                vec!["typed_lvalue", "per_use_extension"],
+            ),
+        ],
+        ScalarSourceAlternativeFamily::ExtensionHoisted => [
+            (
+                SourceAlternativeBoundary::ScalarExtensionHoistedPreVarReduce,
+                vec!["local_lifetime", "typed_lvalue", "hoisted_extension"],
+            ),
+            (
+                SourceAlternativeBoundary::ScalarExtensionHoistedPostVarReduce,
+                vec!["typed_lvalue", "hoisted_extension"],
+            ),
+        ],
+    }
+}
+
+/// Construct the useful printed forms of one v3 family in fixed `[pre, post]`
+/// order. Forms equal to canonical source are discarded and equal alternative
+/// sources collapse to their first boundary. This deliberately permits a
+/// stable one-record profile while keeping identity and signature checks closed.
+pub fn scalar_feature_snapshots(
+    declaration_index: usize,
+    manifold_address: u64,
+    family: ScalarSourceAlternativeFamily,
+    canonical: &FuncDef,
+    pre_var_reduce: &FuncDef,
+    post_var_reduce: &FuncDef,
+) -> Option<Vec<SourceAlternativeSnapshot>> {
+    scalar_feature_snapshots_for_format(
+        declaration_index,
+        manifold_address,
+        family,
+        canonical,
+        pre_var_reduce,
+        post_var_reduce,
+        BinaryFormat::Coff,
+    )
+}
+
+pub fn scalar_feature_snapshots_for_format(
+    declaration_index: usize,
+    manifold_address: u64,
+    family: ScalarSourceAlternativeFamily,
+    canonical: &FuncDef,
+    pre_var_reduce: &FuncDef,
+    post_var_reduce: &FuncDef,
+    format: BinaryFormat,
+) -> Option<Vec<SourceAlternativeSnapshot>> {
+    if !same_signature(canonical, pre_var_reduce)
+        || !same_signature(canonical, post_var_reduce)
+    {
+        return None;
+    }
+    let canonical_source = one_function_source(canonical, format);
+    let mut seen_sources = HashSet::new();
+    let mut snapshots = Vec::new();
+    for ((boundary, kinds), function) in scalar_feature_boundary_data(family)
+        .into_iter()
+        .zip([pre_var_reduce, post_var_reduce])
+    {
+        let source = one_function_source(function, format);
+        if source == canonical_source || !seen_sources.insert(source) {
+            continue;
+        }
+        snapshots.push(SourceAlternativeSnapshot {
+            declaration_index,
+            manifold_name: canonical.name.clone(),
+            manifold_address,
+            boundary,
+            kinds,
+            function: function.clone(),
+        });
+    }
+    (!snapshots.is_empty()).then_some(snapshots)
+}
+
+/// Backward-compatible internal constructor used by the v2 regression
+/// fixtures. The wire schema is v3, but the Stage-2 family bytes and kinds are
+/// intentionally unchanged.
 pub fn scalar_lvalue_snapshot_pair(
     declaration_index: usize,
     manifold_address: u64,
@@ -521,21 +671,23 @@ pub fn scalar_lvalue_snapshot_pair(
     {
         return None;
     }
+    let [(pre_boundary, pre_kinds), (post_boundary, post_kinds)] =
+        scalar_feature_boundary_data(ScalarSourceAlternativeFamily::TypedLvalue);
     Some([
         SourceAlternativeSnapshot {
             declaration_index,
             manifold_name: canonical.name.clone(),
             manifold_address,
-            boundary: SourceAlternativeBoundary::ScalarLvaluePreVarReduce,
-            kinds: vec!["local_lifetime", "typed_lvalue"],
+            boundary: pre_boundary,
+            kinds: pre_kinds,
             function: pre_var_reduce.clone(),
         },
         SourceAlternativeSnapshot {
             declaration_index,
             manifold_name: canonical.name.clone(),
             manifold_address,
-            boundary: SourceAlternativeBoundary::ScalarLvaluePostVarReduce,
-            kinds: vec!["typed_lvalue"],
+            boundary: post_boundary,
+            kinds: post_kinds,
             function: post_var_reduce.clone(),
         },
     ])
@@ -586,6 +738,38 @@ fn same_signature(left: &FuncDef, right: &FuncDef) -> bool {
         && left.params == right.params
         && left.is_variadic == right.is_variadic
         && left.storage_class == right.storage_class
+}
+
+fn feature_boundary_family(
+    boundary: SourceAlternativeBoundary,
+) -> Option<(ScalarSourceAlternativeFamily, bool)> {
+    match boundary {
+        SourceAlternativeBoundary::ScalarLvaluePreVarReduce => {
+            Some((ScalarSourceAlternativeFamily::TypedLvalue, true))
+        }
+        SourceAlternativeBoundary::ScalarLvaluePostVarReduce => {
+            Some((ScalarSourceAlternativeFamily::TypedLvalue, false))
+        }
+        SourceAlternativeBoundary::ScalarFieldPreVarReduce => {
+            Some((ScalarSourceAlternativeFamily::FieldLvalue, true))
+        }
+        SourceAlternativeBoundary::ScalarFieldPostVarReduce => {
+            Some((ScalarSourceAlternativeFamily::FieldLvalue, false))
+        }
+        SourceAlternativeBoundary::ScalarExtensionPerUsePreVarReduce => {
+            Some((ScalarSourceAlternativeFamily::ExtensionPerUse, true))
+        }
+        SourceAlternativeBoundary::ScalarExtensionPerUsePostVarReduce => {
+            Some((ScalarSourceAlternativeFamily::ExtensionPerUse, false))
+        }
+        SourceAlternativeBoundary::ScalarExtensionHoistedPreVarReduce => {
+            Some((ScalarSourceAlternativeFamily::ExtensionHoisted, true))
+        }
+        SourceAlternativeBoundary::ScalarExtensionHoistedPostVarReduce => {
+            Some((ScalarSourceAlternativeFamily::ExtensionHoisted, false))
+        }
+        SourceAlternativeBoundary::PreForLoop | SourceAlternativeBoundary::PreVarReduce => None,
+    }
 }
 
 fn append_digest_field(material: &mut Vec<u8>, field: &[u8]) {
@@ -660,6 +844,34 @@ fn render_manifest_with_limits(
     max_source_bytes: usize,
     max_manifest_bytes: usize,
 ) -> serde_json::Result<Option<String>> {
+    render_manifest_with_limits_inner(
+        final_tu,
+        snapshots,
+        capture_overflowed,
+        exclusions,
+        exact_function_identities,
+        canonical_translation_unit_source,
+        format,
+        max_total,
+        max_source_bytes,
+        max_manifest_bytes,
+        true,
+    )
+}
+
+fn render_manifest_with_limits_inner(
+    final_tu: &TranslationUnit,
+    snapshots: &[SourceAlternativeSnapshot],
+    capture_overflowed: bool,
+    exclusions: &SourceAlternativeExclusions,
+    exact_function_identities: &[(String, u64)],
+    canonical_translation_unit_source: &str,
+    format: BinaryFormat,
+    max_total: usize,
+    max_source_bytes: usize,
+    max_manifest_bytes: usize,
+    allow_feature_fallback: bool,
+) -> serde_json::Result<Option<String>> {
     if capture_overflowed || exclusions.suppress_all {
         return Ok(None);
     }
@@ -671,6 +883,33 @@ fn render_manifest_with_limits(
             "canonical optimized translation unit changed before alternative emission",
         )));
     }
+    let fallback_to_ordinary = || {
+        if !allow_feature_fallback
+            || !snapshots
+                .iter()
+                .any(|snapshot| feature_boundary_family(snapshot.boundary).is_some())
+        {
+            return Ok(None);
+        }
+        let ordinary: Vec<_> = snapshots
+            .iter()
+            .filter(|snapshot| feature_boundary_family(snapshot.boundary).is_none())
+            .cloned()
+            .collect();
+        render_manifest_with_limits_inner(
+            final_tu,
+            &ordinary,
+            capture_overflowed,
+            exclusions,
+            exact_function_identities,
+            canonical_translation_unit_source,
+            format,
+            max_total,
+            max_source_bytes,
+            max_manifest_bytes,
+            false,
+        )
+    };
     // The translation-unit printer category-orders declarations while retaining
     // relative order within each category.  FuncDefs therefore appear in their
     // declaration-relative order, minus definitions the printer omits as empty.
@@ -692,87 +931,177 @@ fn render_manifest_with_limits(
         .enumerate()
         .map(|(function_ordinal, (declaration_index, _))| (*declaration_index, function_ordinal))
         .collect();
-    let is_scalar_lvalue_boundary = |boundary| {
-        matches!(
-            boundary,
-            SourceAlternativeBoundary::ScalarLvaluePreVarReduce
-                | SourceAlternativeBoundary::ScalarLvaluePostVarReduce
-        )
+    let snapshot_source_if_valid = |snapshot: &SourceAlternativeSnapshot| {
+        if exclusions.excludes(&snapshot.manifold_name, snapshot.manifold_address)
+            || !wire_ordinal_by_declaration.contains_key(&snapshot.declaration_index)
+        {
+            return None;
+        }
+        let canonical = final_tu
+            .decls
+            .get(snapshot.declaration_index)
+            .and_then(|declaration| match declaration {
+                TopLevelDecl::FuncDef(function) => Some(function),
+                _ => None,
+            })?;
+        if snapshot.manifold_name != canonical.name
+            || !same_signature(canonical, &snapshot.function)
+            || exact_function_identities
+                .iter()
+                .filter(|(name, address)| {
+                    name == &snapshot.manifold_name && *address == snapshot.manifold_address
+                })
+                .count()
+                != 1
+        {
+            return None;
+        }
+        let canonical_source = one_function_source(canonical, format);
+        let alternative_source = one_function_source(&snapshot.function, format);
+        (canonical_source != alternative_source).then_some(alternative_source)
     };
-    let mut feature_groups: HashMap<usize, Vec<&SourceAlternativeSnapshot>> = HashMap::new();
+
+    // The project adapter rejects duplicate printed alternatives across every
+    // family of one function. Ordinary Stage-1 rows have permanent priority:
+    // compute their exact emitted source set first, then admit later feature
+    // families atomically only when their whole source set is disjoint. The
+    // normal Stage-1 pipeline cannot produce equal pre-forloop and
+    // pre-var-reduce sources (the first exists only when ForLoop changed it),
+    // but a forged duplicate must still suppress the malformed sidecar rather
+    // than silently dropping either historical row.
+    let mut ordinary_key_counts = HashMap::new();
     for snapshot in snapshots
         .iter()
-        .filter(|snapshot| is_scalar_lvalue_boundary(snapshot.boundary))
+        .filter(|snapshot| feature_boundary_family(snapshot.boundary).is_none())
     {
-        feature_groups
+        *ordinary_key_counts
+            .entry((snapshot.declaration_index, snapshot.boundary))
+            .or_insert(0usize) += 1;
+    }
+    let mut admitted_sources: HashMap<usize, HashSet<String>> = HashMap::new();
+    for snapshot in snapshots
+        .iter()
+        .filter(|snapshot| feature_boundary_family(snapshot.boundary).is_none())
+    {
+        if ordinary_key_counts
+            .get(&(snapshot.declaration_index, snapshot.boundary))
+            .copied()
+            != Some(1)
+        {
+            continue;
+        }
+        let Some(source) = snapshot_source_if_valid(snapshot) else {
+            continue;
+        };
+        if !admitted_sources
             .entry(snapshot.declaration_index)
+            .or_default()
+            .insert(source)
+        {
+            return Ok(None);
+        }
+    }
+
+    let mut feature_groups: HashMap<
+        (usize, ScalarSourceAlternativeFamily),
+        Vec<&SourceAlternativeSnapshot>,
+    > = HashMap::new();
+    for snapshot in snapshots
+        .iter()
+        .filter(|snapshot| feature_boundary_family(snapshot.boundary).is_some())
+    {
+        let (family, _) = feature_boundary_family(snapshot.boundary)
+            .expect("feature boundary filtered above");
+        feature_groups
+            .entry((snapshot.declaration_index, family))
             .or_default()
             .push(snapshot);
     }
-    let valid_feature_declarations: HashSet<usize> = feature_groups
-        .into_iter()
-        .filter_map(|(declaration_index, group)| {
-            if group.len() != 2
-                || group
-                    .iter()
-                    .filter(|snapshot| {
-                        snapshot.boundary
-                            == SourceAlternativeBoundary::ScalarLvaluePreVarReduce
-                    })
-                    .count()
-                    != 1
-                || group
-                    .iter()
-                    .filter(|snapshot| {
-                        snapshot.boundary
-                            == SourceAlternativeBoundary::ScalarLvaluePostVarReduce
-                    })
-                    .count()
-                    != 1
-            {
+    let group_sources_if_valid = |family: ScalarSourceAlternativeFamily,
+                                  group: &[&SourceAlternativeSnapshot]| {
+            if group.is_empty() || group.len() > 2 {
                 return None;
             }
-            let canonical = final_tu.decls.get(declaration_index).and_then(|declaration| {
-                if let TopLevelDecl::FuncDef(function) = declaration {
-                    Some(function)
-                } else {
-                    None
-                }
-            })?;
+            let mut boundaries = HashSet::new();
             if group.iter().any(|snapshot| {
-                snapshot.manifold_name != canonical.name
-                    || !same_signature(canonical, &snapshot.function)
-                    || exclusions.excludes(&snapshot.manifold_name, snapshot.manifold_address)
-                    || exact_function_identities
-                        .iter()
-                        .filter(|(name, address)| {
-                            name == &snapshot.manifold_name
-                                && *address == snapshot.manifold_address
-                        })
-                        .count()
-                        != 1
+                feature_boundary_family(snapshot.boundary)
+                    .map_or(true, |(snapshot_family, _)| snapshot_family != family)
+                    || scalar_feature_boundary_data(family)
+                        .into_iter()
+                        .find(|(boundary, _)| *boundary == snapshot.boundary)
+                        .map_or(true, |(_, kinds)| kinds != snapshot.kinds)
+                    || !boundaries.insert(snapshot.boundary)
             }) {
                 return None;
             }
-            let canonical_source = one_function_source(canonical, format);
-            let alternatives: Vec<String> = group
-                .iter()
-                .map(|snapshot| one_function_source(&snapshot.function, format))
-                .collect();
-            (alternatives[0] != canonical_source
-                && alternatives[1] != canonical_source
-                && alternatives[0] != alternatives[1])
-                .then_some(declaration_index)
-        })
+            let mut alternative_sources = HashSet::new();
+            for snapshot in group {
+                let source = snapshot_source_if_valid(snapshot)?;
+                if !alternative_sources.insert(source) {
+                    return None;
+                }
+            }
+            Some(alternative_sources)
+        };
+    let mut valid_feature_groups = HashSet::new();
+    let feature_declarations: std::collections::BTreeSet<usize> = feature_groups
+        .keys()
+        .map(|(declaration_index, _)| *declaration_index)
         .collect();
+    for declaration_index in feature_declarations {
+        for family in [
+            ScalarSourceAlternativeFamily::TypedLvalue,
+            ScalarSourceAlternativeFamily::FieldLvalue,
+        ] {
+            let key = (declaration_index, family);
+            let Some(sources) = feature_groups
+                .get(&key)
+                .and_then(|group| group_sources_if_valid(family, group))
+            else {
+                continue;
+            };
+            let used = admitted_sources.entry(declaration_index).or_default();
+            if sources.is_disjoint(used) {
+                used.extend(sources);
+                valid_feature_groups.insert(key);
+            }
+        }
+
+        let per_use = (
+            declaration_index,
+            ScalarSourceAlternativeFamily::ExtensionPerUse,
+        );
+        let hoisted = (
+            declaration_index,
+            ScalarSourceAlternativeFamily::ExtensionHoisted,
+        );
+        let per_use_sources = feature_groups
+            .get(&per_use)
+            .and_then(|group| group_sources_if_valid(per_use.1, group));
+        let hoisted_sources = feature_groups
+            .get(&hoisted)
+            .and_then(|group| group_sources_if_valid(hoisted.1, group));
+        if let (Some(per_use_sources), Some(hoisted_sources)) =
+            (per_use_sources, hoisted_sources)
+        {
+            let mut extension_sources = per_use_sources;
+            let placements_are_disjoint = hoisted_sources
+                .iter()
+                .all(|source| extension_sources.insert(source.clone()));
+            let used = admitted_sources.entry(declaration_index).or_default();
+            if placements_are_disjoint && extension_sources.is_disjoint(used) {
+                used.extend(extension_sources);
+                valid_feature_groups.insert(per_use);
+                valid_feature_groups.insert(hoisted);
+            }
+        }
+    }
     let mut ordered: Vec<(usize, &SourceAlternativeSnapshot)> = snapshots
         .iter()
         .filter(|snapshot| {
-            if valid_feature_declarations.contains(&snapshot.declaration_index) {
-                is_scalar_lvalue_boundary(snapshot.boundary)
-            } else {
-                !is_scalar_lvalue_boundary(snapshot.boundary)
-            }
+            feature_boundary_family(snapshot.boundary).map_or(true, |(family, _)| {
+                valid_feature_groups.contains(&(snapshot.declaration_index, family))
+            })
         })
         .filter(|snapshot| {
             !exclusions.excludes(&snapshot.manifold_name, snapshot.manifold_address)
@@ -802,10 +1131,10 @@ fn render_manifest_with_limits(
             count_for_function = 0;
         }
         if count_for_function >= MAX_SOURCE_ALTERNATIVES_PER_FUNCTION {
-            continue;
+            return fallback_to_ordinary();
         }
         if alternatives.len() >= max_total {
-            return Ok(None);
+            return fallback_to_ordinary();
         }
         if snapshot_key_counts
             .get(&(snapshot.declaration_index, snapshot.boundary))
@@ -846,7 +1175,7 @@ fn render_manifest_with_limits(
         if candidate_bytes > max_source_bytes
             || source_bytes.saturating_add(candidate_bytes) > max_source_bytes
         {
-            return Ok(None);
+            return fallback_to_ordinary();
         }
         source_bytes += candidate_bytes;
         let canonical_source_sha256 =
@@ -891,7 +1220,7 @@ fn render_manifest_with_limits(
         alternatives,
     })?;
     if rendered.len() > max_manifest_bytes {
-        return Ok(None);
+        return fallback_to_ordinary();
     }
     Ok(Some(rendered))
 }
@@ -947,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_lvalue_pair_is_atomic_closed_and_v2_named() {
+    fn typed_lvalue_pair_is_atomic_closed_and_v3_preserves_legacy_names() {
         let canonical = function("f", CStmt::Return(Some(CExpr::int(0))));
         let pre = function(
             "f",
@@ -962,7 +1291,7 @@ mod tests {
         let post = function("f", CStmt::Return(Some(CExpr::int(1))));
         let pair = scalar_lvalue_snapshot_pair(3, 0x1000, &canonical, &pre, &post)
             .expect("two distinct signature-preserving typed-lvalue forms");
-        assert_eq!(SOURCE_ALTERNATIVES_SCHEMA, "manifold-source-alternatives-v2");
+        assert_eq!(SOURCE_ALTERNATIVES_SCHEMA, "manifold-source-alternatives-v3");
         assert_eq!(
             pair[0].boundary.wire_name(),
             "scalar_lvalue_pre_var_reduce"
@@ -981,6 +1310,73 @@ mod tests {
             scalar_lvalue_snapshot_pair(3, 0x1000, &canonical, &pre, &wrong_signature)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn v3_feature_profiles_collapse_by_ordered_printed_source_identity() {
+        let canonical = function("f", CStmt::Return(Some(CExpr::int(0))));
+        let pre = function("f", CStmt::Return(Some(CExpr::int(1))));
+        let post = function("f", CStmt::Return(Some(CExpr::int(2))));
+        let both = scalar_feature_snapshots_for_format(
+            0,
+            0x1000,
+            ScalarSourceAlternativeFamily::TypedLvalue,
+            &canonical,
+            &pre,
+            &post,
+            BinaryFormat::Coff,
+        )
+        .expect("two useful forms");
+        assert_eq!(both.len(), 2);
+
+        let pre_only = scalar_feature_snapshots_for_format(
+            0,
+            0x1000,
+            ScalarSourceAlternativeFamily::TypedLvalue,
+            &canonical,
+            &pre,
+            &canonical,
+            BinaryFormat::Coff,
+        )
+        .expect("pre remains useful");
+        assert_eq!(pre_only.len(), 1);
+        assert_eq!(pre_only[0].boundary, SourceAlternativeBoundary::ScalarLvaluePreVarReduce);
+
+        let post_only = scalar_feature_snapshots_for_format(
+            0,
+            0x1000,
+            ScalarSourceAlternativeFamily::TypedLvalue,
+            &canonical,
+            &canonical,
+            &post,
+            BinaryFormat::Coff,
+        )
+        .expect("post remains useful");
+        assert_eq!(post_only.len(), 1);
+        assert_eq!(post_only[0].boundary, SourceAlternativeBoundary::ScalarLvaluePostVarReduce);
+
+        let duplicate = scalar_feature_snapshots_for_format(
+            0,
+            0x1000,
+            ScalarSourceAlternativeFamily::TypedLvalue,
+            &canonical,
+            &pre,
+            &pre,
+            BinaryFormat::Coff,
+        )
+        .expect("the first equal alternative survives");
+        assert_eq!(duplicate.len(), 1);
+        assert_eq!(duplicate[0].boundary, SourceAlternativeBoundary::ScalarLvaluePreVarReduce);
+        assert!(scalar_feature_snapshots_for_format(
+            0,
+            0x1000,
+            ScalarSourceAlternativeFamily::TypedLvalue,
+            &canonical,
+            &canonical,
+            &canonical,
+            BinaryFormat::Coff,
+        )
+        .is_none());
     }
 
     #[test]
@@ -1216,38 +1612,60 @@ mod tests {
             parsed["canonical_translation_unit_sha256"],
             crate::decompile::disassembly::coff::sha256_hex(canonical.as_bytes())
         );
-        assert_eq!(parsed["max_per_function"], 2);
+        assert_eq!(
+            parsed["max_per_function"],
+            MAX_SOURCE_ALTERNATIVES_PER_FUNCTION
+        );
         assert_eq!(parsed["truncated"], false);
         assert_eq!(final_tu, final_tu_before);
     }
 
     #[test]
-    fn manifest_emits_typed_lvalue_pair_atomically_under_the_existing_cap() {
-        let canonical_function = function("f", CStmt::Return(Some(CExpr::int(2))));
-        let pre = function(
-            "f",
-            CStmt::Block(vec![
-                CBlockItem::Stmt(CStmt::Expr(CExpr::assign(
-                    CExpr::var("temporary"),
-                    CExpr::int(1),
-                ))),
-                CBlockItem::Stmt(CStmt::Return(Some(CExpr::var("temporary")))),
-            ]),
-        );
-        let post = function("f", CStmt::Return(Some(CExpr::int(1))));
-        let pair = scalar_lvalue_snapshot_pair(0, 0x1000, &canonical_function, &pre, &post)
-            .expect("valid typed-lvalue pair");
-        let mut snapshots = pair.to_vec();
-        snapshots.push(
-            snapshot_if_changed(
-                0,
-                0x1000,
-                SourceAlternativeBoundary::PreForLoop,
-                &function("f", CStmt::Return(Some(CExpr::int(3)))),
-                &canonical_function,
-            )
-            .expect("ordinary control snapshot"),
-        );
+    fn manifest_emits_the_exact_ten_record_cumulative_v3_portfolio() {
+        // Regression shape from
+        // wbemcomn.dll|admin/wmi/wbem/winmgmt/wbemcomn/smallarr|
+        // ?InsertAt@CSmallArrayBlob@@QEAAPEAV1@HPEAX@Z: Stage-2 cap2
+        // displaced its profitable ordinary pre_forloop row. The selector is
+        // wholly generic; this fixture pins only the cumulative wire shape.
+        let canonical_function = function("f", CStmt::Return(Some(CExpr::int(100))));
+        let mut snapshots = Vec::new();
+        for (boundary, value) in [
+            (SourceAlternativeBoundary::PreForLoop, 90),
+            (SourceAlternativeBoundary::PreVarReduce, 91),
+        ] {
+            snapshots.push(
+                snapshot_if_changed(
+                    0,
+                    0x1000,
+                    boundary,
+                    &function("f", CStmt::Return(Some(CExpr::int(value)))),
+                    &canonical_function,
+                )
+                .expect("ordinary snapshot"),
+            );
+        }
+        for (index, family) in [
+            ScalarSourceAlternativeFamily::TypedLvalue,
+            ScalarSourceAlternativeFamily::FieldLvalue,
+            ScalarSourceAlternativeFamily::ExtensionPerUse,
+            ScalarSourceAlternativeFamily::ExtensionHoisted,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            snapshots.extend(
+                scalar_feature_snapshots_for_format(
+                    0,
+                    0x1000,
+                    family,
+                    &canonical_function,
+                    &function("f", CStmt::Return(Some(CExpr::int(10 + index as i64 * 2)))),
+                    &function("f", CStmt::Return(Some(CExpr::int(11 + index as i64 * 2)))),
+                    BinaryFormat::Coff,
+                )
+                .expect("two useful feature forms"),
+            );
+        }
         let mut final_tu = TranslationUnit::new();
         final_tu.add_function(canonical_function);
         let canonical = crate::decompile::passes::c_pass::print_translation_unit_for_format(
@@ -1269,19 +1687,48 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         let records = parsed["alternatives"].as_array().unwrap();
         assert_eq!(records.len(), MAX_SOURCE_ALTERNATIVES_PER_FUNCTION);
-        assert_eq!(
-            records[0]["id"],
-            "function-000000:scalar_lvalue_pre_var_reduce"
-        );
-        assert_eq!(
-            records[1]["id"],
-            "function-000000:scalar_lvalue_post_var_reduce"
-        );
+        assert_eq!(MAX_SOURCE_ALTERNATIVES_PER_FUNCTION, 10);
+        assert_eq!(records[0]["id"], "function-000000:pre_forloop");
+        assert_eq!(records[1]["id"], "function-000000:pre_var_reduce");
+        assert_eq!(records[2]["id"], "function-000000:scalar_lvalue_pre_var_reduce");
+        assert_eq!(records[9]["id"], "function-000000:scalar_extension_hoisted_post_var_reduce");
         assert_eq!(parsed["schema"], SOURCE_ALTERNATIVES_SCHEMA);
+    }
+
+    #[test]
+    fn v3_extension_requires_both_nonempty_collapsed_placements() {
+        let canonical_function = function("f", CStmt::Return(Some(CExpr::int(100))));
+        let per_use = scalar_feature_snapshots_for_format(
+            0,
+            0x1000,
+            ScalarSourceAlternativeFamily::ExtensionPerUse,
+            &canonical_function,
+            &function("f", CStmt::Return(Some(CExpr::int(1)))),
+            &canonical_function,
+            BinaryFormat::Coff,
+        )
+        .expect("one useful per-use boundary");
+        let hoisted = scalar_feature_snapshots_for_format(
+            0,
+            0x1000,
+            ScalarSourceAlternativeFamily::ExtensionHoisted,
+            &canonical_function,
+            &canonical_function,
+            &function("f", CStmt::Return(Some(CExpr::int(2)))),
+            BinaryFormat::Coff,
+        )
+        .expect("one useful hoisted boundary");
+        let mut final_tu = TranslationUnit::new();
+        final_tu.add_function(canonical_function);
+        let canonical = crate::decompile::passes::c_pass::print_translation_unit_for_format(
+            &final_tu,
+            BinaryFormat::Coff,
+        );
+        let identities = [("f".to_string(), 0x1000)];
 
         assert!(render_manifest(
             &final_tu,
-            &pair[..1],
+            &per_use,
             false,
             &SourceAlternativeExclusions::default(),
             &identities,
@@ -1291,20 +1738,363 @@ mod tests {
         .unwrap()
         .is_none());
 
-        assert!(render_manifest(
+        let mut complete = per_use;
+        complete.extend(hoisted);
+        let rendered = render_manifest(
             &final_tu,
-            &pair,
+            &complete,
             false,
-            &SourceAlternativeExclusions {
-                partial_functions: HashSet::from([0x1000]),
-                ..Default::default()
-            },
+            &SourceAlternativeExclusions::default(),
             &identities,
             &canonical,
             BinaryFormat::Coff,
         )
         .unwrap()
-        .is_none());
+        .expect("one boundary from each placement is atomic and useful");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let ids: Vec<_> = parsed["alternatives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "function-000000:scalar_extension_per_use_pre_var_reduce",
+                "function-000000:scalar_extension_hoisted_post_var_reduce",
+            ]
+        );
+    }
+
+    #[test]
+    fn cross_family_source_collisions_preserve_ordinary_and_drop_features_atomically() {
+        let canonical_function = function("f", CStmt::Return(Some(CExpr::int(100))));
+        let ordinary_function = function("f", CStmt::Return(Some(CExpr::int(1))));
+        let ordinary = snapshot_if_changed(
+            0,
+            0x1000,
+            SourceAlternativeBoundary::PreForLoop,
+            &ordinary_function,
+            &canonical_function,
+        )
+        .expect("ordinary snapshot");
+        let mut final_tu = TranslationUnit::new();
+        final_tu.add_function(canonical_function.clone());
+        let canonical = crate::decompile::passes::c_pass::print_translation_unit_for_format(
+            &final_tu,
+            BinaryFormat::Coff,
+        );
+        let identities = [("f".to_string(), 0x1000)];
+        let render = |snapshots: &[SourceAlternativeSnapshot]| {
+            render_manifest(
+                &final_tu,
+                snapshots,
+                false,
+                &SourceAlternativeExclusions::default(),
+                &identities,
+                &canonical,
+                BinaryFormat::Coff,
+            )
+            .expect("render collision fixture")
+        };
+        let ordinary_rendered = render(std::slice::from_ref(&ordinary))
+            .expect("ordinary collision priority row");
+
+        let typed_equal_to_ordinary = scalar_feature_snapshots_for_format(
+            0,
+            0x1000,
+            ScalarSourceAlternativeFamily::TypedLvalue,
+            &canonical_function,
+            &ordinary_function,
+            &canonical_function,
+            BinaryFormat::Coff,
+        )
+        .expect("typed collision row");
+        let mut ordinary_collision = vec![ordinary.clone()];
+        ordinary_collision.extend(typed_equal_to_ordinary);
+        assert_eq!(
+            render(&ordinary_collision).expect("ordinary survives feature collision"),
+            ordinary_rendered,
+        );
+
+        let shared_feature = function("f", CStmt::Return(Some(CExpr::int(2))));
+        let mut typed_field_collision = scalar_feature_snapshots_for_format(
+            0,
+            0x1000,
+            ScalarSourceAlternativeFamily::TypedLvalue,
+            &canonical_function,
+            &shared_feature,
+            &canonical_function,
+            BinaryFormat::Coff,
+        )
+        .expect("typed feature row");
+        typed_field_collision.extend(
+            scalar_feature_snapshots_for_format(
+                0,
+                0x1000,
+                ScalarSourceAlternativeFamily::FieldLvalue,
+                &canonical_function,
+                &shared_feature,
+                &canonical_function,
+                BinaryFormat::Coff,
+            )
+            .expect("field collision row"),
+        );
+        let typed_field = render(&typed_field_collision).expect("typed priority sidecar");
+        let typed_field: serde_json::Value =
+            serde_json::from_str(&typed_field).expect("typed priority sidecar parses");
+        let records = typed_field["alternatives"].as_array().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["boundary"], "scalar_lvalue_pre_var_reduce");
+
+        let shared_extension = function("f", CStmt::Return(Some(CExpr::int(3))));
+        let mut extension_collision = vec![ordinary.clone()];
+        extension_collision.extend(
+            scalar_feature_snapshots_for_format(
+                0,
+                0x1000,
+                ScalarSourceAlternativeFamily::ExtensionPerUse,
+                &canonical_function,
+                &shared_extension,
+                &canonical_function,
+                BinaryFormat::Coff,
+            )
+            .expect("per-use collision row"),
+        );
+        extension_collision.extend(
+            scalar_feature_snapshots_for_format(
+                0,
+                0x1000,
+                ScalarSourceAlternativeFamily::ExtensionHoisted,
+                &canonical_function,
+                &canonical_function,
+                &shared_extension,
+                BinaryFormat::Coff,
+            )
+            .expect("hoisted collision row"),
+        );
+        assert_eq!(
+            render(&extension_collision).expect("ordinary survives extension collision"),
+            ordinary_rendered,
+        );
+
+        // A duplicate between the two historical boundaries cannot arise from
+        // the pass chain, but forged input is rejected rather than silently
+        // choosing one Stage-1 row and changing its ordered-set identity.
+        let mut duplicate_ordinary = ordinary;
+        duplicate_ordinary.boundary = SourceAlternativeBoundary::PreVarReduce;
+        assert!(render(&[ordinary_collision[0].clone(), duplicate_ordinary]).is_none());
+    }
+
+    #[test]
+    fn feature_count_overflow_preserves_exact_ordinary_4095_record_manifest() {
+        let mut final_tu = TranslationUnit::new();
+        let mut ordinary = Vec::new();
+        let mut identities = Vec::new();
+        let mut first_canonical = None;
+        for index in 0..4095usize {
+            let name = format!("f_{index:04}");
+            let address = 0x1000 + index as u64 * 0x10;
+            let canonical_function =
+                function(&name, CStmt::Return(Some(CExpr::int(index as i64))));
+            let alternative = function(
+                &name,
+                CStmt::Return(Some(CExpr::int(index as i64 + 10_000))),
+            );
+            if index == 0 {
+                first_canonical = Some(canonical_function.clone());
+            }
+            ordinary.push(
+                snapshot_if_changed(
+                    index,
+                    address,
+                    SourceAlternativeBoundary::PreForLoop,
+                    &alternative,
+                    &canonical_function,
+                )
+                .expect("ordinary snapshot"),
+            );
+            identities.push((name, address));
+            final_tu.add_function(canonical_function);
+        }
+        let canonical = crate::decompile::passes::c_pass::print_translation_unit_for_format(
+            &final_tu,
+            BinaryFormat::Coff,
+        );
+        let exclusions = SourceAlternativeExclusions::default();
+        let ordinary_rendered = render_manifest_with_limits(
+            &final_tu,
+            &ordinary,
+            false,
+            &exclusions,
+            &identities,
+            &canonical,
+            BinaryFormat::Coff,
+            4096,
+            MAX_SOURCE_ALTERNATIVE_BYTES,
+            MAX_SOURCE_ALTERNATIVE_MANIFEST_BYTES,
+        )
+        .unwrap()
+        .expect("4095 ordinary rows fit");
+        let first_canonical = first_canonical.expect("first function");
+        let one_feature = scalar_feature_snapshots_for_format(
+            0,
+            0x1000,
+            ScalarSourceAlternativeFamily::TypedLvalue,
+            &first_canonical,
+            &function("f_0000", CStmt::Return(Some(CExpr::int(20_000)))),
+            &first_canonical,
+            BinaryFormat::Coff,
+        )
+        .expect("one collapsed feature row");
+        let mut exact_4096 = ordinary.clone();
+        exact_4096.extend(one_feature);
+        let rendered_4096 = render_manifest_with_limits(
+            &final_tu,
+            &exact_4096,
+            false,
+            &exclusions,
+            &identities,
+            &canonical,
+            BinaryFormat::Coff,
+            4096,
+            MAX_SOURCE_ALTERNATIVE_BYTES,
+            MAX_SOURCE_ALTERNATIVE_MANIFEST_BYTES,
+        )
+        .unwrap()
+        .expect("exactly 4096 rows fit");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rendered_4096).unwrap()["alternatives"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4096
+        );
+
+        let two_features = scalar_feature_snapshots_for_format(
+            0,
+            0x1000,
+            ScalarSourceAlternativeFamily::TypedLvalue,
+            &first_canonical,
+            &function("f_0000", CStmt::Return(Some(CExpr::int(20_001)))),
+            &function("f_0000", CStmt::Return(Some(CExpr::int(20_002)))),
+            BinaryFormat::Coff,
+        )
+        .expect("two distinct feature rows");
+        let mut overflow_4097 = ordinary.clone();
+        overflow_4097.extend(two_features);
+        let fallback = render_manifest_with_limits(
+            &final_tu,
+            &overflow_4097,
+            false,
+            &exclusions,
+            &identities,
+            &canonical,
+            BinaryFormat::Coff,
+            4096,
+            MAX_SOURCE_ALTERNATIVE_BYTES,
+            MAX_SOURCE_ALTERNATIVE_MANIFEST_BYTES,
+        )
+        .unwrap()
+        .expect("feature overflow falls back to ordinary");
+        assert_eq!(fallback, ordinary_rendered);
+    }
+
+    #[test]
+    fn feature_source_and_manifest_byte_overflow_preserve_ordinary_bytes() {
+        let canonical_function = function("f", CStmt::Return(Some(CExpr::int(100))));
+        let ordinary_function = function("f", CStmt::Return(Some(CExpr::int(1))));
+        let ordinary = snapshot_if_changed(
+            0,
+            0x1000,
+            SourceAlternativeBoundary::PreForLoop,
+            &ordinary_function,
+            &canonical_function,
+        )
+        .expect("ordinary snapshot");
+        let feature = scalar_feature_snapshots_for_format(
+            0,
+            0x1000,
+            ScalarSourceAlternativeFamily::TypedLvalue,
+            &canonical_function,
+            &function("f", CStmt::Return(Some(CExpr::int(2)))),
+            &canonical_function,
+            BinaryFormat::Coff,
+        )
+        .expect("one feature row");
+        let mut final_tu = TranslationUnit::new();
+        final_tu.add_function(canonical_function.clone());
+        let canonical = crate::decompile::passes::c_pass::print_translation_unit_for_format(
+            &final_tu,
+            BinaryFormat::Coff,
+        );
+        let identities = [("f".to_string(), 0x1000)];
+        let exclusions = SourceAlternativeExclusions::default();
+        let ordinary_source_bytes = one_function_source(&canonical_function, BinaryFormat::Coff)
+            .len()
+            + one_function_source(&ordinary_function, BinaryFormat::Coff).len();
+        let ordinary_rendered = render_manifest_with_limits(
+            &final_tu,
+            std::slice::from_ref(&ordinary),
+            false,
+            &exclusions,
+            &identities,
+            &canonical,
+            BinaryFormat::Coff,
+            10,
+            ordinary_source_bytes,
+            MAX_SOURCE_ALTERNATIVE_MANIFEST_BYTES,
+        )
+        .unwrap()
+        .expect("ordinary row fits its exact source-byte bound");
+        let mut combined = vec![ordinary];
+        combined.extend(feature);
+        let source_fallback = render_manifest_with_limits(
+            &final_tu,
+            &combined,
+            false,
+            &exclusions,
+            &identities,
+            &canonical,
+            BinaryFormat::Coff,
+            10,
+            ordinary_source_bytes,
+            MAX_SOURCE_ALTERNATIVE_MANIFEST_BYTES,
+        )
+        .unwrap()
+        .expect("feature source bytes fall back to ordinary");
+        assert_eq!(source_fallback, ordinary_rendered);
+
+        let ordinary_unlimited = render_manifest_with_limits(
+            &final_tu,
+            &combined[..1],
+            false,
+            &exclusions,
+            &identities,
+            &canonical,
+            BinaryFormat::Coff,
+            10,
+            MAX_SOURCE_ALTERNATIVE_BYTES,
+            MAX_SOURCE_ALTERNATIVE_MANIFEST_BYTES,
+        )
+        .unwrap()
+        .expect("ordinary manifest");
+        let manifest_fallback = render_manifest_with_limits(
+            &final_tu,
+            &combined,
+            false,
+            &exclusions,
+            &identities,
+            &canonical,
+            BinaryFormat::Coff,
+            10,
+            MAX_SOURCE_ALTERNATIVE_BYTES,
+            ordinary_unlimited.len(),
+        )
+        .unwrap()
+        .expect("feature manifest bytes fall back to ordinary");
+        assert_eq!(manifest_fallback, ordinary_unlimited);
     }
 
     #[test]

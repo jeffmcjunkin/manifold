@@ -228,6 +228,180 @@ pub enum ScalarMemoryExtension {
     Plain,
     SignExtend,
     ZeroExtend,
+    /// The architectural zero-extension performed by an x86-64 write to a
+    /// 32-bit general-purpose destination.  V1 admits this only for an exact
+    /// `MOV r32, m32` whose surviving value is consumed at 64-bit width; it
+    /// never treats byte/word partial-register writes as full values.
+    ImplicitZeroExtend,
+}
+
+/// Architectural result formation after the decoded MOV-family opcode has
+/// produced its encoded destination. Every x86-64 r32 write clears the upper
+/// half of the parent register, including MOVSX/MOVZX. Keeping this stage
+/// separate prevents `movsx eax, byte ptr [...]` from being misrepresented as
+/// a direct signed 64-bit extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ScalarMemoryResultChain {
+    Direct,
+    ZeroUpper32,
+}
+
+/// Exact integral interpretation required by one surviving machine use of an
+/// authenticated extended load.  Neutral integer operations inherit the
+/// opcode-defined result interpretation; operations with signed/unsigned
+/// encodings override it locally.  This is provider evidence, not a global C
+/// declaration inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ScalarMemoryUseType {
+    Signed8,
+    Unsigned8,
+    Signed16,
+    Unsigned16,
+    Signed32,
+    Unsigned32,
+    Signed64,
+    Unsigned64,
+}
+
+impl ScalarMemoryUseType {
+    pub fn width(self) -> usize {
+        match self {
+            Self::Signed8 | Self::Unsigned8 => 1,
+            Self::Signed16 | Self::Unsigned16 => 2,
+            Self::Signed32 | Self::Unsigned32 => 4,
+            Self::Signed64 | Self::Unsigned64 => 8,
+        }
+    }
+
+    pub fn signed(self) -> bool {
+        matches!(
+            self,
+            Self::Signed8 | Self::Signed16 | Self::Signed32 | Self::Signed64
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ScalarMemoryUseSite {
+    pub node: Node,
+    /// Exact surviving RTL value consumed at this leaf. It is either the load
+    /// result or the output of one authenticated transport step.
+    pub value: RTLReg,
+    pub required_type: ScalarMemoryUseType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ScalarMemoryTransportKind {
+    Move,
+    LaneCast(ScalarMemoryUseType),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ScalarMemoryTransport {
+    pub node: Node,
+    pub input: RTLReg,
+    pub output: RTLReg,
+    pub kind: ScalarMemoryTransportKind,
+}
+
+/// Closed, function-local def/use plan for one authenticated extension load.
+/// Each listed node uses the value exactly once in final RTL, is uniquely
+/// owned by `function`, and is dominated by the load definition.  Clight
+/// revalidates the same one-use-per-node shape before inserting private casts.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ScalarMemoryUsePlan {
+    pub function: Address,
+    pub definition_node: Node,
+    pub value: RTLReg,
+    pub transports: Arc<Vec<ScalarMemoryTransport>>,
+    pub sites: Arc<Vec<ScalarMemoryUseSite>>,
+}
+
+impl ScalarMemoryUsePlan {
+    pub fn is_closed_v1(&self, proof: &ScalarMemoryAccessProof) -> bool {
+        if proof.function != self.function
+            || proof.selected_node != self.definition_node
+            || proof.value != self.value
+            || proof.direction != ScalarMemoryDirection::Read
+            || self.sites.is_empty()
+            || self.sites.len() > 128
+            || self.transports.len() > 128
+            || self.sites.len().saturating_add(self.transports.len()) > 128
+            || !self.transports.windows(2).all(|pair| pair[0] < pair[1])
+            || !self.sites.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return false;
+        }
+
+        // The transport graph is a bounded forest rooted at the decoded load
+        // value.  A value may fan out through several exact copies/casts, but
+        // no output can merge definitions or feed back into an ancestor.
+        let mut output_to_input = std::collections::BTreeMap::new();
+        let mut transport_nodes = std::collections::BTreeSet::new();
+        for transport in self.transports.iter() {
+            if transport.input == transport.output
+                || transport.output == self.value
+                || output_to_input
+                    .insert(transport.output, transport.input)
+                    .is_some()
+                || !transport_nodes.insert(transport.node)
+            {
+                return false;
+            }
+        }
+        let mut site_occurrences = std::collections::BTreeSet::new();
+        for site in self.sites.iter() {
+            if transport_nodes.contains(&site.node)
+                || !site_occurrences.insert((site.node, site.value))
+            {
+                return false;
+            }
+        }
+
+        let mut reachable = std::collections::BTreeSet::from([self.value]);
+        loop {
+            let before = reachable.len();
+            for (output, input) in &output_to_input {
+                if reachable.contains(input) {
+                    reachable.insert(*output);
+                }
+            }
+            if reachable.len() == before {
+                break;
+            }
+            if reachable.len() > 128 {
+                return false;
+            }
+        }
+        if reachable.len() != output_to_input.len().saturating_add(1)
+            || self
+                .sites
+                .iter()
+                .any(|site| !reachable.contains(&site.value))
+        {
+            return false;
+        }
+
+        // Every root/output is consumed by at least one exact transport or
+        // terminal obligation.  Dead transport branches and hidden values are
+        // not silently serialized.
+        let consumed_values: std::collections::BTreeSet<_> = self
+            .transports
+            .iter()
+            .map(|transport| transport.input)
+            .chain(self.sites.iter().map(|site| site.value))
+            .collect();
+        if reachable
+            .iter()
+            .any(|value| !consumed_values.contains(value))
+        {
+            return false;
+        }
+
+        self.sites
+            .iter()
+            .all(|site| site.required_type.width() <= proof.value_width)
+    }
 }
 
 /// Closed provider-internal spelling carried alongside an authenticated
@@ -238,6 +412,18 @@ pub enum ScalarMemoryExtension {
 pub enum ScalarLvalueSourceForm {
     RawByte,
     TypedScaled,
+}
+
+/// Placement policy attached to a private scalar-lvalue statement candidate.
+/// `Plain` preserves the Stage-2 behavior. Extension candidates are never
+/// admitted to the canonical relation: the private feature view either keeps
+/// a narrow transport temporary and casts every authenticated use, or hoists
+/// the architectural extension into the definition-local temporary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ScalarLvaluePlacement {
+    Plain,
+    ExtensionPerUse,
+    ExtensionHoisted,
 }
 
 /// Closed proof that one surviving post-optimization RTL memory effect is the
@@ -253,6 +439,12 @@ pub struct ScalarMemoryAccessProof {
     pub operand: Symbol,
     pub direction: ScalarMemoryDirection,
     pub extension: ScalarMemoryExtension,
+    /// Width of the decoded destination register for a load. Stores have no
+    /// destination. This remains 4 for an implicit x64 r32->r64 zero extend,
+    /// allowing every later handoff to distinguish it from an encoded r64
+    /// destination even though `value_width` is the architectural result.
+    pub encoded_destination_width: Option<usize>,
+    pub result_chain: Option<ScalarMemoryResultChain>,
     pub address_size: u8,
     pub base_register: Mreg,
     pub index_register: Option<Mreg>,
@@ -264,9 +456,9 @@ pub struct ScalarMemoryAccessProof {
     /// Plain MOV also authenticates it against early downstream type rows;
     /// MOVSX/MOVZX are revalidated after final type/signature reconciliation,
     /// where their narrow chunk artifact is replaced by the opcode-defined
-    /// result type. Stores have no destination and carry None. In particular,
-    /// a 32-bit write is never allowed to flow into a 64-bit C value through
-    /// this v1 proof.
+    /// result type. Stores have no destination and carry None. A sealed
+    /// `ZeroUpper32` result chain is the sole case where an encoded r32 write
+    /// may flow into an authenticated 64-bit C use.
     pub downstream_value_width: Option<usize>,
     pub chunk: MemoryChunk,
     pub base_value: Option<RTLReg>,
@@ -307,9 +499,22 @@ impl ScalarMemoryAccessProof {
         if match self.direction {
             ScalarMemoryDirection::Read => {
                 self.downstream_value_width != Some(self.value_width)
-                    || !matches!(self.value_width, 4 | 8)
+                    || !matches!(self.encoded_destination_width, Some(1 | 2 | 4 | 8))
+                    || match self.result_chain {
+                        Some(ScalarMemoryResultChain::Direct) => {
+                            self.encoded_destination_width != Some(self.value_width)
+                        }
+                        Some(ScalarMemoryResultChain::ZeroUpper32) => {
+                            self.encoded_destination_width != Some(4) || self.value_width != 8
+                        }
+                        None => true,
+                    }
             }
-            ScalarMemoryDirection::Write => self.downstream_value_width.is_some(),
+            ScalarMemoryDirection::Write => {
+                self.downstream_value_width.is_some()
+                    || self.encoded_destination_width.is_some()
+                    || self.result_chain.is_some()
+            }
         } {
             return false;
         }
@@ -335,11 +540,34 @@ impl ScalarMemoryAccessProof {
 
         let semantic_shape = match (self.direction, self.extension, self.width) {
             (ScalarMemoryDirection::Read, ScalarMemoryExtension::Plain, 4) => {
-                self.value_width == 4 && self.chunk == MemoryChunk::MInt32
+                self.encoded_destination_width == Some(4)
+                    && self.value_width == 4
+                    && self.result_chain == Some(ScalarMemoryResultChain::Direct)
+                    && self.chunk == MemoryChunk::MInt32
             }
             (ScalarMemoryDirection::Read, ScalarMemoryExtension::Plain, 8) => {
-                self.value_width == 8
+                self.encoded_destination_width == Some(8)
+                    && self.value_width == 8
+                    && self.result_chain == Some(ScalarMemoryResultChain::Direct)
                     && matches!(self.chunk, MemoryChunk::MInt64 | MemoryChunk::MAny64)
+            }
+            (ScalarMemoryDirection::Read, ScalarMemoryExtension::Plain, 1) => {
+                self.encoded_destination_width == Some(1)
+                    && self.value_width == 1
+                    && self.result_chain == Some(ScalarMemoryResultChain::Direct)
+                    && matches!(
+                        self.chunk,
+                        MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned
+                    )
+            }
+            (ScalarMemoryDirection::Read, ScalarMemoryExtension::Plain, 2) => {
+                self.encoded_destination_width == Some(2)
+                    && self.value_width == 2
+                    && self.result_chain == Some(ScalarMemoryResultChain::Direct)
+                    && matches!(
+                        self.chunk,
+                        MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned
+                    )
             }
             (ScalarMemoryDirection::Write, ScalarMemoryExtension::Plain, width) => {
                 self.value_width == width
@@ -352,35 +580,68 @@ impl ScalarMemoryAccessProof {
                     }
             }
             (ScalarMemoryDirection::Read, ScalarMemoryExtension::SignExtend, 1) => {
-                matches!(self.value_width, 4 | 8)
+                ((self.encoded_destination_width == Some(self.value_width)
+                    && self.result_chain == Some(ScalarMemoryResultChain::Direct)
+                    && matches!(self.value_width, 4 | 8))
+                    || (self.encoded_destination_width == Some(4)
+                        && self.value_width == 8
+                        && self.result_chain == Some(ScalarMemoryResultChain::ZeroUpper32)))
                     && matches!(
                         self.chunk,
                         MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned
                     )
             }
             (ScalarMemoryDirection::Read, ScalarMemoryExtension::SignExtend, 2) => {
-                self.value_width > 2
+                ((self.encoded_destination_width == Some(self.value_width)
+                    && self.result_chain == Some(ScalarMemoryResultChain::Direct)
+                    && self.value_width > 2)
+                    || (self.encoded_destination_width == Some(4)
+                        && self.value_width == 8
+                        && self.result_chain == Some(ScalarMemoryResultChain::ZeroUpper32)))
                     && matches!(
                         self.chunk,
                         MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned
                     )
             }
             (ScalarMemoryDirection::Read, ScalarMemoryExtension::SignExtend, 4) => {
-                self.value_width == 8 && self.chunk == MemoryChunk::MInt32
+                self.encoded_destination_width == Some(8)
+                    && self.value_width == 8
+                    && self.result_chain == Some(ScalarMemoryResultChain::Direct)
+                    && self.chunk == MemoryChunk::MInt32
             }
             (ScalarMemoryDirection::Read, ScalarMemoryExtension::ZeroExtend, 1) => {
-                matches!(self.value_width, 4 | 8)
+                ((self.encoded_destination_width == Some(self.value_width)
+                    && self.result_chain == Some(ScalarMemoryResultChain::Direct)
+                    && matches!(self.value_width, 4 | 8))
+                    || (self.encoded_destination_width == Some(4)
+                        && self.value_width == 8
+                        && self.result_chain == Some(ScalarMemoryResultChain::ZeroUpper32)))
                     && matches!(
                         self.chunk,
                         MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned
                     )
             }
             (ScalarMemoryDirection::Read, ScalarMemoryExtension::ZeroExtend, 2) => {
-                self.value_width > 2
+                ((self.encoded_destination_width == Some(self.value_width)
+                    && self.result_chain == Some(ScalarMemoryResultChain::Direct)
+                    && self.value_width > 2)
+                    || (self.encoded_destination_width == Some(4)
+                        && self.value_width == 8
+                        && self.result_chain == Some(ScalarMemoryResultChain::ZeroUpper32)))
                     && matches!(
                         self.chunk,
                         MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned
                     )
+            }
+            (
+                ScalarMemoryDirection::Read,
+                ScalarMemoryExtension::ImplicitZeroExtend,
+                4,
+            ) => {
+                self.encoded_destination_width == Some(4)
+                    && self.value_width == 8
+                    && self.result_chain == Some(ScalarMemoryResultChain::ZeroUpper32)
+                    && self.chunk == MemoryChunk::MInt32
             }
             _ => false,
         };

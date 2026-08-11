@@ -62,13 +62,38 @@ pub struct SelectedFunction {
 
 #[derive(Debug, Clone)]
 pub struct ScalarLvalueSelectedAlternative {
+    pub family: ScalarSourceAlternativeFamily,
     pub function: SelectedFunction,
+    /// Exact declaration rows changed by the proof-bound private solve.  The
+    /// emitter recomputes this set against the canonical function and refuses
+    /// any drift, preventing an unrelated local from crossing the private
+    /// selection/emission boundary.
+    pub authorized_type_changes: BTreeSet<RTLReg>,
+    /// Exact authenticated load-definition set used by an extension placement.
+    /// Per-use and hoisted siblings must carry the same nonempty set through
+    /// emission; spelling-only raw/field profiles carry an empty set.
+    pub authenticated_load_nodes: BTreeSet<Node>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ScalarSourceAlternativeFamily {
+    /// Stage-2 compatible raw-byte/typed-scaled address spelling.
+    TypedLvalue,
+    /// Existing layout-solver Efield spelling, admitted only when the scalar
+    /// machine proof closes over the same base/displacement/width.
+    FieldLvalue,
+    ExtensionPerUse,
+    ExtensionHoisted,
 }
 
 #[derive(Debug)]
 pub struct ClightSelectionResult {
     pub canonical: Vec<SelectedFunction>,
     pub scalar_lvalue_alternatives: Vec<ScalarLvalueSelectedAlternative>,
+    /// Permanent fail-closed marker for only the private feature portfolio.
+    /// Canonical selection and already-captured ordinary alternatives remain
+    /// usable when the feature views exceed their intermediate resource bound.
+    pub feature_source_alternatives_overflowed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -426,77 +451,82 @@ pub(crate) fn unsupported_functions_requiring_omission(db: &DecompileDB) -> Hash
     unsupported_functions_requiring_omission_from_validation(&validation)
 }
 
-/// Construct the only view in which scalar-lvalue statements are selectable.
-/// The canonical candidate pool is never mutated: ordinary nodes and every
-/// declaration type are frozen to the already-solved primary, while each
-/// authenticated Plain-MOV node receives only its closed expected-form
-/// candidates. Extension loads remain provenance-only in this checkpoint;
-/// their result/ABI normalization must be implemented inside a later isolated
-/// feature stage before they can be emitted safely.
-fn scalar_lvalue_feature_view(
+type ScalarAddressCluster = (RTLReg, Option<RTLReg>, i64, Vec<RTLReg>);
+
+/// Partition closed Plain-MOV proofs by their authenticated address-DAG root.
+/// Ambiguity poisons only the affected cluster; unrelated roots remain eligible
+/// for the same deterministic profile, avoiding a function-wide all-or-nothing
+/// selector without creating a cross-product.
+fn scalar_plain_proof_clusters(
     function: &FunctionData,
-    canonical: &SelectedFunction,
-    canonical_state: &ProgramSelectionState,
-) -> Option<FunctionData> {
-    let mut nodes: Vec<Node> = function
-        .scalar_lvalue_proofs
-        .iter()
-        .filter_map(|(node, proofs)| {
-            proofs
-                .iter()
-                .any(|proof| proof.extension == ScalarMemoryExtension::Plain)
-                .then_some(*node)
-        })
-        .collect();
-    nodes.sort_unstable();
-    if nodes.is_empty() {
-        return None;
-    }
-    let mut feature_candidates = BTreeMap::new();
-    for node in &nodes {
-        let proofs = function.scalar_lvalue_proofs.get(node)?;
-        let mut plain = proofs
+) -> Vec<Vec<(Node, ScalarMemoryAccessProof)>> {
+    let mut clusters: BTreeMap<ScalarAddressCluster, Vec<_>> = BTreeMap::new();
+    let mut invalid = BTreeSet::new();
+    let mut rows: Vec<_> = function.scalar_lvalue_proofs.iter().collect();
+    rows.sort_by_key(|(node, _)| **node);
+    for (node, proofs) in rows {
+        let qualifying: Vec<_> = proofs
             .iter()
-            .filter(|proof| proof.extension == ScalarMemoryExtension::Plain);
-        let proof = plain.next()?;
-        // A second Plain proof, or a conflicting extension interpretation at
-        // the same node, makes this node ineligible. Extension-only nodes at
-        // other addresses remain frozen to their canonical selections.
-        if plain.next().is_some() || proofs.len() != 1 {
-            return None;
+            .filter(|proof| {
+                proof.extension == ScalarMemoryExtension::Plain
+                    && (proof.direction == ScalarMemoryDirection::Write
+                        || matches!(proof.width, 4 | 8))
+            })
+            .collect();
+        if qualifying.is_empty() {
+            continue;
         }
-        if proof.function != function.address
+        let keys: BTreeSet<_> = qualifying
+            .iter()
+            .filter_map(|proof| {
+                Some((
+                    proof.base_value?,
+                    proof.index_value,
+                    proof.scale,
+                    proof.address_param_leaves.as_ref().clone(),
+                ))
+            })
+            .collect();
+        let [proof] = qualifying.as_slice() else {
+            invalid.extend(keys);
+            continue;
+        };
+        let Some(key) = keys.iter().next().cloned().filter(|_| keys.len() == 1) else {
+            invalid.extend(keys);
+            continue;
+        };
+        if proofs.len() != 1
+            || proof.function != function.address
             || proof.selected_node != *node
             || !proof.is_closed_v1()
         {
-            return None;
+            invalid.insert(key);
+            continue;
         }
-        let expected = if proof.exact_scaled_index {
-            ScalarLvalueSourceForm::TypedScaled
-        } else {
-            ScalarLvalueSourceForm::RawByte
-        };
-        let tagged = function.scalar_lvalue_source_candidates.get(node)?;
-        if !proof.exact_scaled_index
-            && tagged
-                .iter()
-                .any(|(form, _)| *form != ScalarLvalueSourceForm::RawByte)
-        {
-            return None;
-        }
-        let mut candidates: Vec<ClightStmt> = tagged
-            .iter()
-            .filter(|(form, _)| *form == expected)
-            .map(|(_, statement)| statement.clone())
-            .collect();
-        candidates.sort_by_cached_key(|statement| format!("{:?}", statement));
-        candidates.dedup();
-        if candidates.is_empty() {
-            return None;
-        }
-        feature_candidates.insert(*node, candidates);
+        clusters.entry(key).or_default().push((*node, (*proof).clone()));
     }
+    clusters
+        .into_iter()
+        .filter_map(|(key, mut rows)| {
+            if invalid.contains(&key) {
+                None
+            } else {
+                rows.sort_by_key(|(node, _)| *node);
+                Some(rows)
+            }
+        })
+        .collect()
+}
 
+fn scalar_freeze_canonical_view(
+    function: &FunctionData,
+    canonical: &SelectedFunction,
+    canonical_state: &ProgramSelectionState,
+    mut feature_candidates: BTreeMap<Node, Vec<ClightStmt>>,
+) -> Option<FunctionData> {
+    if feature_candidates.is_empty() {
+        return None;
+    }
     let mut fixed = function.clone();
     for (node, candidates) in &mut fixed.node_statements {
         if let Some(feature) = feature_candidates.remove(node) {
@@ -510,12 +540,9 @@ fn scalar_lvalue_feature_view(
             .flatten()?;
         *candidates = vec![candidates.get(index)?.clone()];
     }
-    // Every proof node must replace an existing canonical node. A detached
-    // tagged statement cannot create a new CFG node in the feature view.
     if !feature_candidates.is_empty() {
         return None;
     }
-
     fixed.var_types = canonical.var_types.clone();
     fixed.var_type_candidates.clear();
     fixed.var_decl_idx.clear();
@@ -527,8 +554,1078 @@ fn scalar_lvalue_feature_view(
         fixed.var_decl_idx.insert(*reg, 0);
     }
     fixed.scalar_lvalue_proofs.clear();
+    fixed.scalar_memory_use_plans.clear();
     fixed.scalar_lvalue_source_candidates.clear();
     Some(fixed)
+}
+
+/// Stage-2 compatible raw-byte/direct-scaled profile. Each closed root cluster
+/// is admitted as one combined deterministic view; an invalid sibling cluster
+/// stays canonical rather than suppressing unrelated evidence.
+fn scalar_lvalue_feature_view(
+    function: &FunctionData,
+    canonical: &SelectedFunction,
+    canonical_state: &ProgramSelectionState,
+) -> Option<FunctionData> {
+    let mut feature_candidates = BTreeMap::new();
+    for cluster in scalar_plain_proof_clusters(function) {
+        let mut cluster_candidates = Vec::new();
+        let mut valid = true;
+        for (node, proof) in cluster {
+            let expected = if proof.exact_scaled_index {
+                ScalarLvalueSourceForm::TypedScaled
+            } else {
+                ScalarLvalueSourceForm::RawByte
+            };
+            let Some(tagged) = function.scalar_lvalue_source_candidates.get(&node) else {
+                valid = false;
+                break;
+            };
+            if !proof.exact_scaled_index
+                && tagged
+                    .iter()
+                    .any(|(form, _, _)| *form != ScalarLvalueSourceForm::RawByte)
+            {
+                valid = false;
+                break;
+            }
+            let mut candidates: Vec<_> = tagged
+                .iter()
+                .filter(|(form, placement, _)| {
+                    *form == expected && *placement == ScalarLvaluePlacement::Plain
+                })
+                .map(|(_, _, statement)| statement.clone())
+                .collect();
+            candidates.sort_by_cached_key(|statement| format!("{:?}", statement));
+            candidates.dedup();
+            if candidates.is_empty() {
+                valid = false;
+                break;
+            }
+            cluster_candidates.push((node, candidates));
+        }
+        if valid {
+            feature_candidates.extend(cluster_candidates);
+        }
+    }
+    scalar_freeze_canonical_view(function, canonical, canonical_state, feature_candidates)
+}
+
+fn scalar_clight_integral_type(ty: &ClightType) -> Option<ScalarMemoryUseType> {
+    match ty {
+        ClightType::Tint(ClightIntSize::I8, signedness, attributes)
+            if !attributes.attr_volatile =>
+        {
+            Some(if *signedness == ClightSignedness::Signed {
+                ScalarMemoryUseType::Signed8
+            } else {
+                ScalarMemoryUseType::Unsigned8
+            })
+        }
+        ClightType::Tint(ClightIntSize::I16, signedness, attributes)
+            if !attributes.attr_volatile =>
+        {
+            Some(if *signedness == ClightSignedness::Signed {
+                ScalarMemoryUseType::Signed16
+            } else {
+                ScalarMemoryUseType::Unsigned16
+            })
+        }
+        ClightType::Tint(ClightIntSize::I32, signedness, attributes)
+            if !attributes.attr_volatile =>
+        {
+            Some(if *signedness == ClightSignedness::Signed {
+                ScalarMemoryUseType::Signed32
+            } else {
+                ScalarMemoryUseType::Unsigned32
+            })
+        }
+        ClightType::Tlong(signedness, attributes) if !attributes.attr_volatile => {
+            Some(if *signedness == ClightSignedness::Signed {
+                ScalarMemoryUseType::Signed64
+            } else {
+                ScalarMemoryUseType::Unsigned64
+            })
+        }
+        _ => None,
+    }
+}
+
+fn scalar_exact_field_base(expression: &ClightExpr, expected_struct: Ident) -> Option<RTLReg> {
+    let ClightExpr::Ederef(address, ClightType::Tstruct(struct_id, attributes)) = expression else {
+        return None;
+    };
+    if *struct_id != expected_struct || attributes.attr_volatile {
+        return None;
+    }
+    let mut address = address.as_ref();
+    while let ClightExpr::Ecast(inner, ty) = address {
+        if !matches!(
+            ty,
+            ClightType::Tpointer(inner, attributes)
+                if !attributes.attr_volatile
+                    && matches!(inner.as_ref(), ClightType::Tstruct(id, attributes) if *id == expected_struct && !attributes.attr_volatile)
+        ) {
+            return None;
+        }
+        address = inner;
+    }
+    let ClightExpr::Etempvar(identifier, _) = address else {
+        return None;
+    };
+    Some(*identifier as RTLReg)
+}
+
+fn scalar_field_expr<'a>(
+    statement: &'a ClightStmt,
+    proof: &ScalarMemoryAccessProof,
+) -> Option<&'a ClightExpr> {
+    let statement = match statement {
+        ClightStmt::Slabel(_, inner) => inner.as_ref(),
+        statement => statement,
+    };
+    let mut peel = |mut expression: &'a ClightExpr| {
+        while let ClightExpr::Ecast(inner, _) = expression {
+            expression = inner;
+        }
+        expression
+    };
+    match (proof.direction, statement) {
+        (ScalarMemoryDirection::Read, ClightStmt::Sset(destination, expression))
+            if *destination == proof.value as Ident =>
+        {
+            Some(peel(expression))
+        }
+        (ScalarMemoryDirection::Write, ClightStmt::Sassign(left, right)) => {
+            let right = peel(right);
+            matches!(right, ClightExpr::Etempvar(identifier, _) if *identifier == proof.value as Ident)
+                .then_some(left)
+        }
+        _ => None,
+    }
+}
+
+fn scalar_field_candidate_is_closed(
+    function: &FunctionData,
+    proof: &ScalarMemoryAccessProof,
+    statement: &ClightStmt,
+) -> bool {
+    if proof.index_value.is_some()
+        || proof.scale != 1
+        || proof.displacement < 0
+        || proof.base_value.is_none()
+    {
+        return false;
+    }
+    let Some(ClightExpr::Efield(base, field, field_type)) =
+        scalar_field_expr(statement, proof)
+    else {
+        return false;
+    };
+    let Some(access_type) = scalar_clight_integral_type(field_type) else {
+        return false;
+    };
+    if access_type.width() != proof.width
+        || (matches!(
+            proof.extension,
+            ScalarMemoryExtension::SignExtend | ScalarMemoryExtension::ZeroExtend
+        ) && Some(access_type) != scalar_access_use_type(proof))
+        || *field as i64 != proof.displacement
+    {
+        return false;
+    }
+    let ClightExpr::Ederef(_, ClightType::Tstruct(struct_id, _)) = base.as_ref() else {
+        return false;
+    };
+    if scalar_exact_field_base(base, *struct_id) != proof.base_value {
+        return false;
+    }
+    let Some(fields) = function.struct_fields.get(&(proof.base_value.unwrap() as i64)) else {
+        return false;
+    };
+    let mut fields = fields.clone();
+    fields.sort();
+    if fields.iter().any(|(offset, _, _)| *offset < 0)
+        || fields.windows(2).any(|pair| pair[0].0 == pair[1].0)
+    {
+        return false;
+    }
+    let mut previous_end = 0i64;
+    let mut exact = 0usize;
+    for (offset, field_name, chunk) in fields {
+        let width = crate::decompile::analysis::struct_recovery_pass::chunk_byte_size(&chunk);
+        let Some(end) = offset.checked_add(width as i64) else {
+            return false;
+        };
+        if offset < previous_end {
+            return false;
+        }
+        previous_end = end;
+        if offset == proof.displacement && field_name == *field && width == proof.width {
+            exact += 1;
+        }
+    }
+    exact == 1
+}
+
+fn scalar_field_placement_statement(
+    function: &FunctionData,
+    proof: &ScalarMemoryAccessProof,
+    statement: &ClightStmt,
+    placement: ScalarLvaluePlacement,
+) -> Option<ClightStmt> {
+    if proof.direction != ScalarMemoryDirection::Read
+        || !scalar_field_candidate_is_closed(function, proof, statement)
+    {
+        return None;
+    }
+    let field = scalar_field_expr(statement, proof)?.clone();
+    let value = match placement {
+        ScalarLvaluePlacement::ExtensionPerUse => field,
+        ScalarLvaluePlacement::ExtensionHoisted =>
+            crate::decompile::passes::clight_pass::scalar_hoisted_load_value(proof, field)?,
+        ScalarLvaluePlacement::Plain => return None,
+    };
+    let rewritten = ClightStmt::Sset(proof.value as Ident, value);
+    match statement {
+        ClightStmt::Slabel(label, _) => {
+            Some(ClightStmt::Slabel(label.clone(), Box::new(rewritten)))
+        }
+        _ => Some(rewritten),
+    }
+}
+
+/// Prefer only pre-existing layout-solver Efield candidates which describe the
+/// exact same authenticated base+displacement scalar effect. No field name,
+/// struct identity, or layout is invented by this profile.
+fn scalar_field_feature_view(
+    function: &FunctionData,
+    canonical: &SelectedFunction,
+    canonical_state: &ProgramSelectionState,
+) -> Option<FunctionData> {
+    let mut feature_candidates = BTreeMap::new();
+    for cluster in scalar_plain_proof_clusters(function) {
+        let mut cluster_candidates = Vec::new();
+        let mut valid = true;
+        for (node, proof) in cluster {
+            let Some(candidates) = function.node_statements.get(&node) else {
+                valid = false;
+                break;
+            };
+            let mut candidates: Vec<_> = candidates
+                .iter()
+                .filter(|statement| scalar_field_candidate_is_closed(function, &proof, statement))
+                .cloned()
+                .collect();
+            candidates.sort_by_cached_key(|statement| format!("{:?}", statement));
+            candidates.dedup();
+            if candidates.is_empty() {
+                valid = false;
+                break;
+            }
+            cluster_candidates.push((node, candidates));
+        }
+        if valid {
+            feature_candidates.extend(cluster_candidates);
+        }
+    }
+    scalar_freeze_canonical_view(function, canonical, canonical_state, feature_candidates)
+}
+
+fn scalar_use_clight_type(use_type: ScalarMemoryUseType) -> ClightType {
+    let signedness = if use_type.signed() {
+        ClightSignedness::Signed
+    } else {
+        ClightSignedness::Unsigned
+    };
+    match use_type.width() {
+        1 => ClightType::Tint(ClightIntSize::I8, signedness, ClightAttr::default()),
+        2 => ClightType::Tint(ClightIntSize::I16, signedness, ClightAttr::default()),
+        4 => ClightType::Tint(ClightIntSize::I32, signedness, ClightAttr::default()),
+        8 => ClightType::Tlong(signedness, ClightAttr::default()),
+        _ => unreachable!("sealed scalar use width"),
+    }
+}
+
+fn scalar_use_type_string(use_type: ScalarMemoryUseType) -> &'static str {
+    match use_type {
+        ScalarMemoryUseType::Signed8 => "int_I8",
+        ScalarMemoryUseType::Unsigned8 => "int_I8_unsigned",
+        ScalarMemoryUseType::Signed16 => "int_I16",
+        ScalarMemoryUseType::Unsigned16 => "int_I16_unsigned",
+        ScalarMemoryUseType::Signed32 => "int_I32",
+        ScalarMemoryUseType::Unsigned32 => "int_I32_unsigned",
+        ScalarMemoryUseType::Signed64 => "int_I64",
+        ScalarMemoryUseType::Unsigned64 => "int_I64_unsigned",
+    }
+}
+
+fn scalar_access_use_type(proof: &ScalarMemoryAccessProof) -> Option<ScalarMemoryUseType> {
+    let signed = match proof.extension {
+        ScalarMemoryExtension::SignExtend => true,
+        ScalarMemoryExtension::ZeroExtend | ScalarMemoryExtension::ImplicitZeroExtend => false,
+        ScalarMemoryExtension::Plain => matches!(
+            proof.chunk,
+            MemoryChunk::MInt8Signed | MemoryChunk::MInt16Signed
+        ),
+    };
+    match (proof.width, signed) {
+        (1, true) => Some(ScalarMemoryUseType::Signed8),
+        (1, false) => Some(ScalarMemoryUseType::Unsigned8),
+        (2, true) => Some(ScalarMemoryUseType::Signed16),
+        (2, false) => Some(ScalarMemoryUseType::Unsigned16),
+        (4, true) => Some(ScalarMemoryUseType::Signed32),
+        (4, false) => Some(ScalarMemoryUseType::Unsigned32),
+        (8, true) => Some(ScalarMemoryUseType::Signed64),
+        (8, false) => Some(ScalarMemoryUseType::Unsigned64),
+        _ => None,
+    }
+}
+
+/// Resolve the source-lvalue signedness of a plain m32 load whose encoded EAX
+/// destination independently proves an unsigned 64-bit carrier. Machine
+/// evidence does not sign the memory itself, so a unique signed 32-bit leaf
+/// selects a signed lvalue; an unsigned, 64-bit-only, or conflicting leaf set
+/// selects unsigned and preserves every signed leaf through its explicit
+/// per-use cast. This is deterministic and never changes the ZeroUpper32
+/// result interpretation.
+fn scalar_access_use_type_for_plan(
+    proof: &ScalarMemoryAccessProof,
+    plan: &ScalarMemoryUsePlan,
+) -> Option<ScalarMemoryUseType> {
+    if proof.extension != ScalarMemoryExtension::ImplicitZeroExtend {
+        return scalar_access_use_type(proof);
+    }
+    if !plan.is_closed_v1(proof) {
+        return None;
+    }
+    let signed32 = plan
+        .sites
+        .iter()
+        .any(|site| site.required_type == ScalarMemoryUseType::Signed32);
+    let unsigned32 = plan
+        .sites
+        .iter()
+        .any(|site| site.required_type == ScalarMemoryUseType::Unsigned32);
+    Some(if signed32 && !unsigned32 {
+        ScalarMemoryUseType::Signed32
+    } else {
+        ScalarMemoryUseType::Unsigned32
+    })
+}
+
+fn scalar_result_use_type(proof: &ScalarMemoryAccessProof) -> Option<ScalarMemoryUseType> {
+    if proof.result_chain == Some(ScalarMemoryResultChain::ZeroUpper32) {
+        return (proof.encoded_destination_width == Some(4) && proof.value_width == 8)
+            .then_some(ScalarMemoryUseType::Unsigned64);
+    }
+    let signed = match proof.extension {
+        ScalarMemoryExtension::SignExtend => true,
+        ScalarMemoryExtension::ZeroExtend | ScalarMemoryExtension::ImplicitZeroExtend => false,
+        ScalarMemoryExtension::Plain => scalar_access_use_type(proof)?.signed(),
+    };
+    match (proof.value_width, signed) {
+        (1, true) => Some(ScalarMemoryUseType::Signed8),
+        (1, false) => Some(ScalarMemoryUseType::Unsigned8),
+        (2, true) => Some(ScalarMemoryUseType::Signed16),
+        (2, false) => Some(ScalarMemoryUseType::Unsigned16),
+        (4, true) => Some(ScalarMemoryUseType::Signed32),
+        (4, false) => Some(ScalarMemoryUseType::Unsigned32),
+        (8, true) => Some(ScalarMemoryUseType::Signed64),
+        (8, false) => Some(ScalarMemoryUseType::Unsigned64),
+        _ => None,
+    }
+}
+
+fn scalar_load_lvalue_type(statement: &ClightStmt) -> Option<&ClightType> {
+    let statement = match statement {
+        ClightStmt::Slabel(_, inner) => inner.as_ref(),
+        statement => statement,
+    };
+    let ClightStmt::Sset(_, expression) = statement else {
+        return None;
+    };
+    let mut expression = expression;
+    while let ClightExpr::Ecast(inner, _) = expression {
+        expression = inner;
+    }
+    match expression {
+        ClightExpr::Ederef(_, access_type) | ClightExpr::Efield(_, _, access_type) => {
+            Some(access_type)
+        }
+        _ => None,
+    }
+}
+
+fn scalar_rewrite_exact_temp_expr(
+    expression: &mut ClightExpr,
+    target: RTLReg,
+    replacement: &ClightExpr,
+    replacements: &mut usize,
+) {
+    match expression {
+        ClightExpr::Etempvar(identifier, _) if *identifier == target as Ident => {
+            *expression = replacement.clone();
+            *replacements += 1;
+        }
+        ClightExpr::Ederef(inner, _)
+        | ClightExpr::Eaddrof(inner, _)
+        | ClightExpr::Eunop(_, inner, _)
+        | ClightExpr::Ecast(inner, _)
+        | ClightExpr::Efield(inner, _, _) => {
+            scalar_rewrite_exact_temp_expr(inner, target, replacement, replacements)
+        }
+        ClightExpr::Ebinop(_, left, right, _) => {
+            scalar_rewrite_exact_temp_expr(left, target, replacement, replacements);
+            scalar_rewrite_exact_temp_expr(right, target, replacement, replacements);
+        }
+        ClightExpr::Econdition(condition, left, right, _) => {
+            scalar_rewrite_exact_temp_expr(condition, target, replacement, replacements);
+            scalar_rewrite_exact_temp_expr(left, target, replacement, replacements);
+            scalar_rewrite_exact_temp_expr(right, target, replacement, replacements);
+        }
+        ClightExpr::EconstInt(..)
+        | ClightExpr::EconstFloat(..)
+        | ClightExpr::EconstSingle(..)
+        | ClightExpr::EconstLong(..)
+        | ClightExpr::Evar(..)
+        | ClightExpr::EvarSymbol(..)
+        | ClightExpr::Etempvar(..)
+        | ClightExpr::Esizeof(..)
+        | ClightExpr::Ealignof(..) => {}
+    }
+}
+
+fn scalar_rewrite_exact_temp_stmt(
+    statement: &mut ClightStmt,
+    target: RTLReg,
+    replacement: &ClightExpr,
+    replacements: &mut usize,
+) {
+    match statement {
+        ClightStmt::Sassign(left, right) => {
+            scalar_rewrite_exact_temp_expr(left, target, replacement, replacements);
+            scalar_rewrite_exact_temp_expr(right, target, replacement, replacements);
+        }
+        ClightStmt::Sset(_, expression) | ClightStmt::Sreturn(Some(expression)) => {
+            scalar_rewrite_exact_temp_expr(expression, target, replacement, replacements)
+        }
+        ClightStmt::Scall(_, callee, arguments) => {
+            scalar_rewrite_exact_temp_expr(callee, target, replacement, replacements);
+            for argument in arguments {
+                scalar_rewrite_exact_temp_expr(argument, target, replacement, replacements);
+            }
+        }
+        ClightStmt::Sbuiltin(_, _, _, arguments) => {
+            for argument in arguments {
+                scalar_rewrite_exact_temp_expr(argument, target, replacement, replacements);
+            }
+        }
+        ClightStmt::Ssequence(statements) => {
+            for statement in statements {
+                scalar_rewrite_exact_temp_stmt(statement, target, replacement, replacements);
+            }
+        }
+        ClightStmt::Sifthenelse(condition, left, right) => {
+            scalar_rewrite_exact_temp_expr(condition, target, replacement, replacements);
+            scalar_rewrite_exact_temp_stmt(left, target, replacement, replacements);
+            scalar_rewrite_exact_temp_stmt(right, target, replacement, replacements);
+        }
+        ClightStmt::Sloop(body, continuation) => {
+            scalar_rewrite_exact_temp_stmt(body, target, replacement, replacements);
+            scalar_rewrite_exact_temp_stmt(continuation, target, replacement, replacements);
+        }
+        ClightStmt::Sswitch(expression, cases) => {
+            scalar_rewrite_exact_temp_expr(expression, target, replacement, replacements);
+            for (_, statement) in cases {
+                scalar_rewrite_exact_temp_stmt(statement, target, replacement, replacements);
+            }
+        }
+        ClightStmt::Slabel(_, statement) => {
+            scalar_rewrite_exact_temp_stmt(statement, target, replacement, replacements)
+        }
+        ClightStmt::Sskip
+        | ClightStmt::Sbreak
+        | ClightStmt::Scontinue
+        | ClightStmt::Sreturn(None)
+        | ClightStmt::Sgoto(_) => {}
+    }
+}
+
+fn scalar_transport_feature_statement(
+    statement: &ClightStmt,
+    transport: &ScalarMemoryTransport,
+    input_type: &ClightType,
+    output_type: &ClightType,
+) -> Option<ClightStmt> {
+    fn rewrite(
+        statement: &mut ClightStmt,
+        transport: &ScalarMemoryTransport,
+        input_type: &ClightType,
+        output_type: &ClightType,
+    ) -> Option<()> {
+        if let ClightStmt::Slabel(_, inner) = statement {
+            return rewrite(inner, transport, input_type, output_type);
+        }
+        let ClightStmt::Sset(destination, expression) = statement else {
+            return None;
+        };
+        if *destination != transport.output as Ident {
+            return None;
+        }
+        let input = match transport.kind {
+            ScalarMemoryTransportKind::Move => {
+                if !matches!(expression, ClightExpr::Etempvar(_, _)) {
+                    return None;
+                }
+                expression
+            }
+            ScalarMemoryTransportKind::LaneCast(_) => {
+                let ClightExpr::Ecast(inner, target) = expression else {
+                    return None;
+                };
+                *target = output_type.clone();
+                inner.as_mut()
+            }
+        };
+        let ClightExpr::Etempvar(identifier, annotation) = input else {
+            return None;
+        };
+        if *identifier != transport.input as Ident {
+            return None;
+        }
+        *annotation = input_type.clone();
+        Some(())
+    }
+
+    let mut rewritten = statement.clone();
+    rewrite(&mut rewritten, transport, input_type, output_type)?;
+    Some(rewritten)
+}
+
+fn scalar_leaf_feature_statement(
+    statement: &ClightStmt,
+    proof: &ScalarMemoryAccessProof,
+    site: &ScalarMemoryUseSite,
+    declaration_type: ClightType,
+    result_type: ScalarMemoryUseType,
+    placement: ScalarLvaluePlacement,
+) -> Option<ClightStmt> {
+    let result_clight_type = scalar_use_clight_type(result_type);
+    let required_clight_type = scalar_use_clight_type(site.required_type);
+    let mut replacement = ClightExpr::Etempvar(site.value as Ident, declaration_type.clone());
+    if placement == ScalarLvaluePlacement::ExtensionPerUse {
+        if proof.result_chain == Some(ScalarMemoryResultChain::ZeroUpper32) {
+            let encoded = scalar_use_clight_type(if proof.extension
+                == ScalarMemoryExtension::SignExtend
+            {
+                ScalarMemoryUseType::Signed32
+            } else {
+                ScalarMemoryUseType::Unsigned32
+            });
+            replacement = ClightExpr::Ecast(Box::new(replacement), encoded);
+            if proof.extension == ScalarMemoryExtension::SignExtend {
+                replacement = ClightExpr::Ecast(
+                    Box::new(replacement),
+                    scalar_use_clight_type(ScalarMemoryUseType::Unsigned32),
+                );
+            }
+            replacement = ClightExpr::Ecast(Box::new(replacement), result_clight_type.clone());
+        } else if declaration_type != result_clight_type {
+            replacement = ClightExpr::Ecast(Box::new(replacement), result_clight_type.clone());
+        }
+    }
+    if result_clight_type != required_clight_type {
+        replacement = ClightExpr::Ecast(Box::new(replacement), required_clight_type);
+    }
+    let mut rewritten = statement.clone();
+    let mut replacements = 0usize;
+    scalar_rewrite_exact_temp_stmt(
+        &mut rewritten,
+        site.value,
+        &replacement,
+        &mut replacements,
+    );
+    (replacements == 1).then_some(rewritten)
+}
+
+type ScalarExtensionRow = (Node, ScalarMemoryAccessProof, ScalarMemoryUsePlan);
+
+/// A private source rewrite cannot preserve an encoded qword result, or a
+/// plain r32 result admitted specifically for its architectural upper-zero
+/// behavior, after final RTL has narrowed away every wide consumer.  Keep the
+/// proof as provenance, but do not offer either extension placement unless at
+/// least one closed terminal use still observes the full architectural value.
+fn scalar_extension_plan_retains_architectural_result(
+    proof: &ScalarMemoryAccessProof,
+    plan: &ScalarMemoryUsePlan,
+) -> bool {
+    let requires_wide_terminal = proof.encoded_destination_width == Some(8)
+        || proof.extension == ScalarMemoryExtension::ImplicitZeroExtend;
+    !requires_wide_terminal
+        || plan
+            .sites
+            .iter()
+            .any(|site| site.required_type.width() == proof.value_width)
+}
+
+/// Partition extension proofs by the same authenticated address-DAG identity
+/// used by the spelling profiles.  A malformed or ambiguous row poisons only
+/// its own root cluster; it never suppresses an unrelated closed load.
+fn scalar_extension_proof_clusters(function: &FunctionData) -> Vec<Vec<ScalarExtensionRow>> {
+    let mut clusters: BTreeMap<ScalarAddressCluster, Vec<_>> = BTreeMap::new();
+    let mut invalid = BTreeSet::new();
+    let mut rows: Vec<_> = function.scalar_lvalue_proofs.iter().collect();
+    rows.sort_by_key(|(node, _)| **node);
+    for (node, proofs) in rows {
+        let qualifying: Vec<_> = proofs
+            .iter()
+            .filter(|proof| {
+                proof.direction == ScalarMemoryDirection::Read
+                    && (proof.extension != ScalarMemoryExtension::Plain
+                        || matches!(proof.width, 1 | 2))
+            })
+            .collect();
+        if qualifying.is_empty() {
+            continue;
+        }
+        let keys: BTreeSet<_> = qualifying
+            .iter()
+            .filter_map(|proof| {
+                Some((
+                    proof.base_value?,
+                    proof.index_value,
+                    proof.scale,
+                    proof.address_param_leaves.as_ref().clone(),
+                ))
+            })
+            .collect();
+        let Some(key) = keys.iter().next().cloned().filter(|_| keys.len() == 1) else {
+            invalid.extend(keys);
+            continue;
+        };
+        let [proof] = qualifying.as_slice() else {
+            invalid.insert(key);
+            continue;
+        };
+        let Some(plans) = function.scalar_memory_use_plans.get(node) else {
+            invalid.insert(key);
+            continue;
+        };
+        let [plan] = plans.as_slice() else {
+            invalid.insert(key);
+            continue;
+        };
+        if proofs.len() != 1
+            || proof.function != function.address
+            || proof.selected_node != *node
+            || !proof.is_closed_v1()
+            || !plan.is_closed_v1(proof)
+            || !scalar_extension_plan_retains_architectural_result(proof, plan)
+        {
+            invalid.insert(key);
+            continue;
+        }
+        clusters
+            .entry(key)
+            .or_default()
+            .push((*node, (*proof).clone(), plan.clone()));
+    }
+    clusters
+        .into_iter()
+        .filter_map(|(key, mut rows)| {
+            if invalid.contains(&key) {
+                None
+            } else {
+                rows.sort_by_key(|(node, _, _)| *node);
+                Some(rows)
+            }
+        })
+        .collect()
+}
+
+/// Return every cluster whose rewrite footprint overlaps another cluster in a
+/// way that is not a shared terminal consumer.  Several independent values may
+/// occur once each in one binary/call statement; loads/transports, duplicate
+/// occurrences, and shared def values remain ambiguous and reject both roots.
+fn scalar_conflicting_extension_clusters(
+    clusters: &[Vec<ScalarExtensionRow>],
+) -> BTreeSet<usize> {
+    let mut value_owners: BTreeMap<RTLReg, Vec<usize>> = BTreeMap::new();
+    let mut node_roles: BTreeMap<Node, Vec<(usize, bool, RTLReg)>> = BTreeMap::new();
+    for (cluster_index, rows) in clusters.iter().enumerate() {
+        for (node, proof, plan) in rows {
+            value_owners.entry(proof.value).or_default().push(cluster_index);
+            node_roles
+                .entry(*node)
+                .or_default()
+                .push((cluster_index, true, proof.value));
+            for transport in plan.transports.iter() {
+                value_owners
+                    .entry(transport.output)
+                    .or_default()
+                    .push(cluster_index);
+                node_roles.entry(transport.node).or_default().push((
+                    cluster_index,
+                    true,
+                    transport.output,
+                ));
+            }
+            for site in plan.sites.iter() {
+                node_roles
+                    .entry(site.node)
+                    .or_default()
+                    .push((cluster_index, false, site.value));
+            }
+        }
+    }
+    let mut invalid = BTreeSet::new();
+    for owners in value_owners.values() {
+        if owners.len() != 1 {
+            invalid.extend(owners.iter().copied());
+        }
+    }
+    for roles in node_roles.values() {
+        let unique_leaf_values: BTreeSet<_> = roles.iter().map(|(_, _, value)| *value).collect();
+        if (roles.iter().any(|(_, exclusive, _)| *exclusive) && roles.len() != 1)
+            || (roles.iter().all(|(_, exclusive, _)| !*exclusive)
+                && unique_leaf_values.len() != roles.len())
+        {
+            invalid.extend(roles.iter().map(|(owner, _, _)| *owner));
+        }
+    }
+    invalid
+}
+
+/// Field-preferred, raw-fallback spelling for already closed Stage-2 Plain
+/// clusters.  This is composed into extension views while the independent raw
+/// and field families remain separately scoreable in the outer portfolio.
+fn scalar_composed_plain_candidates(function: &FunctionData) -> BTreeMap<Node, Vec<ClightStmt>> {
+    let mut result = BTreeMap::new();
+    for cluster in scalar_plain_proof_clusters(function) {
+        let mut pending = Vec::new();
+        let mut valid = true;
+        for (node, proof) in cluster {
+            let mut candidates: Vec<_> = function
+                .node_statements
+                .get(&node)
+                .into_iter()
+                .flatten()
+                .filter(|statement| scalar_field_candidate_is_closed(function, &proof, statement))
+                .cloned()
+                .collect();
+            if candidates.is_empty() {
+                let expected = if proof.exact_scaled_index {
+                    ScalarLvalueSourceForm::TypedScaled
+                } else {
+                    ScalarLvalueSourceForm::RawByte
+                };
+                candidates = function
+                    .scalar_lvalue_source_candidates
+                    .get(&node)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(form, candidate_placement, _)| {
+                        *form == expected
+                            && *candidate_placement == ScalarLvaluePlacement::Plain
+                    })
+                    .map(|(_, _, statement)| statement.clone())
+                    .collect();
+            }
+            candidates.sort_by_cached_key(|statement| format!("{:?}", statement));
+            candidates.dedup();
+            if candidates.is_empty()
+                || !function.node_statements.contains_key(&node)
+                || result.contains_key(&node)
+            {
+                valid = false;
+                break;
+            }
+            pending.push((node, candidates));
+        }
+        if valid {
+            result.extend(pending);
+        }
+    }
+    result
+}
+
+fn scalar_apply_extension_cluster(
+    fixed: &mut FunctionData,
+    function: &FunctionData,
+    cluster: &[ScalarExtensionRow],
+    placement: ScalarLvaluePlacement,
+) -> Option<BTreeSet<RTLReg>> {
+    let mut authorized_type_changes = BTreeSet::new();
+    let mut leaf_rewrites = Vec::new();
+    for (node, proof, plan) in cluster {
+        let expected = if proof.exact_scaled_index {
+            ScalarLvalueSourceForm::TypedScaled
+        } else {
+            ScalarLvalueSourceForm::RawByte
+        };
+        let access_type = scalar_access_use_type_for_plan(proof, plan)?;
+        let access_clight_type = scalar_use_clight_type(access_type);
+        let mut load_candidates: Vec<_> = function
+            .node_statements
+            .get(node)?
+            .iter()
+            .filter_map(|statement| {
+                scalar_field_placement_statement(function, proof, statement, placement)
+            })
+            .collect();
+        if load_candidates.is_empty() {
+            load_candidates = function
+                .scalar_lvalue_source_candidates
+                .get(node)?
+                .iter()
+                .filter(|(form, candidate_placement, _)| {
+                    *form == expected && *candidate_placement == placement
+                })
+                .filter(|(_, _, statement)| {
+                    scalar_load_lvalue_type(statement) == Some(&access_clight_type)
+                })
+                .map(|(_, _, statement)| statement.clone())
+                .collect();
+        }
+        load_candidates.sort_by_cached_key(|statement| format!("{:?}", statement));
+        load_candidates.dedup();
+        load_candidates.retain(|statement| {
+            scalar_load_lvalue_type(statement) == Some(&access_clight_type)
+        });
+        if load_candidates.is_empty() || !fixed.node_statements.contains_key(node) {
+            return None;
+        }
+        fixed.node_statements.insert(*node, load_candidates);
+
+        let result_type = scalar_result_use_type(proof)?;
+        let root_declaration_type = match (proof.extension, placement) {
+            (ScalarMemoryExtension::Plain, ScalarLvaluePlacement::ExtensionPerUse) => None,
+            (_, ScalarLvaluePlacement::ExtensionPerUse) => Some(access_type),
+            (_, ScalarLvaluePlacement::ExtensionHoisted) => Some(result_type),
+            _ => return None,
+        };
+        let chain_values: BTreeSet<_> = std::iter::once(plan.value)
+            .chain(plan.transports.iter().map(|transport| transport.output))
+            .collect();
+        let canonical_root_type = fixed
+            .var_type_candidates
+            .get(&plan.value)?
+            .first()
+            .map(|type_string| {
+                crate::decompile::passes::clight_select::wt_audit::type_string_to_clight(
+                    type_string,
+                )
+            })
+            .as_ref()
+            .and_then(scalar_clight_integral_type)?;
+        let mut resolved_types = BTreeMap::from([(
+            plan.value,
+            (
+                root_declaration_type.unwrap_or(canonical_root_type),
+                root_declaration_type.is_some(),
+            ),
+        )]);
+        while resolved_types.len() < chain_values.len() {
+            let before = resolved_types.len();
+            for transport in plan.transports.iter() {
+                if resolved_types.contains_key(&transport.output) {
+                    continue;
+                }
+                let Some((input_type, input_retyped)) =
+                    resolved_types.get(&transport.input).copied()
+                else {
+                    continue;
+                };
+                let output = match transport.kind {
+                    ScalarMemoryTransportKind::Move => (input_type, input_retyped),
+                    ScalarMemoryTransportKind::LaneCast(required_type) => (required_type, true),
+                };
+                resolved_types.insert(transport.output, output);
+            }
+            if resolved_types.len() == before {
+                return None;
+            }
+        }
+        let mut chain_types = BTreeMap::new();
+        for value in &chain_values {
+            let (use_type, retype) = resolved_types.get(value).copied()?;
+            if retype {
+                let type_string = scalar_use_type_string(use_type).to_string();
+                fixed.var_types.insert(*value, type_string.clone());
+                fixed
+                    .var_type_candidates
+                    .insert(*value, vec![type_string]);
+                fixed.var_decl_idx.insert(*value, 0);
+                authorized_type_changes.insert(*value);
+            }
+            chain_types.insert(*value, scalar_use_clight_type(use_type));
+        }
+        for transport in plan.transports.iter() {
+            let current = fixed.node_statements.get(&transport.node)?;
+            let [current] = current.as_slice() else {
+                return None;
+            };
+            let rewritten = scalar_transport_feature_statement(
+                current,
+                transport,
+                chain_types.get(&transport.input)?,
+                chain_types.get(&transport.output)?,
+            )?;
+            fixed.node_statements.insert(transport.node, vec![rewritten]);
+        }
+        for site in plan.sites.iter() {
+            leaf_rewrites.push((
+                site.node,
+                site.value,
+                *node,
+                proof.clone(),
+                site.clone(),
+                chain_types.get(&site.value)?.clone(),
+                result_type,
+            ));
+        }
+    }
+    leaf_rewrites.sort_by_key(|(node, value, definition, ..)| (*node, *value, *definition));
+    for (node, _, _, proof, site, declaration_type, result_type) in leaf_rewrites {
+        let current = fixed.node_statements.get(&node)?;
+        let [current] = current.as_slice() else {
+            return None;
+        };
+        let rewritten = scalar_leaf_feature_statement(
+            current,
+            &proof,
+            &site,
+            declaration_type,
+            result_type,
+            placement,
+        )?;
+        fixed.node_statements.insert(node, vec![rewritten]);
+    }
+    Some(authorized_type_changes)
+}
+
+type ScalarExtensionFeatureView = (FunctionData, BTreeSet<RTLReg>, BTreeSet<Node>);
+
+fn scalar_extension_feature_base(
+    function: &FunctionData,
+    canonical: &SelectedFunction,
+    canonical_state: &ProgramSelectionState,
+) -> Option<FunctionData> {
+    let mut fixed = function.clone();
+    for (node, candidates) in &mut fixed.node_statements {
+        let index = canonical_state
+            .candidate_idx
+            .get(&(function.address, *node))
+            .copied()
+            .flatten()?;
+        *candidates = vec![candidates.get(index)?.clone()];
+    }
+    fixed.var_types = canonical.var_types.clone();
+    fixed.var_type_candidates.clear();
+    fixed.var_decl_idx.clear();
+    for (reg, candidates) in &canonical.var_type_candidates {
+        let index = canonical.var_decl_idx.get(reg).copied().unwrap_or(0);
+        fixed
+            .var_type_candidates
+            .insert(*reg, vec![candidates.get(index)?.clone()]);
+        fixed.var_decl_idx.insert(*reg, 0);
+    }
+    for (node, candidates) in scalar_composed_plain_candidates(function) {
+        fixed.node_statements.insert(node, candidates);
+    }
+    Some(fixed)
+}
+
+/// Construct both extension placements over one exact deterministic cluster
+/// set. A cluster is admitted only when it composes successfully into both
+/// current sibling views, so placement-specific failures cannot silently pair
+/// alternatives for different machine loads.
+fn scalar_extension_feature_views(
+    function: &FunctionData,
+    canonical: &SelectedFunction,
+    canonical_state: &ProgramSelectionState,
+) -> Option<(ScalarExtensionFeatureView, ScalarExtensionFeatureView)> {
+    let clusters = scalar_extension_proof_clusters(function);
+    if clusters.is_empty() {
+        return None;
+    }
+    let conflicting = scalar_conflicting_extension_clusters(&clusters);
+    let base = scalar_extension_feature_base(function, canonical, canonical_state)?;
+    let mut per_use = base.clone();
+    let mut hoisted = base;
+
+    let mut per_use_type_changes = BTreeSet::new();
+    let mut hoisted_type_changes = BTreeSet::new();
+    let mut authenticated_load_nodes = BTreeSet::new();
+    for (cluster_index, cluster) in clusters.iter().enumerate() {
+        if conflicting.contains(&cluster_index) {
+            continue;
+        }
+        let mut per_use_candidate = per_use.clone();
+        let mut hoisted_candidate = hoisted.clone();
+        let Some(per_use_changes) = scalar_apply_extension_cluster(
+            &mut per_use_candidate,
+            function,
+            cluster,
+            ScalarLvaluePlacement::ExtensionPerUse,
+        )
+        else {
+            continue;
+        };
+        let Some(hoisted_changes) = scalar_apply_extension_cluster(
+            &mut hoisted_candidate,
+            function,
+            cluster,
+            ScalarLvaluePlacement::ExtensionHoisted,
+        )
+        else {
+            continue;
+        };
+        if per_use_changes
+            .iter()
+            .chain(hoisted_changes.iter())
+            .any(|value| function.param_regs.contains(value))
+        {
+            continue;
+        }
+        per_use = per_use_candidate;
+        hoisted = hoisted_candidate;
+        per_use_type_changes.extend(per_use_changes);
+        hoisted_type_changes.extend(hoisted_changes);
+        authenticated_load_nodes.extend(cluster.iter().map(|(node, _, _)| *node));
+    }
+    if authenticated_load_nodes.is_empty() {
+        return None;
+    }
+    for fixed in [&mut per_use, &mut hoisted] {
+        fixed.scalar_lvalue_proofs.clear();
+        fixed.scalar_memory_use_plans.clear();
+        fixed.scalar_lvalue_source_candidates.clear();
+    }
+    Some((
+        (
+            per_use,
+            per_use_type_changes,
+            authenticated_load_nodes.clone(),
+        ),
+        (hoisted, hoisted_type_changes, authenticated_load_nodes),
+    ))
+}
+
+fn scalar_extension_feature_view(
+    function: &FunctionData,
+    canonical: &SelectedFunction,
+    canonical_state: &ProgramSelectionState,
+    placement: ScalarLvaluePlacement,
+) -> Option<(FunctionData, BTreeSet<RTLReg>)> {
+    let (per_use, hoisted) =
+        scalar_extension_feature_views(function, canonical, canonical_state)?;
+    match placement {
+        ScalarLvaluePlacement::ExtensionPerUse => Some((per_use.0, per_use.1)),
+        ScalarLvaluePlacement::ExtensionHoisted => Some((hoisted.0, hoisted.1)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -563,6 +1660,8 @@ mod scalar_lvalue_alternative_tests {
             operand: "mem0",
             direction: ScalarMemoryDirection::Read,
             extension: ScalarMemoryExtension::Plain,
+            encoded_destination_width: Some(4),
+            result_chain: Some(ScalarMemoryResultChain::Direct),
             address_size: 8,
             base_register: Mreg::AX,
             index_register: scaled.then_some(Mreg::CX),
@@ -608,7 +1707,13 @@ mod scalar_lvalue_alternative_tests {
                 .insert(node, vec![proof_for_form(node, form)]);
             function
                 .scalar_lvalue_source_candidates
-                .insert(node, alternatives.into_iter().map(|s| (form, s)).collect());
+                .insert(
+                    node,
+                    alternatives
+                        .into_iter()
+                        .map(|s| (form, ScalarLvaluePlacement::Plain, s))
+                        .collect(),
+                );
         }
         let canonical_state = ProgramSelectionState {
             candidate_idx: [(0x1000, 0x1000), (0x1000, 0x1004)]
@@ -675,7 +1780,11 @@ mod scalar_lvalue_alternative_tests {
 
         function.scalar_lvalue_source_candidates.insert(
             0x1000,
-            vec![(ScalarLvalueSourceForm::TypedScaled, statement(1))],
+            vec![(
+                ScalarLvalueSourceForm::TypedScaled,
+                ScalarLvaluePlacement::Plain,
+                statement(1),
+            )],
         );
         function.scalar_lvalue_proofs.get_mut(&0x1000).unwrap().push(
             proof_for_form(0x1000, ScalarLvalueSourceForm::RawByte),
@@ -706,11 +1815,19 @@ mod scalar_lvalue_alternative_tests {
         function.scalar_lvalue_proofs.insert(0x1004, vec![extension]);
         function.scalar_lvalue_source_candidates.insert(
             0x1000,
-            vec![(ScalarLvalueSourceForm::RawByte, statement(1))],
+            vec![(
+                ScalarLvalueSourceForm::RawByte,
+                ScalarLvaluePlacement::Plain,
+                statement(1),
+            )],
         );
         function.scalar_lvalue_source_candidates.insert(
             0x1004,
-            vec![(ScalarLvalueSourceForm::RawByte, statement(5))],
+            vec![(
+                ScalarLvalueSourceForm::RawByte,
+                ScalarLvaluePlacement::Plain,
+                statement(5),
+            )],
         );
         let canonical_state = ProgramSelectionState {
             candidate_idx: [
@@ -750,8 +1867,16 @@ mod scalar_lvalue_alternative_tests {
         function.scalar_lvalue_source_candidates.insert(
             0x1000,
             vec![
-                (ScalarLvalueSourceForm::RawByte, statement(1)),
-                (ScalarLvalueSourceForm::TypedScaled, statement(2)),
+                (
+                    ScalarLvalueSourceForm::RawByte,
+                    ScalarLvaluePlacement::Plain,
+                    statement(1),
+                ),
+                (
+                    ScalarLvalueSourceForm::TypedScaled,
+                    ScalarLvaluePlacement::Plain,
+                    statement(2),
+                ),
             ],
         );
         let canonical_state = ProgramSelectionState {
@@ -766,6 +1891,416 @@ mod scalar_lvalue_alternative_tests {
             &HashMap::new(),
         );
         assert!(scalar_lvalue_feature_view(&function, &canonical, &canonical_state).is_none());
+    }
+
+    #[test]
+    fn field_feature_view_activates_only_for_the_exact_existing_layout_candidate() {
+        const NODE: Node = 0x1000;
+        const STRUCT_ID: Ident = 0x55;
+        const FIELD_ID: Ident = 4;
+        let int_type = ClightType::Tint(
+            ClightIntSize::I32,
+            ClightSignedness::Signed,
+            ClightAttr::default(),
+        );
+        let struct_type = ClightType::Tstruct(STRUCT_ID, ClightAttr::default());
+        let base = ClightExpr::Ederef(
+            Box::new(ClightExpr::Etempvar(
+                1,
+                ClightType::Tpointer(
+                    std::sync::Arc::new(struct_type.clone()),
+                    ClightAttr::default(),
+                ),
+            )),
+            struct_type,
+        );
+        let field_statement = ClightStmt::Sset(
+            3,
+            ClightExpr::Efield(Box::new(base), FIELD_ID, int_type.clone()),
+        );
+        let canonical_statement = ClightStmt::Sset(
+            3,
+            ClightExpr::EconstInt(0, int_type),
+        );
+
+        let mut function = function();
+        let mut proof = proof_for_form(NODE, ScalarLvalueSourceForm::RawByte);
+        proof.displacement = FIELD_ID as i64;
+        assert!(proof.is_closed_v1());
+        function
+            .node_statements
+            .insert(NODE, vec![canonical_statement.clone(), field_statement.clone()]);
+        function.scalar_lvalue_proofs.insert(NODE, vec![proof]);
+        function.struct_fields.insert(
+            1,
+            vec![(FIELD_ID as i64, FIELD_ID, MemoryChunk::MInt32)],
+        );
+        let canonical_state = ProgramSelectionState {
+            candidate_idx: [((function.address, NODE), Some(0))].into_iter().collect(),
+            var_decl_idx: HashMap::new(),
+            var_type_override: HashMap::new(),
+        };
+        let canonical = build_selected_function_from_program_state(
+            &function,
+            &canonical_state,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let fixed = scalar_field_feature_view(&function, &canonical, &canonical_state)
+            .expect("exact base+disp+width layout candidate activates the field profile");
+        assert_eq!(fixed.node_statements[&NODE], vec![field_statement]);
+        assert_eq!(canonical.statements[&NODE], canonical_statement);
+
+        let mut wrong_layout = function.clone();
+        wrong_layout.struct_fields.insert(
+            1,
+            vec![(FIELD_ID as i64, FIELD_ID, MemoryChunk::MInt16Unsigned)],
+        );
+        assert!(scalar_field_feature_view(&wrong_layout, &canonical, &canonical_state).is_none());
+    }
+
+    #[test]
+    fn implicit_zero_extend_access_signedness_is_bound_to_the_closed_leaf_plan() {
+        let mut proof = proof_for_form(0x1000, ScalarLvalueSourceForm::RawByte);
+        proof.extension = ScalarMemoryExtension::ImplicitZeroExtend;
+        proof.encoded_destination_width = Some(4);
+        proof.result_chain = Some(ScalarMemoryResultChain::ZeroUpper32);
+        proof.value_width = 8;
+        proof.downstream_value_width = Some(8);
+        assert!(proof.is_closed_v1());
+
+        let plan = |required_types: &[ScalarMemoryUseType]| ScalarMemoryUsePlan {
+            function: proof.function,
+            definition_node: proof.selected_node,
+            value: proof.value,
+            transports: std::sync::Arc::new(Vec::new()),
+            sites: std::sync::Arc::new(
+                required_types
+                    .iter()
+                    .enumerate()
+                    .map(|(index, required_type)| ScalarMemoryUseSite {
+                        node: proof.selected_node + 4 + index as u64,
+                        value: proof.value,
+                        required_type: *required_type,
+                    })
+                    .collect(),
+            ),
+        };
+        assert_eq!(
+            scalar_access_use_type_for_plan(
+                &proof,
+                &plan(&[ScalarMemoryUseType::Signed32]),
+            ),
+            Some(ScalarMemoryUseType::Signed32),
+        );
+        assert_eq!(
+            scalar_access_use_type_for_plan(
+                &proof,
+                &plan(&[ScalarMemoryUseType::Unsigned32]),
+            ),
+            Some(ScalarMemoryUseType::Unsigned32),
+        );
+        assert_eq!(
+            scalar_access_use_type_for_plan(
+                &proof,
+                &plan(&[
+                    ScalarMemoryUseType::Signed32,
+                    ScalarMemoryUseType::Unsigned32,
+                ]),
+            ),
+            Some(ScalarMemoryUseType::Unsigned32),
+            "conflicting leaves retain signedness at each use; the shared access is unsigned",
+        );
+    }
+
+    fn signed_byte_extension_proof(
+        definition: Node,
+        value: RTLReg,
+        base: RTLReg,
+    ) -> ScalarMemoryAccessProof {
+        ScalarMemoryAccessProof {
+            function: 0x1000,
+            origin_node: definition,
+            selected_node: definition,
+            operand: "extension_mem",
+            direction: ScalarMemoryDirection::Read,
+            extension: ScalarMemoryExtension::SignExtend,
+            encoded_destination_width: Some(8),
+            result_chain: Some(ScalarMemoryResultChain::Direct),
+            address_size: 8,
+            base_register: Mreg::AX,
+            index_register: None,
+            scale: 1,
+            displacement: 0,
+            width: 1,
+            value_width: 8,
+            downstream_value_width: Some(8),
+            chunk: MemoryChunk::MInt8Signed,
+            base_value: Some(base),
+            index_value: None,
+            value,
+            address_param_leaves: std::sync::Arc::new(vec![base]),
+            synthetic_stack_origin: false,
+            exact_scaled_index: false,
+        }
+    }
+
+    fn signed_byte_load_statement(
+        proof: &ScalarMemoryAccessProof,
+        placement: ScalarLvaluePlacement,
+    ) -> ClightStmt {
+        let access_type = scalar_use_clight_type(ScalarMemoryUseType::Signed8);
+        let lvalue = ClightExpr::Ederef(
+            Box::new(ClightExpr::Etempvar(
+                proof.base_value.unwrap() as Ident,
+                scalar_use_clight_type(ScalarMemoryUseType::Unsigned64),
+            )),
+            access_type,
+        );
+        let value = match placement {
+            ScalarLvaluePlacement::ExtensionPerUse => lvalue,
+            ScalarLvaluePlacement::ExtensionHoisted => {
+                crate::decompile::passes::clight_pass::scalar_hoisted_load_value(proof, lvalue)
+                    .unwrap()
+            }
+            ScalarLvaluePlacement::Plain => unreachable!(),
+        };
+        ClightStmt::Sset(proof.value as Ident, value)
+    }
+
+    fn extension_shared_consumer_fixture(
+        duplicate_first: bool,
+    ) -> (FunctionData, SelectedFunction, ProgramSelectionState) {
+        let first = signed_byte_extension_proof(0x1010, 20, 10);
+        let second = signed_byte_extension_proof(0x1020, 21, 11);
+        let leaf = 0x1030;
+        let mut function = function();
+        for proof in [&first, &second] {
+            function.node_statements.insert(
+                proof.selected_node,
+                vec![ClightStmt::Sset(
+                    proof.value as Ident,
+                    ClightExpr::EconstLong(
+                        0,
+                        scalar_use_clight_type(ScalarMemoryUseType::Signed64),
+                    ),
+                )],
+            );
+            function
+                .scalar_lvalue_proofs
+                .insert(proof.selected_node, vec![proof.clone()]);
+            function.scalar_memory_use_plans.insert(
+                proof.selected_node,
+                vec![ScalarMemoryUsePlan {
+                    function: 0x1000,
+                    definition_node: proof.selected_node,
+                    value: proof.value,
+                    transports: std::sync::Arc::new(Vec::new()),
+                    sites: std::sync::Arc::new(vec![ScalarMemoryUseSite {
+                        node: leaf,
+                        value: proof.value,
+                        required_type: ScalarMemoryUseType::Signed64,
+                    }]),
+                }],
+            );
+            function.scalar_lvalue_source_candidates.insert(
+                proof.selected_node,
+                vec![
+                    (
+                        ScalarLvalueSourceForm::RawByte,
+                        ScalarLvaluePlacement::ExtensionPerUse,
+                        signed_byte_load_statement(
+                            proof,
+                            ScalarLvaluePlacement::ExtensionPerUse,
+                        ),
+                    ),
+                    (
+                        ScalarLvalueSourceForm::RawByte,
+                        ScalarLvaluePlacement::ExtensionHoisted,
+                        signed_byte_load_statement(
+                            proof,
+                            ScalarLvaluePlacement::ExtensionHoisted,
+                        ),
+                    ),
+                ],
+            );
+            function
+                .var_types
+                .insert(proof.value, "int_I64".to_string());
+            function
+                .var_type_candidates
+                .insert(proof.value, vec!["int_I64".to_string()]);
+            function.var_decl_idx.insert(proof.value, 0);
+        }
+        let long_type = scalar_use_clight_type(ScalarMemoryUseType::Signed64);
+        let first_value = ClightExpr::Etempvar(first.value as Ident, long_type.clone());
+        let right = if duplicate_first {
+            ClightExpr::Etempvar(first.value as Ident, long_type.clone())
+        } else {
+            ClightExpr::Etempvar(second.value as Ident, long_type.clone())
+        };
+        function.node_statements.insert(
+            leaf,
+            vec![ClightStmt::Sreturn(Some(ClightExpr::Ebinop(
+                ClightBinaryOp::Oadd,
+                Box::new(first_value),
+                Box::new(right),
+                long_type,
+            )))],
+        );
+        let canonical_state = ProgramSelectionState {
+            candidate_idx: [0x1010, 0x1020, leaf]
+                .into_iter()
+                .map(|node| ((0x1000, node), Some(0)))
+                .collect(),
+            var_decl_idx: HashMap::new(),
+            var_type_override: HashMap::new(),
+        };
+        let canonical = build_selected_function_from_program_state(
+            &function,
+            &canonical_state,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        (function, canonical, canonical_state)
+    }
+
+    #[test]
+    fn extension_clusters_compose_two_exact_values_at_one_terminal_consumer() {
+        let (function, canonical, canonical_state) =
+            extension_shared_consumer_fixture(false);
+        let (per_use, authorized) = scalar_extension_feature_view(
+            &function,
+            &canonical,
+            &canonical_state,
+            ScalarLvaluePlacement::ExtensionPerUse,
+        )
+        .expect("two independent extension clusters share one exact consumer");
+        assert_eq!(authorized, BTreeSet::from([20, 21]));
+        assert_eq!(
+            format!("{:?}", per_use.node_statements[&0x1030]).matches("Ecast").count(),
+            2,
+            "each uniquely occurring value receives its own per-use cast",
+        );
+
+        let (hoisted, _) = scalar_extension_feature_view(
+            &function,
+            &canonical,
+            &canonical_state,
+            ScalarLvaluePlacement::ExtensionHoisted,
+        )
+        .expect("the matching hoisted sibling closes over the same clusters");
+        assert_eq!(
+            format!("{:?}", hoisted.node_statements[&0x1030]).matches("Ecast").count(),
+            0,
+        );
+    }
+
+    #[test]
+    fn extension_clusters_reject_duplicate_occurrences_without_hiding_ambiguity() {
+        let (function, canonical, canonical_state) =
+            extension_shared_consumer_fixture(true);
+        assert!(scalar_extension_feature_view(
+            &function,
+            &canonical,
+            &canonical_state,
+            ScalarLvaluePlacement::ExtensionPerUse,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn extension_clusters_reject_narrowed_away_encoded_qword_results() {
+        let (mut function, canonical, canonical_state) =
+            extension_shared_consumer_fixture(false);
+        function
+            .scalar_memory_use_plans
+            .get_mut(&0x1010)
+            .unwrap()[0]
+            .sites = std::sync::Arc::new(vec![ScalarMemoryUseSite {
+                node: 0x1030,
+                value: 20,
+                required_type: ScalarMemoryUseType::Signed8,
+            }]);
+        let (view, authorized) = scalar_extension_feature_view(
+            &function,
+            &canonical,
+            &canonical_state,
+            ScalarLvaluePlacement::ExtensionPerUse,
+        )
+        .expect("the unrelated full-width cluster remains eligible");
+        assert_eq!(authorized, BTreeSet::from([21]));
+        assert_eq!(
+            format!("{:?}", view.node_statements[&0x1030])
+                .matches("Ecast")
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn invalid_extension_root_does_not_veto_an_unrelated_closed_root() {
+        let (mut function, canonical, canonical_state) =
+            extension_shared_consumer_fixture(false);
+        let duplicate = function.scalar_lvalue_proofs[&0x1010][0].clone();
+        function
+            .scalar_lvalue_proofs
+            .get_mut(&0x1010)
+            .unwrap()
+            .push(duplicate);
+        let (view, authorized) = scalar_extension_feature_view(
+            &function,
+            &canonical,
+            &canonical_state,
+            ScalarLvaluePlacement::ExtensionPerUse,
+        )
+        .expect("the independent second root remains eligible");
+        assert_eq!(authorized, BTreeSet::from([21]));
+        assert_eq!(
+            format!("{:?}", view.node_statements[&0x1030]).matches("Ecast").count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn extension_placements_reject_disjoint_accepted_proof_sets() {
+        let (mut function, canonical, canonical_state) =
+            extension_shared_consumer_fixture(false);
+        function
+            .scalar_lvalue_source_candidates
+            .get_mut(&0x1010)
+            .unwrap()
+            .retain(|(_, placement, _)| {
+                *placement == ScalarLvaluePlacement::ExtensionPerUse
+            });
+        function
+            .scalar_lvalue_source_candidates
+            .get_mut(&0x1020)
+            .unwrap()
+            .retain(|(_, placement, _)| {
+                *placement == ScalarLvaluePlacement::ExtensionHoisted
+            });
+        assert!(scalar_extension_feature_views(&function, &canonical, &canonical_state).is_none());
+    }
+
+    #[test]
+    fn extension_placements_retain_the_same_unrelated_common_cluster() {
+        let (mut function, canonical, canonical_state) =
+            extension_shared_consumer_fixture(false);
+        function
+            .scalar_lvalue_source_candidates
+            .get_mut(&0x1020)
+            .unwrap()
+            .retain(|(_, placement, _)| {
+                *placement == ScalarLvaluePlacement::ExtensionPerUse
+            });
+        let (per_use, hoisted) =
+            scalar_extension_feature_views(&function, &canonical, &canonical_state)
+                .expect("the first common cluster remains independently useful");
+        assert_eq!(per_use.2, BTreeSet::from([0x1010]));
+        assert_eq!(per_use.2, hoisted.2);
+        assert_eq!(per_use.1, BTreeSet::from([20]));
+        assert_eq!(hoisted.1, BTreeSet::from([20]));
     }
 
     fn canonical_isolation_db(extension: Option<ScalarMemoryExtension>) -> DecompileDB {
@@ -785,7 +2320,12 @@ mod scalar_lvalue_alternative_tests {
             db.rel_push("scalar_lvalue_candidate", (NODE, proof));
             db.rel_push(
                 "scalar_lvalue_source_candidate",
-                (NODE, ScalarLvalueSourceForm::RawByte, ClightStmt::Sskip),
+                (
+                    NODE,
+                    ScalarLvalueSourceForm::RawByte,
+                    ScalarLvaluePlacement::Plain,
+                    ClightStmt::Sskip,
+                ),
             );
         }
         db
@@ -1002,56 +2542,163 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<ClightSelectionResult, St
         })
         .collect();
 
-    // Build at most one feature selection per function.  Every ordinary node
-    // and every declaration type is frozen to the canonical solve; all and
-    // only authenticated Plain-MOV scalar-lvalue nodes are replaced together
-    // while extension nodes remain canonical. The
-    // reduced singleton view is then re-solved through the complete hard
-    // constraint system and audited for zero final frontend typing errors.
+    // Build a deterministic, cumulative feature portfolio. Stage-2 typed
+    // lvalues remain independently scoreable; Stage-3 adds exactly one
+    // per-use and one hoisted view when their complete use plan closes. Each
+    // reduced view is re-solved through the full hard-constraint system and
+    // audited before it can cross the emitter boundary.
     let mut scalar_lvalue_alternatives = Vec::new();
+    let mut feature_source_alternatives_overflowed = false;
     for (func, canonical) in functions.iter().zip(selected.iter()) {
-        if scalar_lvalue_alternatives.len()
-            >= crate::decompile::postselect::source_alternatives::MAX_TOTAL_SOURCE_ALTERNATIVES / 2
+        let mut views = vec![
+            (
+                ScalarSourceAlternativeFamily::TypedLvalue,
+                scalar_lvalue_feature_view(func, canonical, &best_state)
+                    .map(|fixed| (fixed, BTreeSet::new(), BTreeSet::new())),
+            ),
+            (
+                ScalarSourceAlternativeFamily::FieldLvalue,
+                scalar_field_feature_view(func, canonical, &best_state)
+                    .map(|fixed| (fixed, BTreeSet::new(), BTreeSet::new())),
+            ),
+        ];
+        if let Some((per_use, hoisted)) =
+            scalar_extension_feature_views(func, canonical, &best_state)
         {
+            views.push((
+                ScalarSourceAlternativeFamily::ExtensionPerUse,
+                Some(per_use),
+            ));
+            views.push((
+                ScalarSourceAlternativeFamily::ExtensionHoisted,
+                Some(hoisted),
+            ));
+        }
+        let mut function_alternatives = Vec::new();
+        for (family, fixed) in views {
+            let Some((fixed, proof_authorized_type_changes, authenticated_load_nodes)) = fixed else {
+                continue;
+            };
+            let Some(feature_state) =
+                crate::decompile::passes::clight_select::solve::solve_fixed_feature_selection(
+                    &fixed,
+                    &name_to_ident,
+                )
+            else {
+                continue;
+            };
+            let mut alternative = build_selected_function_from_program_state(
+                &fixed,
+                &feature_state,
+                &loop_info_all,
+                &ite_info_all,
+            );
+            if matches!(
+                family,
+                ScalarSourceAlternativeFamily::TypedLvalue
+                    | ScalarSourceAlternativeFamily::FieldLvalue
+            ) {
+                // Stage-2 changes spelling only and keeps exact canonical
+                // declaration metadata. Stage-3 declaration changes remain
+                // private to their feature views and are ABI-audited below.
+                alternative.var_types = canonical.var_types.clone();
+                alternative.var_type_candidates = canonical.var_type_candidates.clone();
+                alternative.var_decl_idx = canonical.var_decl_idx.clone();
+            } else {
+                for (reg, canonical_type) in &canonical.var_types {
+                    if fixed.var_types.get(reg) == Some(canonical_type) {
+                        if let Some(candidates) = canonical.var_type_candidates.get(reg) {
+                            alternative
+                                .var_type_candidates
+                                .insert(*reg, candidates.clone());
+                        }
+                        if let Some(index) = canonical.var_decl_idx.get(reg) {
+                            alternative.var_decl_idx.insert(*reg, *index);
+                        }
+                    }
+                }
+            }
+            let actual_type_changes: BTreeSet<_> = canonical
+                .var_types
+                .keys()
+                .chain(alternative.var_types.keys())
+                .chain(canonical.var_type_candidates.keys())
+                .chain(alternative.var_type_candidates.keys())
+                .chain(canonical.var_decl_idx.keys())
+                .chain(alternative.var_decl_idx.keys())
+                .copied()
+                .filter(|reg| {
+                    canonical.var_types.get(reg) != alternative.var_types.get(reg)
+                        || canonical.var_type_candidates.get(reg)
+                            != alternative.var_type_candidates.get(reg)
+                        || canonical.var_decl_idx.get(reg)
+                            != alternative.var_decl_idx.get(reg)
+                })
+                .collect();
+            if !actual_type_changes.is_subset(&proof_authorized_type_changes)
+                || alternative.return_type != canonical.return_type
+                || alternative.param_regs != canonical.param_regs
+                || alternative.param_types != canonical.param_types
+                || alternative.statements == canonical.statements
+                || crate::decompile::passes::clight_select::wt_audit::selected_error_count(
+                    &fixed,
+                    &alternative,
+                    &name_to_ident,
+                ) != 0
+            {
+                continue;
+            }
+            function_alternatives.push(ScalarLvalueSelectedAlternative {
+                family,
+                function: alternative,
+                authorized_type_changes: actual_type_changes,
+                authenticated_load_nodes,
+            });
+        }
+        let has_per_use = function_alternatives.iter().any(|alternative| {
+            alternative.family == ScalarSourceAlternativeFamily::ExtensionPerUse
+        });
+        let has_hoisted = function_alternatives.iter().any(|alternative| {
+            alternative.family == ScalarSourceAlternativeFamily::ExtensionHoisted
+        });
+        let paired_load_nodes = function_alternatives
+            .iter()
+            .find(|alternative| {
+                alternative.family == ScalarSourceAlternativeFamily::ExtensionPerUse
+            })
+            .zip(function_alternatives.iter().find(|alternative| {
+                alternative.family == ScalarSourceAlternativeFamily::ExtensionHoisted
+            }))
+            .is_some_and(|(per_use, hoisted)| {
+                !per_use.authenticated_load_nodes.is_empty()
+                    && per_use.authenticated_load_nodes == hoisted.authenticated_load_nodes
+            });
+        if has_per_use != has_hoisted || (has_per_use && !paired_load_nodes) {
+            function_alternatives.retain(|alternative| {
+                !matches!(
+                    alternative.family,
+                    ScalarSourceAlternativeFamily::ExtensionPerUse
+                        | ScalarSourceAlternativeFamily::ExtensionHoisted
+                )
+            });
+        }
+        // This is only an intermediate resource bound. The exact post-print
+        // collapsed record count, together with already-captured ordinary
+        // snapshots, is authoritatively checked after VarReduce. A feature view
+        // can contribute as little as one v3 record, so a /2 bound would reject
+        // valid stable-source profiles prematurely.
+        let feature_view_cap =
+            crate::decompile::postselect::source_alternatives::MAX_TOTAL_SOURCE_ALTERNATIVES;
+        if scalar_lvalue_alternatives
+            .len()
+            .saturating_add(function_alternatives.len())
+            > feature_view_cap
+        {
+            scalar_lvalue_alternatives.clear();
+            feature_source_alternatives_overflowed = true;
             break;
         }
-        let Some(fixed) = scalar_lvalue_feature_view(func, canonical, &best_state) else {
-            continue;
-        };
-
-        let Some(feature_state) =
-            crate::decompile::passes::clight_select::solve::solve_fixed_feature_selection(
-                &fixed,
-                &name_to_ident,
-            )
-        else {
-            continue;
-        };
-        let mut alternative = build_selected_function_from_program_state(
-            &fixed,
-            &feature_state,
-            &loop_info_all,
-            &ite_info_all,
-        );
-        // The fixed solve authenticates statements under singleton canonical
-        // declaration types. Restore the exact canonical metadata before the
-        // feature clone crosses the emitter boundary; the sidecar is a source
-        // spelling alternative, never a declaration/ABI alternative.
-        alternative.var_types = canonical.var_types.clone();
-        alternative.var_type_candidates = canonical.var_type_candidates.clone();
-        alternative.var_decl_idx = canonical.var_decl_idx.clone();
-        if alternative.statements == canonical.statements
-            || crate::decompile::passes::clight_select::wt_audit::selected_error_count(
-                &fixed,
-                &alternative,
-                &name_to_ident,
-            ) != 0
-        {
-            continue;
-        }
-        scalar_lvalue_alternatives.push(ScalarLvalueSelectedAlternative {
-            function: alternative,
-        });
+        scalar_lvalue_alternatives.extend(function_alternatives);
     }
 
     // Read-only wt audit (CTYPING_PLAN.md P2): frontend-typing diagnoses over the selected statements/decls, stderr only.
@@ -1138,6 +2785,7 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<ClightSelectionResult, St
     Ok(ClightSelectionResult {
         canonical: selected,
         scalar_lvalue_alternatives,
+        feature_source_alternatives_overflowed,
     })
 }
 

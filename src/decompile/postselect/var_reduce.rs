@@ -1808,6 +1808,32 @@ fn reduce_one_function(function: &mut FuncDef) -> (usize, usize, usize) {
     (folded, merged, split_count)
 }
 
+fn combined_source_alternative_portfolio_fits(
+    ordinary: &[super::source_alternatives::SourceAlternativeSnapshot],
+    features: &[super::source_alternatives::SourceAlternativeSnapshot],
+) -> bool {
+    let Some(total) = ordinary.len().checked_add(features.len()) else {
+        return false;
+    };
+    if total > super::source_alternatives::MAX_TOTAL_SOURCE_ALTERNATIVES {
+        return false;
+    }
+    let mut per_function = HashMap::new();
+    for snapshot in ordinary.iter().chain(features) {
+        let count = per_function
+            .entry(snapshot.declaration_index)
+            .or_insert(0usize);
+        let Some(next) = count.checked_add(1) else {
+            return false;
+        };
+        *count = next;
+        if next > super::source_alternatives::MAX_SOURCE_ALTERNATIVES_PER_FUNCTION {
+            return false;
+        }
+    }
+    true
+}
+
 pub struct VarReducePass;
 
 impl IRPass for VarReducePass {
@@ -1819,8 +1845,11 @@ impl IRPass for VarReducePass {
         if db.cast_optimized_translation_unit.is_none() {
             return;
         }
+        let binary_format = db.abi().format;
         let mut alternatives = std::mem::take(&mut db.cast_source_alternatives);
         let mut alternatives_overflowed = db.cast_source_alternatives_overflowed;
+        let mut feature_alternatives_overflowed =
+            db.cast_feature_source_alternatives_overflowed;
         let function_addresses = super::source_alternatives::exact_function_addresses(
             &db.cast_selected_functions,
             &db.cast_id_to_name,
@@ -1828,16 +1857,6 @@ impl IRPass for VarReducePass {
         let mut total = 0usize;
         let mut merged = 0usize;
         let mut split_total = 0usize;
-        let feature_identities: HashSet<(String, u64)> = db
-            .cast_pending_scalar_lvalue_alternatives
-            .iter()
-            .map(|alternative| {
-                (
-                    alternative.manifold_name.clone(),
-                    alternative.manifold_address,
-                )
-            })
-            .collect();
         {
             let tu = match db.cast_optimized_translation_unit.as_mut() {
                 Some(tu) => tu,
@@ -1853,17 +1872,13 @@ impl IRPass for VarReducePass {
                     split_total += function_split;
                     if let Some(alternative) = before_function.as_ref().and_then(|before| {
                         function_addresses.get(&f.name).and_then(|address| {
-                            (!feature_identities.contains(&(f.name.clone(), *address)))
-                                .then(|| {
-                                    super::source_alternatives::snapshot_if_changed(
-                                        declaration_index,
-                                        *address,
-                                        super::source_alternatives::SourceAlternativeBoundary::PreVarReduce,
-                                        before,
-                                        f,
-                                    )
-                                })
-                                .flatten()
+                            super::source_alternatives::snapshot_if_changed(
+                                declaration_index,
+                                *address,
+                                super::source_alternatives::SourceAlternativeBoundary::PreVarReduce,
+                                before,
+                                f,
+                            )
                         })
                     }) {
                         super::source_alternatives::record_bounded_snapshot(
@@ -1876,57 +1891,151 @@ impl IRPass for VarReducePass {
             }
         }
 
-        // A feature function contributes one coherent selection state, then
-        // exactly its temp-preserving and inlined forms.  If either form is
-        // stale, identical, signature-changing, or cannot be bound to one
-        // canonical definition, emit neither rather than falling back to a
-        // partial/cross-product sidecar.
+        // Each feature profile is collapsed by exact printed source identity in
+        // fixed [pre, post] order. Typed/field profiles may contribute one or
+        // two useful records. The per-use and hoisted extension profiles remain
+        // atomic as a superfamily: each side must contribute a nonempty subset.
         let pending = std::mem::take(&mut db.cast_pending_scalar_lvalue_alternatives);
-        if !alternatives_overflowed {
+        if !alternatives_overflowed && !feature_alternatives_overflowed {
             let Some(canonical_tu) = db.cast_optimized_translation_unit.as_ref() else {
                 unreachable!("translation unit checked above")
             };
-            for mut alternative in pending {
+            let mut pending_by_identity = HashMap::new();
+            let mut pending_names = HashMap::new();
+            for alternative in pending {
+                *pending_names
+                    .entry(alternative.manifold_name.clone())
+                    .or_insert(0usize) += 1;
+                pending_by_identity
+                    .entry((
+                        alternative.manifold_name.clone(),
+                        alternative.manifold_address,
+                    ))
+                    .or_insert_with(Vec::new)
+                    .push(alternative);
+            }
+            let mut feature_snapshots = Vec::new();
+            for ((manifold_name, manifold_address), mut group) in pending_by_identity {
+                if function_addresses.get(&manifold_name) != Some(&manifold_address) {
+                    continue;
+                }
                 let matching: Vec<(usize, &FuncDef)> = canonical_tu
                     .decls
                     .iter()
                     .enumerate()
                     .filter_map(|(index, declaration)| match declaration {
                         TopLevelDecl::FuncDef(function)
-                            if function.name == alternative.manifold_name =>
+                            if function.name == manifold_name =>
                         {
                             Some((index, function))
                         }
                         _ => None,
                     })
                     .collect();
-                if matching.len() != 1 {
+                if matching.len() != 1
+                    || pending_names.get(&manifold_name).copied()
+                        != Some(group.len())
+                {
                     continue;
                 }
                 let (declaration_index, canonical) = matching[0];
-                let pre = alternative.function.clone();
-                reduce_one_function(&mut alternative.function);
-                let post = alternative.function;
-                let Some(snapshots) = super::source_alternatives::scalar_lvalue_snapshot_pair(
-                    declaration_index,
-                    alternative.manifold_address,
-                    canonical,
-                    &pre,
-                    &post,
-                ) else {
-                    continue;
-                };
-                for snapshot in snapshots {
-                    super::source_alternatives::record_bounded_snapshot(
-                        &mut alternatives,
-                        &mut alternatives_overflowed,
-                        snapshot,
-                    );
+                group.sort_by_key(|alternative| alternative.family);
+
+                for family in [
+                    crate::decompile::passes::clight_select::select::ScalarSourceAlternativeFamily::TypedLvalue,
+                    crate::decompile::passes::clight_select::select::ScalarSourceAlternativeFamily::FieldLvalue,
+                ] {
+                    let mut family_alternatives: Vec<_> = group
+                        .iter()
+                        .filter(|alternative| alternative.family == family)
+                        .cloned()
+                        .collect();
+                    if family_alternatives.len() == 1 {
+                        let mut alternative = family_alternatives
+                            .pop()
+                            .expect("one independent lvalue alternative");
+                        let pre = alternative.function.clone();
+                        reduce_one_function(&mut alternative.function);
+                        if let Some(snapshots) =
+                            super::source_alternatives::scalar_feature_snapshots_for_format(
+                                declaration_index,
+                                manifold_address,
+                                alternative.family,
+                                canonical,
+                                &pre,
+                                &alternative.function,
+                                binary_format,
+                            )
+                        {
+                            feature_snapshots.extend(snapshots);
+                        }
+                    }
                 }
+
+                let mut per_use: Vec<_> = group
+                    .iter()
+                    .filter(|alternative| {
+                        alternative.family
+                            == crate::decompile::passes::clight_select::select::ScalarSourceAlternativeFamily::ExtensionPerUse
+                    })
+                    .cloned()
+                    .collect();
+                let mut hoisted: Vec<_> = group
+                    .into_iter()
+                    .filter(|alternative| {
+                        alternative.family
+                            == crate::decompile::passes::clight_select::select::ScalarSourceAlternativeFamily::ExtensionHoisted
+                    })
+                    .collect();
+                if per_use.len() == 1 && hoisted.len() == 1 {
+                    let mut per_use = per_use.pop().expect("one per-use alternative");
+                    let mut hoisted = hoisted.pop().expect("one hoisted alternative");
+                    let per_use_pre = per_use.function.clone();
+                    let hoisted_pre = hoisted.function.clone();
+                    reduce_one_function(&mut per_use.function);
+                    reduce_one_function(&mut hoisted.function);
+                    let per_use_snapshots =
+                        super::source_alternatives::scalar_feature_snapshots_for_format(
+                            declaration_index,
+                            manifold_address,
+                            per_use.family,
+                            canonical,
+                            &per_use_pre,
+                            &per_use.function,
+                            binary_format,
+                        );
+                    let hoisted_snapshots =
+                        super::source_alternatives::scalar_feature_snapshots_for_format(
+                            declaration_index,
+                            manifold_address,
+                            hoisted.family,
+                            canonical,
+                            &hoisted_pre,
+                            &hoisted.function,
+                            binary_format,
+                        );
+                    if let (Some(per_use_snapshots), Some(hoisted_snapshots)) =
+                        (per_use_snapshots, hoisted_snapshots)
+                    {
+                        feature_snapshots.extend(per_use_snapshots);
+                        feature_snapshots.extend(hoisted_snapshots);
+                    }
+                }
+            }
+            if !combined_source_alternative_portfolio_fits(
+                &alternatives,
+                &feature_snapshots,
+            ) {
+                // Feature pressure never invalidates the already-complete
+                // ordinary portfolio. Drop all scalar families atomically.
+                feature_alternatives_overflowed = true;
+            } else {
+                alternatives.extend(feature_snapshots);
             }
         }
         db.cast_source_alternatives = alternatives;
         db.cast_source_alternatives_overflowed = alternatives_overflowed;
+        db.cast_feature_source_alternatives_overflowed = feature_alternatives_overflowed;
         log::info!(
             "var_reduce: coalesced {} locals, folded {} single-use temporaries, split {} initializers",
             merged,
@@ -1945,6 +2054,7 @@ impl IRPass for VarReducePass {
             "cast_optimized_translation_unit",
             "cast_pending_scalar_lvalue_alternatives",
             "cast_source_alternatives",
+            "cast_feature_source_alternatives_overflowed",
         ]
     }
 }
@@ -2232,5 +2342,56 @@ mod tests {
         let split = split_scalar_inits(&mut f);
         assert!(split.is_empty());
         assert!(f.local_vars.iter().all(|d| d.init.is_some()));
+    }
+
+    #[test]
+    fn final_combined_preflight_owns_exact_4095_4096_4097_boundary() {
+        use super::super::source_alternatives::{
+            SourceAlternativeBoundary, SourceAlternativeSnapshot,
+        };
+        let function = fd(Vec::new(), vec![CStmt::Return(Some(CExpr::int(0)))]);
+        let snapshot = |declaration_index, boundary| SourceAlternativeSnapshot {
+            declaration_index,
+            manifold_name: format!("f_{declaration_index}"),
+            manifold_address: 0x1000 + declaration_index as u64 * 0x10,
+            boundary,
+            kinds: vec!["local_lifetime"],
+            function: function.clone(),
+        };
+        let ordinary: Vec<_> = (0..4095)
+            .map(|index| snapshot(index, SourceAlternativeBoundary::PreForLoop))
+            .collect();
+        let one_feature = vec![snapshot(
+            0,
+            SourceAlternativeBoundary::ScalarLvaluePreVarReduce,
+        )];
+        let two_features = vec![
+            snapshot(
+                0,
+                SourceAlternativeBoundary::ScalarLvaluePreVarReduce,
+            ),
+            snapshot(
+                0,
+                SourceAlternativeBoundary::ScalarLvaluePostVarReduce,
+            ),
+        ];
+        assert!(combined_source_alternative_portfolio_fits(&ordinary, &[]));
+        assert!(combined_source_alternative_portfolio_fits(
+            &ordinary,
+            &one_feature,
+        ));
+        assert!(!combined_source_alternative_portfolio_fits(
+            &ordinary,
+            &two_features,
+        ));
+
+        let exact_ten: Vec<_> = (0..10)
+            .map(|_| snapshot(0, SourceAlternativeBoundary::PreForLoop))
+            .collect();
+        let eleven: Vec<_> = (0..11)
+            .map(|_| snapshot(0, SourceAlternativeBoundary::PreForLoop))
+            .collect();
+        assert!(combined_source_alternative_portfolio_fits(&exact_ten, &[]));
+        assert!(!combined_source_alternative_portfolio_fits(&eleven, &[]));
     }
 }
