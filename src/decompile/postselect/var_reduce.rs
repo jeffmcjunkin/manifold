@@ -1784,6 +1784,30 @@ fn refuse_scalar_inits(func: &mut FuncDef, split: &[String]) {
     }
 }
 
+fn reduce_one_function(function: &mut FuncDef) -> (usize, usize, usize) {
+    let split = split_scalar_inits(function);
+    let split_count = split.len();
+    let mut folded = 0usize;
+    loop {
+        let count = reduce_function(function);
+        folded += count;
+        if count == 0 {
+            break;
+        }
+    }
+    let merged = run_coalesce(function);
+    loop {
+        let count = reduce_function(function);
+        folded += count;
+        if count == 0 {
+            break;
+        }
+    }
+    refuse_scalar_inits(function, &split);
+    demote_pointer_counters(function);
+    (folded, merged, split_count)
+}
+
 pub struct VarReducePass;
 
 impl IRPass for VarReducePass {
@@ -1804,6 +1828,16 @@ impl IRPass for VarReducePass {
         let mut total = 0usize;
         let mut merged = 0usize;
         let mut split_total = 0usize;
+        let feature_identities: HashSet<(String, u64)> = db
+            .cast_pending_scalar_lvalue_alternatives
+            .iter()
+            .map(|alternative| {
+                (
+                    alternative.manifold_name.clone(),
+                    alternative.manifold_address,
+                )
+            })
+            .collect();
         {
             let tu = match db.cast_optimized_translation_unit.as_mut() {
                 Some(tu) => tu,
@@ -1812,40 +1846,24 @@ impl IRPass for VarReducePass {
             for (declaration_index, decl) in tu.decls.iter_mut().enumerate() {
                 if let TopLevelDecl::FuncDef(f) = decl {
                     let before_function = (!alternatives_overflowed).then(|| f.clone());
-                    // 0) Split initializers -> fold/coalesce candidates (VR-3a); re-fused at end.
-                    let split = split_scalar_inits(f);
-                    split_total += split.len();
-                    // 1) Fold single-use temporaries first, so coalescing operates on real variables (and its casts don't block any folds). fixpoint so chained temps (t1=*p; t2=t1->f; x=t2) collapse.
-                    loop {
-                        let n = reduce_function(f);
-                        total += n;
-                        if n == 0 {
-                            break;
-                        }
-                    }
-                    // 2) Merge non-interfering locals (live-range coalescing) + drop identity copies.
-                    merged += run_coalesce(f);
-                    // 3) Mop up any temporaries coalescing newly made single-use.
-                    loop {
-                        let n = reduce_function(f);
-                        total += n;
-                        if n == 0 {
-                            break;
-                        }
-                    }
-                    // 4) Re-fuse surviving split initializers (cosmetic identity inverse of 0).
-                    refuse_scalar_inits(f, &split);
-                    // 5) Retype pointer locals used as integer countdown counters to `long` (UB-safe at -O2).
-                    demote_pointer_counters(f);
+                    let (function_total, function_merged, function_split) =
+                        reduce_one_function(f);
+                    total += function_total;
+                    merged += function_merged;
+                    split_total += function_split;
                     if let Some(alternative) = before_function.as_ref().and_then(|before| {
                         function_addresses.get(&f.name).and_then(|address| {
-                            super::source_alternatives::snapshot_if_changed(
-                                declaration_index,
-                                *address,
-                                super::source_alternatives::SourceAlternativeBoundary::PreVarReduce,
-                                before,
-                                f,
-                            )
+                            (!feature_identities.contains(&(f.name.clone(), *address)))
+                                .then(|| {
+                                    super::source_alternatives::snapshot_if_changed(
+                                        declaration_index,
+                                        *address,
+                                        super::source_alternatives::SourceAlternativeBoundary::PreVarReduce,
+                                        before,
+                                        f,
+                                    )
+                                })
+                                .flatten()
                         })
                     }) {
                         super::source_alternatives::record_bounded_snapshot(
@@ -1854,6 +1872,56 @@ impl IRPass for VarReducePass {
                             alternative,
                         );
                     }
+                }
+            }
+        }
+
+        // A feature function contributes one coherent selection state, then
+        // exactly its temp-preserving and inlined forms.  If either form is
+        // stale, identical, signature-changing, or cannot be bound to one
+        // canonical definition, emit neither rather than falling back to a
+        // partial/cross-product sidecar.
+        let pending = std::mem::take(&mut db.cast_pending_scalar_lvalue_alternatives);
+        if !alternatives_overflowed {
+            let Some(canonical_tu) = db.cast_optimized_translation_unit.as_ref() else {
+                unreachable!("translation unit checked above")
+            };
+            for mut alternative in pending {
+                let matching: Vec<(usize, &FuncDef)> = canonical_tu
+                    .decls
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, declaration)| match declaration {
+                        TopLevelDecl::FuncDef(function)
+                            if function.name == alternative.manifold_name =>
+                        {
+                            Some((index, function))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if matching.len() != 1 {
+                    continue;
+                }
+                let (declaration_index, canonical) = matching[0];
+                let pre = alternative.function.clone();
+                reduce_one_function(&mut alternative.function);
+                let post = alternative.function;
+                let Some(snapshots) = super::source_alternatives::scalar_lvalue_snapshot_pair(
+                    declaration_index,
+                    alternative.manifold_address,
+                    canonical,
+                    &pre,
+                    &post,
+                ) else {
+                    continue;
+                };
+                for snapshot in snapshots {
+                    super::source_alternatives::record_bounded_snapshot(
+                        &mut alternatives,
+                        &mut alternatives_overflowed,
+                        snapshot,
+                    );
                 }
             }
         }
@@ -1873,7 +1941,11 @@ impl IRPass for VarReducePass {
     }
 
     fn outputs(&self) -> &'static [&'static str] {
-        &["cast_optimized_translation_unit"]
+        &[
+            "cast_optimized_translation_unit",
+            "cast_pending_scalar_lvalue_alternatives",
+            "cast_source_alternatives",
+        ]
     }
 }
 

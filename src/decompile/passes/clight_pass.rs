@@ -14,6 +14,338 @@ use ascent::ascent_par;
 use either::Either;
 use log::debug;
 
+fn scalar_int_type(width: usize, signed: bool) -> Option<ClightType> {
+    let signedness = if signed {
+        ClightSignedness::Signed
+    } else {
+        ClightSignedness::Unsigned
+    };
+    match width {
+        1 => Some(ClightType::Tint(
+            ClightIntSize::I8,
+            signedness,
+            default_attr(),
+        )),
+        2 => Some(ClightType::Tint(
+            ClightIntSize::I16,
+            signedness,
+            default_attr(),
+        )),
+        4 => Some(ClightType::Tint(
+            ClightIntSize::I32,
+            signedness,
+            default_attr(),
+        )),
+        8 => Some(ClightType::Tlong(signedness, default_attr())),
+        _ => None,
+    }
+}
+
+fn scalar_access_types(proof: &ScalarMemoryAccessProof) -> Vec<ClightType> {
+    let signed = match proof.extension {
+        ScalarMemoryExtension::SignExtend => true,
+        ScalarMemoryExtension::ZeroExtend => false,
+        ScalarMemoryExtension::Plain => matches!(
+            proof.chunk,
+            MemoryChunk::MInt8Signed | MemoryChunk::MInt16Signed
+        ),
+    };
+    let Some(primary) = scalar_int_type(proof.width, signed) else {
+        return Vec::new();
+    };
+    let mut result = vec![primary];
+    // Plain MOV fixes width but not C signedness.  Keep the ambiguity bounded
+    // to the two scalar spellings rather than inventing a declaration type.
+    if proof.extension == ScalarMemoryExtension::Plain {
+        if let Some(other) = scalar_int_type(proof.width, !signed) {
+            if !result.contains(&other) {
+                result.push(other);
+            }
+        }
+    }
+    result
+}
+
+fn scalar_long_constant_matches(expr: &CsharpminorExpr, expected: i64) -> bool {
+    matches!(expr, CsharpminorExpr::Econst(Constant::Olongconst(value)) if *value == expected)
+}
+
+fn scalar_add_expr(expr: &CsharpminorExpr) -> Option<(&CsharpminorExpr, &CsharpminorExpr)> {
+    match expr {
+        CsharpminorExpr::Ebinop(CminorBinop::Oaddl, left, right) => Some((left, right)),
+        _ => None,
+    }
+}
+
+fn scalar_mul_expr(expr: &CsharpminorExpr, expected_scale: i64) -> Option<&CsharpminorExpr> {
+    match expr {
+        CsharpminorExpr::Ebinop(CminorBinop::Omull, index, scale)
+            if scalar_long_constant_matches(scale, expected_scale) =>
+        {
+            Some(index)
+        }
+        _ => None,
+    }
+}
+
+/// Split only the exact outer address tree generated from the authenticated
+/// Addressing descriptor.  Pure unique-use expressions may have replaced its
+/// leaves during structuring, but those substitutions cannot change this
+/// outer base/index/scale/displacement skeleton.
+fn scalar_address_parts(
+    proof: &ScalarMemoryAccessProof,
+    address: &CsharpminorExpr,
+) -> Option<(CsharpminorExpr, Option<CsharpminorExpr>)> {
+    if proof.address_size != 8 {
+        return None;
+    }
+    let core = if !proof.synthetic_stack_origin && proof.displacement != 0 {
+        let (left, right) = scalar_add_expr(address)?;
+        if !scalar_long_constant_matches(right, proof.displacement) {
+            return None;
+        }
+        left
+    } else {
+        address
+    };
+    let Some(_) = proof.index_value else {
+        return Some((core.clone(), None));
+    };
+    let (base, index_term) = scalar_add_expr(core)?;
+    let index = if proof.scale == 1 {
+        index_term
+    } else {
+        scalar_mul_expr(index_term, proof.scale)?
+    };
+    Some((base.clone(), Some(index.clone())))
+}
+
+fn scalar_addr32_leaf(expr: &CsharpminorExpr) -> Option<&CsharpminorExpr> {
+    match expr {
+        CsharpminorExpr::Eunop(CminorUnop::Ointuoflong, inner) => Some(inner),
+        _ => None,
+    }
+}
+
+/// Authenticate the exact modulo-2^32 Csharp skeleton emitted for an x64
+/// address-size override.  Unique-use substitution may replace the narrowed
+/// leaves, but it may not erase or reorder the two width-defining casts.
+fn scalar_addr32_matches(proof: &ScalarMemoryAccessProof, address: &CsharpminorExpr) -> bool {
+    if proof.address_size != 4 || proof.synthetic_stack_origin {
+        return false;
+    }
+    let CsharpminorExpr::Eunop(CminorUnop::Olongofintu, low) = address else {
+        return false;
+    };
+    let low = if proof.displacement != 0 {
+        let CsharpminorExpr::Ebinop(CminorBinop::Oadd, left, right) = low.as_ref() else {
+            return false;
+        };
+        if !matches!(
+            right.as_ref(),
+            CsharpminorExpr::Econst(Constant::Ointconst(value))
+                if *value == (proof.displacement as u32) as i32 as i64
+        ) {
+            return false;
+        }
+        left.as_ref()
+    } else {
+        low.as_ref()
+    };
+    let Some(_) = proof.index_value else {
+        return scalar_addr32_leaf(low).is_some();
+    };
+    let CsharpminorExpr::Ebinop(CminorBinop::Oadd, base, index_term) = low else {
+        return false;
+    };
+    if scalar_addr32_leaf(base).is_none() {
+        return false;
+    }
+    if proof.scale == 1 {
+        scalar_addr32_leaf(index_term).is_some()
+    } else {
+        matches!(
+            index_term.as_ref(),
+            CsharpminorExpr::Ebinop(CminorBinop::Omul, index, scale)
+                if scalar_addr32_leaf(index).is_some()
+                    && matches!(
+                        scale.as_ref(),
+                        CsharpminorExpr::Econst(Constant::Ointconst(value))
+                            if *value == proof.scale
+                    )
+        )
+    }
+}
+
+fn scalar_raw_lvalue(
+    proof: &ScalarMemoryAccessProof,
+    address: &CsharpminorExpr,
+    access_type: &ClightType,
+    var_types: &MultiVarTypeMap,
+) -> Option<ClightExpr> {
+    let pointer_type = pointer_to(access_type.clone());
+    let byte_type = ClightType::Tint(
+        ClightIntSize::I8,
+        ClightSignedness::Unsigned,
+        default_attr(),
+    );
+    let byte_pointer = pointer_to(byte_type);
+    let byte_address = if proof.address_size == 8 {
+        let (base, index) = scalar_address_parts(proof, address)?;
+        let base = clight_expr_from_csharp_with_multi_types(&base, var_types);
+        let mut address = ClightExpr::Ecast(Box::new(base), byte_pointer.clone());
+        if let Some(index) = index {
+            let index = cast_expr_to_type(
+                clight_expr_from_csharp_with_multi_types(&index, var_types),
+                default_long_type(),
+            );
+            let offset = if proof.scale == 1 {
+                index
+            } else {
+                ClightExpr::Ebinop(
+                    ClightBinaryOp::Omul,
+                    Box::new(index),
+                    Box::new(ClightExpr::EconstLong(proof.scale, default_long_type())),
+                    default_long_type(),
+                )
+            };
+            address = ClightExpr::Ebinop(
+                ClightBinaryOp::Oadd,
+                Box::new(address),
+                Box::new(offset),
+                byte_pointer.clone(),
+            );
+        }
+        if !proof.synthetic_stack_origin && proof.displacement != 0 {
+            address = ClightExpr::Ebinop(
+                ClightBinaryOp::Oadd,
+                Box::new(address),
+                Box::new(ClightExpr::EconstLong(
+                    proof.displacement,
+                    default_long_type(),
+                )),
+                byte_pointer,
+            );
+        }
+        address
+    } else if scalar_addr32_matches(proof, address) {
+        // Preserve the complete modulo-2^32 numeric tree, then enter pointer
+        // arithmetic only after its explicit zero-extension to 64 bits.
+        ClightExpr::Ecast(
+            Box::new(clight_expr_from_csharp_with_multi_types(address, var_types)),
+            byte_pointer,
+        )
+    } else {
+        return None;
+    };
+    Some(ClightExpr::Ederef(
+        Box::new(ClightExpr::Ecast(Box::new(byte_address), pointer_type)),
+        access_type.clone(),
+    ))
+}
+
+fn scalar_scaled_lvalue(
+    proof: &ScalarMemoryAccessProof,
+    address: &CsharpminorExpr,
+    access_type: &ClightType,
+    var_types: &MultiVarTypeMap,
+) -> Option<ClightExpr> {
+    if !proof.exact_scaled_index {
+        return None;
+    }
+    let Some((base, Some(index))) = scalar_address_parts(proof, address) else {
+        return None;
+    };
+    let pointer_type = pointer_to(access_type.clone());
+    let base = ClightExpr::Ecast(
+        Box::new(clight_expr_from_csharp_with_multi_types(&base, var_types)),
+        pointer_type.clone(),
+    );
+    let index = cast_expr_to_type(
+        clight_expr_from_csharp_with_multi_types(&index, var_types),
+        default_long_type(),
+    );
+    let address = ClightExpr::Ebinop(
+        ClightBinaryOp::Oadd,
+        Box::new(base),
+        Box::new(index),
+        pointer_type,
+    );
+    Some(ClightExpr::Ederef(Box::new(address), access_type.clone()))
+}
+
+fn scalar_memory_clight_candidates(
+    proof: &ScalarMemoryAccessProof,
+    statement: &CsharpminorStmt,
+    all_var_types: &[(RTLReg, XType)],
+) -> Vec<(ScalarLvalueSourceForm, ClightStmt)> {
+    if !proof.is_closed_v1() {
+        return Vec::new();
+    }
+    let (address, stored_value) = match (proof.direction, statement) {
+        (
+            ScalarMemoryDirection::Read,
+            CsharpminorStmt::Sset(destination, CsharpminorExpr::Eload(chunk, address)),
+        ) if *destination == proof.value && *chunk == proof.chunk => (address.as_ref(), None),
+        (ScalarMemoryDirection::Write, CsharpminorStmt::Sstore(chunk, address, value))
+            if *chunk == proof.chunk =>
+        {
+            (address, Some(value))
+        }
+        _ => return Vec::new(),
+    };
+    let mut expressions = vec![(*address).clone()];
+    if let Some(value) = stored_value {
+        expressions.push((*value).clone());
+    }
+    let vars = extract_vars_from_csharp_exprs(&expressions);
+    let variants = build_var_type_map_variants(all_var_types, &vars);
+    let mut statements = Vec::new();
+    for var_types in &variants {
+        for access_type in scalar_access_types(proof) {
+            let Some(raw) = scalar_raw_lvalue(proof, address, &access_type, var_types) else {
+                continue;
+            };
+            let mut lvalues = vec![(ScalarLvalueSourceForm::RawByte, raw)];
+            if let Some(scaled) = scalar_scaled_lvalue(proof, address, &access_type, var_types) {
+                lvalues.push((ScalarLvalueSourceForm::TypedScaled, scaled));
+            }
+            for (form, lvalue) in lvalues {
+                let statement = match stored_value {
+                    None => {
+                        let value = match proof.extension {
+                            ScalarMemoryExtension::Plain => lvalue,
+                            ScalarMemoryExtension::SignExtend => {
+                                let Some(result_type) = scalar_int_type(proof.value_width, true)
+                                else {
+                                    continue;
+                                };
+                                ClightExpr::Ecast(Box::new(lvalue), result_type)
+                            }
+                            ScalarMemoryExtension::ZeroExtend => {
+                                let Some(result_type) = scalar_int_type(proof.value_width, false)
+                                else {
+                                    continue;
+                                };
+                                ClightExpr::Ecast(Box::new(lvalue), result_type)
+                            }
+                        };
+                        ClightStmt::Sset(ident_from_reg(proof.value), value)
+                    }
+                    Some(value) => {
+                        let value = clight_expr_from_csharp_with_multi_types(value, var_types);
+                        ClightStmt::Sassign(lvalue, cast_expr_to_type(value, access_type.clone()))
+                    }
+                };
+                if !statements.contains(&(form, statement.clone())) {
+                    statements.push((form, statement));
+                }
+            }
+        }
+    }
+    statements
+}
+
 ascent_par! {
     #![measure_rule_times]
 
@@ -54,6 +386,8 @@ ascent_par! {
     relation reg_xtl(Node, Mreg, RTLReg);
     relation rtl_inst(Node, RTLInst);
     relation rtl_succ(Node, Node);
+    relation scalar_lvalue_candidate(Node, ScalarMemoryAccessProof);
+    relation scalar_lvalue_source_candidate(Node, ScalarLvalueSourceForm, ClightStmt);
     relation next(Address, Address);
     relation stack_var(Address, Address, i64, RTLReg);
     relation string_data(String, String, usize);
@@ -147,6 +481,18 @@ ascent_par! {
     // collect_all_var_types aggregates the whole emit_var_type_candidate relation and does not depend on any node, so materialize it once here instead of recomputing it inside every per-statement rule below.
     all_var_types_global(Arc::new(pairs)) <--
         agg pairs = collect_all_var_types(reg, xty) in emit_var_type_candidate(reg, xty);
+
+    // These candidates are provenance-tagged feature material only.  They
+    // must never enter clight_stmt: that relation is the canonical selector's
+    // candidate pool, and widening it would make merely enabling the sidecar
+    // change the primary source.  ClightSelect builds a separate fixed view
+    // for the bounded feature solve.
+    scalar_lvalue_source_candidate(node, tagged.0, tagged.1.clone()) <--
+        scalar_lvalue_candidate(node, proof),
+        csharp_stmt(node, statement),
+        all_var_types_global(all_var_types),
+        let candidates = scalar_memory_clight_candidates(proof, statement, all_var_types),
+        for tagged in candidates.iter();
 
     clight_stmt_raw(node, stmt) <--
         clight_stmt(node, s),
@@ -5342,5 +5688,325 @@ fn typ_to_clight_type(typ: &Typ) -> ClightType {
         Typ::Tfloat => default_float_type(),
         Typ::Tsingle => default_single_type(),
         _ => default_int_type(),
+    }
+}
+
+#[cfg(test)]
+mod scalar_lvalue_candidate_tests {
+    use super::*;
+
+    const FUNCTION: Address = 0x1000;
+    const NODE: Node = 0x1010;
+    const BASE: RTLReg = 0x8000_0000_0000_0010;
+    const INDEX: RTLReg = 0x8000_0000_0000_0020;
+    const TEMP: RTLReg = 0x8000_0000_0000_0030;
+    const VALUE: RTLReg = 0x8000_0000_0000_0040;
+
+    fn proof(
+        width: usize,
+        displacement: i64,
+        index: bool,
+        extension: ScalarMemoryExtension,
+    ) -> ScalarMemoryAccessProof {
+        let chunk = match (width, extension) {
+            (1, ScalarMemoryExtension::SignExtend) => MemoryChunk::MInt8Signed,
+            (1, _) => MemoryChunk::MInt8Unsigned,
+            (2, ScalarMemoryExtension::SignExtend) => MemoryChunk::MInt16Signed,
+            (2, _) => MemoryChunk::MInt16Unsigned,
+            (4, _) => MemoryChunk::MInt32,
+            (8, _) => MemoryChunk::MInt64,
+            _ => MemoryChunk::Unknown,
+        };
+        ScalarMemoryAccessProof {
+            function: FUNCTION,
+            origin_node: NODE,
+            selected_node: NODE,
+            operand: "scalar_candidate_memory",
+            direction: ScalarMemoryDirection::Read,
+            extension,
+            address_size: 8,
+            base_register: Mreg::CX,
+            index_register: index.then_some(Mreg::DX),
+            scale: if index { width as i64 } else { 1 },
+            displacement,
+            width,
+            value_width: if extension == ScalarMemoryExtension::Plain {
+                width
+            } else {
+                8
+            },
+            chunk,
+            base_value: Some(BASE),
+            index_value: index.then_some(INDEX),
+            value: VALUE,
+            downstream_value_width: Some(if extension == ScalarMemoryExtension::Plain {
+                width
+            } else {
+                8
+            }),
+            address_param_leaves: Arc::new(if index { vec![BASE, INDEX] } else { vec![BASE] }),
+            synthetic_stack_origin: false,
+            exact_scaled_index: index && displacement == 0,
+        }
+    }
+
+    fn csharp_address(base: CsharpminorExpr, proof: &ScalarMemoryAccessProof) -> CsharpminorExpr {
+        let mut address = if proof.index_value.is_some() {
+            let index = CsharpminorExpr::Ebinop(
+                CminorBinop::Omull,
+                Box::new(CsharpminorExpr::Evar(INDEX)),
+                Box::new(CsharpminorExpr::Econst(Constant::Olongconst(proof.scale))),
+            );
+            CsharpminorExpr::Ebinop(CminorBinop::Oaddl, Box::new(base), Box::new(index))
+        } else {
+            base
+        };
+        if proof.displacement != 0 {
+            address = CsharpminorExpr::Ebinop(
+                CminorBinop::Oaddl,
+                Box::new(address),
+                Box::new(CsharpminorExpr::Econst(Constant::Olongconst(
+                    proof.displacement,
+                ))),
+            );
+        }
+        address
+    }
+
+    fn load_stmt(proof: &ScalarMemoryAccessProof, address: CsharpminorExpr) -> CsharpminorStmt {
+        CsharpminorStmt::Sset(
+            VALUE,
+            CsharpminorExpr::Eload(proof.chunk, Box::new(address)),
+        )
+    }
+
+    fn store_stmt(proof: &ScalarMemoryAccessProof, address: CsharpminorExpr) -> CsharpminorStmt {
+        CsharpminorStmt::Sstore(proof.chunk, address, CsharpminorExpr::Evar(proof.value))
+    }
+
+    fn addr32_address(proof: &ScalarMemoryAccessProof) -> CsharpminorExpr {
+        let narrow = |reg| {
+            CsharpminorExpr::Eunop(
+                CminorUnop::Ointuoflong,
+                Box::new(CsharpminorExpr::Evar(reg)),
+            )
+        };
+        let mut low = if proof.index_value.is_some() {
+            let index = if proof.scale == 1 {
+                narrow(INDEX)
+            } else {
+                CsharpminorExpr::Ebinop(
+                    CminorBinop::Omul,
+                    Box::new(narrow(INDEX)),
+                    Box::new(CsharpminorExpr::Econst(Constant::Ointconst(proof.scale))),
+                )
+            };
+            CsharpminorExpr::Ebinop(CminorBinop::Oadd, Box::new(narrow(BASE)), Box::new(index))
+        } else {
+            narrow(BASE)
+        };
+        if proof.displacement != 0 {
+            low = CsharpminorExpr::Ebinop(
+                CminorBinop::Oadd,
+                Box::new(low),
+                Box::new(CsharpminorExpr::Econst(Constant::Ointconst(
+                    (proof.displacement as u32) as i32 as i64,
+                ))),
+            );
+        }
+        CsharpminorExpr::Eunop(CminorUnop::Olongofintu, Box::new(low))
+    }
+
+    fn exprs(statement: &ClightStmt) -> Vec<&ClightExpr> {
+        match statement {
+            ClightStmt::Sset(_, expression) => vec![expression],
+            ClightStmt::Sassign(left, right) => vec![left, right],
+            _ => Vec::new(),
+        }
+    }
+
+    fn candidate_exprs(
+        candidate: &(ScalarLvalueSourceForm, ClightStmt),
+    ) -> Vec<&ClightExpr> {
+        exprs(&candidate.1)
+    }
+
+    fn contains_long(expr: &ClightExpr, expected: i64) -> bool {
+        match expr {
+            ClightExpr::EconstLong(value, _) => *value == expected,
+            ClightExpr::Ederef(inner, _)
+            | ClightExpr::Eaddrof(inner, _)
+            | ClightExpr::Eunop(_, inner, _)
+            | ClightExpr::Ecast(inner, _) => contains_long(inner, expected),
+            ClightExpr::Ebinop(_, left, right, _) => {
+                contains_long(left, expected) || contains_long(right, expected)
+            }
+            ClightExpr::Efield(base, _, _) => contains_long(base, expected),
+            _ => false,
+        }
+    }
+
+    fn contains_temp(expr: &ClightExpr, expected: RTLReg) -> bool {
+        match expr {
+            ClightExpr::Etempvar(ident, _) => *ident == ident_from_reg(expected),
+            ClightExpr::Ederef(inner, _)
+            | ClightExpr::Eaddrof(inner, _)
+            | ClightExpr::Eunop(_, inner, _)
+            | ClightExpr::Ecast(inner, _) => contains_temp(inner, expected),
+            ClightExpr::Ebinop(_, left, right, _) => {
+                contains_temp(left, expected) || contains_temp(right, expected)
+            }
+            ClightExpr::Efield(base, _, _) => contains_temp(base, expected),
+            _ => false,
+        }
+    }
+
+    fn contains_multiply(expr: &ClightExpr) -> bool {
+        match expr {
+            ClightExpr::Ebinop(ClightBinaryOp::Omul, _, _, _) => true,
+            ClightExpr::Ederef(inner, _)
+            | ClightExpr::Eaddrof(inner, _)
+            | ClightExpr::Eunop(_, inner, _)
+            | ClightExpr::Ecast(inner, _) => contains_multiply(inner),
+            ClightExpr::Ebinop(_, left, right, _) => {
+                contains_multiply(left) || contains_multiply(right)
+            }
+            ClightExpr::Efield(base, _, _) => contains_multiply(base),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn raw_candidate_preserves_width_and_signed_displacement() {
+        let proof = proof(4, -12, false, ScalarMemoryExtension::Plain);
+        let statement = load_stmt(&proof, csharp_address(CsharpminorExpr::Evar(BASE), &proof));
+        let candidates = scalar_memory_clight_candidates(&proof, &statement, &[]);
+        assert!(!candidates.is_empty());
+        assert!(candidates
+            .iter()
+            .all(|(form, _)| *form == ScalarLvalueSourceForm::RawByte));
+        assert!(candidates
+            .iter()
+            .flat_map(candidate_exprs)
+            .all(|expression| contains_long(expression, -12)));
+        assert!(candidates.iter().flat_map(candidate_exprs).any(|expression| {
+            matches!(
+                expression,
+                ClightExpr::Ederef(_, ClightType::Tint(ClightIntSize::I32, _, _))
+            )
+        }));
+    }
+
+    #[test]
+    fn exact_scale_adds_direct_index_without_removing_raw_form() {
+        let proof = proof(4, 0, true, ScalarMemoryExtension::Plain);
+        let statement = load_stmt(&proof, csharp_address(CsharpminorExpr::Evar(BASE), &proof));
+        let candidates = scalar_memory_clight_candidates(&proof, &statement, &[]);
+        assert!(candidates
+            .iter()
+            .any(|(form, _)| *form == ScalarLvalueSourceForm::RawByte));
+        assert!(candidates
+            .iter()
+            .any(|(form, _)| *form == ScalarLvalueSourceForm::TypedScaled));
+        assert!(candidates
+            .iter()
+            .flat_map(candidate_exprs)
+            .any(contains_multiply));
+        assert!(candidates
+            .iter()
+            .flat_map(candidate_exprs)
+            .any(|expression| !contains_multiply(expression)));
+    }
+
+    #[test]
+    fn direct_index_keeps_the_inlined_unique_use_address_dag() {
+        let proof = proof(8, 0, true, ScalarMemoryExtension::Plain);
+        let inlined_base = CsharpminorExpr::Ebinop(
+            CminorBinop::Oaddl,
+            Box::new(CsharpminorExpr::Evar(BASE)),
+            Box::new(CsharpminorExpr::Econst(Constant::Olongconst(24))),
+        );
+        let statement = load_stmt(&proof, csharp_address(inlined_base, &proof));
+        let candidates = scalar_memory_clight_candidates(&proof, &statement, &[]);
+        let direct = candidates
+            .iter()
+            .flat_map(candidate_exprs)
+            .find(|expression| !contains_multiply(expression))
+            .expect("direct scaled-index candidate");
+        assert!(contains_long(direct, 24));
+        assert!(contains_temp(direct, BASE));
+        assert!(contains_temp(direct, INDEX));
+        assert!(!contains_temp(direct, TEMP));
+    }
+
+    #[test]
+    fn addr32_candidate_requires_the_exact_modulo_width_skeleton() {
+        let mut proof = proof(4, -7, true, ScalarMemoryExtension::Plain);
+        proof.address_size = 4;
+        proof.exact_scaled_index = false;
+        let exact = load_stmt(&proof, addr32_address(&proof));
+        assert!(!scalar_memory_clight_candidates(&proof, &exact, &[]).is_empty());
+
+        let wrong_width = load_stmt(&proof, csharp_address(CsharpminorExpr::Evar(BASE), &proof));
+        assert!(scalar_memory_clight_candidates(&proof, &wrong_width, &[]).is_empty());
+    }
+
+    #[test]
+    fn scalar_store_keeps_the_exact_width_and_raw_byte_address() {
+        let mut proof = proof(2, -6, false, ScalarMemoryExtension::Plain);
+        proof.direction = ScalarMemoryDirection::Write;
+        proof.downstream_value_width = None;
+        let statement = store_stmt(&proof, csharp_address(CsharpminorExpr::Evar(BASE), &proof));
+        let candidates = scalar_memory_clight_candidates(&proof, &statement, &[]);
+        assert!(!candidates.is_empty());
+        assert!(candidates.iter().all(|(_, candidate)| matches!(
+            candidate,
+            ClightStmt::Sassign(
+                ClightExpr::Ederef(_, ClightType::Tint(ClightIntSize::I16, _, _)),
+                _
+            )
+        )));
+    }
+
+    #[test]
+    fn extension_class_controls_source_and_result_signedness() {
+        for (extension, signedness) in [
+            (ScalarMemoryExtension::SignExtend, ClightSignedness::Signed),
+            (
+                ScalarMemoryExtension::ZeroExtend,
+                ClightSignedness::Unsigned,
+            ),
+        ] {
+            let proof = proof(1, 0, false, extension);
+            let statement = load_stmt(&proof, CsharpminorExpr::Evar(BASE));
+            let candidates = scalar_memory_clight_candidates(&proof, &statement, &[]);
+            assert!(candidates
+                .iter()
+                .flat_map(candidate_exprs)
+                .all(|expression| matches!(
+                expression,
+                ClightExpr::Ecast(
+                    inner,
+                    ClightType::Tlong(result_sign, _)
+                ) if *result_sign == signedness
+                    && matches!(
+                        inner.as_ref(),
+                        ClightExpr::Ederef(
+                            _,
+                            ClightType::Tint(ClightIntSize::I8, source_sign, _)
+                        ) if *source_sign == signedness
+                    )
+            )));
+        }
+    }
+
+    #[test]
+    fn mismatched_post_structuring_width_produces_no_candidate() {
+        let proof = proof(4, 0, false, ScalarMemoryExtension::Plain);
+        let statement = CsharpminorStmt::Sset(
+            VALUE,
+            CsharpminorExpr::Eload(MemoryChunk::MInt64, Box::new(CsharpminorExpr::Evar(BASE))),
+        );
+        assert!(scalar_memory_clight_candidates(&proof, &statement, &[]).is_empty());
     }
 }

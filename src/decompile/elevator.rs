@@ -86,9 +86,13 @@ impl RelationEntry {
     }
 }
 use crate::decompile::passes::c_pass::types::{CType, TranslationUnit};
-use crate::decompile::passes::clight_select::select::SelectedFunction;
+use crate::decompile::passes::clight_select::select::{
+    ScalarLvalueSelectedAlternative, SelectedFunction,
+};
 use crate::decompile::passes::clight_select::query::GlobalData;
-use crate::decompile::postselect::source_alternatives::SourceAlternativeSnapshot;
+use crate::decompile::postselect::source_alternatives::{
+    PendingScalarLvalueAlternative, SourceAlternativeSnapshot,
+};
 
 /// Pipeline policy fixed at the 2026-06 corpus optimum; behavior env gates were removed after A/B decisions closed -- the pass list and these constants ARE the configuration; diagnostic env vars (TRACE_NODE etc.) remain but never change output.
 pub mod config {
@@ -183,6 +187,7 @@ pub struct DecompileDB {
 
     // Typed per-function trees produced by ClightSelectPass and consumed by ClightEmitPass.
     pub clight_selected_functions: Vec<SelectedFunction>,
+    pub clight_scalar_lvalue_alternatives: Vec<ScalarLvalueSelectedAlternative>,
 
     pub cast_selected_functions: Vec<SelectedFunction>,
     pub cast_globals: Vec<GlobalData>,
@@ -193,6 +198,7 @@ pub struct DecompileDB {
     pub cast_optimized_translation_unit: Option<TranslationUnit>,
     pub cast_source_alternatives: Vec<SourceAlternativeSnapshot>,
     pub cast_source_alternatives_overflowed: bool,
+    pub cast_pending_scalar_lvalue_alternatives: Vec<PendingScalarLvalueAlternative>,
 
     // P5 decl solve: program-level decl decisions from selected-statement obligations, computed before TU builds -- the field int-veto, force-long override, per-field pointer retype, and fnptr globals.
     pub decl_solve_field_int_veto: HashSet<(String, String)>,
@@ -233,6 +239,7 @@ impl Default for DecompileDB {
             target_abi: None,
 
             clight_selected_functions: Default::default(),
+            clight_scalar_lvalue_alternatives: Default::default(),
             cast_selected_functions: Default::default(),
             cast_globals: Default::default(),
             cast_id_to_name: Default::default(),
@@ -242,6 +249,7 @@ impl Default for DecompileDB {
             cast_optimized_translation_unit: None,
             cast_source_alternatives: Default::default(),
             cast_source_alternatives_overflowed: false,
+            cast_pending_scalar_lvalue_alternatives: Default::default(),
             decl_solve_field_int_veto: Default::default(),
             decl_solve_field_force_long: Default::default(),
             decl_solve_field_ptr_selection: Default::default(),

@@ -796,7 +796,7 @@ fn solve_function(
     func: &FunctionData,
     name_to_ident: &HashMap<String, Ident>,
 ) -> (HashMap<Node, Option<usize>>, HashMap<RTLReg, usize>, HashMap<RTLReg, String>) {
-    match solve_function_z3(func, name_to_ident) {
+    match solve_function_z3(func, name_to_ident, false) {
         Ok((c, ty, ov, grade)) => {
             if matches!(grade, SatResult::Unknown) {
                 TYPE_SOLVE_PARTIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -834,6 +834,7 @@ fn solve_function(
 fn solve_function_z3(
     func: &FunctionData,
     name_to_ident: &HashMap<String, Ident>,
+    strict_candidate_state: bool,
 ) -> Result<
     (HashMap<Node, Option<usize>>, HashMap<RTLReg, usize>, HashMap<RTLReg, String>, SatResult),
     SatResult,
@@ -1083,12 +1084,25 @@ fn solve_function_z3(
                                     eprintln!("  repick node {:#x} cand[{}]: wt={} sviol={} narrow={} wviol={} errs={:?}", node, ci, wt, sviol, narrow, wviol,
                                         errs.iter().map(|e| format!("{}:{}", e.kind.gcc_family(), e.detail)).collect::<Vec<_>>());
                                 }
-                                let key = (wt, sviol, narrow, wviol, ci);
+                                // Canonical selection retains its historical
+                                // exact-WT-first re-pick. A feature-only solve
+                                // instead admits only candidates whose every
+                                // recorded structural obligation is true under
+                                // the frozen canonical type model.
+                                let key = if strict_candidate_state {
+                                    (sviol, wt, narrow, wviol, ci)
+                                } else {
+                                    (wt, sviol, narrow, wviol, ci)
+                                };
                                 if best.is_none_or(|b| key < b) {
                                     best = Some(key);
                                 }
                             }
-                            if let Some((_, _, _, _, ci)) = best {
+                            if let Some((first, _, _, _, ci)) = best {
+                                if strict_candidate_state && first != 0 {
+                                    cand_out.insert(node, None);
+                                    continue;
+                                }
                                 chosen = ci;
                             }
                         }
@@ -1154,6 +1168,61 @@ fn solve_function_z3(
         }
         None => Err(check_result),
     }
+    })
+}
+
+/// Re-run the complete hard selection/type system for a feature-only view
+/// assembled from already-solved canonical declarations. Ordinary statements
+/// and all declaration types are singleton-frozen; authenticated feature nodes
+/// may retain a closed same-form candidate set so the hard model, rather than
+/// relation iteration order, chooses the exact signed/unsigned spelling.
+/// Partial/unknown models and any synthesized type are rejected.
+pub(crate) fn solve_fixed_feature_selection(
+    func: &FunctionData,
+    name_to_ident: &HashMap<String, Ident>,
+) -> Option<ProgramSelectionState> {
+    fn reset_feature_diagnostics() {
+        SOFT_CLAUSES.store(0, std::sync::atomic::Ordering::Relaxed);
+        BUILD_NS.store(0, std::sync::atomic::Ordering::Relaxed);
+        CHECK_NS.store(0, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut tags) = SOFT_TAGS.lock() {
+            tags.clear();
+        }
+    }
+
+    let solved = solve_function_z3(func, name_to_ident, true);
+    // The canonical run summary is emitted/reset before feature validation.
+    // Do not leak this bounded second solve into the next TU's diagnostics.
+    reset_feature_diagnostics();
+    let Ok((candidates, types, overrides, grade)) = solved else {
+        return None;
+    };
+    if grade != SatResult::Sat || !overrides.is_empty() {
+        return None;
+    }
+    if !func.node_statements.iter().all(|(node, choices)| {
+        !choices.is_empty()
+            && candidates
+                .get(node)
+                .copied()
+                .flatten()
+                .is_some_and(|index| index < choices.len())
+    }) || !func.var_type_candidates.iter().all(|(reg, choices)| {
+        choices.len() == 1 && types.get(reg).copied() == Some(0)
+    }) {
+        return None;
+    }
+
+    Some(ProgramSelectionState {
+        candidate_idx: candidates
+            .into_iter()
+            .map(|(node, index)| ((func.address, node), index))
+            .collect(),
+        var_decl_idx: types
+            .into_iter()
+            .map(|(reg, index)| ((func.address, reg), index))
+            .collect(),
+        var_type_override: HashMap::new(),
     })
 }
 

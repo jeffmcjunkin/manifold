@@ -211,6 +211,191 @@ pub enum MemoryChunk {
     Unknown,
 }
 
+/// Decoder-authenticated direction of one scalar memory operand.  This is a
+/// machine effect, not a source qualifier: in particular it never implies
+/// `volatile` or an aliasing class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ScalarMemoryDirection {
+    Read,
+    Write,
+}
+
+/// The exact value-extension semantics attached to a decoded scalar load.
+/// Stores and plain MOV loads use `Plain`; signedness inferred later for a C
+/// declaration is deliberately kept separate from this opcode fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ScalarMemoryExtension {
+    Plain,
+    SignExtend,
+    ZeroExtend,
+}
+
+/// Closed provider-internal spelling carried alongside an authenticated
+/// scalar-memory Clight candidate.  These are selection provenance tags, not
+/// source-alternative wire identifiers: the wire records only the final
+/// typed-lvalue boundary that was actually assembled and emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ScalarLvalueSourceForm {
+    RawByte,
+    TypedScaled,
+}
+
+/// Closed proof that one surviving post-optimization RTL memory effect is the
+/// reversible lowering of one real decoded MOV-family operand.  The record is
+/// provider-internal and carries no source-level struct, array, volatile,
+/// union, or alias claim.  V1 authorizes only raw unsigned-byte address
+/// arithmetic and exact typed scaled-index source alternatives.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ScalarMemoryAccessProof {
+    pub function: Address,
+    pub origin_node: Node,
+    pub selected_node: Node,
+    pub operand: Symbol,
+    pub direction: ScalarMemoryDirection,
+    pub extension: ScalarMemoryExtension,
+    pub address_size: u8,
+    pub base_register: Mreg,
+    pub index_register: Option<Mreg>,
+    pub scale: i64,
+    pub displacement: i64,
+    pub width: usize,
+    pub value_width: usize,
+    /// Exact architectural result width for a decoded load destination.
+    /// Plain MOV also authenticates it against early downstream type rows;
+    /// MOVSX/MOVZX are revalidated after final type/signature reconciliation,
+    /// where their narrow chunk artifact is replaced by the opcode-defined
+    /// result type. Stores have no destination and carry None. In particular,
+    /// a 32-bit write is never allowed to flow into a 64-bit C value through
+    /// this v1 proof.
+    pub downstream_value_width: Option<usize>,
+    pub chunk: MemoryChunk,
+    pub base_value: Option<RTLReg>,
+    pub index_value: Option<RTLReg>,
+    pub value: RTLReg,
+    /// Sorted, unique parameter leaves reached by the authenticated address
+    /// DAG.  Cshminor revalidates every leaf against the reconciled final
+    /// function-parameter relation before exposing a source candidate.
+    pub address_param_leaves: Arc<Vec<RTLReg>>,
+    pub synthetic_stack_origin: bool,
+    /// A typed pointer index has exactly the decoded byte scale.  No array
+    /// identity is inferred; this merely admits an address-equivalent source
+    /// spelling as a bounded candidate.
+    pub exact_scaled_index: bool,
+}
+
+impl ScalarMemoryAccessProof {
+    /// Revalidate the sealed v1 descriptor at every IR handoff.  This does not
+    /// recreate decoder evidence; it prevents a stale or cross-node relation
+    /// row from changing width, extension, address shape, or synthetic-node
+    /// identity after authentication.
+    pub fn is_closed_v1(&self) -> bool {
+        if !matches!(self.address_size, 4 | 8)
+            || !matches!(self.width, 1 | 2 | 4 | 8)
+            || !matches!(self.value_width, 1 | 2 | 4 | 8)
+            || self.base_register.is_unknown()
+            || self.base_value.is_none()
+            || self.index_register.is_some() != self.index_value.is_some()
+            || self.index_register.is_some_and(|index| index.is_unknown())
+            || self.address_param_leaves.is_empty()
+            || self
+                .address_param_leaves
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return false;
+        }
+        if match self.direction {
+            ScalarMemoryDirection::Read => {
+                self.downstream_value_width != Some(self.value_width)
+                    || !matches!(self.value_width, 4 | 8)
+            }
+            ScalarMemoryDirection::Write => self.downstream_value_width.is_some(),
+        } {
+            return false;
+        }
+        match (self.index_register, self.scale) {
+            (None, 1) | (Some(_), 1 | 2 | 4 | 8) => {}
+            _ => return false,
+        }
+
+        let synthetic_mask = (1u64 << 62) | (1u64 << 63);
+        if self.origin_node & synthetic_mask != 0
+            || if self.synthetic_stack_origin {
+                self.address_size != 8
+                    || !matches!(self.base_register, Mreg::SP | Mreg::BP)
+                    || self.index_register.is_none()
+                    || self.selected_node != (self.origin_node | (1u64 << 62))
+            } else {
+                self.selected_node != self.origin_node
+                    || (self.address_size == 8 && matches!(self.base_register, Mreg::SP | Mreg::BP))
+            }
+        {
+            return false;
+        }
+
+        let semantic_shape = match (self.direction, self.extension, self.width) {
+            (ScalarMemoryDirection::Read, ScalarMemoryExtension::Plain, 4) => {
+                self.value_width == 4 && self.chunk == MemoryChunk::MInt32
+            }
+            (ScalarMemoryDirection::Read, ScalarMemoryExtension::Plain, 8) => {
+                self.value_width == 8
+                    && matches!(self.chunk, MemoryChunk::MInt64 | MemoryChunk::MAny64)
+            }
+            (ScalarMemoryDirection::Write, ScalarMemoryExtension::Plain, width) => {
+                self.value_width == width
+                    && match width {
+                        1 => self.chunk == MemoryChunk::MInt8Unsigned,
+                        2 => self.chunk == MemoryChunk::MInt16Unsigned,
+                        4 => self.chunk == MemoryChunk::MInt32,
+                        8 => matches!(self.chunk, MemoryChunk::MInt64 | MemoryChunk::MAny64),
+                        _ => return false,
+                    }
+            }
+            (ScalarMemoryDirection::Read, ScalarMemoryExtension::SignExtend, 1) => {
+                matches!(self.value_width, 4 | 8)
+                    && matches!(
+                        self.chunk,
+                        MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned
+                    )
+            }
+            (ScalarMemoryDirection::Read, ScalarMemoryExtension::SignExtend, 2) => {
+                self.value_width > 2
+                    && matches!(
+                        self.chunk,
+                        MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned
+                    )
+            }
+            (ScalarMemoryDirection::Read, ScalarMemoryExtension::SignExtend, 4) => {
+                self.value_width == 8 && self.chunk == MemoryChunk::MInt32
+            }
+            (ScalarMemoryDirection::Read, ScalarMemoryExtension::ZeroExtend, 1) => {
+                matches!(self.value_width, 4 | 8)
+                    && matches!(
+                        self.chunk,
+                        MemoryChunk::MInt8Signed | MemoryChunk::MInt8Unsigned
+                    )
+            }
+            (ScalarMemoryDirection::Read, ScalarMemoryExtension::ZeroExtend, 2) => {
+                self.value_width > 2
+                    && matches!(
+                        self.chunk,
+                        MemoryChunk::MInt16Signed | MemoryChunk::MInt16Unsigned
+                    )
+            }
+            _ => false,
+        };
+        if !semantic_shape {
+            return false;
+        }
+
+        let exact_scaled_index = self.address_size == 8
+            && self.index_value.is_some()
+            && (self.displacement == 0 || self.synthetic_stack_origin)
+            && self.scale == self.width as i64;
+        self.exact_scaled_index == exact_scaled_index
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Signature {
     pub sig_args: Arc<Vec<XType>>,

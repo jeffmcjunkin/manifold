@@ -38,7 +38,7 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
     eprintln!("  emit_var_type:                  {}", var_type_count);
     eprintln!("=== End Diagnostics ===\n");
 
-    let selected_functions = select_clight_stmts(db)?;
+    let selected_functions = select_clight_stmts(db)?.canonical;
 
     let binary_path = db.binary_path.as_ref().ok_or("binary_path not set")?;
 

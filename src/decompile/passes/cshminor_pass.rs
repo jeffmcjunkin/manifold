@@ -454,6 +454,255 @@ fn filter_cr8_byte_compares_with_incompatible_types(db: &mut DecompileDB) {
     );
 }
 
+fn scalar_lvalue_integral_type_width(xtype: XType) -> Option<usize> {
+    match xtype {
+        XType::Xint8signed | XType::Xint8unsigned => Some(1),
+        XType::Xint16signed | XType::Xint16unsigned => Some(2),
+        XType::Xint | XType::Xintunsigned | XType::Xany32 => Some(4),
+        XType::Xlong | XType::Xlongunsigned | XType::Xany64 => Some(8),
+        XType::Xbool
+        | XType::Xfloat
+        | XType::Xsingle
+        | XType::Xptr
+        | XType::Xcharptr
+        | XType::Xcharptrptr
+        | XType::Xintptr
+        | XType::Xfloatptr
+        | XType::Xsingleptr
+        | XType::Xfuncptr
+        | XType::Xvoid
+        | XType::XstructPtr(_) => None,
+    }
+}
+
+pub(crate) fn scalar_lvalue_extension_result_type(
+    proof: &ScalarMemoryAccessProof,
+) -> Option<XType> {
+    match (proof.direction, proof.extension, proof.value_width) {
+        (ScalarMemoryDirection::Read, ScalarMemoryExtension::SignExtend, 4) => Some(XType::Xint),
+        (ScalarMemoryDirection::Read, ScalarMemoryExtension::ZeroExtend, 4) => {
+            Some(XType::Xintunsigned)
+        }
+        (ScalarMemoryDirection::Read, ScalarMemoryExtension::SignExtend, 8) => Some(XType::Xlong),
+        (ScalarMemoryDirection::Read, ScalarMemoryExtension::ZeroExtend, 8) => {
+            Some(XType::Xlongunsigned)
+        }
+        _ => None,
+    }
+}
+
+fn scalar_lvalue_extension_chunk_type(proof: &ScalarMemoryAccessProof) -> Option<XType> {
+    match proof.chunk {
+        MemoryChunk::MInt8Signed => Some(XType::Xint8signed),
+        MemoryChunk::MInt8Unsigned => Some(XType::Xint8unsigned),
+        MemoryChunk::MInt16Signed => Some(XType::Xint16signed),
+        MemoryChunk::MInt16Unsigned => Some(XType::Xint16unsigned),
+        MemoryChunk::MInt32 => Some(XType::Xint),
+        _ => None,
+    }
+}
+
+fn scalar_lvalue_extension_companion_type(proof: &ScalarMemoryAccessProof) -> Option<XType> {
+    match (proof.chunk, proof.width) {
+        (MemoryChunk::MInt8Signed, 1) => Some(XType::Xint8unsigned),
+        (MemoryChunk::MInt8Unsigned, 1) => Some(XType::Xint8signed),
+        (MemoryChunk::MInt16Signed, 2) => Some(XType::Xint16unsigned),
+        (MemoryChunk::MInt16Unsigned, 2) => Some(XType::Xint16signed),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScalarExtensionTypeRewrite {
+    pub(crate) transport_types: BTreeSet<XType>,
+    pub(crate) result_type: XType,
+}
+
+/// Validate the complete late type set for one authenticated extension load.
+/// The selected transport and its sole same-width signedness companion are
+/// lowering artifacts; the raw opcode's exact architectural result type is
+/// the only other admissible row. This is shared by SignatureReconciliation
+/// and Cshminor so the ABI and final source cannot disagree.
+pub(crate) fn scalar_lvalue_extension_type_rewrite(
+    proof: &ScalarMemoryAccessProof,
+    types: &BTreeSet<XType>,
+    pointer: bool,
+) -> Option<ScalarExtensionTypeRewrite> {
+    if pointer
+        || !proof.is_closed_v1()
+        || proof.direction != ScalarMemoryDirection::Read
+        || proof.extension == ScalarMemoryExtension::Plain
+        || types.is_empty()
+    {
+        return None;
+    }
+    let selected = scalar_lvalue_extension_chunk_type(proof)?;
+    let result_type = scalar_lvalue_extension_result_type(proof)?;
+    let mut transport_types = BTreeSet::from([selected]);
+    if let Some(companion) = scalar_lvalue_extension_companion_type(proof) {
+        transport_types.insert(companion);
+    }
+    types
+        .iter()
+        .all(|xtype| transport_types.contains(xtype) || *xtype == result_type)
+        .then_some(ScalarExtensionTypeRewrite {
+            transport_types,
+            result_type,
+        })
+}
+
+/// Revalidate scalar-lvalue proof values after TypePass, PtrTo, struct, and
+/// signature reconciliation have reached their final relation state.  This is
+/// deliberately the last gate before Csharp structuring: an authenticated
+/// memory operand is not permission to reinterpret a late float, pointer,
+/// bool, or wider value as an integer lvalue.
+///
+/// MOVSX/MOVZX are special only in one closed way.  The decoder proves their
+/// architectural result width/signedness, while the ordinary type pipeline
+/// may leave the loaded source chunk's sealed signedness pair on the result
+/// register. For a surviving proof, remove only those transport artifacts and
+/// publish exactly the opcode-defined EAX/RAX result type. Any other
+/// conflicting late type rejects every proof sharing that value instead of
+/// being filtered away.
+fn filter_scalar_lvalues_with_final_types(db: &mut DecompileDB) {
+    let mut proofs: Vec<(Node, ScalarMemoryAccessProof)> = db
+        .rel_iter::<(Node, ScalarMemoryAccessProof)>("cminor_scalar_memory_access")
+        .cloned()
+        .collect();
+    if proofs.is_empty() {
+        return;
+    }
+    proofs.sort();
+    proofs.dedup();
+
+    let pointer_values: BTreeSet<RTLReg> = db
+        .rel_iter::<(RTLReg,)>("is_ptr")
+        .map(|row| row.0)
+        .collect();
+    let mut types_by_value: BTreeMap<RTLReg, BTreeSet<XType>> = BTreeMap::new();
+    let mut type_rows: Vec<(RTLReg, XType)> = db
+        .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+        .copied()
+        .collect();
+    type_rows.sort();
+    type_rows.dedup();
+    for (value, xtype) in &type_rows {
+        types_by_value.entry(*value).or_default().insert(*xtype);
+    }
+
+    let signature_extensions: BTreeSet<(Node, ScalarMemoryAccessProof)> = db
+        .rel_iter::<(Node, ScalarMemoryAccessProof)>("signature_scalar_extension_access")
+        .cloned()
+        .collect();
+    let mut returns_by_function: BTreeMap<Address, BTreeSet<RTLReg>> = BTreeMap::new();
+    for (function, value) in db.rel_iter::<(Address, RTLReg)>("emit_function_return") {
+        returns_by_function
+            .entry(*function)
+            .or_default()
+            .insert(*value);
+    }
+    let mut final_returns_by_function: BTreeMap<Address, BTreeSet<XType>> = BTreeMap::new();
+    for (function, xtype) in db.rel_iter::<(Address, XType)>("emit_function_return_type_xtype") {
+        final_returns_by_function
+            .entry(*function)
+            .or_default()
+            .insert(*xtype);
+    }
+
+    let mut individually_valid = BTreeSet::new();
+    let mut blocked_values = BTreeSet::new();
+    let mut extension_rewrites: BTreeMap<RTLReg, ScalarExtensionTypeRewrite> = BTreeMap::new();
+    for (node, proof) in &proofs {
+        let types = types_by_value.get(&proof.value);
+        let valid = proof.is_closed_v1()
+            && !pointer_values.contains(&proof.value)
+            && types.is_some_and(|types| {
+                if types.is_empty() {
+                    return false;
+                }
+                match (proof.direction, proof.extension) {
+                    (ScalarMemoryDirection::Write, ScalarMemoryExtension::Plain) => types
+                        .iter()
+                        .all(|xtype| scalar_lvalue_integral_type_width(*xtype).is_some()),
+                    (ScalarMemoryDirection::Read, ScalarMemoryExtension::Plain) => {
+                        types.iter().all(|xtype| {
+                            scalar_lvalue_integral_type_width(*xtype) == Some(proof.value_width)
+                        })
+                    }
+                    (ScalarMemoryDirection::Read, _) => {
+                        signature_extensions.contains(&(*node, proof.clone()))
+                            && scalar_lvalue_extension_type_rewrite(proof, types, false).is_some()
+                            && returns_by_function
+                                .get(&proof.function)
+                                .map_or(true, |returns| {
+                                    !returns.contains(&proof.value)
+                                        || (returns == &BTreeSet::from([proof.value])
+                                            && final_returns_by_function.get(&proof.function)
+                                                == Some(&BTreeSet::from([
+                                                    scalar_lvalue_extension_result_type(proof)
+                                                        .expect("validated extension result"),
+                                                ])))
+                                })
+                    }
+                    (ScalarMemoryDirection::Write, _) => false,
+                }
+            });
+        if valid {
+            individually_valid.insert((*node, proof.clone()));
+            if proof.direction == ScalarMemoryDirection::Read
+                && proof.extension != ScalarMemoryExtension::Plain
+            {
+                let rewrite = scalar_lvalue_extension_type_rewrite(
+                    proof,
+                    types.expect("validated extension type set"),
+                    false,
+                )
+                .expect("validated extension rewrite");
+                if extension_rewrites
+                    .insert(proof.value, rewrite.clone())
+                    .is_some_and(|previous| previous != rewrite)
+                {
+                    blocked_values.insert(proof.value);
+                }
+            }
+        } else {
+            blocked_values.insert(proof.value);
+        }
+    }
+
+    let accepted: Vec<_> = individually_valid
+        .into_iter()
+        .filter(|(_, proof)| !blocked_values.contains(&proof.value))
+        .collect();
+    let accepted_values: BTreeSet<RTLReg> = accepted.iter().map(|(_, proof)| proof.value).collect();
+    extension_rewrites.retain(|value, _| accepted_values.contains(value));
+
+    db.rel_set(
+        "cminor_scalar_memory_access",
+        accepted.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+    if extension_rewrites.is_empty() {
+        return;
+    }
+
+    type_rows.retain(|(value, xtype)| {
+        !extension_rewrites
+            .get(value)
+            .is_some_and(|rewrite| rewrite.transport_types.contains(xtype))
+    });
+    type_rows.extend(
+        extension_rewrites
+            .into_iter()
+            .map(|(value, rewrite)| (value, rewrite.result_type)),
+    );
+    type_rows.sort();
+    type_rows.dedup();
+    db.rel_set(
+        "emit_var_type_candidate",
+        type_rows.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+}
+
 ascent_par! {
     #![measure_rule_times]
 
@@ -462,10 +711,17 @@ ascent_par! {
 
 
     relation cminor_stmt(Node, CminorStmt);
+    relation cminor_scalar_memory_access(Node, ScalarMemoryAccessProof);
+    relation signature_scalar_extension_access(Node, ScalarMemoryAccessProof);
     relation trim_jump_table_impl(Node);
     // RTLOptimize's post-rewrite proof that one exact CR8 condition consumes
     // the matching low byte of its still-64-bit intrinsic result.
     relation cr8_byte_compare(Node, RTLReg);
+    // Provenance marker kept separate from csharp_stmt_candidate: the
+    // structuring pass intentionally selects one canonical statement per
+    // node, while Clight may safely retain bounded source alternatives.
+    relation scalar_lvalue_candidate(Node, ScalarMemoryAccessProof);
+    #[local] relation scalar_lvalue_param_leaf_missing(Node);
 
     #[local] relation active_cminor_stmt(Node, CminorStmt);
     active_cminor_stmt(node, stmt.clone()) <--
@@ -476,11 +732,24 @@ ascent_par! {
         trim_jump_table_impl(node),
         if matches!(stmt, CminorStmt::Sjumptable(_, _));
 
+    scalar_lvalue_param_leaf_missing(node) <--
+        cminor_scalar_memory_access(node, proof),
+        for leaf in proof.address_param_leaves.iter(),
+        !emit_function_param(proof.function, *leaf);
+
+    scalar_lvalue_candidate(node, proof.clone()) <--
+        cminor_scalar_memory_access(node, proof),
+        active_cminor_stmt(node, stmt),
+        !scalar_lvalue_param_leaf_missing(node),
+        if crate::decompile::passes::cminor_pass::scalar_memory_proof_matches_cminor(proof, stmt);
+
     relation instr_in_function(Node, Address);
     relation rtl_succ(Node, Node);
     relation cminor_fallthrough(Node, Node);
     relation emit_function(Address, Symbol, Node);
     relation emit_function_param(Address, RTLReg);
+    relation emit_function_return(Address, RTLReg);
+    relation emit_function_return_type_xtype(Address, XType);
     relation next(Address, Address);
     relation emit_var_type_candidate(RTLReg, XType);
     relation idom(Address, Node, Node);
@@ -1537,6 +1806,7 @@ impl IRPass for CshminorPass {
 
     fn run(&self, db: &mut DecompileDB) {
         filter_cr8_byte_compares_with_incompatible_types(db);
+        filter_scalar_lvalues_with_final_types(db);
         Self::prepare_jump_tables(db);
 
         run_pass!(db, CshminorPassProgram);
@@ -1687,5 +1957,361 @@ mod cr8_byte_condition_tests {
                 .rel_iter::<(Node, RTLReg)>("cr8_byte_compare")
                 .any(|(node, _)| *node == CONDITION));
         }
+    }
+}
+
+#[cfg(test)]
+mod scalar_lvalue_final_param_tests {
+    use super::*;
+
+    const FUNCTION: Address = 0x2000;
+    const NODE: Node = 0x2010;
+    const BASE: RTLReg = 0x8000_0000_0000_2010;
+    const INDEX: RTLReg = 0x8000_0000_0000_2020;
+    const VALUE: RTLReg = 0x8000_0000_0000_2030;
+
+    fn proof(
+        direction: ScalarMemoryDirection,
+        extension: ScalarMemoryExtension,
+        width: usize,
+        value_width: usize,
+        chunk: MemoryChunk,
+    ) -> ScalarMemoryAccessProof {
+        ScalarMemoryAccessProof {
+            function: FUNCTION,
+            origin_node: NODE,
+            selected_node: NODE,
+            operand: "scalar_final_param_memory",
+            direction,
+            extension,
+            address_size: 8,
+            base_register: Mreg::CX,
+            index_register: Some(Mreg::DX),
+            scale: 4,
+            displacement: 8,
+            width,
+            value_width,
+            downstream_value_width: (direction == ScalarMemoryDirection::Read)
+                .then_some(value_width),
+            chunk,
+            base_value: Some(BASE),
+            index_value: Some(INDEX),
+            value: VALUE,
+            address_param_leaves: Arc::new(vec![BASE, INDEX]),
+            synthetic_stack_origin: false,
+            exact_scaled_index: false,
+        }
+    }
+
+    fn run_case(
+        proof: ScalarMemoryAccessProof,
+        final_params: &[RTLReg],
+        types: &[XType],
+        pointer: bool,
+    ) -> DecompileDB {
+        run_case_with_return(proof, final_params, types, pointer, None)
+    }
+
+    fn run_case_with_return(
+        proof: ScalarMemoryAccessProof,
+        final_params: &[RTLReg],
+        types: &[XType],
+        pointer: bool,
+        final_return: Option<XType>,
+    ) -> DecompileDB {
+        run_case_with_marker_and_return(proof, final_params, types, pointer, true, final_return)
+    }
+
+    fn run_case_with_marker_and_return(
+        proof: ScalarMemoryAccessProof,
+        final_params: &[RTLReg],
+        types: &[XType],
+        pointer: bool,
+        signature_marker: bool,
+        final_return: Option<XType>,
+    ) -> DecompileDB {
+        let mut db = DecompileDB::default();
+        let statement = match proof.direction {
+            ScalarMemoryDirection::Read => CminorStmt::Sassign(
+                VALUE,
+                CminorExpr::Eload(
+                    proof.chunk,
+                    Addressing::Aindexed2scaled(4, 8),
+                    Arc::new(vec![BASE, INDEX]),
+                ),
+            ),
+            ScalarMemoryDirection::Write => CminorStmt::Sstore(
+                proof.chunk,
+                Addressing::Aindexed2scaled(4, 8),
+                Arc::new(vec![BASE, INDEX]),
+                VALUE,
+            ),
+        };
+        db.rel_push("cminor_stmt", (NODE, statement));
+        db.rel_push("cminor_scalar_memory_access", (NODE, proof.clone()));
+        if signature_marker && proof.extension != ScalarMemoryExtension::Plain {
+            db.rel_push("signature_scalar_extension_access", (NODE, proof));
+        }
+        if let Some(xtype) = final_return {
+            db.rel_push("emit_function_return", (FUNCTION, VALUE));
+            db.rel_push("emit_function_return_type_xtype", (FUNCTION, xtype));
+        }
+        for parameter in final_params {
+            db.rel_push("emit_function_param", (FUNCTION, *parameter));
+        }
+        for xtype in types {
+            db.rel_push("emit_var_type_candidate", (VALUE, *xtype));
+        }
+        if pointer {
+            db.rel_push("is_ptr", (VALUE,));
+        }
+        CshminorPass.run(&mut db);
+        db
+    }
+
+    fn candidate_count(db: &DecompileDB) -> usize {
+        db.rel_iter::<(Node, ScalarMemoryAccessProof)>("scalar_lvalue_candidate")
+            .filter(|(node, _)| *node == NODE)
+            .count()
+    }
+
+    fn plain_read_proof() -> ScalarMemoryAccessProof {
+        proof(
+            ScalarMemoryDirection::Read,
+            ScalarMemoryExtension::Plain,
+            4,
+            4,
+            MemoryChunk::MInt32,
+        )
+    }
+
+    #[test]
+    fn scalar_lvalue_revalidates_every_address_leaf_after_param_reconciliation() {
+        for (params, expected) in [
+            (&[BASE, INDEX][..], 1),
+            (&[BASE, INDEX, VALUE][..], 1),
+            (&[BASE][..], 0),
+            (&[INDEX][..], 0),
+            (&[][..], 0),
+        ] {
+            let db = run_case(plain_read_proof(), params, &[XType::Xint], false);
+            assert_eq!(candidate_count(&db), expected, "params={params:?}");
+        }
+    }
+
+    #[test]
+    fn scalar_lvalue_rejects_late_nonintegral_pointer_bool_and_wider_load_types() {
+        for (types, pointer) in [
+            (&[XType::Xfloat][..], false),
+            (&[XType::Xptr][..], false),
+            (&[XType::Xint][..], true),
+            (&[XType::Xbool][..], false),
+            (&[XType::Xlong][..], false),
+        ] {
+            let db = run_case(plain_read_proof(), &[BASE, INDEX], types, pointer);
+            assert_eq!(
+                candidate_count(&db),
+                0,
+                "late types={types:?}, pointer={pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_lvalue_store_rejects_late_float_source_without_numeric_cast() {
+        let store = proof(
+            ScalarMemoryDirection::Write,
+            ScalarMemoryExtension::Plain,
+            4,
+            4,
+            MemoryChunk::MInt32,
+        );
+        let db = run_case(store, &[BASE, INDEX], &[XType::Xfloat], false);
+        assert_eq!(candidate_count(&db), 0);
+    }
+
+    #[test]
+    fn scalar_lvalue_extension_replaces_only_chunk_type_with_exact_result_type() {
+        for (proof, original, result) in [
+            (
+                proof(
+                    ScalarMemoryDirection::Read,
+                    ScalarMemoryExtension::ZeroExtend,
+                    1,
+                    4,
+                    MemoryChunk::MInt8Unsigned,
+                ),
+                XType::Xint8unsigned,
+                XType::Xintunsigned,
+            ),
+            (
+                proof(
+                    ScalarMemoryDirection::Read,
+                    ScalarMemoryExtension::SignExtend,
+                    1,
+                    8,
+                    MemoryChunk::MInt8Signed,
+                ),
+                XType::Xint8signed,
+                XType::Xlong,
+            ),
+        ] {
+            let db = run_case(proof, &[BASE, INDEX], &[original], false);
+            assert_eq!(candidate_count(&db), 1);
+            let types: BTreeSet<XType> = db
+                .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+                .filter_map(|(value, xtype)| (*value == VALUE).then_some(*xtype))
+                .collect();
+            assert_eq!(types, BTreeSet::from([result]));
+        }
+    }
+
+    #[test]
+    fn scalar_lvalue_signed_extension_retypes_selected_unsigned_transport() {
+        let signed_movsx = proof(
+            ScalarMemoryDirection::Read,
+            ScalarMemoryExtension::SignExtend,
+            1,
+            8,
+            MemoryChunk::MInt8Unsigned,
+        );
+        let db = run_case(signed_movsx, &[BASE, INDEX], &[XType::Xint8unsigned], false);
+        assert_eq!(candidate_count(&db), 1);
+        let types: BTreeSet<XType> = db
+            .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .filter_map(|(value, xtype)| (*value == VALUE).then_some(*xtype))
+            .collect();
+        assert_eq!(types, BTreeSet::from([XType::Xlong]));
+    }
+
+    #[test]
+    fn scalar_lvalue_extension_retypes_sole_late_signedness_companion() {
+        let zero_extended = proof(
+            ScalarMemoryDirection::Read,
+            ScalarMemoryExtension::ZeroExtend,
+            1,
+            4,
+            MemoryChunk::MInt8Unsigned,
+        );
+        let db = run_case(zero_extended, &[BASE, INDEX], &[XType::Xint8signed], false);
+        assert_eq!(candidate_count(&db), 1);
+        let types: BTreeSet<XType> = db
+            .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .filter_map(|(value, xtype)| (*value == VALUE).then_some(*xtype))
+            .collect();
+        assert_eq!(types, BTreeSet::from([XType::Xintunsigned]));
+    }
+
+    #[test]
+    fn scalar_lvalue_extension_requires_signature_marker() {
+        let zero_extended = proof(
+            ScalarMemoryDirection::Read,
+            ScalarMemoryExtension::ZeroExtend,
+            1,
+            4,
+            MemoryChunk::MInt8Unsigned,
+        );
+        let db = run_case_with_marker_and_return(
+            zero_extended,
+            &[BASE, INDEX],
+            &[XType::Xint8signed],
+            false,
+            false,
+            None,
+        );
+        assert_eq!(candidate_count(&db), 0);
+        let types: BTreeSet<XType> = db
+            .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .filter_map(|(value, xtype)| (*value == VALUE).then_some(*xtype))
+            .collect();
+        assert_eq!(types, BTreeSet::from([XType::Xint8signed]));
+    }
+
+    #[test]
+    fn scalar_lvalue_direct_return_respects_prototype_selected_final_type() {
+        for (final_return, expected) in [
+            (XType::Xintunsigned, 1),
+            (XType::Xint, 0),
+            (XType::Xint8unsigned, 0),
+            (XType::Xlong, 0),
+        ] {
+            let zero_extended = proof(
+                ScalarMemoryDirection::Read,
+                ScalarMemoryExtension::ZeroExtend,
+                1,
+                4,
+                MemoryChunk::MInt8Unsigned,
+            );
+            let db = run_case_with_return(
+                zero_extended,
+                &[BASE, INDEX],
+                &[XType::Xintunsigned],
+                false,
+                Some(final_return),
+            );
+            assert_eq!(
+                candidate_count(&db),
+                expected,
+                "final return {final_return:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_lvalue_extension_rejects_late_type_conflict_without_sanitizing_it() {
+        for incompatible in [
+            XType::Xfloat,
+            XType::Xptr,
+            XType::Xbool,
+            XType::Xint16unsigned,
+            XType::Xlong,
+        ] {
+            let extension = proof(
+                ScalarMemoryDirection::Read,
+                ScalarMemoryExtension::ZeroExtend,
+                1,
+                4,
+                MemoryChunk::MInt8Unsigned,
+            );
+            let db = run_case(
+                extension,
+                &[BASE, INDEX],
+                &[XType::Xint8unsigned, incompatible],
+                false,
+            );
+            assert_eq!(candidate_count(&db), 0, "late type={incompatible:?}");
+            let types: BTreeSet<XType> = db
+                .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+                .filter_map(|(value, xtype)| (*value == VALUE).then_some(*xtype))
+                .collect();
+            assert_eq!(
+                types,
+                BTreeSet::from([XType::Xint8unsigned, incompatible]),
+                "rejected type evidence must not be sanitized"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_lvalue_extension_retains_only_the_exact_opcode_result_type() {
+        let extension = proof(
+            ScalarMemoryDirection::Read,
+            ScalarMemoryExtension::ZeroExtend,
+            1,
+            4,
+            MemoryChunk::MInt8Unsigned,
+        );
+        let db = run_case(
+            extension,
+            &[BASE, INDEX],
+            &[XType::Xint8unsigned, XType::Xintunsigned],
+            false,
+        );
+        assert_eq!(candidate_count(&db), 1);
+        let types: BTreeSet<XType> = db
+            .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+            .filter_map(|(value, xtype)| (*value == VALUE).then_some(*xtype))
+            .collect();
+        assert_eq!(types, BTreeSet::from([XType::Xintunsigned]));
     }
 }

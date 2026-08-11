@@ -10,6 +10,80 @@ use log::warn;
 use std::convert::TryFrom;
 use std::sync::Arc;
 
+/// Reconstruct the selected RTL address solely from the authenticated machine
+/// descriptor.  Keeping this check at the Cminor boundary prevents a stale or
+/// cross-node proof from surviving an intervening rewrite.
+pub(crate) fn scalar_memory_proof_matches_cminor(
+    proof: &ScalarMemoryAccessProof,
+    stmt: &CminorStmt,
+) -> bool {
+    if !proof.is_closed_v1() {
+        return false;
+    }
+    let (base, index) = match (proof.base_value, proof.index_value) {
+        (Some(base), index) => (base, index),
+        _ => return false,
+    };
+    let (inner, args) = if proof.synthetic_stack_origin {
+        let Some(index) = index else {
+            return false;
+        };
+        let addressing = if proof.scale == 1 {
+            Addressing::Aindexed2(0)
+        } else {
+            Addressing::Aindexed2scaled(proof.scale, 0)
+        };
+        (addressing, Arc::new(vec![base, index]))
+    } else {
+        let (addressing, args) = match index {
+            None if proof.scale == 1 => (
+                Addressing::Aindexed(proof.displacement),
+                Arc::new(vec![base]),
+            ),
+            Some(index) if proof.scale == 1 => (
+                Addressing::Aindexed2(proof.displacement),
+                Arc::new(vec![base, index]),
+            ),
+            Some(index) if matches!(proof.scale, 2 | 4 | 8) => (
+                Addressing::Aindexed2scaled(proof.scale, proof.displacement),
+                Arc::new(vec![base, index]),
+            ),
+            _ => return false,
+        };
+        (addressing, args)
+    };
+    let addressing = if proof.address_size == 4 {
+        Addressing::Aaddr32(Box::new(inner))
+    } else {
+        inner
+    };
+
+    match (proof.direction, stmt) {
+        (
+            ScalarMemoryDirection::Read,
+            CminorStmt::Sassign(
+                destination,
+                CminorExpr::Eload(chunk, actual_addressing, actual_args),
+            ),
+        ) => {
+            *destination == proof.value
+                && *chunk == proof.chunk
+                && *actual_addressing == addressing
+                && actual_args.as_slice() == args.as_slice()
+        }
+        (
+            ScalarMemoryDirection::Write,
+            CminorStmt::Sstore(chunk, actual_addressing, actual_args, source),
+        ) => {
+            *source == proof.value
+                && *chunk == proof.chunk
+                && *actual_addressing == addressing
+                && actual_args.as_slice() == args.as_slice()
+        }
+        _ => false,
+    }
+}
+
 ascent_par! {
     #![measure_rule_times]
 
@@ -23,9 +97,16 @@ ascent_par! {
     relation func_stacksz(Address, Address, Symbol, u64);
     relation call_return_reg(Node, RTLReg);
     relation stack_var(Address, Address, i64, RTLReg);
+    relation authenticated_scalar_memory_access(Node, ScalarMemoryAccessProof);
 
     relation cminor_stmt(Node, CminorStmt);
     relation cminor_fallthrough(Node, Node);
+    relation cminor_scalar_memory_access(Node, ScalarMemoryAccessProof);
+
+    cminor_scalar_memory_access(node, proof.clone()) <--
+        authenticated_scalar_memory_access(node, proof),
+        cminor_stmt(node, stmt),
+        if crate::decompile::passes::cminor_pass::scalar_memory_proof_matches_cminor(proof, stmt);
 
     // Track nodes where Olea(Ainstack) was resolved to a stack address constant via stack_var.
     #[local] relation stack_addr_resolved(Node);
@@ -1112,5 +1193,98 @@ fn extract_var_writes_from_stmt_recursive(stmt: &ClightStmt, writes: &mut Vec<Id
         ClightStmt::Slabel(_lbl, body) => {
             extract_var_writes_from_stmt_recursive(body, writes);
         }
+    }
+}
+
+#[cfg(test)]
+mod scalar_lvalue_memory_proof_tests {
+    use super::*;
+    use crate::mreg::Mreg;
+
+    fn proof() -> ScalarMemoryAccessProof {
+        ScalarMemoryAccessProof {
+            function: 0x1000,
+            origin_node: 0x1010,
+            selected_node: 0x1010,
+            operand: "cminor_scalar_memory",
+            direction: ScalarMemoryDirection::Read,
+            extension: ScalarMemoryExtension::Plain,
+            address_size: 8,
+            base_register: Mreg::CX,
+            index_register: Some(Mreg::DX),
+            scale: 4,
+            displacement: -12,
+            width: 4,
+            value_width: 4,
+            downstream_value_width: Some(4),
+            chunk: MemoryChunk::MInt32,
+            base_value: Some(0x8000_0000_0000_0010),
+            index_value: Some(0x8000_0000_0000_0020),
+            value: 0x8000_0000_0000_0030,
+            address_param_leaves: Arc::new(vec![0x8000_0000_0000_0010, 0x8000_0000_0000_0020]),
+            synthetic_stack_origin: false,
+            exact_scaled_index: false,
+        }
+    }
+
+    #[test]
+    fn cminor_boundary_requires_the_exact_selected_memory_effect() {
+        let proof = proof();
+        let exact = CminorStmt::Sassign(
+            proof.value,
+            CminorExpr::Eload(
+                proof.chunk,
+                Addressing::Aindexed2scaled(4, -12),
+                Arc::new(vec![proof.base_value.unwrap(), proof.index_value.unwrap()]),
+            ),
+        );
+        assert!(scalar_memory_proof_matches_cminor(&proof, &exact));
+
+        let wrong_scale = CminorStmt::Sassign(
+            proof.value,
+            CminorExpr::Eload(
+                proof.chunk,
+                Addressing::Aindexed2scaled(8, -12),
+                Arc::new(vec![proof.base_value.unwrap(), proof.index_value.unwrap()]),
+            ),
+        );
+        assert!(!scalar_memory_proof_matches_cminor(&proof, &wrong_scale));
+
+        let wrong_order = CminorStmt::Sassign(
+            proof.value,
+            CminorExpr::Eload(
+                proof.chunk,
+                Addressing::Aindexed2scaled(4, -12),
+                Arc::new(vec![proof.index_value.unwrap(), proof.base_value.unwrap()]),
+            ),
+        );
+        assert!(!scalar_memory_proof_matches_cminor(&proof, &wrong_order));
+
+        let mut stale = proof.clone();
+        stale.exact_scaled_index = true;
+        assert!(!scalar_memory_proof_matches_cminor(&stale, &exact));
+        stale = proof.clone();
+        stale.address_size = 2;
+        assert!(!scalar_memory_proof_matches_cminor(&stale, &exact));
+        stale = proof.clone();
+        stale.downstream_value_width = Some(8);
+        assert!(!scalar_memory_proof_matches_cminor(&stale, &exact));
+        stale = proof.clone();
+        stale.address_param_leaves = Arc::new(vec![0x8000_0000_0000_0020, 0x8000_0000_0000_0010]);
+        assert!(!scalar_memory_proof_matches_cminor(&stale, &exact));
+
+        let mut store_proof = proof;
+        store_proof.direction = ScalarMemoryDirection::Write;
+        store_proof.downstream_value_width = None;
+        let store = CminorStmt::Sstore(
+            store_proof.chunk,
+            Addressing::Aindexed2scaled(4, -12),
+            Arc::new(vec![
+                store_proof.base_value.unwrap(),
+                store_proof.index_value.unwrap(),
+            ]),
+            store_proof.value,
+        );
+        assert!(scalar_memory_proof_matches_cminor(&store_proof, &store));
     }
 }

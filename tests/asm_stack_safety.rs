@@ -2448,7 +2448,8 @@ fn assert_unsupported_rsp_suppresses_only_affected_functions(object: &Path) {
     );
     let selected_after_conflict =
         manifold::decompile::passes::clight_select::select::select_clight_stmts(&db)
-            .expect("default Clight selection after malformed certificate");
+            .expect("default Clight selection after malformed certificate")
+            .canonical;
     assert!(!selected_after_conflict
         .iter()
         .any(|function| function.address == multi_site));

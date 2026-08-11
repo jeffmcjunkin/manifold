@@ -3,7 +3,8 @@
 use crate::decompile::disassembly::operand::NO_OP;
 use crate::decompile::elevator::DecompileDB;
 use crate::decompile::passes::pass::IRPass;
-use crate::x86::op::{Comparison, Condition, Operation};
+use crate::mreg::Mreg;
+use crate::x86::op::{Addressing, Comparison, Condition, Operation};
 use crate::x86::types::*;
 use either::Either;
 use log::info;
@@ -39,6 +40,1786 @@ fn exact_raw_operand_count(row: &Cr8RawInstruction) -> Option<usize> {
     Some(count)
 }
 
+#[cfg(test)]
+mod scalar_lvalue_memory_access_tests {
+    use super::*;
+    use crate::decompile::disassembly::coff::{
+        CoffAddressMap, CoffFunctionMap, CoffRelocationMap, CoffSectionMap,
+    };
+
+    const FUNCTION: Address = 0x1000;
+    const NODE: Node = 0x1010;
+    const NEXT: Node = 0x1020;
+    const BASE: RTLReg = 0x8000_0000_0000_0010;
+    const INDEX: RTLReg = 0x8000_0000_0000_0020;
+    const VALUE: RTLReg = 0x8000_0000_0000_0030;
+    const TEMP: RTLReg = 0x8000_0000_0000_0040;
+    const MEMORY: Symbol = "scalar_test_memory";
+    const REGISTER: Symbol = "scalar_test_register";
+    const EXTRA: Symbol = "scalar_test_extra";
+
+    #[derive(Clone, Copy, Debug)]
+    enum Mutation {
+        None,
+        Prefix,
+        WrongOrder,
+        WrongWidth,
+        WrongRegisterWidth,
+        AmbiguousRegister,
+        CrossKindOperands,
+        WrongLtlValue,
+        AmbiguousLtl,
+        WrongDisplacement,
+        WrongAddressSize,
+        AmbiguousAddressSize,
+        Segment,
+        SymbolicBase,
+        MissingEffect,
+        ExtraEffect,
+        MissingRegisterDef,
+        ExtraRegisterDef,
+        MissingRegisterUse,
+        ExtraRegisterUse,
+        RawMismatch,
+        AmbiguousInstruction,
+        ExtraOperand,
+        AmbiguousOperand,
+        MissingCandidate,
+        CandidateDrift,
+        AmbiguousFinal,
+        AmbiguousOwner,
+        OverlappingFunction,
+        BadMapSpan,
+        NonlinearSection,
+        WrongSection,
+        RelocationOverlap,
+        MappedRelocationWrongSection,
+        RelocationOverflow,
+        WrongRelocationSectionName,
+        RedefinedRoot,
+        WrongDownstreamWidth,
+        AmbiguousDownstreamWidth,
+    }
+
+    fn coff_map() -> CoffAddressMap {
+        CoffAddressMap {
+            schema: "manifold.coff-address-map.v1",
+            loader_id: "amd64-coff-image-v1",
+            architecture: "x86_64-pc-windows-msvc",
+            image_base: FUNCTION,
+            function_boundary_sidecar_sha256: None,
+            sections: vec![CoffSectionMap {
+                index: 1,
+                name: ".text".into(),
+                kind: "Text".into(),
+                original_file_offset: Some(0x100),
+                original_offset_start: 0,
+                original_offset_end: 0x40,
+                mapped_va_start: FUNCTION,
+                mapped_va_end: FUNCTION + 0x40,
+            }],
+            functions: vec![CoffFunctionMap {
+                original_name: "arbitrary_original".into(),
+                provider_name: "arbitrary_provider".into(),
+                section_index: 1,
+                section_offset: 0,
+                original_size: 0x40,
+                manifold_size: 0x40,
+                mapped_entry: FUNCTION,
+                mapped_end: FUNCTION + 0x40,
+            }],
+            symbols: Vec::new(),
+            externs: Vec::new(),
+            relocations: Vec::new(),
+        }
+    }
+
+    fn instruction(
+        prefix: &'static str,
+        mnemonic: &'static str,
+        first: Symbol,
+        second: Symbol,
+    ) -> Cr8RawInstruction {
+        (4, prefix, mnemonic, first, second, NO_OP, NO_OP, 0, 0)
+    }
+
+    fn push_instruction(
+        db: &mut DecompileDB,
+        relation: &'static str,
+        node: Node,
+        row: Cr8RawInstruction,
+    ) {
+        let (size, prefix, mnemonic, op1, op2, op3, op4, metadata0, metadata1) = row;
+        db.rel_push(
+            relation,
+            (
+                node, size, prefix, mnemonic, op1, op2, op3, op4, metadata0, metadata1,
+            ),
+        );
+    }
+
+    fn scalar_fixture(
+        mnemonic: &'static str,
+        width: usize,
+        register_name: &'static str,
+        chunk: MemoryChunk,
+        direction: ScalarMemoryDirection,
+        mutation: Mutation,
+    ) -> DecompileDB {
+        let mut db = DecompileDB::default();
+        db.coff_address_map = Some(coff_map());
+        let displacement = 12;
+        let first = if direction == ScalarMemoryDirection::Read {
+            MEMORY
+        } else {
+            REGISTER
+        };
+        let second = if direction == ScalarMemoryDirection::Read {
+            REGISTER
+        } else {
+            MEMORY
+        };
+        let (first, second) = if matches!(mutation, Mutation::WrongOrder) {
+            (second, first)
+        } else {
+            (first, second)
+        };
+        let mut decoded = instruction(
+            if matches!(mutation, Mutation::Prefix) {
+                "LOCK"
+            } else {
+                ""
+            },
+            mnemonic,
+            first,
+            second,
+        );
+        if matches!(mutation, Mutation::ExtraOperand) {
+            decoded.5 = EXTRA;
+            db.rel_push("op_immediate", (EXTRA, 1_i64, 1_usize));
+        }
+        push_instruction(&mut db, "instruction", NODE, decoded.clone());
+        push_instruction(
+            &mut db,
+            "unrefinedinstruction",
+            NODE,
+            if matches!(mutation, Mutation::RawMismatch) {
+                instruction("", "MOVZX", first, second)
+            } else {
+                decoded.clone()
+            },
+        );
+        if matches!(mutation, Mutation::AmbiguousInstruction) {
+            push_instruction(
+                &mut db,
+                "instruction",
+                NODE,
+                instruction("", "MOVZX", first, second),
+            );
+        }
+        db.rel_push(
+            "op_register",
+            (
+                REGISTER,
+                if matches!(mutation, Mutation::WrongRegisterWidth) {
+                    "RAX"
+                } else {
+                    register_name
+                },
+            ),
+        );
+        if matches!(mutation, Mutation::AmbiguousRegister) {
+            db.rel_push("op_register", (REGISTER, "EDX"));
+        }
+        db.rel_push(
+            "op_indirect",
+            (
+                MEMORY,
+                if matches!(mutation, Mutation::Segment) {
+                    "FS"
+                } else {
+                    "NONE"
+                },
+                if matches!(mutation, Mutation::SymbolicBase) {
+                    "RIP"
+                } else {
+                    "RCX"
+                },
+                "NONE",
+                1_i64,
+                if matches!(mutation, Mutation::WrongDisplacement) {
+                    displacement + 1
+                } else {
+                    displacement
+                },
+                if matches!(mutation, Mutation::WrongWidth) {
+                    width.saturating_add(1)
+                } else {
+                    width
+                },
+            ),
+        );
+        if matches!(mutation, Mutation::AmbiguousOperand) {
+            db.rel_push(
+                "op_indirect",
+                (MEMORY, "NONE", "RCX", "RDX", 2_i64, displacement, width),
+            );
+        }
+        if matches!(mutation, Mutation::CrossKindOperands) {
+            db.rel_push("op_register", (MEMORY, "RCX"));
+            db.rel_push(
+                "op_indirect",
+                (REGISTER, "NONE", "RCX", "NONE", 1_i64, 0_i64, width),
+            );
+        }
+        db.rel_push(
+            "instruction_address_size",
+            (
+                NODE,
+                if matches!(mutation, Mutation::WrongAddressSize) {
+                    2_u8
+                } else {
+                    8_u8
+                },
+            ),
+        );
+        if matches!(mutation, Mutation::AmbiguousAddressSize) {
+            db.rel_push("instruction_address_size", (NODE, 4_u8));
+        }
+        if !matches!(mutation, Mutation::MissingEffect) {
+            let relation = if direction == ScalarMemoryDirection::Read {
+                "decoded_memory_read_operand"
+            } else {
+                "decoded_memory_write_operand"
+            };
+            db.rel_push(relation, (NODE, MEMORY));
+        }
+        if matches!(mutation, Mutation::ExtraEffect) {
+            db.rel_push("decoded_memory_read_operand", (NODE, EXTRA));
+        }
+        let value_mreg = Mreg::x86(register_name);
+        let mut decoded_uses = BTreeSet::from([Mreg::CX]);
+        let mut decoded_defs = BTreeSet::new();
+        match direction {
+            ScalarMemoryDirection::Read => {
+                decoded_defs.insert(value_mreg);
+            }
+            ScalarMemoryDirection::Write => {
+                decoded_uses.insert(value_mreg);
+            }
+        }
+        if matches!(mutation, Mutation::MissingRegisterDef) {
+            decoded_defs.clear();
+        }
+        if matches!(mutation, Mutation::ExtraRegisterDef) {
+            decoded_defs.insert(Mreg::DX);
+        }
+        if matches!(mutation, Mutation::MissingRegisterUse) {
+            decoded_uses.clear();
+        }
+        if matches!(mutation, Mutation::ExtraRegisterUse) {
+            decoded_uses.insert(Mreg::DX);
+        }
+        for register in decoded_defs {
+            db.rel_push("decoded_reg_def", (NODE, register));
+        }
+        for register in decoded_uses {
+            db.rel_push("decoded_reg_use", (NODE, register));
+        }
+
+        let address = Addressing::Aindexed(displacement);
+        let mregs = Arc::new(vec![Mreg::CX]);
+        let args = Arc::new(vec![BASE]);
+        let ltl = if direction == ScalarMemoryDirection::Read {
+            LTLInst::Lload(
+                chunk,
+                address.clone(),
+                mregs,
+                if matches!(mutation, Mutation::WrongLtlValue) {
+                    Mreg::DX
+                } else {
+                    Mreg::x86(register_name)
+                },
+            )
+        } else {
+            LTLInst::Lstore(
+                chunk,
+                address.clone(),
+                mregs,
+                if matches!(mutation, Mutation::WrongLtlValue) {
+                    Mreg::DX
+                } else {
+                    Mreg::x86(register_name)
+                },
+            )
+        };
+        db.rel_push("ltl_inst", (NODE, ltl.clone()));
+        if matches!(mutation, Mutation::AmbiguousLtl) {
+            let competing = match ltl {
+                LTLInst::Lload(chunk, _, mregs, destination) => LTLInst::Lload(
+                    chunk,
+                    Addressing::Aindexed(displacement + 1),
+                    mregs,
+                    destination,
+                ),
+                LTLInst::Lstore(chunk, _, mregs, source) => {
+                    LTLInst::Lstore(chunk, Addressing::Aindexed(displacement + 1), mregs, source)
+                }
+                _ => unreachable!(),
+            };
+            db.rel_push("ltl_inst", (NODE, competing));
+        }
+        let selected = if direction == ScalarMemoryDirection::Read {
+            RTLInst::Iload(chunk, address, args, VALUE)
+        } else {
+            RTLInst::Istore(chunk, address, args, VALUE)
+        };
+        db.rel_push("rtl_inst", (NODE, selected.clone()));
+        if matches!(mutation, Mutation::AmbiguousFinal) {
+            let competing = match &selected {
+                RTLInst::Iload(chunk, addressing, _, destination) => RTLInst::Iload(
+                    *chunk,
+                    addressing.clone(),
+                    Arc::new(vec![INDEX]),
+                    *destination,
+                ),
+                RTLInst::Istore(chunk, addressing, _, source) => {
+                    RTLInst::Istore(*chunk, addressing.clone(), Arc::new(vec![INDEX]), *source)
+                }
+                _ => unreachable!(),
+            };
+            db.rel_push("rtl_inst", (NODE, competing));
+        }
+        if !matches!(mutation, Mutation::MissingCandidate) {
+            let candidate = if matches!(mutation, Mutation::CandidateDrift) {
+                match &selected {
+                    RTLInst::Iload(chunk, addressing, _, destination) => RTLInst::Iload(
+                        *chunk,
+                        addressing.clone(),
+                        Arc::new(vec![INDEX]),
+                        *destination,
+                    ),
+                    RTLInst::Istore(chunk, addressing, _, source) => {
+                        RTLInst::Istore(*chunk, addressing.clone(), Arc::new(vec![INDEX]), *source)
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                selected
+            };
+            db.rel_push("rtl_inst_candidate", (NODE, candidate));
+        }
+        db.rel_push("rtl_inst", (NEXT, RTLInst::Ireturn(VALUE)));
+        db.rel_push("rtl_inst_candidate", (NEXT, RTLInst::Ireturn(VALUE)));
+        db.rel_push("rtl_succ", (NODE, NEXT));
+        db.rel_push("instr_in_function", (NODE, FUNCTION));
+        db.rel_push("instr_in_function", (NEXT, FUNCTION));
+        if matches!(mutation, Mutation::AmbiguousOwner) {
+            db.rel_push("instr_in_function", (NODE, FUNCTION + 0x200));
+        }
+        db.rel_push("emit_function", (FUNCTION, "arbitrary_function", NODE));
+        db.rel_push("emit_function_param_candidate", (FUNCTION, BASE));
+        if direction == ScalarMemoryDirection::Read {
+            let xtype = if matches!(mutation, Mutation::WrongDownstreamWidth) {
+                XType::Xlong
+            } else {
+                match x86_scalar_register_width(register_name) {
+                    Some(4) => XType::Xint,
+                    Some(8) => XType::Xlong,
+                    Some(2) => XType::Xint16unsigned,
+                    Some(1) => XType::Xint8unsigned,
+                    _ => XType::Xvoid,
+                }
+            };
+            db.rel_push("emit_var_type_candidate", (VALUE, xtype));
+            if matches!(mutation, Mutation::AmbiguousDownstreamWidth) {
+                db.rel_push("emit_var_type_candidate", (VALUE, XType::Xlong));
+            }
+        }
+
+        if matches!(mutation, Mutation::OverlappingFunction) {
+            db.coff_address_map
+                .as_mut()
+                .expect("map")
+                .functions
+                .push(CoffFunctionMap {
+                    original_name: "overlap".into(),
+                    provider_name: "overlap_provider".into(),
+                    section_index: 1,
+                    section_offset: 8,
+                    original_size: 0x20,
+                    manifold_size: 0x20,
+                    mapped_entry: FUNCTION + 8,
+                    mapped_end: FUNCTION + 0x28,
+                });
+        }
+        if matches!(mutation, Mutation::BadMapSpan) {
+            db.coff_address_map.as_mut().expect("map").functions[0].manifold_size -= 1;
+        }
+        if matches!(mutation, Mutation::NonlinearSection) {
+            db.coff_address_map.as_mut().expect("map").sections[0].mapped_va_end += 1;
+        }
+        if matches!(mutation, Mutation::WrongSection) {
+            db.coff_address_map.as_mut().expect("map").functions[0].section_index = 2;
+        }
+        if matches!(mutation, Mutation::RelocationOverlap) {
+            db.coff_address_map
+                .as_mut()
+                .expect("map")
+                .relocations
+                .push(CoffRelocationMap {
+                    section_index: 1,
+                    section_name: ".text".into(),
+                    section_offset: 0x11,
+                    mapped_field_va: NODE + 1,
+                    relocation_type: "IMAGE_REL_AMD64_REL32".into(),
+                    width_bits: 32,
+                    target_original_name: "external".into(),
+                    target_mapped_address: 0x9000,
+                    encoded_value: 0,
+                });
+        }
+        if matches!(mutation, Mutation::MappedRelocationWrongSection) {
+            db.coff_address_map
+                .as_mut()
+                .expect("map")
+                .relocations
+                .push(CoffRelocationMap {
+                    section_index: 99,
+                    section_name: ".other".into(),
+                    section_offset: 0,
+                    mapped_field_va: NODE + 1,
+                    relocation_type: "IMAGE_REL_AMD64_REL32".into(),
+                    width_bits: 32,
+                    target_original_name: "external".into(),
+                    target_mapped_address: 0x9000,
+                    encoded_value: 0,
+                });
+        }
+        if matches!(mutation, Mutation::RelocationOverflow) {
+            db.coff_address_map
+                .as_mut()
+                .expect("map")
+                .relocations
+                .push(CoffRelocationMap {
+                    section_index: 99,
+                    section_name: ".other".into(),
+                    section_offset: u64::MAX,
+                    mapped_field_va: u64::MAX,
+                    relocation_type: "IMAGE_REL_AMD64_ADDR64".into(),
+                    width_bits: 64,
+                    target_original_name: "external".into(),
+                    target_mapped_address: 0x9000,
+                    encoded_value: 0,
+                });
+        }
+        if matches!(mutation, Mutation::WrongRelocationSectionName) {
+            db.coff_address_map
+                .as_mut()
+                .expect("map")
+                .relocations
+                .push(CoffRelocationMap {
+                    section_index: 1,
+                    section_name: ".wrong".into(),
+                    section_offset: 0x30,
+                    mapped_field_va: FUNCTION + 0x30,
+                    relocation_type: "IMAGE_REL_AMD64_REL32".into(),
+                    width_bits: 32,
+                    target_original_name: "external".into(),
+                    target_mapped_address: 0x9000,
+                    encoded_value: 0,
+                });
+        }
+        if matches!(mutation, Mutation::RedefinedRoot) {
+            db.rel_push(
+                "rtl_inst",
+                (
+                    FUNCTION + 4,
+                    RTLInst::Iop(Operation::Omove, Arc::new(vec![INDEX]), BASE),
+                ),
+            );
+            db.rel_push("instr_in_function", (FUNCTION + 4, FUNCTION));
+            db.rel_push("rtl_succ", (FUNCTION + 4, NODE));
+        }
+        db
+    }
+
+    fn proofs(mut db: DecompileDB) -> Vec<ScalarMemoryAccessProof> {
+        materialize_authenticated_scalar_memory_accesses(&mut db);
+        db.rel_iter::<(Node, ScalarMemoryAccessProof)>("authenticated_scalar_memory_access")
+            .map(|(_, proof)| proof.clone())
+            .collect()
+    }
+
+    fn add_ltl_signedness_companion(
+        db: &mut DecompileDB,
+        width: usize,
+        register_name: &'static str,
+        chunk: MemoryChunk,
+        direction: ScalarMemoryDirection,
+    ) {
+        let companion = scalar_signedness_companion(chunk, width)
+            .expect("byte/word fixture has a signedness companion");
+        let value = Mreg::x86(register_name);
+        let addressing = Addressing::Aindexed(12);
+        let mregs = Arc::new(vec![Mreg::CX]);
+        let row = match direction {
+            ScalarMemoryDirection::Read => LTLInst::Lload(companion, addressing, mregs, value),
+            ScalarMemoryDirection::Write => LTLInst::Lstore(companion, addressing, mregs, value),
+        };
+        db.rel_push("ltl_inst", (NODE, row));
+    }
+
+    fn add_rtl_signedness_companion(
+        db: &mut DecompileDB,
+        width: usize,
+        chunk: MemoryChunk,
+        direction: ScalarMemoryDirection,
+    ) {
+        let companion = scalar_signedness_companion(chunk, width)
+            .expect("byte/word fixture has a signedness companion");
+        let args = Arc::new(vec![BASE]);
+        let row = match direction {
+            ScalarMemoryDirection::Read => {
+                RTLInst::Iload(companion, Addressing::Aindexed(12), args, VALUE)
+            }
+            ScalarMemoryDirection::Write => {
+                RTLInst::Istore(companion, Addressing::Aindexed(12), args, VALUE)
+            }
+        };
+        db.rel_push("rtl_inst_candidate", (NODE, row));
+    }
+
+    fn scalar_fixture_with_signedness_companions(
+        mnemonic: &'static str,
+        width: usize,
+        register_name: &'static str,
+        chunk: MemoryChunk,
+        direction: ScalarMemoryDirection,
+    ) -> DecompileDB {
+        let mut db = scalar_fixture(
+            mnemonic,
+            width,
+            register_name,
+            chunk,
+            direction,
+            Mutation::None,
+        );
+        add_ltl_signedness_companion(&mut db, width, register_name, chunk, direction);
+        add_rtl_signedness_companion(&mut db, width, chunk, direction);
+        db
+    }
+
+    #[test]
+    fn scalar_memory_access_authenticates_all_closed_width_and_extension_forms() {
+        let cases = [
+            (
+                "MOV",
+                4,
+                "EAX",
+                MemoryChunk::MInt32,
+                ScalarMemoryExtension::Plain,
+            ),
+            (
+                "MOV",
+                8,
+                "RAX",
+                MemoryChunk::MInt64,
+                ScalarMemoryExtension::Plain,
+            ),
+            (
+                "MOVSX",
+                1,
+                "EAX",
+                MemoryChunk::MInt8Signed,
+                ScalarMemoryExtension::SignExtend,
+            ),
+            (
+                "MOVSX",
+                1,
+                "RAX",
+                MemoryChunk::MInt8Signed,
+                ScalarMemoryExtension::SignExtend,
+            ),
+            (
+                "MOVSX",
+                2,
+                "EAX",
+                MemoryChunk::MInt16Signed,
+                ScalarMemoryExtension::SignExtend,
+            ),
+            (
+                "MOVSX",
+                2,
+                "RAX",
+                MemoryChunk::MInt16Signed,
+                ScalarMemoryExtension::SignExtend,
+            ),
+            (
+                "MOVSXD",
+                4,
+                "RAX",
+                MemoryChunk::MInt32,
+                ScalarMemoryExtension::SignExtend,
+            ),
+            (
+                "MOVZX",
+                1,
+                "EAX",
+                MemoryChunk::MInt8Unsigned,
+                ScalarMemoryExtension::ZeroExtend,
+            ),
+            (
+                "MOVZX",
+                1,
+                "RAX",
+                MemoryChunk::MInt8Unsigned,
+                ScalarMemoryExtension::ZeroExtend,
+            ),
+            (
+                "MOVZX",
+                2,
+                "EAX",
+                MemoryChunk::MInt16Unsigned,
+                ScalarMemoryExtension::ZeroExtend,
+            ),
+            (
+                "MOVZX",
+                2,
+                "RAX",
+                MemoryChunk::MInt16Unsigned,
+                ScalarMemoryExtension::ZeroExtend,
+            ),
+        ];
+        for (mnemonic, width, register, chunk, extension) in cases {
+            let rows = proofs(scalar_fixture(
+                mnemonic,
+                width,
+                register,
+                chunk,
+                ScalarMemoryDirection::Read,
+                Mutation::None,
+            ));
+            assert_eq!(rows.len(), 1, "{mnemonic}/{width}/{register}");
+            assert_eq!(rows[0].width, width);
+            assert_eq!(rows[0].extension, extension);
+            assert_eq!(
+                rows[0].downstream_value_width,
+                Some(x86_scalar_register_width(register).unwrap())
+            );
+        }
+        for (width, register, chunk) in [
+            (1, "AL", MemoryChunk::MInt8Unsigned),
+            (2, "AX", MemoryChunk::MInt16Unsigned),
+            (4, "EAX", MemoryChunk::MInt32),
+            (8, "RAX", MemoryChunk::MInt64),
+        ] {
+            let rows = proofs(scalar_fixture(
+                "MOV",
+                width,
+                register,
+                chunk,
+                ScalarMemoryDirection::Write,
+                Mutation::None,
+            ));
+            assert_eq!(rows.len(), 1, "store/{width}/{register}");
+            assert_eq!(rows[0].downstream_value_width, None);
+        }
+        for (width, register, chunk) in [
+            (1, "AL", MemoryChunk::MInt8Unsigned),
+            (2, "AX", MemoryChunk::MInt16Unsigned),
+        ] {
+            assert!(proofs(scalar_fixture(
+                "MOV",
+                width,
+                register,
+                chunk,
+                ScalarMemoryDirection::Read,
+                Mutation::None,
+            ))
+            .is_empty());
+        }
+        assert!(proofs(scalar_fixture(
+            "MOVSX",
+            1,
+            "AL",
+            MemoryChunk::MInt8Signed,
+            ScalarMemoryDirection::Read,
+            Mutation::None,
+        ))
+        .is_empty());
+        for mnemonic in ["MOVSX", "MOVZX"] {
+            assert!(proofs(scalar_fixture(
+                mnemonic,
+                1,
+                "AX",
+                if mnemonic == "MOVSX" {
+                    MemoryChunk::MInt8Signed
+                } else {
+                    MemoryChunk::MInt8Unsigned
+                },
+                ScalarMemoryDirection::Read,
+                Mutation::None,
+            ))
+            .is_empty());
+        }
+        assert!(proofs(scalar_fixture(
+            "MOV",
+            1,
+            "AH",
+            MemoryChunk::MInt8Unsigned,
+            ScalarMemoryDirection::Write,
+            Mutation::None,
+        ))
+        .is_empty());
+        assert!(proofs(scalar_fixture(
+            "MOVZX",
+            1,
+            "EAX",
+            MemoryChunk::MInt8Unsigned,
+            ScalarMemoryDirection::Write,
+            Mutation::None,
+        ))
+        .is_empty());
+    }
+
+    #[test]
+    fn any64_transport_alias_is_closed_to_plain_gp_qword_movs() {
+        for direction in [ScalarMemoryDirection::Read, ScalarMemoryDirection::Write] {
+            let rows = proofs(scalar_fixture(
+                "MOV",
+                8,
+                "RAX",
+                MemoryChunk::MAny64,
+                direction,
+                Mutation::None,
+            ));
+            assert_eq!(rows.len(), 1, "qword transport {direction:?}");
+            assert_eq!(rows[0].chunk, MemoryChunk::MAny64);
+            assert!(rows[0].is_closed_v1());
+        }
+
+        for (mnemonic, width, register, chunk) in [
+            ("MOVZX", 1, "RAX", MemoryChunk::MAny64),
+            ("MOV", 4, "EAX", MemoryChunk::MAny64),
+            ("MOV", 8, "RAX", MemoryChunk::MFloat64),
+        ] {
+            assert!(
+                proofs(scalar_fixture(
+                    mnemonic,
+                    width,
+                    register,
+                    chunk,
+                    ScalarMemoryDirection::Read,
+                    Mutation::None,
+                ))
+                .is_empty(),
+                "transport alias escaped: {mnemonic}/{width}/{register}/{chunk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn signedness_companion_is_closed_to_one_exact_byte_or_word_pipeline_pair() {
+        for (mnemonic, width, register, chunk, direction) in [
+            (
+                "MOVZX",
+                1,
+                "EAX",
+                MemoryChunk::MInt8Unsigned,
+                ScalarMemoryDirection::Read,
+            ),
+            (
+                "MOVZX",
+                2,
+                "EAX",
+                MemoryChunk::MInt16Unsigned,
+                ScalarMemoryDirection::Read,
+            ),
+            (
+                "MOVSX",
+                1,
+                "EAX",
+                MemoryChunk::MInt8Signed,
+                ScalarMemoryDirection::Read,
+            ),
+            (
+                "MOVSX",
+                2,
+                "EAX",
+                MemoryChunk::MInt16Signed,
+                ScalarMemoryDirection::Read,
+            ),
+            (
+                "MOV",
+                1,
+                "AL",
+                MemoryChunk::MInt8Unsigned,
+                ScalarMemoryDirection::Write,
+            ),
+            (
+                "MOV",
+                2,
+                "AX",
+                MemoryChunk::MInt16Unsigned,
+                ScalarMemoryDirection::Write,
+            ),
+        ] {
+            let rows = proofs(scalar_fixture_with_signedness_companions(
+                mnemonic, width, register, chunk, direction,
+            ));
+            assert_eq!(rows.len(), 1, "{mnemonic}/{width}/{register}/{direction:?}");
+            assert_eq!(rows[0].chunk, chunk);
+            assert_eq!(rows[0].direction, direction);
+        }
+    }
+
+    #[test]
+    fn extension_raw_semantics_accept_only_sealed_selected_transport_pairs() {
+        for (mnemonic, width, register, selected, extension) in [
+            (
+                "MOVSX",
+                1,
+                "RAX",
+                MemoryChunk::MInt8Unsigned,
+                ScalarMemoryExtension::SignExtend,
+            ),
+            (
+                "MOVSX",
+                2,
+                "RAX",
+                MemoryChunk::MInt16Unsigned,
+                ScalarMemoryExtension::SignExtend,
+            ),
+            (
+                "MOVZX",
+                1,
+                "EAX",
+                MemoryChunk::MInt8Signed,
+                ScalarMemoryExtension::ZeroExtend,
+            ),
+            (
+                "MOVZX",
+                2,
+                "EAX",
+                MemoryChunk::MInt16Signed,
+                ScalarMemoryExtension::ZeroExtend,
+            ),
+        ] {
+            let rows = proofs(scalar_fixture_with_signedness_companions(
+                mnemonic,
+                width,
+                register,
+                selected,
+                ScalarMemoryDirection::Read,
+            ));
+            assert_eq!(rows.len(), 1, "{mnemonic}/{width}/{register}/{selected:?}");
+            assert_eq!(rows[0].extension, extension);
+            assert_eq!(rows[0].chunk, selected);
+            assert!(rows[0].is_closed_v1());
+        }
+
+        let singleton_opposite = scalar_fixture(
+            "MOVSX",
+            1,
+            "RAX",
+            MemoryChunk::MInt8Unsigned,
+            ScalarMemoryDirection::Read,
+            Mutation::None,
+        );
+        assert!(
+            proofs(singleton_opposite).is_empty(),
+            "an opposite selected transport requires its exact twin in both retained layers"
+        );
+
+        let mut ltl_pair_only = scalar_fixture(
+            "MOVSX",
+            1,
+            "RAX",
+            MemoryChunk::MInt8Unsigned,
+            ScalarMemoryDirection::Read,
+            Mutation::None,
+        );
+        add_ltl_signedness_companion(
+            &mut ltl_pair_only,
+            1,
+            "RAX",
+            MemoryChunk::MInt8Unsigned,
+            ScalarMemoryDirection::Read,
+        );
+        assert!(
+            proofs(ltl_pair_only).is_empty(),
+            "an LTL-only signedness pair authenticated"
+        );
+
+        let mut rtl_pair_only = scalar_fixture(
+            "MOVZX",
+            1,
+            "EAX",
+            MemoryChunk::MInt8Signed,
+            ScalarMemoryDirection::Read,
+            Mutation::None,
+        );
+        add_rtl_signedness_companion(
+            &mut rtl_pair_only,
+            1,
+            MemoryChunk::MInt8Signed,
+            ScalarMemoryDirection::Read,
+        );
+        assert!(
+            proofs(rtl_pair_only).is_empty(),
+            "an RTL-only signedness pair authenticated"
+        );
+
+        for (mnemonic, width, register, selected) in [
+            ("MOVSX", 1, "RAX", MemoryChunk::MInt16Unsigned),
+            ("MOVZX", 2, "EAX", MemoryChunk::MInt8Signed),
+        ] {
+            assert!(
+                proofs(scalar_fixture(
+                    mnemonic,
+                    width,
+                    register,
+                    selected,
+                    ScalarMemoryDirection::Read,
+                    Mutation::None,
+                ))
+                .is_empty(),
+                "outside-pair transport authenticated: {mnemonic}/{width}/{selected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn signedness_companion_rejects_every_other_ltl_interpretation() {
+        let exact = || {
+            LTLInst::Lload(
+                MemoryChunk::MInt8Unsigned,
+                Addressing::Aindexed(12),
+                Arc::new(vec![Mreg::CX]),
+                Mreg::AX,
+            )
+        };
+        let rejected = [
+            ("duplicate-exact", exact()),
+            (
+                "wrong-address",
+                LTLInst::Lload(
+                    MemoryChunk::MInt8Signed,
+                    Addressing::Aindexed(13),
+                    Arc::new(vec![Mreg::CX]),
+                    Mreg::AX,
+                ),
+            ),
+            (
+                "wrong-args",
+                LTLInst::Lload(
+                    MemoryChunk::MInt8Signed,
+                    Addressing::Aindexed(12),
+                    Arc::new(vec![Mreg::DX]),
+                    Mreg::AX,
+                ),
+            ),
+            (
+                "wrong-value",
+                LTLInst::Lload(
+                    MemoryChunk::MInt8Signed,
+                    Addressing::Aindexed(12),
+                    Arc::new(vec![Mreg::CX]),
+                    Mreg::DX,
+                ),
+            ),
+            (
+                "cross-width",
+                LTLInst::Lload(
+                    MemoryChunk::MInt16Signed,
+                    Addressing::Aindexed(12),
+                    Arc::new(vec![Mreg::CX]),
+                    Mreg::AX,
+                ),
+            ),
+            (
+                "wrong-kind",
+                LTLInst::Lstore(
+                    MemoryChunk::MInt8Signed,
+                    Addressing::Aindexed(12),
+                    Arc::new(vec![Mreg::CX]),
+                    Mreg::AX,
+                ),
+            ),
+        ];
+        for (label, competing) in rejected {
+            let mut db = scalar_fixture(
+                "MOVZX",
+                1,
+                "EAX",
+                MemoryChunk::MInt8Unsigned,
+                ScalarMemoryDirection::Read,
+                Mutation::None,
+            );
+            db.rel_push("ltl_inst", (NODE, competing));
+            assert!(proofs(db).is_empty(), "{label} LTL row authenticated");
+        }
+
+        let mut third = scalar_fixture_with_signedness_companions(
+            "MOVZX",
+            1,
+            "EAX",
+            MemoryChunk::MInt8Unsigned,
+            ScalarMemoryDirection::Read,
+        );
+        third.rel_push("ltl_inst", (NODE, exact()));
+        assert!(proofs(third).is_empty(), "third LTL row authenticated");
+    }
+
+    #[test]
+    fn signedness_companion_rejects_every_other_rtl_candidate_interpretation() {
+        let exact = || {
+            RTLInst::Iload(
+                MemoryChunk::MInt8Unsigned,
+                Addressing::Aindexed(12),
+                Arc::new(vec![BASE]),
+                VALUE,
+            )
+        };
+        let rejected = [
+            ("duplicate-exact", exact()),
+            (
+                "wrong-address",
+                RTLInst::Iload(
+                    MemoryChunk::MInt8Signed,
+                    Addressing::Aindexed(13),
+                    Arc::new(vec![BASE]),
+                    VALUE,
+                ),
+            ),
+            (
+                "wrong-args",
+                RTLInst::Iload(
+                    MemoryChunk::MInt8Signed,
+                    Addressing::Aindexed(12),
+                    Arc::new(vec![INDEX]),
+                    VALUE,
+                ),
+            ),
+            (
+                "wrong-value",
+                RTLInst::Iload(
+                    MemoryChunk::MInt8Signed,
+                    Addressing::Aindexed(12),
+                    Arc::new(vec![BASE]),
+                    TEMP,
+                ),
+            ),
+            (
+                "cross-width",
+                RTLInst::Iload(
+                    MemoryChunk::MInt16Signed,
+                    Addressing::Aindexed(12),
+                    Arc::new(vec![BASE]),
+                    VALUE,
+                ),
+            ),
+            (
+                "wrong-kind",
+                RTLInst::Istore(
+                    MemoryChunk::MInt8Signed,
+                    Addressing::Aindexed(12),
+                    Arc::new(vec![BASE]),
+                    VALUE,
+                ),
+            ),
+        ];
+        for (label, competing) in rejected {
+            let mut db = scalar_fixture(
+                "MOVZX",
+                1,
+                "EAX",
+                MemoryChunk::MInt8Unsigned,
+                ScalarMemoryDirection::Read,
+                Mutation::None,
+            );
+            db.rel_push("rtl_inst_candidate", (NODE, competing));
+            assert!(proofs(db).is_empty(), "{label} RTL candidate authenticated");
+        }
+
+        let mut third = scalar_fixture_with_signedness_companions(
+            "MOVZX",
+            1,
+            "EAX",
+            MemoryChunk::MInt8Unsigned,
+            ScalarMemoryDirection::Read,
+        );
+        third.rel_push("rtl_inst_candidate", (NODE, exact()));
+        assert!(
+            proofs(third).is_empty(),
+            "third RTL candidate authenticated"
+        );
+    }
+
+    #[test]
+    fn address_size_is_part_of_the_reversible_register_identity() {
+        assert_eq!(
+            decoded_scalar_addressing("ECX", "EDX", 4, -7, 4),
+            Some((
+                Addressing::Aaddr32(Box::new(Addressing::Aindexed2scaled(4, -7))),
+                vec![Mreg::CX, Mreg::DX],
+                false,
+            ))
+        );
+        assert!(decoded_scalar_addressing("RCX", "RDX", 4, -7, 4).is_none());
+        assert!(decoded_scalar_addressing("ECX", "EDX", 4, -7, 8).is_none());
+        assert!(decoded_scalar_addressing("RCX", "NONE", 2, -7, 8).is_none());
+        assert!(decoded_scalar_addressing("RCX", "RDX", 3, -7, 8).is_none());
+        assert!(decoded_scalar_addressing("RIP", "NONE", 1, -7, 8).is_none());
+    }
+
+    #[test]
+    fn scalar_coff_interval_index_is_unique_and_overlap_fail_closed() {
+        let index = ScalarIntervalIndex::new(vec![
+            ScalarInterval {
+                start: 0x100,
+                end: 0x120,
+                payload: 1,
+            },
+            ScalarInterval {
+                start: 0x110,
+                end: 0x130,
+                payload: 2,
+            },
+            ScalarInterval {
+                start: 0x200,
+                end: 0x210,
+                payload: 3,
+            },
+        ]);
+        assert_eq!(index.unique_overlap_payload(0x100, 0x101), Some(1));
+        assert_eq!(index.unique_overlap_payload(0x10f, 0x110), Some(1));
+        assert_eq!(index.unique_overlap_payload(0x110, 0x111), None);
+        assert_eq!(index.unique_overlap_payload(0x200, 0x201), Some(3));
+        assert!(index.has_overlap(0x12f, 0x131));
+        assert!(!index.has_overlap(0x130, 0x140));
+    }
+
+    #[test]
+    fn nonzero_original_section_origin_uses_equal_linear_coordinates() {
+        let mut db = scalar_fixture(
+            "MOV",
+            4,
+            "EAX",
+            MemoryChunk::MInt32,
+            ScalarMemoryDirection::Read,
+            Mutation::None,
+        );
+        let map = db.coff_address_map.as_mut().expect("map");
+        map.sections[0].original_offset_start = 0x80;
+        map.sections[0].original_offset_end = 0xc0;
+        map.functions[0].section_offset = 0x80;
+        assert_eq!(proofs(db).len(), 1);
+    }
+
+    fn defined_address_root(
+        symbolic: bool,
+        malformed_args: bool,
+        nested_symbolic: bool,
+    ) -> DecompileDB {
+        let mut db = scalar_fixture(
+            "MOV",
+            4,
+            "EAX",
+            MemoryChunk::MInt32,
+            ScalarMemoryDirection::Read,
+            Mutation::None,
+        );
+        let def = FUNCTION + 4;
+        db.rel_set(
+            "emit_function_param_candidate",
+            vec![(FUNCTION, INDEX)]
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        let nested_def = FUNCTION + 2;
+        db.rel_set(
+            "emit_function",
+            vec![(
+                FUNCTION,
+                "arbitrary_function",
+                if nested_symbolic { nested_def } else { def },
+            )]
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        let operation = if nested_symbolic {
+            Operation::Oaddl
+        } else if symbolic {
+            Operation::Olea(Addressing::Aglobal(7, 0))
+        } else {
+            Operation::Olea(Addressing::Aindexed(24))
+        };
+        let inst = RTLInst::Iop(
+            operation,
+            Arc::new(if malformed_args {
+                Vec::new()
+            } else if nested_symbolic {
+                vec![TEMP, INDEX]
+            } else {
+                vec![INDEX]
+            }),
+            BASE,
+        );
+        db.rel_push("rtl_inst", (def, inst.clone()));
+        db.rel_push("rtl_inst_candidate", (def, inst));
+        db.rel_push("instr_in_function", (def, FUNCTION));
+        db.rel_push("rtl_succ", (def, NODE));
+        if nested_symbolic {
+            let nested = RTLInst::Iop(
+                Operation::Olea(Addressing::Aglobal(9, 0)),
+                Arc::new(Vec::new()),
+                TEMP,
+            );
+            db.rel_push("rtl_inst", (nested_def, nested.clone()));
+            db.rel_push("rtl_inst_candidate", (nested_def, nested));
+            db.rel_push("instr_in_function", (nested_def, FUNCTION));
+            db.rel_push("rtl_succ", (nested_def, def));
+        }
+        db.rel_push("emit_inline_temp", BASE);
+        if nested_symbolic {
+            db.rel_push("emit_inline_temp", TEMP);
+        }
+        db
+    }
+
+    fn without_address_inline_markers(mut db: DecompileDB) -> DecompileDB {
+        db.rel_set("emit_inline_temp", ascent::boxcar::Vec::<RTLReg>::new());
+        db
+    }
+
+    fn noninline_address_root_mutation(mutation: &'static str) -> DecompileDB {
+        let mut db = without_address_inline_markers(defined_address_root(false, false, false));
+        let def = FUNCTION + 4;
+        let extra = FUNCTION + 6;
+        match mutation {
+            "none" => {}
+            "multiple-definitions" => {
+                let competing = RTLInst::Iop(
+                    Operation::Olea(Addressing::Aindexed(8)),
+                    Arc::new(vec![INDEX]),
+                    BASE,
+                );
+                db.rel_push("rtl_inst", (extra, competing.clone()));
+                db.rel_push("rtl_inst_candidate", (extra, competing));
+                db.rel_push("instr_in_function", (extra, FUNCTION));
+            }
+            "duplicate-definition-row" => {
+                let duplicate = RTLInst::Iop(
+                    Operation::Olea(Addressing::Aindexed(24)),
+                    Arc::new(vec![INDEX]),
+                    BASE,
+                );
+                db.rel_push("rtl_inst", (def, duplicate));
+            }
+            "multiple-uses" => {
+                let competing = RTLInst::Iop(Operation::Omove, Arc::new(vec![BASE]), TEMP);
+                db.rel_push("rtl_inst", (extra, competing.clone()));
+                db.rel_push("rtl_inst_candidate", (extra, competing));
+                db.rel_push("instr_in_function", (extra, FUNCTION));
+                db.rel_set(
+                    "rtl_succ",
+                    vec![(def, extra), (extra, NODE)]
+                        .into_iter()
+                        .collect::<ascent::boxcar::Vec<_>>(),
+                );
+            }
+            "duplicate-use-row" => {
+                db.rel_push(
+                    "rtl_inst",
+                    (
+                        NODE,
+                        RTLInst::Iload(
+                            MemoryChunk::MInt32,
+                            Addressing::Aindexed(0),
+                            Arc::new(vec![BASE]),
+                            VALUE,
+                        ),
+                    ),
+                );
+            }
+            "hidden-memory-call-use" => {
+                db.rel_push(
+                    "call_through_memory_load",
+                    (
+                        extra,
+                        TEMP,
+                        MemoryChunk::MInt64,
+                        Addressing::Aindexed(0),
+                        Arc::new(vec![BASE]),
+                    ),
+                );
+            }
+            "definition-bypass" => {
+                let entry = FUNCTION + 2;
+                db.rel_push("rtl_inst", (entry, RTLInst::Inop));
+                db.rel_push("rtl_inst_candidate", (entry, RTLInst::Inop));
+                db.rel_push("instr_in_function", (entry, FUNCTION));
+                db.rel_set(
+                    "emit_function",
+                    vec![(FUNCTION, "arbitrary_function", entry)]
+                        .into_iter()
+                        .collect::<ascent::boxcar::Vec<_>>(),
+                );
+                db.rel_set(
+                    "rtl_succ",
+                    vec![(entry, def), (entry, NODE), (def, NODE)]
+                        .into_iter()
+                        .collect::<ascent::boxcar::Vec<_>>(),
+                );
+            }
+            "ambiguous-owner-bypass" | "unowned-bypass" => {
+                let entry = FUNCTION + 2;
+                db.rel_push("rtl_inst", (entry, RTLInst::Inop));
+                db.rel_push("rtl_inst_candidate", (entry, RTLInst::Inop));
+                db.rel_push("instr_in_function", (entry, FUNCTION));
+                db.rel_push("rtl_inst", (extra, RTLInst::Inop));
+                db.rel_push("rtl_inst_candidate", (extra, RTLInst::Inop));
+                if mutation == "ambiguous-owner-bypass" {
+                    db.rel_push("instr_in_function", (extra, FUNCTION));
+                    db.rel_push("instr_in_function", (extra, FUNCTION + 0x200));
+                }
+                db.rel_set(
+                    "emit_function",
+                    vec![(FUNCTION, "arbitrary_function", entry)]
+                        .into_iter()
+                        .collect::<ascent::boxcar::Vec<_>>(),
+                );
+                db.rel_set(
+                    "rtl_succ",
+                    vec![(entry, def), (entry, extra), (def, NODE), (extra, NODE)]
+                        .into_iter()
+                        .collect::<ascent::boxcar::Vec<_>>(),
+                );
+            }
+            "ambiguous-entry" => {
+                db.rel_push(
+                    "emit_function",
+                    (FUNCTION, "competing_arbitrary_function", extra),
+                );
+            }
+            "parameter-redefinition" => {
+                let entry = FUNCTION + 2;
+                let redefine = RTLInst::Iop(Operation::Ointconst(0), Arc::new(Vec::new()), INDEX);
+                db.rel_push("rtl_inst", (entry, redefine.clone()));
+                db.rel_push("rtl_inst_candidate", (entry, redefine));
+                db.rel_push("instr_in_function", (entry, FUNCTION));
+                db.rel_set(
+                    "emit_function",
+                    vec![(FUNCTION, "arbitrary_function", entry)]
+                        .into_iter()
+                        .collect::<ascent::boxcar::Vec<_>>(),
+                );
+                db.rel_set(
+                    "rtl_succ",
+                    vec![(entry, def), (def, NODE)]
+                        .into_iter()
+                        .collect::<ascent::boxcar::Vec<_>>(),
+                );
+            }
+            _ => unreachable!(),
+        }
+        db
+    }
+
+    #[test]
+    fn unique_use_address_dag_is_retained_but_symbolic_origin_is_rejected() {
+        let rows = proofs(defined_address_root(false, false, false));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].base_value, Some(BASE));
+        assert_eq!(rows[0].address_param_leaves.as_slice(), &[INDEX]);
+        assert!(proofs(defined_address_root(true, false, false)).is_empty());
+        assert!(proofs(defined_address_root(false, true, false)).is_empty());
+        assert!(proofs(defined_address_root(false, false, true)).is_empty());
+    }
+
+    #[test]
+    fn dead_at_use_address_dag_requires_exact_dominating_parameter_chain() {
+        let rows = proofs(noninline_address_root_mutation("none"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].base_value, Some(BASE));
+        assert_eq!(rows[0].address_param_leaves.as_slice(), &[INDEX]);
+
+        for (label, db) in [
+            (
+                "symbolic-definition",
+                without_address_inline_markers(defined_address_root(true, false, false)),
+            ),
+            (
+                "malformed-definition",
+                without_address_inline_markers(defined_address_root(false, true, false)),
+            ),
+            (
+                "nested-symbolic-definition",
+                without_address_inline_markers(defined_address_root(false, false, true)),
+            ),
+            (
+                "multiple-definitions",
+                noninline_address_root_mutation("multiple-definitions"),
+            ),
+            (
+                "duplicate-definition-row",
+                noninline_address_root_mutation("duplicate-definition-row"),
+            ),
+            (
+                "multiple-uses",
+                noninline_address_root_mutation("multiple-uses"),
+            ),
+            (
+                "duplicate-use-row",
+                noninline_address_root_mutation("duplicate-use-row"),
+            ),
+            (
+                "hidden-memory-call-use",
+                noninline_address_root_mutation("hidden-memory-call-use"),
+            ),
+            (
+                "definition-bypass",
+                noninline_address_root_mutation("definition-bypass"),
+            ),
+            (
+                "ambiguous-owner-bypass",
+                noninline_address_root_mutation("ambiguous-owner-bypass"),
+            ),
+            (
+                "unowned-bypass",
+                noninline_address_root_mutation("unowned-bypass"),
+            ),
+            (
+                "ambiguous-entry",
+                noninline_address_root_mutation("ambiguous-entry"),
+            ),
+            (
+                "parameter-redefinition",
+                noninline_address_root_mutation("parameter-redefinition"),
+            ),
+        ] {
+            assert!(proofs(db).is_empty(), "{label} authenticated");
+        }
+    }
+
+    #[test]
+    fn cyclic_address_definition_dag_fails_closed() {
+        let first = FUNCTION + 2;
+        let second = FUNCTION + 4;
+        let final_rtl = BTreeMap::from([
+            (
+                first,
+                vec![RTLInst::Iop(Operation::Omove, Arc::new(vec![BASE]), TEMP)],
+            ),
+            (
+                second,
+                vec![RTLInst::Iop(Operation::Omove, Arc::new(vec![TEMP]), BASE)],
+            ),
+            (
+                NODE,
+                vec![RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed(0),
+                    Arc::new(vec![BASE]),
+                    VALUE,
+                )],
+            ),
+        ]);
+        let definitions = BTreeMap::from([
+            (TEMP, BTreeSet::from([first])),
+            (BASE, BTreeSet::from([second])),
+            (VALUE, BTreeSet::from([NODE])),
+        ]);
+        assert!(scalar_address_param_leaves(
+            FUNCTION,
+            NODE,
+            &[BASE],
+            first,
+            &BTreeSet::from([first, second, NODE]),
+            &definitions,
+            &final_rtl,
+            &BTreeMap::from([(BASE, vec![first, NODE]), (TEMP, vec![second])]),
+            &HashMap::from([(first, vec![second]), (second, vec![NODE])]),
+            &BTreeSet::new(),
+            &BTreeSet::from([BASE, TEMP]),
+            None,
+            &mut ScalarAddressClosureCache::new(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn address_proof_work_limits_fail_closed() {
+        let first = FUNCTION + 0x100;
+        let mut allowed = BTreeSet::new();
+        let mut succs = HashMap::new();
+        for offset in 0..=SCALAR_ADDRESS_CFG_NODE_LIMIT {
+            let node = first + offset as u64;
+            allowed.insert(node);
+            if offset != SCALAR_ADDRESS_CFG_NODE_LIMIT {
+                succs.insert(node, vec![node + 1]);
+            }
+        }
+        assert_eq!(
+            graph_reaches_through_owned_region(
+                &succs,
+                &allowed,
+                first,
+                first + SCALAR_ADDRESS_CFG_NODE_LIMIT as u64,
+                None,
+            ),
+            None
+        );
+
+        let mut visiting = BTreeSet::new();
+        let mut cache = ScalarAddressClosureCache::new();
+        let mut exhausted = 0;
+        assert!(scalar_address_value_param_leaves(
+            FUNCTION,
+            BASE,
+            NODE,
+            NODE,
+            &BTreeSet::from([NODE]),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &HashMap::new(),
+            &BTreeSet::from([(FUNCTION, BASE)]),
+            &BTreeSet::new(),
+            &mut visiting,
+            &mut cache,
+            &mut exhausted,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn scalar_memory_access_mutations_all_fail_closed() {
+        let mutations = [
+            Mutation::Prefix,
+            Mutation::WrongOrder,
+            Mutation::WrongWidth,
+            Mutation::WrongRegisterWidth,
+            Mutation::AmbiguousRegister,
+            Mutation::CrossKindOperands,
+            Mutation::WrongLtlValue,
+            Mutation::AmbiguousLtl,
+            Mutation::WrongDisplacement,
+            Mutation::WrongAddressSize,
+            Mutation::AmbiguousAddressSize,
+            Mutation::Segment,
+            Mutation::SymbolicBase,
+            Mutation::MissingEffect,
+            Mutation::ExtraEffect,
+            Mutation::MissingRegisterDef,
+            Mutation::ExtraRegisterDef,
+            Mutation::MissingRegisterUse,
+            Mutation::ExtraRegisterUse,
+            Mutation::RawMismatch,
+            Mutation::AmbiguousInstruction,
+            Mutation::ExtraOperand,
+            Mutation::AmbiguousOperand,
+            Mutation::MissingCandidate,
+            Mutation::CandidateDrift,
+            Mutation::AmbiguousFinal,
+            Mutation::AmbiguousOwner,
+            Mutation::OverlappingFunction,
+            Mutation::BadMapSpan,
+            Mutation::NonlinearSection,
+            Mutation::WrongSection,
+            Mutation::RelocationOverlap,
+            Mutation::MappedRelocationWrongSection,
+            Mutation::RelocationOverflow,
+            Mutation::WrongRelocationSectionName,
+            Mutation::RedefinedRoot,
+            Mutation::WrongDownstreamWidth,
+            Mutation::AmbiguousDownstreamWidth,
+        ];
+        for mutation in mutations {
+            assert!(
+                proofs(scalar_fixture(
+                    "MOV",
+                    4,
+                    "EAX",
+                    MemoryChunk::MInt32,
+                    ScalarMemoryDirection::Read,
+                    mutation,
+                ))
+                .is_empty(),
+                "mutation unexpectedly authenticated: {mutation:?}"
+            );
+        }
+        assert!(proofs(scalar_fixture(
+            "MOV",
+            4,
+            "EAX",
+            MemoryChunk::MInt64,
+            ScalarMemoryDirection::Read,
+            Mutation::None,
+        ))
+        .is_empty());
+        let mut missing_map = scalar_fixture(
+            "MOV",
+            4,
+            "EAX",
+            MemoryChunk::MInt32,
+            ScalarMemoryDirection::Read,
+            Mutation::None,
+        );
+        missing_map.coff_address_map = None;
+        assert!(proofs(missing_map).is_empty());
+    }
+
+    fn synthetic_stack_fixture(
+        extra_successor: bool,
+        bad_origin: bool,
+        bypass_origin: bool,
+    ) -> DecompileDB {
+        let selected = NODE | (1u64 << 62);
+        let mut db = DecompileDB::default();
+        db.coff_address_map = Some(coff_map());
+        let decoded = instruction("", "MOV", MEMORY, REGISTER);
+        push_instruction(&mut db, "instruction", NODE, decoded.clone());
+        push_instruction(&mut db, "unrefinedinstruction", NODE, decoded);
+        db.rel_push("op_register", (REGISTER, "EAX"));
+        db.rel_push(
+            "op_indirect",
+            (MEMORY, "NONE", "RSP", "RDX", 4_i64, -32_i64, 4_usize),
+        );
+        db.rel_push("instruction_address_size", (NODE, 8_u8));
+        db.rel_push("decoded_memory_read_operand", (NODE, MEMORY));
+        db.rel_push("decoded_reg_def", (NODE, Mreg::AX));
+        db.rel_push("decoded_reg_use", (NODE, Mreg::SP));
+        db.rel_push("decoded_reg_use", (NODE, Mreg::DX));
+        db.rel_push(
+            "ltl_inst",
+            (
+                NODE,
+                LTLInst::Lload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed2scaled(4, -32),
+                    Arc::new(vec![Mreg::SP, Mreg::DX]),
+                    Mreg::AX,
+                ),
+            ),
+        );
+        let origin = RTLInst::Iop(
+            Operation::Olea(Addressing::Ainstack(if bad_origin { -24 } else { -32 })),
+            Arc::new(Vec::new()),
+            TEMP,
+        );
+        let load = RTLInst::Iload(
+            MemoryChunk::MInt32,
+            Addressing::Aindexed2scaled(4, 0),
+            Arc::new(vec![TEMP, INDEX]),
+            VALUE,
+        );
+        db.rel_push("rtl_inst", (NODE, origin.clone()));
+        db.rel_push("rtl_inst_candidate", (NODE, origin));
+        db.rel_push("rtl_inst", (selected, load.clone()));
+        db.rel_push("rtl_inst_candidate", (selected, load));
+        db.rel_push("rtl_succ", (NODE, selected));
+        if extra_successor {
+            db.rel_push("rtl_succ", (NODE, NEXT));
+        }
+        db.rel_push("instr_in_function", (NODE, FUNCTION));
+        db.rel_push("instr_in_function", (selected, FUNCTION));
+        let entry = FUNCTION + 4;
+        db.rel_push(
+            "emit_function",
+            (
+                FUNCTION,
+                "arbitrary_stack_function",
+                if bypass_origin { entry } else { NODE },
+            ),
+        );
+        if bypass_origin {
+            db.rel_push("rtl_inst", (entry, RTLInst::Inop));
+            db.rel_push("rtl_inst_candidate", (entry, RTLInst::Inop));
+            db.rel_push("instr_in_function", (entry, FUNCTION));
+            db.rel_push("rtl_succ", (entry, NODE));
+            db.rel_push("rtl_succ", (entry, selected));
+        }
+        db.rel_push("emit_function_param_candidate", (FUNCTION, INDEX));
+        db.rel_push("emit_var_type_candidate", (VALUE, XType::Xint));
+        db
+    }
+
+    fn synthetic_stack_ownership_bypass(ambiguous: bool) -> DecompileDB {
+        let mut db = synthetic_stack_fixture(false, false, false);
+        let selected = NODE | (1u64 << 62);
+        let entry = FUNCTION + 4;
+        let intermediate = FUNCTION + 6;
+        db.rel_push("rtl_inst", (entry, RTLInst::Inop));
+        db.rel_push("rtl_inst_candidate", (entry, RTLInst::Inop));
+        db.rel_push("instr_in_function", (entry, FUNCTION));
+        db.rel_push("rtl_inst", (intermediate, RTLInst::Inop));
+        db.rel_push("rtl_inst_candidate", (intermediate, RTLInst::Inop));
+        if ambiguous {
+            db.rel_push("instr_in_function", (intermediate, FUNCTION));
+            db.rel_push("instr_in_function", (intermediate, FUNCTION + 0x200));
+        }
+        db.rel_set(
+            "emit_function",
+            vec![(FUNCTION, "arbitrary_stack_function", entry)]
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "rtl_succ",
+            vec![
+                (entry, NODE),
+                (entry, intermediate),
+                (NODE, selected),
+                (intermediate, selected),
+            ]
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db
+    }
+
+    fn synthetic_stack_cfg_limit_fixture() -> DecompileDB {
+        let mut db = synthetic_stack_fixture(false, false, false);
+        let selected = NODE | (1u64 << 62);
+        let first = FUNCTION + 0x100;
+        let mut edges = Vec::new();
+        let mut previous = NODE;
+        for offset in 0..SCALAR_ADDRESS_CFG_NODE_LIMIT {
+            let intermediate = first + offset as u64;
+            db.rel_push("instr_in_function", (intermediate, FUNCTION));
+            edges.push((previous, intermediate));
+            previous = intermediate;
+        }
+        edges.push((previous, selected));
+        db.rel_set(
+            "rtl_succ",
+            edges
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<(Node, Node)>>(),
+        );
+        db
+    }
+
+    #[test]
+    fn indexed_stack_origin_is_exact_and_ambiguity_fails_closed() {
+        let rows = proofs(synthetic_stack_fixture(false, false, false));
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].synthetic_stack_origin);
+        assert_eq!(rows[0].displacement, -32);
+        assert!(rows[0].exact_scaled_index);
+        assert_eq!(rows[0].address_param_leaves.as_slice(), &[INDEX]);
+        assert!(proofs(synthetic_stack_fixture(true, false, false)).is_empty());
+        assert!(proofs(synthetic_stack_fixture(false, true, false)).is_empty());
+        assert!(proofs(synthetic_stack_fixture(false, false, true)).is_empty());
+        assert!(proofs(synthetic_stack_ownership_bypass(true)).is_empty());
+        assert!(proofs(synthetic_stack_ownership_bypass(false)).is_empty());
+        assert!(proofs(synthetic_stack_cfg_limit_fixture()).is_empty());
+    }
+}
+
 fn low_byte_register(full: &str) -> Option<(&'static str, usize)> {
     match full {
         "RAX" => Some(("AL", 2)),
@@ -68,6 +1849,1484 @@ fn rtl_definition(inst: &RTLInst) -> Option<RTLReg> {
         RTLInst::Ibuiltin(_, _, BuiltinArg::BA(destination)) => Some(*destination),
         _ => None,
     }
+}
+
+const SCALAR_LVALUE_SYNTHETIC_MASK: Node = (1u64 << 62) | (1u64 << 63);
+
+type ScalarIndirectOperand = (&'static str, &'static str, &'static str, i64, i64, usize);
+
+fn x86_scalar_register_width(name: &str) -> Option<usize> {
+    match name {
+        "RAX" | "RBX" | "RCX" | "RDX" | "RSI" | "RDI" | "RBP" | "RSP" | "R8" | "R9" | "R10"
+        | "R11" | "R12" | "R13" | "R14" | "R15" => Some(8),
+        "EAX" | "EBX" | "ECX" | "EDX" | "ESI" | "EDI" | "EBP" | "ESP" | "R8D" | "R9D" | "R10D"
+        | "R11D" | "R12D" | "R13D" | "R14D" | "R15D" => Some(4),
+        "AX" | "BX" | "CX" | "DX" | "SI" | "DI" | "BP" | "SP" | "R8W" | "R9W" | "R10W" | "R11W"
+        | "R12W" | "R13W" | "R14W" | "R15W" => Some(2),
+        // AH/BH/CH/DH select bits 8..15 but collapse to the parent Mreg in
+        // LTL.  V1 cannot reverse that alias without a sub-register offset, so
+        // those four spellings deliberately have no scalar width here.
+        "AL" | "BL" | "CL" | "DL" | "SIL" | "DIL" | "BPL" | "SPL" | "R8B" | "R9B" | "R10B"
+        | "R11B" | "R12B" | "R13B" | "R14B" | "R15B" => Some(1),
+        _ => None,
+    }
+}
+
+fn scalar_integral_xtype_width(xtype: XType) -> Option<usize> {
+    match xtype {
+        XType::Xint8signed | XType::Xint8unsigned => Some(1),
+        XType::Xint16signed | XType::Xint16unsigned => Some(2),
+        XType::Xint | XType::Xintunsigned | XType::Xany32 => Some(4),
+        XType::Xlong | XType::Xlongunsigned | XType::Xany64 => Some(8),
+        XType::Xbool
+        | XType::Xfloat
+        | XType::Xsingle
+        | XType::Xptr
+        | XType::Xcharptr
+        | XType::Xcharptrptr
+        | XType::Xintptr
+        | XType::Xfloatptr
+        | XType::Xsingleptr
+        | XType::Xfuncptr
+        | XType::Xvoid
+        | XType::XstructPtr(_) => None,
+    }
+}
+
+fn scalar_mov_semantics(
+    mnemonic: &str,
+    direction: ScalarMemoryDirection,
+    width: usize,
+    value_width: usize,
+) -> Option<(ScalarMemoryExtension, MemoryChunk)> {
+    if !matches!(width, 1 | 2 | 4 | 8) {
+        return None;
+    }
+    match (mnemonic, direction) {
+        ("MOV", ScalarMemoryDirection::Read) if matches!(width, 4 | 8) && value_width == width => {
+            Some((
+                ScalarMemoryExtension::Plain,
+                if width == 4 {
+                    MemoryChunk::MInt32
+                } else {
+                    MemoryChunk::MInt64
+                },
+            ))
+        }
+        ("MOV", ScalarMemoryDirection::Write) if value_width == width => Some((
+            ScalarMemoryExtension::Plain,
+            match width {
+                1 => MemoryChunk::MInt8Unsigned,
+                2 => MemoryChunk::MInt16Unsigned,
+                4 => MemoryChunk::MInt32,
+                8 => MemoryChunk::MInt64,
+                _ => unreachable!(),
+            },
+        )),
+        ("MOVSX", ScalarMemoryDirection::Read)
+            if matches!(width, 1 | 2) && matches!(value_width, 4 | 8) && value_width > width =>
+        {
+            Some((
+                ScalarMemoryExtension::SignExtend,
+                if width == 1 {
+                    MemoryChunk::MInt8Signed
+                } else {
+                    MemoryChunk::MInt16Signed
+                },
+            ))
+        }
+        ("MOVSXD", ScalarMemoryDirection::Read) if width == 4 && value_width == 8 => {
+            Some((ScalarMemoryExtension::SignExtend, MemoryChunk::MInt32))
+        }
+        ("MOVZX", ScalarMemoryDirection::Read)
+            if matches!(width, 1 | 2) && matches!(value_width, 4 | 8) && value_width > width =>
+        {
+            Some((
+                ScalarMemoryExtension::ZeroExtend,
+                if width == 1 {
+                    MemoryChunk::MInt8Unsigned
+                } else {
+                    MemoryChunk::MInt16Unsigned
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Bind raw opcode semantics to the selected final transport chunk.  An exact
+/// chunk (or AsmPass's closed plain-qword `MAny64` alias) needs no companion.
+/// MOVSX/MOVZX may select the opposite same-width byte/word signedness only
+/// when both retained RTL and LTL layers contain the exact sealed pair.
+/// Every other disagreement remains a hard veto.  The selected chunk is
+/// retained in the proof; the raw opcode remains authoritative for extension.
+fn scalar_transport_companion_required(
+    canonical: MemoryChunk,
+    selected: MemoryChunk,
+    direction: ScalarMemoryDirection,
+    extension: ScalarMemoryExtension,
+    width: usize,
+    value_width: usize,
+) -> Option<bool> {
+    if selected == canonical {
+        return Some(false);
+    }
+    if matches!(
+        (
+            direction,
+            extension,
+            width,
+            value_width,
+            canonical,
+            selected
+        ),
+        (
+            ScalarMemoryDirection::Read | ScalarMemoryDirection::Write,
+            ScalarMemoryExtension::Plain,
+            8,
+            8,
+            MemoryChunk::MInt64,
+            MemoryChunk::MAny64
+        )
+    ) {
+        return Some(false);
+    }
+    (direction == ScalarMemoryDirection::Read
+        && matches!(
+            extension,
+            ScalarMemoryExtension::SignExtend | ScalarMemoryExtension::ZeroExtend
+        )
+        && matches!(width, 1 | 2)
+        && matches!(value_width, 4 | 8)
+        && value_width > width
+        && scalar_signedness_companion(canonical, width) == Some(selected))
+    .then_some(true)
+}
+
+fn scalar_signedness_companion(chunk: MemoryChunk, width: usize) -> Option<MemoryChunk> {
+    match (chunk, width) {
+        (MemoryChunk::MInt8Signed, 1) => Some(MemoryChunk::MInt8Unsigned),
+        (MemoryChunk::MInt8Unsigned, 1) => Some(MemoryChunk::MInt8Signed),
+        (MemoryChunk::MInt16Signed, 2) => Some(MemoryChunk::MInt16Unsigned),
+        (MemoryChunk::MInt16Unsigned, 2) => Some(MemoryChunk::MInt16Signed),
+        _ => None,
+    }
+}
+
+fn scalar_ltl_row_matches(
+    row: &LTLInst,
+    direction: ScalarMemoryDirection,
+    chunk: MemoryChunk,
+    addressing: &Addressing,
+    mregs: &[Mreg],
+    value: Mreg,
+) -> bool {
+    match (direction, row) {
+        (
+            ScalarMemoryDirection::Read,
+            LTLInst::Lload(row_chunk, row_addressing, row_mregs, destination),
+        ) => {
+            *row_chunk == chunk
+                && row_addressing == addressing
+                && row_mregs.as_slice() == mregs
+                && *destination == value
+        }
+        (
+            ScalarMemoryDirection::Write,
+            LTLInst::Lstore(row_chunk, row_addressing, row_mregs, source),
+        ) => {
+            *row_chunk == chunk
+                && row_addressing == addressing
+                && row_mregs.as_slice() == mregs
+                && *source == value
+        }
+        _ => false,
+    }
+}
+
+fn scalar_rtl_row_matches(
+    row: &RTLInst,
+    direction: ScalarMemoryDirection,
+    chunk: MemoryChunk,
+    addressing: &Addressing,
+    args: &[RTLReg],
+    value: RTLReg,
+) -> bool {
+    match (direction, row) {
+        (
+            ScalarMemoryDirection::Read,
+            RTLInst::Iload(row_chunk, row_addressing, row_args, destination),
+        ) => {
+            *row_chunk == chunk
+                && row_addressing == addressing
+                && row_args.as_slice() == args
+                && *destination == value
+        }
+        (
+            ScalarMemoryDirection::Write,
+            RTLInst::Istore(row_chunk, row_addressing, row_args, source),
+        ) => {
+            *row_chunk == chunk
+                && row_addressing == addressing
+                && row_args.as_slice() == args
+                && *source == value
+        }
+        _ => false,
+    }
+}
+
+/// AsmPass deliberately emits the opposite signedness for each byte/word
+/// load/store so later type selection can choose either spelling. Admit that
+/// one known transport companion only after immutable decoder evidence has
+/// fixed opcode semantics and final RTL has fixed the selected transport.
+/// Any duplicate, third, cross-width, or structurally different interpretation
+/// remains an ambiguity and vetoes the proof.
+fn scalar_exact_or_signedness_companion_rows_match<T>(
+    rows: &[T],
+    expected_chunk: MemoryChunk,
+    width: usize,
+    companion_required: bool,
+    row_matches: impl Fn(&T, MemoryChunk) -> bool,
+) -> bool {
+    match rows.len() {
+        1 if !companion_required => row_matches(&rows[0], expected_chunk),
+        2 => {
+            let Some(companion) = scalar_signedness_companion(expected_chunk, width) else {
+                return false;
+            };
+            rows.iter()
+                .filter(|row| row_matches(row, expected_chunk))
+                .count()
+                == 1
+                && rows
+                    .iter()
+                    .filter(|row| row_matches(row, companion))
+                    .count()
+                    == 1
+        }
+        _ => false,
+    }
+}
+
+fn scalar_ltl_rows_match(
+    rows: &[LTLInst],
+    direction: ScalarMemoryDirection,
+    expected_chunk: MemoryChunk,
+    width: usize,
+    companion_required: bool,
+    addressing: &Addressing,
+    mregs: &[Mreg],
+    value: Mreg,
+) -> bool {
+    scalar_exact_or_signedness_companion_rows_match(
+        rows,
+        expected_chunk,
+        width,
+        companion_required,
+        |row, chunk| scalar_ltl_row_matches(row, direction, chunk, addressing, mregs, value),
+    )
+}
+
+fn scalar_rtl_rows_match(
+    rows: &[RTLInst],
+    direction: ScalarMemoryDirection,
+    expected_chunk: MemoryChunk,
+    width: usize,
+    companion_required: bool,
+    addressing: &Addressing,
+    args: &[RTLReg],
+    value: RTLReg,
+) -> bool {
+    scalar_exact_or_signedness_companion_rows_match(
+        rows,
+        expected_chunk,
+        width,
+        companion_required,
+        |row, chunk| scalar_rtl_row_matches(row, direction, chunk, addressing, args, value),
+    )
+}
+
+fn decoded_scalar_addressing(
+    base_name: &str,
+    index_name: &str,
+    scale: i64,
+    displacement: i64,
+    address_size: u8,
+) -> Option<(Addressing, Vec<Mreg>, bool)> {
+    if !matches!(address_size, 4 | 8) || matches!(base_name, "" | "NONE" | "RIP" | "EIP") {
+        return None;
+    }
+    let base = Mreg::x86(base_name);
+    if base.is_unknown() || x86_scalar_register_width(base_name) != Some(address_size as usize) {
+        return None;
+    }
+    let index = if matches!(index_name, "" | "NONE") {
+        None
+    } else {
+        let index = Mreg::x86(index_name);
+        if index.is_unknown()
+            || x86_scalar_register_width(index_name) != Some(address_size as usize)
+        {
+            return None;
+        }
+        Some(index)
+    };
+    if index.is_none() && scale != 1 {
+        return None;
+    }
+
+    let stack_base = address_size == 8 && matches!(base, Mreg::SP | Mreg::BP);
+    let (inner, args, indexed_stack) = match index {
+        // A bare stack displacement has no surviving RTL base value from
+        // which a raw C lvalue can be reconstructed.  Indexed stack accesses
+        // are represented by RTL's exact LEA-origin split below.
+        None if stack_base => return None,
+        None => (Addressing::Aindexed(displacement), vec![base], false),
+        Some(index) if scale == 1 => (
+            Addressing::Aindexed2(displacement),
+            vec![base, index],
+            stack_base,
+        ),
+        Some(index) if matches!(scale, 2 | 4 | 8) => (
+            Addressing::Aindexed2scaled(scale, displacement),
+            vec![base, index],
+            stack_base,
+        ),
+        Some(_) => return None,
+    };
+    if address_size == 4 {
+        Some((Addressing::Aaddr32(Box::new(inner)), args, false))
+    } else {
+        Some((inner, args, indexed_stack))
+    }
+}
+
+fn unique_equal<T: PartialEq>(rows: &[T]) -> Option<&T> {
+    let first = rows.first()?;
+    rows.iter().all(|row| row == first).then_some(first)
+}
+
+const SCALAR_ADDRESS_DAG_NODE_LIMIT: usize = 128;
+const SCALAR_ADDRESS_CFG_NODE_LIMIT: usize = 4096;
+
+/// Prove reachability without hiding an ownership-ambiguous or unowned CFG
+/// intermediate.  Expansion stops at `target`, so ownership beyond the
+/// consumer is irrelevant; every reachable node before it must be one of the
+/// function's uniquely owned nodes.  `None` is an ambiguity or work-limit
+/// failure, while `Some(false)` is a closed proof that no path exists.
+fn graph_reaches_through_owned_region(
+    succs: &HashMap<Node, Vec<Node>>,
+    allowed: &BTreeSet<Node>,
+    start: Node,
+    target: Node,
+    blocked: Option<Node>,
+) -> Option<bool> {
+    if blocked == Some(start) || !allowed.contains(&start) || !allowed.contains(&target) {
+        return None;
+    }
+    let mut reached = false;
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::from([start]);
+    while let Some(node) = queue.pop_front() {
+        if !seen.insert(node) {
+            continue;
+        }
+        if seen.len() > SCALAR_ADDRESS_CFG_NODE_LIMIT || !allowed.contains(&node) {
+            return None;
+        }
+        if node == target {
+            reached = true;
+            continue;
+        }
+        if let Some(nexts) = succs.get(&node) {
+            for next in nexts {
+                if blocked == Some(*next) {
+                    continue;
+                }
+                if !allowed.contains(next) {
+                    return None;
+                }
+                if seen.len().saturating_add(queue.len()) >= SCALAR_ADDRESS_CFG_NODE_LIMIT {
+                    return None;
+                }
+                queue.push_back(*next);
+            }
+        }
+    }
+    Some(reached)
+}
+
+fn scalar_addressing_is_nonsymbolic(addressing: &Addressing) -> bool {
+    match addressing {
+        Addressing::Aindexed(_)
+        | Addressing::Aindexed2(_)
+        | Addressing::Ascaled(_, _)
+        | Addressing::Aindexed2scaled(_, _) => true,
+        Addressing::Aaddr32(inner) => scalar_addressing_is_nonsymbolic(inner),
+        Addressing::Aglobal(..)
+        | Addressing::Abased(..)
+        | Addressing::Abasedscaled(..)
+        | Addressing::Ainstack(_)
+        | Addressing::Unknown => false,
+    }
+}
+
+fn scalar_addressing_arg_count(addressing: &Addressing) -> Option<usize> {
+    match addressing {
+        Addressing::Aindexed(_) | Addressing::Ascaled(_, _) => Some(1),
+        Addressing::Aindexed2(_) | Addressing::Aindexed2scaled(_, _) => Some(2),
+        Addressing::Ainstack(_) => Some(0),
+        Addressing::Aaddr32(inner) => scalar_addressing_arg_count(inner),
+        Addressing::Aglobal(..)
+        | Addressing::Abased(..)
+        | Addressing::Abasedscaled(..)
+        | Addressing::Unknown => None,
+    }
+}
+
+fn scalar_address_definition_is_closed(inst: &RTLInst) -> bool {
+    match inst {
+        RTLInst::Iop(Operation::Omove, args, _) => args.len() == 1,
+        RTLInst::Iop(Operation::Oadd | Operation::Oaddl, args, _) => args.len() == 2,
+        RTLInst::Iop(
+            Operation::Oaddimm(_)
+            | Operation::Omulimm(_)
+            | Operation::Oshlimm(_)
+            | Operation::Oaddlimm(_)
+            | Operation::Omullimm(_)
+            | Operation::Oshllimm(_),
+            args,
+            _,
+        ) => args.len() == 1,
+        RTLInst::Iop(Operation::Olea(addressing) | Operation::Oleal(addressing), args, _) => {
+            scalar_addressing_is_nonsymbolic(addressing)
+                && scalar_addressing_arg_count(addressing) == Some(args.len())
+        }
+        _ => false,
+    }
+}
+
+type ScalarAddressClosureCache = BTreeMap<(Address, RTLReg, Node), Option<BTreeSet<RTLReg>>>;
+
+/// Return the final parameter leaves of one ordinary address-DAG value.  The
+/// non-inline extension binds an interior value to one exact consumer, so
+/// memoize per (function, value, consumer) rather than recursively rewalking
+/// the same authenticated chain for every access.
+fn scalar_address_value_param_leaves(
+    function: Address,
+    value: RTLReg,
+    consumer: Node,
+    entry: Node,
+    function_nodes: &BTreeSet<Node>,
+    definitions: &BTreeMap<RTLReg, BTreeSet<Node>>,
+    final_rtl: &BTreeMap<Node, Vec<RTLInst>>,
+    uses: &BTreeMap<RTLReg, Vec<Node>>,
+    succs: &HashMap<Node, Vec<Node>>,
+    params: &BTreeSet<(Address, RTLReg)>,
+    inline_temps: &BTreeSet<RTLReg>,
+    visiting: &mut BTreeSet<RTLReg>,
+    cache: &mut ScalarAddressClosureCache,
+    dag_budget: &mut usize,
+) -> Option<BTreeSet<RTLReg>> {
+    let cache_key = (function, value, consumer);
+    if let Some(cached) = cache.get(&cache_key) {
+        return cached.clone();
+    }
+    if *dag_budget == 0 {
+        cache.insert(cache_key, None);
+        return None;
+    }
+    *dag_budget -= 1;
+    if !visiting.insert(value) {
+        cache.insert(cache_key, None);
+        return None;
+    }
+
+    let defs = definitions.get(&value).cloned().unwrap_or_default();
+    if defs.iter().any(|node| {
+        !function_nodes.contains(node)
+            || final_rtl
+                .get(node)
+                .and_then(|rows| unique_equal(rows))
+                .is_none()
+    }) {
+        visiting.remove(&value);
+        cache.insert(cache_key, None);
+        return None;
+    }
+    if params.contains(&(function, value)) {
+        if !defs.is_empty() {
+            visiting.remove(&value);
+            cache.insert(cache_key, None);
+            return None;
+        }
+        visiting.remove(&value);
+        let leaves = BTreeSet::from([value]);
+        cache.insert(cache_key, Some(leaves.clone()));
+        return Some(leaves);
+    }
+    if defs.len() != 1 {
+        visiting.remove(&value);
+        cache.insert(cache_key, None);
+        return None;
+    }
+    let def = *defs.iter().next().expect("one definition");
+    if def & SCALAR_LVALUE_SYNTHETIC_MASK != 0 {
+        visiting.remove(&value);
+        cache.insert(cache_key, None);
+        return None;
+    }
+    let Some(inst) = final_rtl.get(&def).and_then(|rows| unique_equal(rows)) else {
+        visiting.remove(&value);
+        cache.insert(cache_key, None);
+        return None;
+    };
+    if !scalar_address_definition_is_closed(inst) || rtl_definition(inst) != Some(value) {
+        visiting.remove(&value);
+        cache.insert(cache_key, None);
+        return None;
+    }
+    // `emit_inline_temp` remains the established canonical-structuring proof.
+    // Scalar authentication additionally admits an address-only value whose
+    // exact definition/sole DAG use prove the same substitution without the
+    // liveness-at-use requirement. This local extension never changes global
+    // inlining or canonical C source selection.
+    if !inline_temps.contains(&value) {
+        let exact_single_definition_row = final_rtl.get(&def).is_some_and(|rows| rows.len() == 1);
+        let exact_sole_use = uses
+            .get(&value)
+            .is_some_and(|nodes| nodes.as_slice() == [consumer]);
+        let entry_reaches_def = def == entry
+            || graph_reaches_through_owned_region(succs, function_nodes, entry, def, None)
+                == Some(true);
+        let def_reaches_consumer = def == consumer
+            || graph_reaches_through_owned_region(succs, function_nodes, def, consumer, None)
+                == Some(true);
+        let no_bypass = def == entry
+            || graph_reaches_through_owned_region(
+                succs,
+                function_nodes,
+                entry,
+                consumer,
+                Some(def),
+            ) == Some(false);
+        let dominates_consumer = entry_reaches_def && def_reaches_consumer && no_bypass;
+        if !exact_single_definition_row || !exact_sole_use || !dominates_consumer {
+            visiting.remove(&value);
+            cache.insert(cache_key, None);
+            return None;
+        }
+    }
+    let uses_in_definition = inst_def_use(inst).1;
+    if uses_in_definition.is_empty() {
+        visiting.remove(&value);
+        cache.insert(cache_key, None);
+        return None;
+    }
+    let mut leaves = BTreeSet::new();
+    for input in uses_in_definition {
+        let Some(input_leaves) = scalar_address_value_param_leaves(
+            function,
+            input,
+            def,
+            entry,
+            function_nodes,
+            definitions,
+            final_rtl,
+            uses,
+            succs,
+            params,
+            inline_temps,
+            visiting,
+            cache,
+            dag_budget,
+        ) else {
+            visiting.remove(&value);
+            cache.insert(cache_key, None);
+            return None;
+        };
+        leaves.extend(input_leaves);
+    }
+    visiting.remove(&value);
+    if leaves.is_empty() {
+        cache.insert(cache_key, None);
+        return None;
+    }
+    cache.insert(cache_key, Some(leaves.clone()));
+    Some(leaves)
+}
+
+fn scalar_address_param_leaves(
+    function: Address,
+    selected_node: Node,
+    roots: &[RTLReg],
+    entry: Node,
+    function_nodes: &BTreeSet<Node>,
+    definitions: &BTreeMap<RTLReg, BTreeSet<Node>>,
+    final_rtl: &BTreeMap<Node, Vec<RTLInst>>,
+    uses: &BTreeMap<RTLReg, Vec<Node>>,
+    succs: &HashMap<Node, Vec<Node>>,
+    params: &BTreeSet<(Address, RTLReg)>,
+    inline_temps: &BTreeSet<RTLReg>,
+    stack_origin: Option<(Node, RTLReg)>,
+    closure_cache: &mut ScalarAddressClosureCache,
+) -> Option<Arc<Vec<RTLReg>>> {
+    if !function_nodes.contains(&entry) || !function_nodes.contains(&selected_node) {
+        return None;
+    }
+    let mut visiting = BTreeSet::new();
+    let mut dag_budget = SCALAR_ADDRESS_DAG_NODE_LIMIT;
+    let mut leaves = BTreeSet::new();
+    let mut saw_stack_origin = false;
+    for root in roots {
+        if let Some((def, stack_value)) = stack_origin.filter(|(_, value)| value == root) {
+            if saw_stack_origin {
+                return None;
+            }
+            saw_stack_origin = true;
+            let defs = definitions.get(root)?;
+            let exact_stack_def = defs.len() == 1 && defs.contains(&def);
+            let exact_stack_inst = final_rtl
+                .get(&def)
+                .and_then(|rows| unique_equal(rows))
+                .is_some_and(|inst| {
+                    matches!(
+                        inst,
+                        RTLInst::Iop(Operation::Olea(Addressing::Ainstack(_)), args, destination)
+                            if args.is_empty() && destination == root
+                    )
+                });
+            let entry_reaches_def = def == entry
+                || graph_reaches_through_owned_region(succs, function_nodes, entry, def, None)
+                    == Some(true);
+            let def_reaches_selected = def == selected_node
+                || graph_reaches_through_owned_region(
+                    succs,
+                    function_nodes,
+                    def,
+                    selected_node,
+                    None,
+                ) == Some(true);
+            let no_bypass = def == entry
+                || graph_reaches_through_owned_region(
+                    succs,
+                    function_nodes,
+                    entry,
+                    selected_node,
+                    Some(def),
+                ) == Some(false);
+            let dominates = entry_reaches_def && def_reaches_selected && no_bypass;
+            if !exact_stack_def || !exact_stack_inst || !dominates {
+                return None;
+            }
+            continue;
+        }
+        leaves.extend(scalar_address_value_param_leaves(
+            function,
+            *root,
+            selected_node,
+            entry,
+            function_nodes,
+            definitions,
+            final_rtl,
+            uses,
+            succs,
+            params,
+            inline_temps,
+            &mut visiting,
+            closure_cache,
+            &mut dag_budget,
+        )?);
+    }
+    if stack_origin.is_some() != saw_stack_origin || leaves.is_empty() {
+        return None;
+    }
+    Some(Arc::new(leaves.into_iter().collect()))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScalarInterval {
+    start: u64,
+    end: u64,
+    payload: usize,
+}
+
+#[derive(Debug, Default)]
+struct ScalarIntervalIndex {
+    intervals: Vec<ScalarInterval>,
+    prefix_max_end: Vec<u64>,
+}
+
+impl ScalarIntervalIndex {
+    fn new(mut intervals: Vec<ScalarInterval>) -> Self {
+        intervals.retain(|interval| interval.start < interval.end);
+        intervals.sort_by_key(|interval| (interval.start, interval.end, interval.payload));
+        let mut running_end = 0;
+        let prefix_max_end = intervals
+            .iter()
+            .map(|interval| {
+                running_end = running_end.max(interval.end);
+                running_end
+            })
+            .collect();
+        Self {
+            intervals,
+            prefix_max_end,
+        }
+    }
+
+    fn overlap_bounds(&self, start: u64, end: u64) -> Option<(usize, usize)> {
+        if start >= end {
+            return None;
+        }
+        let upper = self
+            .intervals
+            .partition_point(|interval| interval.start < end);
+        let lower = self.prefix_max_end[..upper].partition_point(|seen_end| *seen_end <= start);
+        (lower < upper).then_some((lower, upper))
+    }
+
+    fn has_overlap(&self, start: u64, end: u64) -> bool {
+        self.overlap_bounds(start, end)
+            .is_some_and(|(lower, upper)| {
+                self.intervals[lower..upper]
+                    .iter()
+                    .any(|interval| interval.end > start)
+            })
+    }
+
+    fn unique_overlap_payload(&self, start: u64, end: u64) -> Option<usize> {
+        let (lower, upper) = self.overlap_bounds(start, end)?;
+        let mut matches = self.intervals[lower..upper]
+            .iter()
+            .filter(|interval| interval.end > start)
+            .map(|interval| interval.payload);
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
+    }
+}
+
+/// Immutable interval/identity index over the COFF map.  Building it once
+/// keeps authentication linearithmic in the map plus the actually overlapping
+/// relocation count, rather than rescanning every function/section/relocation
+/// for every selected memory effect.
+struct ScalarCoffIndex {
+    functions: ScalarIntervalIndex,
+    valid_function_section: Vec<Option<usize>>,
+    mapped_relocations: ScalarIntervalIndex,
+    original_relocations: BTreeMap<usize, ScalarIntervalIndex>,
+    relocation_section_names: BTreeMap<usize, BTreeSet<String>>,
+    relocations_well_formed: bool,
+}
+
+impl ScalarCoffIndex {
+    fn new(map: &crate::decompile::disassembly::coff::CoffAddressMap) -> Self {
+        let mut section_rows: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (index, section) in map.sections.iter().enumerate() {
+            section_rows.entry(section.index).or_default().push(index);
+        }
+        let valid_function_section = map
+            .functions
+            .iter()
+            .map(|function| {
+                let section_index = section_rows
+                    .get(&function.section_index)
+                    .filter(|rows| rows.len() == 1)?[0];
+                let section = &map.sections[section_index];
+                let original_section_size = section
+                    .original_offset_end
+                    .checked_sub(section.original_offset_start)?;
+                let mapped_section_size =
+                    section.mapped_va_end.checked_sub(section.mapped_va_start)?;
+                let original_function_delta = function
+                    .section_offset
+                    .checked_sub(section.original_offset_start)?;
+                let mapped_function_delta =
+                    function.mapped_entry.checked_sub(section.mapped_va_start)?;
+                let mapped_span = function.mapped_end.checked_sub(function.mapped_entry)?;
+                let original_function_end = function
+                    .section_offset
+                    .checked_add(function.original_size)?;
+                (section.kind == "Text"
+                    && original_section_size == mapped_section_size
+                    && original_function_delta == mapped_function_delta
+                    && mapped_span == function.manifold_size
+                    && function.original_size == function.manifold_size
+                    && function.mapped_end <= section.mapped_va_end
+                    && original_function_end <= section.original_offset_end)
+                    .then_some(section_index)
+            })
+            .collect();
+        let functions = ScalarIntervalIndex::new(
+            map.functions
+                .iter()
+                .enumerate()
+                .map(|(payload, function)| ScalarInterval {
+                    start: function.mapped_entry,
+                    end: function.mapped_end,
+                    payload,
+                })
+                .collect(),
+        );
+
+        let mut mapped_relocations = Vec::new();
+        let mut original_relocations: BTreeMap<usize, Vec<ScalarInterval>> = BTreeMap::new();
+        let mut relocation_section_names: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
+        let mut relocations_well_formed = true;
+        for (payload, relocation) in map.relocations.iter().enumerate() {
+            let width = u64::from(relocation.width_bits).div_ceil(8).max(1);
+            let Some(mapped_end) = relocation.mapped_field_va.checked_add(width) else {
+                relocations_well_formed = false;
+                continue;
+            };
+            let Some(original_end) = relocation.section_offset.checked_add(width) else {
+                relocations_well_formed = false;
+                continue;
+            };
+            mapped_relocations.push(ScalarInterval {
+                start: relocation.mapped_field_va,
+                end: mapped_end,
+                payload,
+            });
+            original_relocations
+                .entry(relocation.section_index)
+                .or_default()
+                .push(ScalarInterval {
+                    start: relocation.section_offset,
+                    end: original_end,
+                    payload,
+                });
+            relocation_section_names
+                .entry(relocation.section_index)
+                .or_default()
+                .insert(relocation.section_name.clone());
+        }
+
+        Self {
+            functions,
+            valid_function_section,
+            mapped_relocations: ScalarIntervalIndex::new(mapped_relocations),
+            original_relocations: original_relocations
+                .into_iter()
+                .map(|(section, intervals)| (section, ScalarIntervalIndex::new(intervals)))
+                .collect(),
+            relocation_section_names,
+            relocations_well_formed,
+        }
+    }
+}
+
+/// Authenticate scalar MOV-family accesses only after RTL optimization has
+/// selected and rewritten the surviving memory effects.  Every rejected or
+/// ambiguous input produces no row; the ordinary decompilation path is never
+/// removed or rewritten here.
+fn materialize_authenticated_scalar_memory_accesses(db: &mut DecompileDB) {
+    let Some(coff_map) = db.coff_address_map.as_ref() else {
+        db.rel_set(
+            "authenticated_scalar_memory_access",
+            ascent::boxcar::Vec::<(Node, ScalarMemoryAccessProof)>::new(),
+        );
+        return;
+    };
+    if coff_map.schema != "manifold.coff-address-map.v1"
+        || coff_map.loader_id != "amd64-coff-image-v1"
+        || coff_map.architecture != "x86_64-pc-windows-msvc"
+    {
+        db.rel_set(
+            "authenticated_scalar_memory_access",
+            ascent::boxcar::Vec::<(Node, ScalarMemoryAccessProof)>::new(),
+        );
+        return;
+    }
+    let coff_index = ScalarCoffIndex::new(coff_map);
+    if !coff_index.relocations_well_formed {
+        db.rel_set(
+            "authenticated_scalar_memory_access",
+            ascent::boxcar::Vec::<(Node, ScalarMemoryAccessProof)>::new(),
+        );
+        return;
+    }
+
+    let mut owners: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for (node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        owners.entry(*node).or_default().insert(*function);
+    }
+    let mut instructions: BTreeMap<Node, Vec<Cr8RawInstruction>> = BTreeMap::new();
+    for (node, size, prefix, mnemonic, op1, op2, op3, op4, metadata0, metadata1) in
+        db.rel_iter::<(
+            Node,
+            usize,
+            &'static str,
+            &'static str,
+            Symbol,
+            Symbol,
+            Symbol,
+            Symbol,
+            usize,
+            usize,
+        )>("instruction")
+    {
+        instructions.entry(*node).or_default().push((
+            *size, *prefix, *mnemonic, *op1, *op2, *op3, *op4, *metadata0, *metadata1,
+        ));
+    }
+    let mut raw_instructions: BTreeMap<Node, Vec<Cr8RawInstruction>> = BTreeMap::new();
+    for (node, size, prefix, mnemonic, op1, op2, op3, op4, metadata0, metadata1) in
+        db.rel_iter::<(
+            Node,
+            usize,
+            &'static str,
+            &'static str,
+            Symbol,
+            Symbol,
+            Symbol,
+            Symbol,
+            usize,
+            usize,
+        )>("unrefinedinstruction")
+    {
+        raw_instructions.entry(*node).or_default().push((
+            *size, *prefix, *mnemonic, *op1, *op2, *op3, *op4, *metadata0, *metadata1,
+        ));
+    }
+    let mut indirects: BTreeMap<Symbol, BTreeSet<ScalarIndirectOperand>> = BTreeMap::new();
+    for (operand, segment, base, index, scale, displacement, width) in db.rel_iter::<(
+        Symbol,
+        &'static str,
+        &'static str,
+        &'static str,
+        i64,
+        i64,
+        usize,
+    )>("op_indirect")
+    {
+        indirects.entry(*operand).or_default().insert((
+            *segment,
+            *base,
+            *index,
+            *scale,
+            *displacement,
+            *width,
+        ));
+    }
+    let mut registers: BTreeMap<Symbol, BTreeSet<&'static str>> = BTreeMap::new();
+    for (operand, register) in db.rel_iter::<(Symbol, &'static str)>("op_register") {
+        registers.entry(*operand).or_default().insert(*register);
+    }
+    let immediate_operands: BTreeSet<Symbol> = db
+        .rel_iter::<(Symbol, i64, usize)>("op_immediate")
+        .map(|row| row.0)
+        .collect();
+    let mut reads: BTreeMap<Node, BTreeSet<Symbol>> = BTreeMap::new();
+    for (node, operand) in db.rel_iter::<(Node, Symbol)>("decoded_memory_read_operand") {
+        reads.entry(*node).or_default().insert(*operand);
+    }
+    let mut writes: BTreeMap<Node, BTreeSet<Symbol>> = BTreeMap::new();
+    for (node, operand) in db.rel_iter::<(Node, Symbol)>("decoded_memory_write_operand") {
+        writes.entry(*node).or_default().insert(*operand);
+    }
+    let mut decoded_register_defs: BTreeMap<Node, BTreeSet<Mreg>> = BTreeMap::new();
+    for (node, register) in db.rel_iter::<(Node, Mreg)>("decoded_reg_def") {
+        decoded_register_defs
+            .entry(*node)
+            .or_default()
+            .insert(*register);
+    }
+    let mut decoded_register_uses: BTreeMap<Node, BTreeSet<Mreg>> = BTreeMap::new();
+    for (node, register) in db.rel_iter::<(Node, Mreg)>("decoded_reg_use") {
+        decoded_register_uses
+            .entry(*node)
+            .or_default()
+            .insert(*register);
+    }
+    let mut address_sizes: BTreeMap<Node, BTreeSet<u8>> = BTreeMap::new();
+    for (node, size) in db.rel_iter::<(Node, u8)>("instruction_address_size") {
+        address_sizes.entry(*node).or_default().insert(*size);
+    }
+    let mut ltl: BTreeMap<Node, Vec<LTLInst>> = BTreeMap::new();
+    for (node, inst) in db.rel_iter::<(Node, LTLInst)>("ltl_inst") {
+        ltl.entry(*node).or_default().push(inst.clone());
+    }
+    let mut final_rtl: BTreeMap<Node, Vec<RTLInst>> = BTreeMap::new();
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        final_rtl.entry(*node).or_default().push(inst.clone());
+    }
+    let mut definitions: BTreeMap<RTLReg, BTreeSet<Node>> = BTreeMap::new();
+    let mut uses: BTreeMap<RTLReg, Vec<Node>> = BTreeMap::new();
+    for (node, rows) in &final_rtl {
+        for inst in rows {
+            let (definition, inst_uses) = inst_def_use(inst);
+            if let Some(value) = definition {
+                definitions.entry(value).or_default().insert(*node);
+            }
+            for value in inst_uses {
+                uses.entry(value).or_default().push(*node);
+            }
+        }
+    }
+    // A memory-indirect call's address inputs are carried outside final RTL
+    // after the target load is folded.  Count them exactly as the optimizer's
+    // liveness model does, so such a hidden call use cannot masquerade as the
+    // address DAG's sole scalar-memory consumer.
+    for (node, _temp, _chunk, _addressing, args) in
+        db.rel_iter::<(Node, RTLReg, MemoryChunk, Addressing, Arc<Vec<RTLReg>>)>(
+            "call_through_memory_load",
+        )
+    {
+        for value in args.iter() {
+            uses.entry(*value).or_default().push(*node);
+        }
+    }
+    for nodes in uses.values_mut() {
+        nodes.sort_unstable();
+    }
+    let mut function_nodes: BTreeMap<Address, BTreeSet<Node>> = BTreeMap::new();
+    for (node, functions) in &owners {
+        if functions.len() == 1 {
+            function_nodes
+                .entry(*functions.iter().next().expect("one owner"))
+                .or_default()
+                .insert(*node);
+        }
+    }
+    let mut input_rtl: BTreeMap<Node, Vec<RTLInst>> = BTreeMap::new();
+    for (node, inst) in db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate") {
+        input_rtl.entry(*node).or_default().push(inst.clone());
+    }
+    let mut succs: HashMap<Node, Vec<Node>> = HashMap::new();
+    for (source, target) in db.rel_iter::<(Node, Node)>("rtl_succ") {
+        succs.entry(*source).or_default().push(*target);
+    }
+    for targets in succs.values_mut() {
+        targets.sort_unstable();
+        targets.dedup();
+    }
+    let params: BTreeSet<(Address, RTLReg)> = db
+        .rel_iter::<(Address, RTLReg)>("emit_function_param_candidate")
+        .copied()
+        .collect();
+    let inline_temps: BTreeSet<RTLReg> =
+        db.rel_iter::<RTLReg>("emit_inline_temp").copied().collect();
+    let mut value_type_candidates: BTreeMap<RTLReg, BTreeSet<XType>> = BTreeMap::new();
+    for (value, xtype) in db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate") {
+        value_type_candidates
+            .entry(*value)
+            .or_default()
+            .insert(*xtype);
+    }
+    let entries: BTreeMap<Address, BTreeSet<Node>> = {
+        let mut grouped = BTreeMap::new();
+        for (function, _, entry) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
+            grouped
+                .entry(*function)
+                .or_insert_with(BTreeSet::new)
+                .insert(*entry);
+        }
+        grouped
+    };
+
+    let mut proofs = Vec::new();
+    let mut address_closure_cache = ScalarAddressClosureCache::new();
+    for (selected_node, final_rows) in &final_rtl {
+        let Some(final_inst) = unique_equal(final_rows) else {
+            continue;
+        };
+        let (final_chunk, final_addressing, final_args, value, direction) = match final_inst {
+            RTLInst::Iload(chunk, addressing, args, destination) => (
+                *chunk,
+                addressing,
+                args,
+                *destination,
+                ScalarMemoryDirection::Read,
+            ),
+            RTLInst::Istore(chunk, addressing, args, source) => (
+                *chunk,
+                addressing,
+                args,
+                *source,
+                ScalarMemoryDirection::Write,
+            ),
+            _ => continue,
+        };
+        let origin = *selected_node & !SCALAR_LVALUE_SYNTHETIC_MASK;
+        let synthetic = origin != *selected_node;
+        if synthetic && *selected_node != (origin | (1u64 << 62)) {
+            continue;
+        }
+        let Some(function) = owners.get(&origin).and_then(|rows| {
+            (rows.len() == 1)
+                .then(|| rows.iter().next().copied())
+                .flatten()
+        }) else {
+            continue;
+        };
+        if owners
+            .get(selected_node)
+            .map_or(true, |rows| rows.len() != 1 || !rows.contains(&function))
+        {
+            continue;
+        }
+        let Some(origin_end) = origin.checked_add(1) else {
+            continue;
+        };
+        let Some(mapped_function_index) = coff_index
+            .functions
+            .unique_overlap_payload(origin, origin_end)
+        else {
+            continue;
+        };
+        let mapped_function = &coff_map.functions[mapped_function_index];
+        if mapped_function.mapped_entry != function {
+            continue;
+        }
+        let Some(section_index) = coff_index.valid_function_section[mapped_function_index] else {
+            continue;
+        };
+        let section = &coff_map.sections[section_index];
+        let Some(instruction) = instructions
+            .get(&origin)
+            .and_then(|rows| unique_equal(rows))
+        else {
+            continue;
+        };
+        if raw_instructions
+            .get(&origin)
+            .and_then(|rows| unique_equal(rows))
+            != Some(instruction)
+            || instruction.1 != ""
+            || exact_raw_operand_count(instruction) != Some(2)
+        {
+            continue;
+        }
+        let instruction_end = match origin.checked_add(instruction.0 as u64) {
+            Some(end) => end,
+            None => continue,
+        };
+        if instruction_end > mapped_function.mapped_end {
+            continue;
+        }
+        let Some(instruction_delta) = origin.checked_sub(mapped_function.mapped_entry) else {
+            continue;
+        };
+        let Some(original_instruction_start) = mapped_function
+            .section_offset
+            .checked_add(instruction_delta)
+        else {
+            continue;
+        };
+        let Some(original_instruction_end) =
+            original_instruction_start.checked_add(instruction.0 as u64)
+        else {
+            continue;
+        };
+        let mapped_relocation_overlap = coff_index
+            .mapped_relocations
+            .has_overlap(origin, instruction_end);
+        let original_relocation_overlap = coff_index
+            .original_relocations
+            .get(&mapped_function.section_index)
+            .is_some_and(|intervals| {
+                intervals.has_overlap(original_instruction_start, original_instruction_end)
+            });
+        let wrong_relocation_section_name = coff_index
+            .relocation_section_names
+            .get(&mapped_function.section_index)
+            .is_some_and(|names| names.iter().any(|name| name != &section.name));
+        if mapped_relocation_overlap || original_relocation_overlap || wrong_relocation_section_name
+        {
+            continue;
+        }
+
+        let (register_operand, memory_operand) = match direction {
+            // The instruction relation is source-first/destination-second,
+            // matching AsmPass's pmov normalization.
+            ScalarMemoryDirection::Read => (instruction.4, instruction.3),
+            ScalarMemoryDirection::Write => (instruction.3, instruction.4),
+        };
+        if indirects.contains_key(&register_operand)
+            || immediate_operands.contains(&register_operand)
+            || registers.contains_key(&memory_operand)
+            || immediate_operands.contains(&memory_operand)
+        {
+            continue;
+        }
+        let Some(register_name) = registers.get(&register_operand).and_then(|rows| {
+            (rows.len() == 1)
+                .then(|| rows.iter().next().copied())
+                .flatten()
+        }) else {
+            continue;
+        };
+        let Some(value_width) = x86_scalar_register_width(register_name) else {
+            continue;
+        };
+        let Some((segment, base_name, index_name, scale, displacement, width)) =
+            indirects.get(&memory_operand).and_then(|rows| {
+                (rows.len() == 1)
+                    .then(|| rows.iter().next().copied())
+                    .flatten()
+            })
+        else {
+            continue;
+        };
+        if segment != "NONE" {
+            continue;
+        }
+        let Some((extension, canonical_chunk)) =
+            scalar_mov_semantics(instruction.2, direction, width, value_width)
+        else {
+            continue;
+        };
+        let Some(companion_required) = scalar_transport_companion_required(
+            canonical_chunk,
+            final_chunk,
+            direction,
+            extension,
+            width,
+            value_width,
+        ) else {
+            continue;
+        };
+        // v1 does not replay copy propagation inside an address. The final
+        // row must occur exactly once among the input candidates; only
+        // AsmPass's sole same-width signedness companion may coexist with it.
+        let Some(input_rows) = input_rtl.get(selected_node) else {
+            continue;
+        };
+        if !scalar_rtl_rows_match(
+            input_rows,
+            direction,
+            final_chunk,
+            width,
+            companion_required,
+            final_addressing,
+            final_args,
+            value,
+        ) {
+            continue;
+        }
+        // LTL and the proof must retain the exact selected transport chunk;
+        // the contract above authorizes raw-semantic equivalence, not a global
+        // chunk normalization.
+        let expected_chunk = final_chunk;
+        if reads.get(&origin).cloned().unwrap_or_default()
+            != if direction == ScalarMemoryDirection::Read {
+                BTreeSet::from([memory_operand])
+            } else {
+                BTreeSet::new()
+            }
+            || writes.get(&origin).cloned().unwrap_or_default()
+                != if direction == ScalarMemoryDirection::Write {
+                    BTreeSet::from([memory_operand])
+                } else {
+                    BTreeSet::new()
+                }
+        {
+            continue;
+        }
+        let Some(address_size) = address_sizes.get(&origin).and_then(|rows| {
+            (rows.len() == 1)
+                .then(|| rows.iter().next().copied())
+                .flatten()
+        }) else {
+            continue;
+        };
+        let Some((expected_addressing, expected_mregs, indexed_stack)) =
+            decoded_scalar_addressing(base_name, index_name, scale, displacement, address_size)
+        else {
+            continue;
+        };
+        let expected_value_mreg = Mreg::x86(register_name);
+        let mut expected_register_uses: BTreeSet<Mreg> = expected_mregs.iter().copied().collect();
+        let expected_register_defs = match direction {
+            ScalarMemoryDirection::Read => BTreeSet::from([expected_value_mreg]),
+            ScalarMemoryDirection::Write => {
+                expected_register_uses.insert(expected_value_mreg);
+                BTreeSet::new()
+            }
+        };
+        if decoded_register_defs
+            .get(&origin)
+            .cloned()
+            .unwrap_or_default()
+            != expected_register_defs
+            || decoded_register_uses
+                .get(&origin)
+                .cloned()
+                .unwrap_or_default()
+                != expected_register_uses
+        {
+            continue;
+        }
+        let Some(ltl_rows) = ltl.get(&origin) else {
+            continue;
+        };
+        if !scalar_ltl_rows_match(
+            ltl_rows,
+            direction,
+            expected_chunk,
+            width,
+            companion_required,
+            &expected_addressing,
+            &expected_mregs,
+            expected_value_mreg,
+        ) || synthetic != indexed_stack
+        {
+            continue;
+        }
+
+        let (base_value, index_value) = if synthetic {
+            let Some(origin_rtl) = final_rtl.get(&origin).and_then(|rows| unique_equal(rows))
+            else {
+                continue;
+            };
+            let Some(base_value) = (match origin_rtl {
+                RTLInst::Iop(Operation::Olea(Addressing::Ainstack(ofs)), args, destination)
+                    if *ofs == displacement && args.is_empty() =>
+                {
+                    Some(*destination)
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            let expected_synthetic_addressing = match expected_addressing {
+                Addressing::Aindexed2(_) => Addressing::Aindexed2(0),
+                Addressing::Aindexed2scaled(decoded_scale, _) => {
+                    Addressing::Aindexed2scaled(decoded_scale, 0)
+                }
+                _ => continue,
+            };
+            if *final_addressing != expected_synthetic_addressing
+                || final_args.len() != 2
+                || final_args[0] != base_value
+                || !succs
+                    .get(&origin)
+                    .is_some_and(|targets| targets.as_slice() == [*selected_node])
+            {
+                continue;
+            }
+            (Some(base_value), Some(final_args[1]))
+        } else {
+            if *final_addressing != expected_addressing || final_args.len() != expected_mregs.len()
+            {
+                continue;
+            }
+            (final_args.first().copied(), final_args.get(1).copied())
+        };
+        let downstream_value_width = match (direction, extension) {
+            // MOVSX/MOVZX define the architectural result width and
+            // signedness independently of the source chunk.  The early type
+            // pass often still carries that narrow chunk type for `value`;
+            // the final pre-Csh gate removes only that exact lowering
+            // artifact, publishes the opcode-defined result type, and rejects
+            // every other late incompatible type.
+            (ScalarMemoryDirection::Read, extension)
+                if extension != ScalarMemoryExtension::Plain =>
+            {
+                Some(value_width)
+            }
+            (ScalarMemoryDirection::Read, ScalarMemoryExtension::Plain) => {
+                let Some(types) = value_type_candidates
+                    .get(&value)
+                    .filter(|types| !types.is_empty())
+                else {
+                    continue;
+                };
+                let widths: Option<BTreeSet<usize>> = types
+                    .iter()
+                    .copied()
+                    .map(scalar_integral_xtype_width)
+                    .collect();
+                let Some(widths) = widths else {
+                    continue;
+                };
+                let Some(width) = (widths.len() == 1)
+                    .then(|| widths.iter().next().copied())
+                    .flatten()
+                else {
+                    continue;
+                };
+                if width != value_width {
+                    continue;
+                }
+                Some(width)
+            }
+            // Keep the guarded extension arm fail-closed if the enum grows or
+            // its predicate changes; guards do not make a match exhaustive.
+            (ScalarMemoryDirection::Read, _) => continue,
+            (ScalarMemoryDirection::Write, ScalarMemoryExtension::Plain) => None,
+            (ScalarMemoryDirection::Write, _) => continue,
+        };
+        let roots: Vec<_> = base_value.into_iter().chain(index_value).collect();
+        let Some(entry) = entries.get(&function).and_then(|rows| {
+            (rows.len() == 1)
+                .then(|| rows.iter().next().copied())
+                .flatten()
+        }) else {
+            continue;
+        };
+        let Some(owned_nodes) = function_nodes.get(&function) else {
+            continue;
+        };
+        let Some(address_param_leaves) = scalar_address_param_leaves(
+            function,
+            *selected_node,
+            &roots,
+            entry,
+            owned_nodes,
+            &definitions,
+            &final_rtl,
+            &uses,
+            &succs,
+            &params,
+            &inline_temps,
+            synthetic.then_some((origin, base_value.expect("synthetic stack base"))),
+            &mut address_closure_cache,
+        ) else {
+            continue;
+        };
+
+        let proof = ScalarMemoryAccessProof {
+            function,
+            origin_node: origin,
+            selected_node: *selected_node,
+            operand: memory_operand,
+            direction,
+            extension,
+            address_size,
+            base_register: Mreg::x86(base_name),
+            index_register: (!matches!(index_name, "" | "NONE")).then(|| Mreg::x86(index_name)),
+            scale,
+            displacement,
+            width,
+            value_width,
+            downstream_value_width,
+            chunk: final_chunk,
+            base_value,
+            index_value,
+            value,
+            address_param_leaves,
+            synthetic_stack_origin: synthetic,
+            exact_scaled_index: address_size == 8
+                && index_value.is_some()
+                && (displacement == 0 || synthetic)
+                && scale == width as i64,
+        };
+        if proof.is_closed_v1() {
+            proofs.push(proof);
+        }
+    }
+
+    proofs.sort();
+    proofs.dedup();
+    db.rel_set(
+        "authenticated_scalar_memory_access",
+        proofs
+            .into_iter()
+            .map(|proof| (proof.selected_node, proof))
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
 }
 
 /// Recover the one width fact which the Mach condition algebra cannot carry:
@@ -1351,6 +4610,7 @@ impl IRPass for RTLOptimizePass {
             }
         }
         materialize_cr8_byte_compares(db);
+        materialize_authenticated_scalar_memory_accesses(db);
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -1384,6 +4644,7 @@ impl IRPass for RTLOptimizePass {
             "call_arg",
             "call_args_collected_candidate",
             "cr8_byte_compare",
+            "authenticated_scalar_memory_access",
             // Static-eq branch folding can retype a function void; these signal that to the signature reconciliation pass.
             "emit_function_void_candidate",
             "emit_function_has_return_candidate",
@@ -1414,6 +4675,11 @@ impl IRPass for RTLOptimizePass {
             "op_indirect",
             "instruction",
             "unrefinedinstruction",
+            "decoded_memory_read_operand",
+            "decoded_memory_write_operand",
+            "decoded_reg_def",
+            "decoded_reg_use",
+            "instruction_address_size",
         ]
     }
 }

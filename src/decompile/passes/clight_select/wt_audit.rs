@@ -162,7 +162,7 @@ impl<'a> AuditEnv<'a> {
         AuditEnv { temps, fields, known_composites, ret, callee_sigs, name_to_ident }
     }
 
-    fn build(
+    pub(crate) fn build(
         func: &'a FunctionData,
         sel: &SelectedFunction,
         name_to_ident: &'a HashMap<String, Ident>,
@@ -202,6 +202,19 @@ impl<'a> AuditEnv<'a> {
             name_to_ident,
         }
     }
+}
+
+pub(crate) fn selected_error_count(
+    func: &FunctionData,
+    selected: &SelectedFunction,
+    name_to_ident: &HashMap<String, Ident>,
+) -> usize {
+    let env = AuditEnv::build(func, selected, name_to_ident);
+    selected
+        .statements
+        .values()
+        .map(|statement| ctyping::error_count(&ctyping::wt_check_stmt(statement, &env)))
+        .sum()
 }
 
 impl WtEnv for AuditEnv<'_> {

@@ -17,6 +17,7 @@ struct SelectionState {
     candidate_idx: HashMap<Node, Option<usize>>,
 }
 
+#[derive(Clone)]
 pub(crate) struct ProgramSelectionState {
     /// (func_addr, node) -> candidate index
     pub(crate) candidate_idx: HashMap<(Address, Node), Option<usize>>,
@@ -57,6 +58,17 @@ pub struct SelectedFunction {
     pub reg_struct_ids: HashMap<RTLReg, usize>,
 
     pub loop_info: HashMap<Node, LoopInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScalarLvalueSelectedAlternative {
+    pub function: SelectedFunction,
+}
+
+#[derive(Debug)]
+pub struct ClightSelectionResult {
+    pub canonical: Vec<SelectedFunction>,
+    pub scalar_lvalue_alternatives: Vec<ScalarLvalueSelectedAlternative>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -414,7 +426,410 @@ pub(crate) fn unsupported_functions_requiring_omission(db: &DecompileDB) -> Hash
     unsupported_functions_requiring_omission_from_validation(&validation)
 }
 
-pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, String> {
+/// Construct the only view in which scalar-lvalue statements are selectable.
+/// The canonical candidate pool is never mutated: ordinary nodes and every
+/// declaration type are frozen to the already-solved primary, while each
+/// authenticated Plain-MOV node receives only its closed expected-form
+/// candidates. Extension loads remain provenance-only in this checkpoint;
+/// their result/ABI normalization must be implemented inside a later isolated
+/// feature stage before they can be emitted safely.
+fn scalar_lvalue_feature_view(
+    function: &FunctionData,
+    canonical: &SelectedFunction,
+    canonical_state: &ProgramSelectionState,
+) -> Option<FunctionData> {
+    let mut nodes: Vec<Node> = function
+        .scalar_lvalue_proofs
+        .iter()
+        .filter_map(|(node, proofs)| {
+            proofs
+                .iter()
+                .any(|proof| proof.extension == ScalarMemoryExtension::Plain)
+                .then_some(*node)
+        })
+        .collect();
+    nodes.sort_unstable();
+    if nodes.is_empty() {
+        return None;
+    }
+    let mut feature_candidates = BTreeMap::new();
+    for node in &nodes {
+        let proofs = function.scalar_lvalue_proofs.get(node)?;
+        let mut plain = proofs
+            .iter()
+            .filter(|proof| proof.extension == ScalarMemoryExtension::Plain);
+        let proof = plain.next()?;
+        // A second Plain proof, or a conflicting extension interpretation at
+        // the same node, makes this node ineligible. Extension-only nodes at
+        // other addresses remain frozen to their canonical selections.
+        if plain.next().is_some() || proofs.len() != 1 {
+            return None;
+        }
+        if proof.function != function.address
+            || proof.selected_node != *node
+            || !proof.is_closed_v1()
+        {
+            return None;
+        }
+        let expected = if proof.exact_scaled_index {
+            ScalarLvalueSourceForm::TypedScaled
+        } else {
+            ScalarLvalueSourceForm::RawByte
+        };
+        let tagged = function.scalar_lvalue_source_candidates.get(node)?;
+        if !proof.exact_scaled_index
+            && tagged
+                .iter()
+                .any(|(form, _)| *form != ScalarLvalueSourceForm::RawByte)
+        {
+            return None;
+        }
+        let mut candidates: Vec<ClightStmt> = tagged
+            .iter()
+            .filter(|(form, _)| *form == expected)
+            .map(|(_, statement)| statement.clone())
+            .collect();
+        candidates.sort_by_cached_key(|statement| format!("{:?}", statement));
+        candidates.dedup();
+        if candidates.is_empty() {
+            return None;
+        }
+        feature_candidates.insert(*node, candidates);
+    }
+
+    let mut fixed = function.clone();
+    for (node, candidates) in &mut fixed.node_statements {
+        if let Some(feature) = feature_candidates.remove(node) {
+            *candidates = feature;
+            continue;
+        }
+        let index = canonical_state
+            .candidate_idx
+            .get(&(function.address, *node))
+            .copied()
+            .flatten()?;
+        *candidates = vec![candidates.get(index)?.clone()];
+    }
+    // Every proof node must replace an existing canonical node. A detached
+    // tagged statement cannot create a new CFG node in the feature view.
+    if !feature_candidates.is_empty() {
+        return None;
+    }
+
+    fixed.var_types = canonical.var_types.clone();
+    fixed.var_type_candidates.clear();
+    fixed.var_decl_idx.clear();
+    for (reg, candidates) in &canonical.var_type_candidates {
+        let index = canonical.var_decl_idx.get(reg).copied().unwrap_or(0);
+        fixed
+            .var_type_candidates
+            .insert(*reg, vec![candidates.get(index)?.clone()]);
+        fixed.var_decl_idx.insert(*reg, 0);
+    }
+    fixed.scalar_lvalue_proofs.clear();
+    fixed.scalar_lvalue_source_candidates.clear();
+    Some(fixed)
+}
+
+#[cfg(test)]
+mod scalar_lvalue_alternative_tests {
+    use super::*;
+    use crate::mreg::Mreg;
+
+    fn statement(value: i32) -> ClightStmt {
+        ClightStmt::Sset(
+            9,
+            ClightExpr::EconstInt(
+                value,
+                ClightType::Tint(
+                    ClightIntSize::I32,
+                    ClightSignedness::Signed,
+                    ClightAttr::default(),
+                ),
+            ),
+        )
+    }
+
+    fn function() -> FunctionData {
+        FunctionData::new(0x1000, "f".into(), Vec::new(), Vec::new(), None, 0, 0x1000)
+    }
+
+    fn proof_for_form(node: Node, form: ScalarLvalueSourceForm) -> ScalarMemoryAccessProof {
+        let scaled = form == ScalarLvalueSourceForm::TypedScaled;
+        ScalarMemoryAccessProof {
+            function: 0x1000,
+            origin_node: node,
+            selected_node: node,
+            operand: "mem0",
+            direction: ScalarMemoryDirection::Read,
+            extension: ScalarMemoryExtension::Plain,
+            address_size: 8,
+            base_register: Mreg::AX,
+            index_register: scaled.then_some(Mreg::CX),
+            scale: if scaled { 4 } else { 1 },
+            displacement: 0,
+            width: 4,
+            value_width: 4,
+            downstream_value_width: Some(4),
+            chunk: MemoryChunk::MInt32,
+            base_value: Some(1),
+            index_value: scaled.then_some(2),
+            value: 3,
+            address_param_leaves: std::sync::Arc::new(vec![1]),
+            synthetic_stack_origin: false,
+            exact_scaled_index: scaled,
+        }
+    }
+
+    #[test]
+    fn feature_view_isolates_canonical_candidates_and_keeps_plain_multiplicity() {
+        let mut function = function();
+        function
+            .var_type_candidates
+            .insert(9, vec!["int_I32".to_string()]);
+        function.var_decl_idx.insert(9, 0);
+        for (node, form, alternatives) in [
+            (
+                0x1000,
+                ScalarLvalueSourceForm::RawByte,
+                vec![statement(1), statement(2)],
+            ),
+            (
+                0x1004,
+                ScalarLvalueSourceForm::TypedScaled,
+                vec![statement(3)],
+            ),
+        ] {
+            function
+                .node_statements
+                .insert(node, vec![statement(0)]);
+            function
+                .scalar_lvalue_proofs
+                .insert(node, vec![proof_for_form(node, form)]);
+            function
+                .scalar_lvalue_source_candidates
+                .insert(node, alternatives.into_iter().map(|s| (form, s)).collect());
+        }
+        let canonical_state = ProgramSelectionState {
+            candidate_idx: [(0x1000, 0x1000), (0x1000, 0x1004)]
+                .into_iter()
+                .map(|key| (key, Some(0)))
+                .collect(),
+            var_decl_idx: HashMap::new(),
+            var_type_override: HashMap::new(),
+        };
+        let canonical = build_selected_function_from_program_state(
+            &function,
+            &canonical_state,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let fixed = scalar_lvalue_feature_view(&function, &canonical, &canonical_state).unwrap();
+
+        assert_eq!(function.node_statements[&0x1000], vec![statement(0)]);
+        assert_eq!(canonical.statements[&0x1000], statement(0));
+        assert_eq!(fixed.node_statements[&0x1000].len(), 2);
+        assert!(fixed.node_statements[&0x1000].contains(&statement(1)));
+        assert!(fixed.node_statements[&0x1000].contains(&statement(2)));
+        assert_eq!(fixed.node_statements[&0x1004], vec![statement(3)]);
+
+        let solved =
+            crate::decompile::passes::clight_select::solve::solve_fixed_feature_selection(
+                &fixed,
+                &HashMap::new(),
+            )
+            .expect("hard feature solve");
+        assert!(matches!(
+            solved.candidate_idx.get(&(0x1000, 0x1000)),
+            Some(Some(index)) if *index < 2
+        ));
+        assert_eq!(
+            solved.candidate_idx.get(&(0x1000, 0x1004)),
+            Some(&Some(0))
+        );
+        assert_eq!(solved.var_decl_idx.get(&(0x1000, 9)), Some(&0));
+    }
+
+    #[test]
+    fn feature_view_rejects_missing_ambiguous_or_extension_proofs() {
+        let mut function = function();
+        function
+            .node_statements
+            .insert(0x1000, vec![statement(0)]);
+        function.scalar_lvalue_proofs.insert(
+            0x1000,
+            vec![proof_for_form(0x1000, ScalarLvalueSourceForm::TypedScaled)],
+        );
+        let canonical_state = ProgramSelectionState {
+            candidate_idx: [((0x1000, 0x1000), Some(0))].into_iter().collect(),
+            var_decl_idx: HashMap::new(),
+            var_type_override: HashMap::new(),
+        };
+        let canonical = build_selected_function_from_program_state(
+            &function,
+            &canonical_state,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(scalar_lvalue_feature_view(&function, &canonical, &canonical_state).is_none());
+
+        function.scalar_lvalue_source_candidates.insert(
+            0x1000,
+            vec![(ScalarLvalueSourceForm::TypedScaled, statement(1))],
+        );
+        function.scalar_lvalue_proofs.get_mut(&0x1000).unwrap().push(
+            proof_for_form(0x1000, ScalarLvalueSourceForm::RawByte),
+        );
+        assert!(scalar_lvalue_feature_view(&function, &canonical, &canonical_state).is_none());
+
+        function.scalar_lvalue_proofs.get_mut(&0x1000).unwrap().truncate(1);
+        function.scalar_lvalue_proofs.get_mut(&0x1000).unwrap()[0].extension =
+            ScalarMemoryExtension::ZeroExtend;
+        assert!(scalar_lvalue_feature_view(&function, &canonical, &canonical_state).is_none());
+    }
+
+    #[test]
+    fn feature_view_forces_plain_nodes_and_freezes_unrelated_extension_nodes() {
+        let mut function = function();
+        function
+            .node_statements
+            .insert(0x1000, vec![statement(0)]);
+        function
+            .node_statements
+            .insert(0x1004, vec![statement(4)]);
+        function.scalar_lvalue_proofs.insert(
+            0x1000,
+            vec![proof_for_form(0x1000, ScalarLvalueSourceForm::RawByte)],
+        );
+        let mut extension = proof_for_form(0x1004, ScalarLvalueSourceForm::RawByte);
+        extension.extension = ScalarMemoryExtension::ZeroExtend;
+        function.scalar_lvalue_proofs.insert(0x1004, vec![extension]);
+        function.scalar_lvalue_source_candidates.insert(
+            0x1000,
+            vec![(ScalarLvalueSourceForm::RawByte, statement(1))],
+        );
+        function.scalar_lvalue_source_candidates.insert(
+            0x1004,
+            vec![(ScalarLvalueSourceForm::RawByte, statement(5))],
+        );
+        let canonical_state = ProgramSelectionState {
+            candidate_idx: [
+                ((0x1000, 0x1000), Some(0)),
+                ((0x1000, 0x1004), Some(0)),
+            ]
+            .into_iter()
+            .collect(),
+            var_decl_idx: HashMap::new(),
+            var_type_override: HashMap::new(),
+        };
+        let canonical = build_selected_function_from_program_state(
+            &function,
+            &canonical_state,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let fixed = scalar_lvalue_feature_view(&function, &canonical, &canonical_state).unwrap();
+        assert_eq!(fixed.node_statements[&0x1000], vec![statement(1)]);
+        assert_eq!(
+            fixed.node_statements[&0x1004],
+            vec![statement(4)],
+            "extension node must remain the exact canonical statement"
+        );
+    }
+
+    #[test]
+    fn feature_view_rejects_an_unproved_form_on_unscaled_plain_access() {
+        let mut function = function();
+        function
+            .node_statements
+            .insert(0x1000, vec![statement(0)]);
+        function.scalar_lvalue_proofs.insert(
+            0x1000,
+            vec![proof_for_form(0x1000, ScalarLvalueSourceForm::RawByte)],
+        );
+        function.scalar_lvalue_source_candidates.insert(
+            0x1000,
+            vec![
+                (ScalarLvalueSourceForm::RawByte, statement(1)),
+                (ScalarLvalueSourceForm::TypedScaled, statement(2)),
+            ],
+        );
+        let canonical_state = ProgramSelectionState {
+            candidate_idx: [((0x1000, 0x1000), Some(0))].into_iter().collect(),
+            var_decl_idx: HashMap::new(),
+            var_type_override: HashMap::new(),
+        };
+        let canonical = build_selected_function_from_program_state(
+            &function,
+            &canonical_state,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(scalar_lvalue_feature_view(&function, &canonical, &canonical_state).is_none());
+    }
+
+    fn canonical_isolation_db(extension: Option<ScalarMemoryExtension>) -> DecompileDB {
+        const FUNCTION: Address = 0x1000;
+        const NODE: Node = 0x1010;
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        db.rel_push("emit_function", (FUNCTION, "canonical_isolation", FUNCTION));
+        db.rel_push("instr_in_function", (NODE, FUNCTION));
+        db.rel_push(
+            "emit_clight_stmt",
+            (FUNCTION, NODE, ClightStmt::Sreturn(None)),
+        );
+        if let Some(extension) = extension {
+            let mut proof = proof_for_form(NODE, ScalarLvalueSourceForm::RawByte);
+            proof.extension = extension;
+            db.rel_push("scalar_lvalue_candidate", (NODE, proof));
+            db.rel_push(
+                "scalar_lvalue_source_candidate",
+                (NODE, ScalarLvalueSourceForm::RawByte, ClightStmt::Sskip),
+            );
+        }
+        db
+    }
+
+    #[test]
+    fn canonical_selection_is_identical_with_plain_or_extension_feature_evidence() {
+        let baseline = select_clight_stmts(&canonical_isolation_db(None))
+            .expect("baseline canonical selection");
+        let plain = select_clight_stmts(&canonical_isolation_db(Some(
+            ScalarMemoryExtension::Plain,
+        )))
+        .expect("plain-feature canonical selection");
+        let extension = select_clight_stmts(&canonical_isolation_db(Some(
+            ScalarMemoryExtension::ZeroExtend,
+        )))
+        .expect("extension-evidence canonical selection");
+
+        let canonical_fingerprint = |result: &ClightSelectionResult| {
+            let function = result
+                .canonical
+                .iter()
+                .find(|function| function.address == 0x1000)
+                .expect("canonical fixture function");
+            format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}",
+                function.return_type,
+                function.param_types,
+                function.statements,
+                function.var_type_candidates,
+                function.var_decl_idx
+            )
+        };
+        assert_eq!(canonical_fingerprint(&plain), canonical_fingerprint(&baseline));
+        assert_eq!(
+            canonical_fingerprint(&extension),
+            canonical_fingerprint(&baseline)
+        );
+        assert_eq!(plain.scalar_lvalue_alternatives.len(), 1);
+        assert!(extension.scalar_lvalue_alternatives.is_empty());
+    }
+}
+
+pub fn select_clight_stmts(db: &DecompileDB) -> Result<ClightSelectionResult, String> {
     let (mut functions, id_to_name) = extract_functions(db)?;
 
     // Arbitrary stack addresses cannot be represented faithfully in source.
@@ -587,6 +1002,58 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
         })
         .collect();
 
+    // Build at most one feature selection per function.  Every ordinary node
+    // and every declaration type is frozen to the canonical solve; all and
+    // only authenticated Plain-MOV scalar-lvalue nodes are replaced together
+    // while extension nodes remain canonical. The
+    // reduced singleton view is then re-solved through the complete hard
+    // constraint system and audited for zero final frontend typing errors.
+    let mut scalar_lvalue_alternatives = Vec::new();
+    for (func, canonical) in functions.iter().zip(selected.iter()) {
+        if scalar_lvalue_alternatives.len()
+            >= crate::decompile::postselect::source_alternatives::MAX_TOTAL_SOURCE_ALTERNATIVES / 2
+        {
+            break;
+        }
+        let Some(fixed) = scalar_lvalue_feature_view(func, canonical, &best_state) else {
+            continue;
+        };
+
+        let Some(feature_state) =
+            crate::decompile::passes::clight_select::solve::solve_fixed_feature_selection(
+                &fixed,
+                &name_to_ident,
+            )
+        else {
+            continue;
+        };
+        let mut alternative = build_selected_function_from_program_state(
+            &fixed,
+            &feature_state,
+            &loop_info_all,
+            &ite_info_all,
+        );
+        // The fixed solve authenticates statements under singleton canonical
+        // declaration types. Restore the exact canonical metadata before the
+        // feature clone crosses the emitter boundary; the sidecar is a source
+        // spelling alternative, never a declaration/ABI alternative.
+        alternative.var_types = canonical.var_types.clone();
+        alternative.var_type_candidates = canonical.var_type_candidates.clone();
+        alternative.var_decl_idx = canonical.var_decl_idx.clone();
+        if alternative.statements == canonical.statements
+            || crate::decompile::passes::clight_select::wt_audit::selected_error_count(
+                &fixed,
+                &alternative,
+                &name_to_ident,
+            ) != 0
+        {
+            continue;
+        }
+        scalar_lvalue_alternatives.push(ScalarLvalueSelectedAlternative {
+            function: alternative,
+        });
+    }
+
     // Read-only wt audit (CTYPING_PLAN.md P2): frontend-typing diagnoses over the selected statements/decls, stderr only.
     if std::env::var("MANIFOLD_WT_AUDIT_OFF").is_err() {
         crate::decompile::passes::clight_select::wt_audit::wt_audit(
@@ -668,8 +1135,12 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<Vec<SelectedFunction>, St
         }
     }
 
-    Ok(selected)
+    Ok(ClightSelectionResult {
+        canonical: selected,
+        scalar_lvalue_alternatives,
+    })
 }
+
 
 fn det_fp_stage(addr: Address, stage: &str, statements: &HashMap<Node, ClightStmt>) {
     if let Ok(want) = std::env::var("CF3_DUMP") {

@@ -17,7 +17,7 @@ use crate::decompile::passes::c_pass::types::{
 };
 use crate::decompile::passes::clight_select::select::SelectedFunction;
 
-pub const SOURCE_ALTERNATIVES_SCHEMA: &str = "manifold-source-alternatives-v1";
+pub const SOURCE_ALTERNATIVES_SCHEMA: &str = "manifold-source-alternatives-v2";
 pub const MAX_SOURCE_ALTERNATIVES_PER_FUNCTION: usize = 2;
 pub const MAX_TOTAL_SOURCE_ALTERNATIVES: usize = 4096;
 pub const MAX_SOURCE_ALTERNATIVE_BYTES: usize = 32 * 1024 * 1024;
@@ -110,6 +110,8 @@ pub fn final_source_alternative_exclusions(
 pub enum SourceAlternativeBoundary {
     PreForLoop,
     PreVarReduce,
+    ScalarLvaluePreVarReduce,
+    ScalarLvaluePostVarReduce,
 }
 
 impl SourceAlternativeBoundary {
@@ -117,6 +119,8 @@ impl SourceAlternativeBoundary {
         match self {
             Self::PreForLoop => "pre_forloop",
             Self::PreVarReduce => "pre_var_reduce",
+            Self::ScalarLvaluePreVarReduce => "scalar_lvalue_pre_var_reduce",
+            Self::ScalarLvaluePostVarReduce => "scalar_lvalue_post_var_reduce",
         }
     }
 }
@@ -131,6 +135,17 @@ pub struct SourceAlternativeSnapshot {
     pub manifold_address: u64,
     pub boundary: SourceAlternativeBoundary,
     pub kinds: Vec<&'static str>,
+    pub function: FuncDef,
+}
+
+/// Provider-owned typed-lvalue function assembled through the same Clight/C
+/// path as the canonical definition.  It is kept private until the two
+/// destructive post-selection boundaries have run; only then can the exact
+/// pre/post forms be admitted to the v2 wire manifest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingScalarLvalueAlternative {
+    pub manifold_name: String,
+    pub manifold_address: u64,
     pub function: FuncDef,
 }
 
@@ -451,6 +466,8 @@ pub fn snapshot_if_changed(
     let mut kinds = match boundary {
         SourceAlternativeBoundary::PreForLoop => vec!["control_layout"],
         SourceAlternativeBoundary::PreVarReduce => vec!["local_lifetime"],
+        SourceAlternativeBoundary::ScalarLvaluePreVarReduce
+        | SourceAlternativeBoundary::ScalarLvaluePostVarReduce => return None,
     };
     match boundary {
         SourceAlternativeBoundary::PreForLoop => {
@@ -471,6 +488,8 @@ pub fn snapshot_if_changed(
                 kinds.push("call_result");
             }
         }
+        SourceAlternativeBoundary::ScalarLvaluePreVarReduce
+        | SourceAlternativeBoundary::ScalarLvaluePostVarReduce => unreachable!(),
     }
     kinds.sort_unstable();
     kinds.dedup();
@@ -482,6 +501,44 @@ pub fn snapshot_if_changed(
         kinds,
         function: before.clone(),
     })
+}
+
+/// Atomically construct the two v2 typed-lvalue forms.  A caller cannot
+/// publish only one boundary: any identity/signature/equality failure rejects
+/// the pair before it reaches the bounded snapshot store.
+pub fn scalar_lvalue_snapshot_pair(
+    declaration_index: usize,
+    manifold_address: u64,
+    canonical: &FuncDef,
+    pre_var_reduce: &FuncDef,
+    post_var_reduce: &FuncDef,
+) -> Option<[SourceAlternativeSnapshot; 2]> {
+    if pre_var_reduce == post_var_reduce
+        || pre_var_reduce == canonical
+        || post_var_reduce == canonical
+        || !same_signature(canonical, pre_var_reduce)
+        || !same_signature(canonical, post_var_reduce)
+    {
+        return None;
+    }
+    Some([
+        SourceAlternativeSnapshot {
+            declaration_index,
+            manifold_name: canonical.name.clone(),
+            manifold_address,
+            boundary: SourceAlternativeBoundary::ScalarLvaluePreVarReduce,
+            kinds: vec!["local_lifetime", "typed_lvalue"],
+            function: pre_var_reduce.clone(),
+        },
+        SourceAlternativeSnapshot {
+            declaration_index,
+            manifold_name: canonical.name.clone(),
+            manifold_address,
+            boundary: SourceAlternativeBoundary::ScalarLvaluePostVarReduce,
+            kinds: vec!["typed_lvalue"],
+            function: post_var_reduce.clone(),
+        },
+    ])
 }
 
 #[derive(Serialize)]
@@ -635,8 +692,88 @@ fn render_manifest_with_limits(
         .enumerate()
         .map(|(function_ordinal, (declaration_index, _))| (*declaration_index, function_ordinal))
         .collect();
+    let is_scalar_lvalue_boundary = |boundary| {
+        matches!(
+            boundary,
+            SourceAlternativeBoundary::ScalarLvaluePreVarReduce
+                | SourceAlternativeBoundary::ScalarLvaluePostVarReduce
+        )
+    };
+    let mut feature_groups: HashMap<usize, Vec<&SourceAlternativeSnapshot>> = HashMap::new();
+    for snapshot in snapshots
+        .iter()
+        .filter(|snapshot| is_scalar_lvalue_boundary(snapshot.boundary))
+    {
+        feature_groups
+            .entry(snapshot.declaration_index)
+            .or_default()
+            .push(snapshot);
+    }
+    let valid_feature_declarations: HashSet<usize> = feature_groups
+        .into_iter()
+        .filter_map(|(declaration_index, group)| {
+            if group.len() != 2
+                || group
+                    .iter()
+                    .filter(|snapshot| {
+                        snapshot.boundary
+                            == SourceAlternativeBoundary::ScalarLvaluePreVarReduce
+                    })
+                    .count()
+                    != 1
+                || group
+                    .iter()
+                    .filter(|snapshot| {
+                        snapshot.boundary
+                            == SourceAlternativeBoundary::ScalarLvaluePostVarReduce
+                    })
+                    .count()
+                    != 1
+            {
+                return None;
+            }
+            let canonical = final_tu.decls.get(declaration_index).and_then(|declaration| {
+                if let TopLevelDecl::FuncDef(function) = declaration {
+                    Some(function)
+                } else {
+                    None
+                }
+            })?;
+            if group.iter().any(|snapshot| {
+                snapshot.manifold_name != canonical.name
+                    || !same_signature(canonical, &snapshot.function)
+                    || exclusions.excludes(&snapshot.manifold_name, snapshot.manifold_address)
+                    || exact_function_identities
+                        .iter()
+                        .filter(|(name, address)| {
+                            name == &snapshot.manifold_name
+                                && *address == snapshot.manifold_address
+                        })
+                        .count()
+                        != 1
+            }) {
+                return None;
+            }
+            let canonical_source = one_function_source(canonical, format);
+            let alternatives: Vec<String> = group
+                .iter()
+                .map(|snapshot| one_function_source(&snapshot.function, format))
+                .collect();
+            (alternatives[0] != canonical_source
+                && alternatives[1] != canonical_source
+                && alternatives[0] != alternatives[1])
+                .then_some(declaration_index)
+        })
+        .collect();
     let mut ordered: Vec<(usize, &SourceAlternativeSnapshot)> = snapshots
         .iter()
+        .filter(|snapshot| {
+            if valid_feature_declarations.contains(&snapshot.declaration_index) {
+                is_scalar_lvalue_boundary(snapshot.boundary)
+            } else {
+                !is_scalar_lvalue_boundary(snapshot.boundary)
+            }
+        })
         .filter(|snapshot| {
             !exclusions.excludes(&snapshot.manifold_name, snapshot.manifold_address)
         })
@@ -807,6 +944,43 @@ mod tests {
             &renamed,
         )
         .is_none());
+    }
+
+    #[test]
+    fn typed_lvalue_pair_is_atomic_closed_and_v2_named() {
+        let canonical = function("f", CStmt::Return(Some(CExpr::int(0))));
+        let pre = function(
+            "f",
+            CStmt::Block(vec![
+                CBlockItem::Stmt(CStmt::Expr(CExpr::assign(
+                    CExpr::var("temporary"),
+                    CExpr::int(1),
+                ))),
+                CBlockItem::Stmt(CStmt::Return(Some(CExpr::var("temporary")))),
+            ]),
+        );
+        let post = function("f", CStmt::Return(Some(CExpr::int(1))));
+        let pair = scalar_lvalue_snapshot_pair(3, 0x1000, &canonical, &pre, &post)
+            .expect("two distinct signature-preserving typed-lvalue forms");
+        assert_eq!(SOURCE_ALTERNATIVES_SCHEMA, "manifold-source-alternatives-v2");
+        assert_eq!(
+            pair[0].boundary.wire_name(),
+            "scalar_lvalue_pre_var_reduce"
+        );
+        assert_eq!(pair[0].kinds, vec!["local_lifetime", "typed_lvalue"]);
+        assert_eq!(
+            pair[1].boundary.wire_name(),
+            "scalar_lvalue_post_var_reduce"
+        );
+        assert_eq!(pair[1].kinds, vec!["typed_lvalue"]);
+        assert!(scalar_lvalue_snapshot_pair(3, 0x1000, &canonical, &post, &post).is_none());
+
+        let mut wrong_signature = post.clone();
+        wrong_signature.return_type = CType::long();
+        assert!(
+            scalar_lvalue_snapshot_pair(3, 0x1000, &canonical, &pre, &wrong_signature)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1045,6 +1219,92 @@ mod tests {
         assert_eq!(parsed["max_per_function"], 2);
         assert_eq!(parsed["truncated"], false);
         assert_eq!(final_tu, final_tu_before);
+    }
+
+    #[test]
+    fn manifest_emits_typed_lvalue_pair_atomically_under_the_existing_cap() {
+        let canonical_function = function("f", CStmt::Return(Some(CExpr::int(2))));
+        let pre = function(
+            "f",
+            CStmt::Block(vec![
+                CBlockItem::Stmt(CStmt::Expr(CExpr::assign(
+                    CExpr::var("temporary"),
+                    CExpr::int(1),
+                ))),
+                CBlockItem::Stmt(CStmt::Return(Some(CExpr::var("temporary")))),
+            ]),
+        );
+        let post = function("f", CStmt::Return(Some(CExpr::int(1))));
+        let pair = scalar_lvalue_snapshot_pair(0, 0x1000, &canonical_function, &pre, &post)
+            .expect("valid typed-lvalue pair");
+        let mut snapshots = pair.to_vec();
+        snapshots.push(
+            snapshot_if_changed(
+                0,
+                0x1000,
+                SourceAlternativeBoundary::PreForLoop,
+                &function("f", CStmt::Return(Some(CExpr::int(3)))),
+                &canonical_function,
+            )
+            .expect("ordinary control snapshot"),
+        );
+        let mut final_tu = TranslationUnit::new();
+        final_tu.add_function(canonical_function);
+        let canonical = crate::decompile::passes::c_pass::print_translation_unit_for_format(
+            &final_tu,
+            BinaryFormat::Coff,
+        );
+        let identities = [("f".to_string(), 0x1000)];
+        let rendered = render_manifest(
+            &final_tu,
+            &snapshots,
+            false,
+            &SourceAlternativeExclusions::default(),
+            &identities,
+            &canonical,
+            BinaryFormat::Coff,
+        )
+        .unwrap()
+        .expect("complete pair renders");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let records = parsed["alternatives"].as_array().unwrap();
+        assert_eq!(records.len(), MAX_SOURCE_ALTERNATIVES_PER_FUNCTION);
+        assert_eq!(
+            records[0]["id"],
+            "function-000000:scalar_lvalue_pre_var_reduce"
+        );
+        assert_eq!(
+            records[1]["id"],
+            "function-000000:scalar_lvalue_post_var_reduce"
+        );
+        assert_eq!(parsed["schema"], SOURCE_ALTERNATIVES_SCHEMA);
+
+        assert!(render_manifest(
+            &final_tu,
+            &pair[..1],
+            false,
+            &SourceAlternativeExclusions::default(),
+            &identities,
+            &canonical,
+            BinaryFormat::Coff,
+        )
+        .unwrap()
+        .is_none());
+
+        assert!(render_manifest(
+            &final_tu,
+            &pair,
+            false,
+            &SourceAlternativeExclusions {
+                partial_functions: HashSet::from([0x1000]),
+                ..Default::default()
+            },
+            &identities,
+            &canonical,
+            BinaryFormat::Coff,
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]

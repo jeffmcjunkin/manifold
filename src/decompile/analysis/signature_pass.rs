@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::decompile::elevator::DecompileDB;
@@ -304,10 +304,182 @@ pub struct FunctionPrototype {
 
 pub struct SignatureReconciliationPass;
 
+/// Validate only extension results whose complete post-Type/Ptr/Struct type
+/// evidence is closed under the authenticated selected transport pair. A sole
+/// exact direct return is normalized before signature reconciliation so a
+/// narrow lowering artifact cannot outrank the architectural EAX/RAX result
+/// in that function's ABI. Non-return values publish provenance only: Cshminor
+/// performs their local rewrite after call-site/prototype inference is final.
+#[cfg(test)]
+fn normalize_authenticated_scalar_extension_types(db: &mut DecompileDB) {
+    let mut proofs_by_value: BTreeMap<RTLReg, Vec<(Node, ScalarMemoryAccessProof)>> =
+        BTreeMap::new();
+    for (node, proof) in
+        db.rel_iter::<(Node, ScalarMemoryAccessProof)>("authenticated_scalar_memory_access")
+    {
+        if proof.direction == ScalarMemoryDirection::Read
+            && proof.extension != ScalarMemoryExtension::Plain
+        {
+            proofs_by_value
+                .entry(proof.value)
+                .or_default()
+                .push((*node, proof.clone()));
+        }
+    }
+    for proofs in proofs_by_value.values_mut() {
+        proofs.sort();
+        proofs.dedup();
+    }
+    if proofs_by_value.is_empty() {
+        db.rel_set(
+            "signature_scalar_extension_access",
+            Vec::<(Node, ScalarMemoryAccessProof)>::new()
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        return;
+    }
+
+    let pointers: BTreeSet<RTLReg> = db
+        .rel_iter::<(RTLReg,)>("is_ptr")
+        .map(|row| row.0)
+        .collect();
+    let mut value_types: BTreeMap<RTLReg, BTreeSet<XType>> = BTreeMap::new();
+    let mut value_type_rows: Vec<(RTLReg, XType)> = db
+        .rel_iter::<(RTLReg, XType)>("emit_var_type_candidate")
+        .copied()
+        .collect();
+    value_type_rows.sort();
+    value_type_rows.dedup();
+    for (value, xtype) in &value_type_rows {
+        value_types.entry(*value).or_default().insert(*xtype);
+    }
+
+    let mut returns: BTreeMap<Address, BTreeSet<RTLReg>> = BTreeMap::new();
+    for (function, value) in db.rel_iter::<(Address, RTLReg)>("emit_function_return") {
+        returns.entry(*function).or_default().insert(*value);
+    }
+    let void_functions: BTreeSet<Address> = db
+        .rel_iter::<(Address,)>("emit_function_void_candidate")
+        .map(|row| row.0)
+        .collect();
+    let mut return_types: BTreeMap<Address, BTreeSet<XType>> = BTreeMap::new();
+    let mut return_type_rows: Vec<(Address, XType)> = db
+        .rel_iter::<(Address, XType)>("emit_function_return_type_xtype_candidate")
+        .copied()
+        .collect();
+    return_type_rows.sort();
+    return_type_rows.dedup();
+    for (function, xtype) in &return_type_rows {
+        return_types.entry(*function).or_default().insert(*xtype);
+    }
+
+    let mut accepted = Vec::new();
+    let mut value_rewrites = BTreeMap::new();
+    let mut return_rewrites = BTreeMap::new();
+    for (value, proofs) in proofs_by_value {
+        let [(node, proof)] = proofs.as_slice() else {
+            continue;
+        };
+        let Some(types) = value_types.get(&value) else {
+            continue;
+        };
+        let Some(rewrite) =
+            crate::decompile::passes::cshminor_pass::scalar_lvalue_extension_type_rewrite(
+                proof,
+                types,
+                pointers.contains(&value),
+            )
+        else {
+            continue;
+        };
+
+        let direct_return = match returns.get(&proof.function) {
+            Some(function_returns) if function_returns.contains(&value) => {
+                if function_returns != &BTreeSet::from([value])
+                    || void_functions.contains(&proof.function)
+                {
+                    continue;
+                }
+                true
+            }
+            _ => false,
+        };
+        if direct_return {
+            let Some(types) = return_types.get(&proof.function) else {
+                continue;
+            };
+            let Some(return_rewrite) =
+                crate::decompile::passes::cshminor_pass::scalar_lvalue_extension_type_rewrite(
+                    proof, types, false,
+                )
+            else {
+                continue;
+            };
+            if return_rewrite != rewrite || return_rewrites.contains_key(&proof.function) {
+                continue;
+            }
+            return_rewrites.insert(proof.function, return_rewrite);
+            value_rewrites.insert(value, rewrite);
+        }
+        accepted.push((*node, proof.clone()));
+    }
+
+    value_type_rows.retain(|(value, xtype)| {
+        !value_rewrites
+            .get(value)
+            .is_some_and(|rewrite| rewrite.transport_types.contains(xtype))
+    });
+    value_type_rows.extend(
+        value_rewrites
+            .into_iter()
+            .map(|(value, rewrite)| (value, rewrite.result_type)),
+    );
+    value_type_rows.sort();
+    value_type_rows.dedup();
+    db.rel_set(
+        "emit_var_type_candidate",
+        value_type_rows
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    return_type_rows.retain(|(function, xtype)| {
+        !return_rewrites
+            .get(function)
+            .is_some_and(|rewrite| rewrite.transport_types.contains(xtype))
+    });
+    return_type_rows.extend(
+        return_rewrites
+            .into_iter()
+            .map(|(function, rewrite)| (function, rewrite.result_type)),
+    );
+    return_type_rows.sort();
+    return_type_rows.dedup();
+    db.rel_set(
+        "emit_function_return_type_xtype_candidate",
+        return_type_rows
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+
+    accepted.sort();
+    accepted.dedup();
+    db.rel_set(
+        "signature_scalar_extension_access",
+        accepted.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+}
+
 impl IRPass for SignatureReconciliationPass {
     fn name(&self) -> &'static str { "signature-reconciliation" }
 
     fn run(&self, db: &mut DecompileDB) {
+        // Scalar MOVSX/MOVZX proof is intentionally inert at the signature
+        // boundary. Rewriting the shared type relations here changes the
+        // canonical ABI/source before feature selection. A future ordered
+        // feature stage may reuse the closed proof helpers on a private clone;
+        // stage 2 emits Plain MOV lvalue alternatives only.
         reconcile_signatures(db);
     }
 
@@ -1992,6 +2164,425 @@ fn patch_db(
 mod tests {
     use super::*;
     use either::Either;
+
+    const SCALAR_FUNCTION: Address = 0x1000;
+    const SCALAR_NODE: Node = 0x1010;
+    const SCALAR_VALUE: RTLReg = 0x8000_0000_0000_1010;
+    const OTHER_VALUE: RTLReg = 0x8000_0000_0000_1020;
+
+    fn scalar_extension_proof(
+        extension: ScalarMemoryExtension,
+        chunk: MemoryChunk,
+        value_width: usize,
+    ) -> ScalarMemoryAccessProof {
+        ScalarMemoryAccessProof {
+            function: SCALAR_FUNCTION,
+            origin_node: SCALAR_NODE,
+            selected_node: SCALAR_NODE,
+            operand: "signature_scalar_memory",
+            direction: ScalarMemoryDirection::Read,
+            extension,
+            address_size: 8,
+            base_register: Mreg::CX,
+            index_register: Some(Mreg::DX),
+            scale: 1,
+            displacement: 3,
+            width: 1,
+            value_width,
+            downstream_value_width: Some(value_width),
+            chunk,
+            base_value: Some(OTHER_VALUE + 1),
+            index_value: Some(OTHER_VALUE + 2),
+            value: SCALAR_VALUE,
+            address_param_leaves: Arc::new(vec![OTHER_VALUE + 1, OTHER_VALUE + 2]),
+            synthetic_stack_origin: false,
+            exact_scaled_index: false,
+        }
+    }
+
+    fn relation_types<T: Copy + Ord + Send + Sync + 'static>(
+        db: &DecompileDB,
+        relation: &'static str,
+        key: T,
+    ) -> BTreeSet<XType> {
+        db.rel_iter::<(T, XType)>(relation)
+            .filter_map(|(row_key, xtype)| (*row_key == key).then_some(*xtype))
+            .collect()
+    }
+
+    fn has_scalar_signature_marker(db: &DecompileDB) -> bool {
+        db.rel_iter::<(Node, ScalarMemoryAccessProof)>("signature_scalar_extension_access")
+            .any(|(node, proof)| *node == SCALAR_NODE && proof.value == SCALAR_VALUE)
+    }
+
+    #[test]
+    fn scalar_extension_normalization_retypes_direct_return_abi() {
+        for (proof, transport_types, result_type) in [
+            (
+                scalar_extension_proof(
+                    ScalarMemoryExtension::ZeroExtend,
+                    MemoryChunk::MInt8Unsigned,
+                    4,
+                ),
+                vec![XType::Xint8signed, XType::Xint8unsigned],
+                XType::Xintunsigned,
+            ),
+            (
+                scalar_extension_proof(
+                    ScalarMemoryExtension::SignExtend,
+                    MemoryChunk::MInt8Unsigned,
+                    8,
+                ),
+                vec![XType::Xint8signed, XType::Xint8unsigned],
+                XType::Xlong,
+            ),
+        ] {
+            let mut db = DecompileDB::default();
+            db.rel_push("authenticated_scalar_memory_access", (SCALAR_NODE, proof));
+            db.rel_push("emit_function_return", (SCALAR_FUNCTION, SCALAR_VALUE));
+            for xtype in transport_types {
+                db.rel_push("emit_var_type_candidate", (SCALAR_VALUE, xtype));
+                db.rel_push(
+                    "emit_function_return_type_xtype_candidate",
+                    (SCALAR_FUNCTION, xtype),
+                );
+            }
+
+            normalize_authenticated_scalar_extension_types(&mut db);
+
+            assert!(has_scalar_signature_marker(&db));
+            assert_eq!(
+                relation_types(&db, "emit_var_type_candidate", SCALAR_VALUE),
+                BTreeSet::from([result_type])
+            );
+            assert_eq!(
+                relation_types(
+                    &db,
+                    "emit_function_return_type_xtype_candidate",
+                    SCALAR_FUNCTION,
+                ),
+                BTreeSet::from([result_type])
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_extension_nonreturn_defers_value_rewrite_and_does_not_retype_function_abi() {
+        let proof = scalar_extension_proof(
+            ScalarMemoryExtension::ZeroExtend,
+            MemoryChunk::MInt8Unsigned,
+            4,
+        );
+        let mut db = DecompileDB::default();
+        db.rel_push("authenticated_scalar_memory_access", (SCALAR_NODE, proof));
+        db.rel_push(
+            "emit_var_type_candidate",
+            (SCALAR_VALUE, XType::Xint8signed),
+        );
+        db.rel_push("emit_function_return", (SCALAR_FUNCTION, OTHER_VALUE));
+        db.rel_push(
+            "emit_function_return_type_xtype_candidate",
+            (SCALAR_FUNCTION, XType::Xint8signed),
+        );
+
+        normalize_authenticated_scalar_extension_types(&mut db);
+
+        assert!(has_scalar_signature_marker(&db));
+        assert_eq!(
+            relation_types(&db, "emit_var_type_candidate", SCALAR_VALUE),
+            BTreeSet::from([XType::Xint8signed])
+        );
+        assert_eq!(
+            relation_types(
+                &db,
+                "emit_function_return_type_xtype_candidate",
+                SCALAR_FUNCTION,
+            ),
+            BTreeSet::from([XType::Xint8signed])
+        );
+    }
+
+    fn nonreturn_call_argument_db(authenticated: bool) -> DecompileDB {
+        const CALLER: Address = SCALAR_FUNCTION;
+        const CALLEE: Address = 0x2000;
+        const CALL: Node = 0x1100;
+
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        db.rel_push("emit_function", (CALLER, "scalar_caller", CALLER));
+        db.rel_push("emit_function", (CALLEE, "scalar_callee", CALLEE));
+        db.rel_push(
+            "emit_var_type_candidate",
+            (SCALAR_VALUE, XType::Xint8signed),
+        );
+        db.rel_push("call_target_func", (CALL, CALLEE));
+        db.rel_push("call_arg", (CALL, 0usize, SCALAR_VALUE));
+        db.rel_push("call_has_arg_evidence", (CALL, 0usize));
+        db.rel_push(
+            "call_args_collected_candidate",
+            (CALL, Arc::new(vec![SCALAR_VALUE])),
+        );
+        db.rel_push("abi_int_arg_position", (Mreg::CX, 0usize));
+        db.rel_push(
+            "rtl_inst",
+            (
+                CALL,
+                RTLInst::Icall(
+                    None,
+                    Either::Right(Either::Left(CALLEE)),
+                    Arc::new(vec![SCALAR_VALUE]),
+                    None,
+                    CALL + 5,
+                ),
+            ),
+        );
+        if authenticated {
+            db.rel_push(
+                "authenticated_scalar_memory_access",
+                (
+                    SCALAR_NODE,
+                    scalar_extension_proof(
+                        ScalarMemoryExtension::ZeroExtend,
+                        MemoryChunk::MInt8Unsigned,
+                        4,
+                    ),
+                ),
+            );
+        }
+        SignatureReconciliationPass.run(&mut db);
+        db
+    }
+
+    fn relation_set<T>(db: &DecompileDB, relation: &'static str) -> HashSet<T>
+    where
+        T: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    {
+        db.rel_iter::<T>(relation).cloned().collect()
+    }
+
+    #[test]
+    fn scalar_extension_nonreturn_call_argument_preserves_callee_and_call_abi() {
+        let baseline = nonreturn_call_argument_db(false);
+        let authenticated = nonreturn_call_argument_db(true);
+
+        assert!(
+            !has_scalar_signature_marker(&authenticated),
+            "stage-2 extension proof must remain inert at the canonical signature boundary"
+        );
+        assert_eq!(
+            relation_set::<(RTLReg, XType)>(&authenticated, "emit_var_type_candidate"),
+            relation_set::<(RTLReg, XType)>(&baseline, "emit_var_type_candidate")
+        );
+        assert_eq!(
+            relation_set::<(Address, RTLReg, XType)>(&authenticated, "emit_function_param_type"),
+            relation_set::<(Address, RTLReg, XType)>(&baseline, "emit_function_param_type")
+        );
+        assert_eq!(
+            relation_set::<(Address, Signature)>(&authenticated, "emit_function_signature"),
+            relation_set::<(Address, Signature)>(&baseline, "emit_function_signature")
+        );
+        assert_eq!(
+            relation_set::<(Node, Args)>(&authenticated, "call_args_collected"),
+            relation_set::<(Node, Args)>(&baseline, "call_args_collected")
+        );
+        assert_eq!(
+            relation_set::<(Node, RTLInst)>(&authenticated, "rtl_inst"),
+            relation_set::<(Node, RTLInst)>(&baseline, "rtl_inst")
+        );
+
+        let expected_signature = Signature {
+            sig_args: Arc::new(vec![XType::Xint8signed]),
+            sig_res: XType::Xvoid,
+            sig_cc: CallConv::default(),
+        };
+        assert!(
+            relation_set::<(Address, Signature)>(&authenticated, "emit_function_signature")
+                .contains(&(0x2000, expected_signature.clone()))
+        );
+        assert!(
+            relation_set::<(Node, RTLInst)>(&authenticated, "rtl_inst")
+                .iter()
+                .any(|(node, inst)| *node == 0x1100 && matches!(inst, RTLInst::Icall(..))),
+            "the unprototyped call itself must survive reconciliation"
+        );
+    }
+
+    fn direct_return_extension_db(authenticated: bool) -> DecompileDB {
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        db.rel_push(
+            "emit_function",
+            (SCALAR_FUNCTION, "scalar_direct_return", SCALAR_FUNCTION),
+        );
+        db.rel_push("emit_function_has_return_candidate", (SCALAR_FUNCTION,));
+        db.rel_push("emit_function_return", (SCALAR_FUNCTION, SCALAR_VALUE));
+        db.rel_push(
+            "emit_var_type_candidate",
+            (SCALAR_VALUE, XType::Xint8signed),
+        );
+        db.rel_push(
+            "emit_function_return_type_xtype_candidate",
+            (SCALAR_FUNCTION, XType::Xint8signed),
+        );
+        if authenticated {
+            db.rel_push(
+                "authenticated_scalar_memory_access",
+                (
+                    SCALAR_NODE,
+                    scalar_extension_proof(
+                        ScalarMemoryExtension::ZeroExtend,
+                        MemoryChunk::MInt8Unsigned,
+                        4,
+                    ),
+                ),
+            );
+        }
+        SignatureReconciliationPass.run(&mut db);
+        db
+    }
+
+    #[test]
+    fn scalar_extension_direct_return_preserves_canonical_signature_relations() {
+        let baseline = direct_return_extension_db(false);
+        let authenticated = direct_return_extension_db(true);
+        assert!(!has_scalar_signature_marker(&authenticated));
+        for relation in [
+            "emit_var_type_candidate",
+            "emit_function_return_type_xtype_candidate",
+        ] {
+            assert_eq!(
+                relation_set::<(RTLReg, XType)>(&authenticated, relation),
+                relation_set::<(RTLReg, XType)>(&baseline, relation),
+                "{relation} changed under inert extension proof"
+            );
+        }
+        assert_eq!(
+            relation_set::<(Address, XType)>(
+                &authenticated,
+                "emit_function_return_type_xtype"
+            ),
+            relation_set::<(Address, XType)>(&baseline, "emit_function_return_type_xtype")
+        );
+        assert_eq!(
+            relation_set::<(Address, Signature)>(&authenticated, "emit_function_signature"),
+            relation_set::<(Address, Signature)>(&baseline, "emit_function_signature")
+        );
+    }
+
+    #[test]
+    fn scalar_extension_normalization_does_not_broaden_to_plain_loads() {
+        let mut proof = scalar_extension_proof(
+            ScalarMemoryExtension::ZeroExtend,
+            MemoryChunk::MInt8Unsigned,
+            4,
+        );
+        proof.extension = ScalarMemoryExtension::Plain;
+        let mut db = DecompileDB::default();
+        db.rel_push("authenticated_scalar_memory_access", (SCALAR_NODE, proof));
+        db.rel_push(
+            "emit_var_type_candidate",
+            (SCALAR_VALUE, XType::Xint8signed),
+        );
+        db.rel_push("emit_function_return", (SCALAR_FUNCTION, SCALAR_VALUE));
+        db.rel_push(
+            "emit_function_return_type_xtype_candidate",
+            (SCALAR_FUNCTION, XType::Xint8signed),
+        );
+
+        normalize_authenticated_scalar_extension_types(&mut db);
+
+        assert!(!has_scalar_signature_marker(&db));
+        assert_eq!(
+            relation_types(&db, "emit_var_type_candidate", SCALAR_VALUE),
+            BTreeSet::from([XType::Xint8signed])
+        );
+        assert_eq!(
+            relation_types(
+                &db,
+                "emit_function_return_type_xtype_candidate",
+                SCALAR_FUNCTION,
+            ),
+            BTreeSet::from([XType::Xint8signed])
+        );
+    }
+
+    #[test]
+    fn scalar_extension_normalization_rejects_ambiguous_or_conflicting_evidence() {
+        for mutation in [
+            "pointer",
+            "float",
+            "cross-width",
+            "ambiguous-return",
+            "void-return",
+            "conflicting-return-type",
+            "multiple-proofs",
+        ] {
+            let proof = scalar_extension_proof(
+                ScalarMemoryExtension::ZeroExtend,
+                MemoryChunk::MInt8Unsigned,
+                4,
+            );
+            let mut db = DecompileDB::default();
+            db.rel_push(
+                "authenticated_scalar_memory_access",
+                (SCALAR_NODE, proof.clone()),
+            );
+            db.rel_push(
+                "emit_var_type_candidate",
+                (SCALAR_VALUE, XType::Xint8signed),
+            );
+            db.rel_push("emit_function_return", (SCALAR_FUNCTION, SCALAR_VALUE));
+            db.rel_push(
+                "emit_function_return_type_xtype_candidate",
+                (SCALAR_FUNCTION, XType::Xint8signed),
+            );
+            match mutation {
+                "pointer" => db.rel_push("is_ptr", (SCALAR_VALUE,)),
+                "float" => db.rel_push("emit_var_type_candidate", (SCALAR_VALUE, XType::Xfloat)),
+                "cross-width" => db.rel_push(
+                    "emit_var_type_candidate",
+                    (SCALAR_VALUE, XType::Xint16unsigned),
+                ),
+                "ambiguous-return" => {
+                    db.rel_push("emit_function_return", (SCALAR_FUNCTION, OTHER_VALUE))
+                }
+                "void-return" => db.rel_push("emit_function_void_candidate", (SCALAR_FUNCTION,)),
+                "conflicting-return-type" => db.rel_push(
+                    "emit_function_return_type_xtype_candidate",
+                    (SCALAR_FUNCTION, XType::Xptr),
+                ),
+                "multiple-proofs" => {
+                    let mut competing = proof;
+                    competing.origin_node += 1;
+                    competing.selected_node += 1;
+                    competing.operand = "signature_scalar_memory_competing";
+                    db.rel_push(
+                        "authenticated_scalar_memory_access",
+                        (SCALAR_NODE + 1, competing),
+                    );
+                }
+                _ => unreachable!(),
+            }
+
+            normalize_authenticated_scalar_extension_types(&mut db);
+
+            assert!(!has_scalar_signature_marker(&db), "{mutation}");
+            assert!(
+                relation_types(&db, "emit_var_type_candidate", SCALAR_VALUE)
+                    .contains(&XType::Xint8signed),
+                "{mutation} sanitized rejected value evidence"
+            );
+            assert!(
+                relation_types(
+                    &db,
+                    "emit_function_return_type_xtype_candidate",
+                    SCALAR_FUNCTION,
+                )
+                .contains(&XType::Xint8signed),
+                "{mutation} rewrote rejected ABI evidence"
+            );
+        }
+    }
 
     fn guard_signature() -> Signature {
         Signature {

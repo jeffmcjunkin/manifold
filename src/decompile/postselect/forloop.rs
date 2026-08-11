@@ -766,6 +766,37 @@ fn inline_gotos(body: &mut CStmt) -> usize {
     total
 }
 
+/// Apply the exact canonical control-flow recovery to one function.  The
+/// typed-lvalue alternative path calls this same helper, so retaining a
+/// feature tree does not create a second structuring implementation.
+fn recover_forloop_function(function: &mut FuncDef) -> Option<(usize, usize)> {
+    if !has_goto_or_label(&function.body) {
+        return None;
+    }
+    let before = count_gotos(&function.body);
+    let loops_before = count_loops(&function.body);
+    let mut candidate = function.body.clone();
+    inline_gotos(&mut candidate);
+    let mut targets = Vec::new();
+    collect_goto_targets(&candidate, &mut targets);
+    let mut references: HashMap<String, usize> = HashMap::new();
+    for target in targets {
+        *references.entry(target).or_insert(0) += 1;
+    }
+    let candidate = recover(candidate, &references);
+    let candidate = break_convert(candidate);
+    let after = count_gotos(&candidate);
+    if after < before
+        && count_loops(&candidate) >= loops_before
+        && all_gotos_resolve(&candidate)
+    {
+        function.body = candidate;
+        Some((before, after))
+    } else {
+        None
+    }
+}
+
 // Pass
 
 pub struct ForLoopPass;
@@ -790,6 +821,16 @@ impl IRPass for ForLoopPass {
         let mut removed = 0usize;
         let (mut tot_g, mut kept_g) = (0usize, 0usize);
         {
+            let feature_identities: HashSet<(String, u64)> = db
+                .cast_pending_scalar_lvalue_alternatives
+                .iter()
+                .map(|alternative| {
+                    (
+                        alternative.manifold_name.clone(),
+                        alternative.manifold_address,
+                    )
+                })
+                .collect();
             let tu = match db.cast_optimized_translation_unit.as_mut() {
                 Some(tu) => tu,
                 None => unreachable!("translation unit checked above"),
@@ -801,39 +842,21 @@ impl IRPass for ForLoopPass {
                     }
                     let before_function = (!alternatives_overflowed).then(|| f.clone());
                     let before = count_gotos(&f.body);
-                    let loops_before = count_loops(&f.body);
                     tot_g += before;
-
-                    // 1) Inline single-ref labeled blocks at their goto site.
-                    let mut cand = f.body.clone();
-                    inline_gotos(&mut cand);
-
-                    // 2) Recover loops + if-bodies (counts recomputed after inlining).
-                    let mut tgts = Vec::new();
-                    collect_goto_targets(&cand, &mut tgts);
-                    let mut refs: HashMap<String, usize> = HashMap::new();
-                    for t in tgts {
-                        *refs.entry(t).or_insert(0) += 1;
-                    }
-                    let cand = recover(cand, &refs);
-
-                    // 3) CF-7 runs last so while(1) loops formed in step 2 also get their exit gotos converted.
-                    let cand = break_convert(cand);
-                    let after = count_gotos(&cand);
-                    if after < before
-                        && count_loops(&cand) >= loops_before
-                        && all_gotos_resolve(&cand)
-                    {
-                        f.body = cand;
+                    if let Some((before, after)) = recover_forloop_function(f) {
                         if let Some(alternative) = before_function.as_ref().and_then(|before| {
                             function_addresses.get(&f.name).and_then(|address| {
-                                super::source_alternatives::snapshot_if_changed(
-                                    declaration_index,
-                                    *address,
-                                    super::source_alternatives::SourceAlternativeBoundary::PreForLoop,
-                                    before,
-                                    f,
-                                )
+                                (!feature_identities.contains(&(f.name.clone(), *address)))
+                                    .then(|| {
+                                        super::source_alternatives::snapshot_if_changed(
+                                            declaration_index,
+                                            *address,
+                                            super::source_alternatives::SourceAlternativeBoundary::PreForLoop,
+                                            before,
+                                            f,
+                                        )
+                                    })
+                                    .flatten()
                             })
                         }) {
                             super::source_alternatives::record_bounded_snapshot(
@@ -849,6 +872,13 @@ impl IRPass for ForLoopPass {
                 }
             }
         }
+        if !alternatives_overflowed {
+            for alternative in &mut db.cast_pending_scalar_lvalue_alternatives {
+                recover_forloop_function(&mut alternative.function);
+            }
+        } else {
+            db.cast_pending_scalar_lvalue_alternatives.clear();
+        }
         db.cast_source_alternatives = alternatives;
         db.cast_source_alternatives_overflowed = alternatives_overflowed;
         log::info!(
@@ -862,7 +892,11 @@ impl IRPass for ForLoopPass {
     }
 
     fn outputs(&self) -> &'static [&'static str] {
-        &["cast_optimized_translation_unit"]
+        &[
+            "cast_optimized_translation_unit",
+            "cast_pending_scalar_lvalue_alternatives",
+            "cast_source_alternatives",
+        ]
     }
 }
 

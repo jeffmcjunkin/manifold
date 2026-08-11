@@ -159,6 +159,14 @@ pub struct FunctionData {
 
     pub node_statements: HashMap<Node, Vec<ClightStmt>>,
 
+    /// Closed scalar-lvalue form expected at each authenticated proof node and
+    /// the exact tagged candidates retained outside the canonical selectable
+    /// statement relation. Selection consumes this only through a private,
+    /// bounded feature solve; canonical candidate ordering is unchanged.
+    pub scalar_lvalue_proofs: HashMap<Node, Vec<ScalarMemoryAccessProof>>,
+    pub scalar_lvalue_source_candidates:
+        HashMap<Node, Vec<(ScalarLvalueSourceForm, ClightStmt)>>,
+
     pub successors: HashMap<Node, Vec<Node>>,
 
     pub used_regs: HashSet<RTLReg>,
@@ -261,6 +269,8 @@ impl FunctionData {
             param_types,
             stack_size,
             node_statements: HashMap::new(),
+            scalar_lvalue_proofs: HashMap::new(),
+            scalar_lvalue_source_candidates: HashMap::new(),
             successors: HashMap::new(),
             used_regs: HashSet::new(),
             struct_fields: HashMap::new(),
@@ -708,6 +718,80 @@ pub fn extract_functions(
                     .or_insert_with(Vec::new)
                     .push(ClightStmt::Slabel(label, Box::new(ClightStmt::Sskip)));
             }
+        }
+    }
+
+    // Bind scalar-lvalue provenance only after the canonical selectable
+    // candidate lists have received their final label wrappers.  Tagged
+    // feature statements are deliberately kept in a separate map: admitting
+    // one into node_statements would perturb the primary Z3 solve merely by
+    // enabling the sidecar path.
+    for (node, proof) in
+        db.rel_iter::<(Node, ScalarMemoryAccessProof)>("scalar_lvalue_candidate")
+    {
+        if *node != proof.selected_node || !proof.is_closed_v1() {
+            continue;
+        }
+        let Some(&owner) = node_owner.get(node) else {
+            continue;
+        };
+        if owner != proof.function {
+            continue;
+        }
+        if let Some(function) = func_map.get_mut(&proof.function) {
+            let proofs = function.scalar_lvalue_proofs.entry(*node).or_default();
+            if !proofs.contains(proof) {
+                proofs.push(proof.clone());
+                proofs.sort_unstable();
+            }
+        }
+    }
+
+    // A feature statement may be attached only to the unique exact
+    // proof/function identity established above.  This is independent of the
+    // canonical statement vector, but it uses the same goto-label convention
+    // so a feature-only fixed view has the same CFG identity.
+    let mut scalar_node_owner: HashMap<Node, Option<Address>> = HashMap::new();
+    for (address, function) in &func_map {
+        for node in function.scalar_lvalue_proofs.keys() {
+            scalar_node_owner
+                .entry(*node)
+                .and_modify(|owner| {
+                    if *owner != Some(*address) {
+                        *owner = None;
+                    }
+                })
+                .or_insert(Some(*address));
+        }
+    }
+    for (node, form, candidate) in db.rel_iter::<(
+        Node,
+        ScalarLvalueSourceForm,
+        ClightStmt,
+    )>("scalar_lvalue_source_candidate")
+    {
+        let Some(Some(owner)) = scalar_node_owner.get(node).copied() else {
+            continue;
+        };
+        let Some(function) = func_map.get_mut(&owner) else {
+            continue;
+        };
+        let Some(candidate) = crate::decompile::passes::clight_pass::check_clight_stmt(candidate)
+        else {
+            continue;
+        };
+        let candidate = if goto_targets.contains(node) {
+            ClightStmt::Slabel(ident_from_node(*node), Box::new(candidate))
+        } else {
+            candidate
+        };
+        let tagged = function
+            .scalar_lvalue_source_candidates
+            .entry(*node)
+            .or_default();
+        if !tagged.contains(&(*form, candidate.clone())) {
+            tagged.push((*form, candidate));
+            tagged.sort_by_key(|(form, statement)| (*form, format!("{:?}", statement)));
         }
     }
 
@@ -3452,6 +3536,64 @@ pub fn collect_stmt_regs(stmt: &ClightStmt) -> Vec<RTLReg> {
 #[cfg(test)]
 mod tr3_tests {
     use super::*;
+
+    fn scalar_isolation_proof(function: Address, node: Node) -> ScalarMemoryAccessProof {
+        ScalarMemoryAccessProof {
+            function,
+            origin_node: node,
+            selected_node: node,
+            operand: "scalar_isolation_mem",
+            direction: ScalarMemoryDirection::Read,
+            extension: ScalarMemoryExtension::Plain,
+            address_size: 8,
+            base_register: Mreg::CX,
+            index_register: None,
+            scale: 1,
+            displacement: 4,
+            width: 4,
+            value_width: 4,
+            downstream_value_width: Some(4),
+            chunk: MemoryChunk::MInt32,
+            base_value: Some(1),
+            index_value: None,
+            value: 2,
+            address_param_leaves: std::sync::Arc::new(vec![1]),
+            synthetic_stack_origin: false,
+            exact_scaled_index: false,
+        }
+    }
+
+    #[test]
+    fn tagged_scalar_statement_never_enters_canonical_candidate_set() {
+        const FUNCTION: Address = 0x1000;
+        const NODE: Node = 0x1010;
+        let canonical = ClightStmt::Sreturn(None);
+        let feature = ClightStmt::Sskip;
+        let proof = scalar_isolation_proof(FUNCTION, NODE);
+        assert!(proof.is_closed_v1());
+
+        let mut db = DecompileDB::default();
+        db.target_abi = Some(crate::abi::AbiConfig::win64());
+        db.rel_push("emit_function", (FUNCTION, "scalar_isolation", FUNCTION));
+        db.rel_push("instr_in_function", (NODE, FUNCTION));
+        db.rel_push("emit_clight_stmt", (FUNCTION, NODE, canonical.clone()));
+        db.rel_push("scalar_lvalue_candidate", (NODE, proof));
+        db.rel_push(
+            "scalar_lvalue_source_candidate",
+            (NODE, ScalarLvalueSourceForm::RawByte, feature.clone()),
+        );
+
+        let (functions, _) = extract_functions(&db).expect("extract isolated candidates");
+        let function = functions
+            .iter()
+            .find(|function| function.address == FUNCTION)
+            .expect("fixture function");
+        assert_eq!(function.node_statements[&NODE], vec![canonical]);
+        assert_eq!(
+            function.scalar_lvalue_source_candidates[&NODE],
+            vec![(ScalarLvalueSourceForm::RawByte, feature)]
+        );
+    }
 
     #[test]
     fn preferred_symbol_name_is_order_independent_for_equal_length_aliases() {

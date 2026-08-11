@@ -4,7 +4,7 @@ use crate::decompile::passes::c_pass::helpers::{
     inline_string_literals, is_terminal_cstmt, param_name_for_reg, xtype_string_to_ctype,
 };
 use crate::decompile::passes::c_pass::types::{
-    CExpr, CStmt, CType, StructField, TopLevelDecl, TypeQualifiers,
+    CExpr, CStmt, CType, FuncDef, StructField, TopLevelDecl, TypeQualifiers,
 };
 use crate::decompile::passes::pass::IRPass;
 use crate::x86::types::*;
@@ -1493,6 +1493,8 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "plt_entry",
     "pointer_in_data",
     "reg_rtl",
+    "scalar_lvalue_candidate",
+    "scalar_lvalue_source_candidate",
     "resolved_extern_signature",
     "rtl_reg_used_in_func",
     "struct_id_to_canonical",
@@ -1584,17 +1586,20 @@ impl IRPass for ClightSelectPass {
     fn run(&self, db: &mut DecompileDB) {
         let t = std::time::Instant::now();
         match crate::decompile::passes::clight_select::select::select_clight_stmts(db) {
-            Ok(funcs) => {
+            Ok(result) => {
                 eprintln!(
-                    "[clight-select] select_clight_stmts: {:?} ({} funcs)",
+                    "[clight-select] select_clight_stmts: {:?} ({} funcs, {} typed-lvalue alternatives)",
                     t.elapsed(),
-                    funcs.len()
+                    result.canonical.len(),
+                    result.scalar_lvalue_alternatives.len(),
                 );
-                db.clight_selected_functions = funcs;
+                db.clight_selected_functions = result.canonical;
+                db.clight_scalar_lvalue_alternatives = result.scalar_lvalue_alternatives;
             }
             Err(e) => {
                 log::warn!("ClightSelectPass: failed to select statements: {}", e);
                 db.clight_selected_functions = Vec::new();
+                db.clight_scalar_lvalue_alternatives = Vec::new();
             }
         }
     }
@@ -1604,7 +1609,10 @@ impl IRPass for ClightSelectPass {
     }
 
     fn outputs(&self) -> &'static [&'static str] {
-        &["clight_selected_functions"]
+        &[
+            "clight_selected_functions",
+            "clight_scalar_lvalue_alternatives",
+        ]
     }
 
     fn extra_reads(&self) -> &'static [&'static str] {
@@ -1613,6 +1621,46 @@ impl IRPass for ClightSelectPass {
 }
 
 pub struct ClightEmitPass;
+
+fn convert_selected_function_statements(
+    function: &crate::decompile::passes::clight_select::select::SelectedFunction,
+    context: &mut crate::decompile::passes::c_pass::convert::from_relations::ConversionContext,
+    local_evar_ids: Option<&HashSet<Ident>>,
+    string_map: &HashMap<String, String>,
+    rodata_const_map: &HashMap<String, CExpr>,
+) -> Vec<(Node, CStmt)> {
+    context.enter_function(function.address, local_evar_ids);
+    let mut nodes: Vec<Node> = function.statements.keys().copied().collect();
+    nodes.sort_unstable();
+    nodes
+        .into_iter()
+        .map(|node| {
+            let statement =
+                crate::decompile::passes::c_pass::convert::from_relations::convert_stmt(
+                    &function.statements[&node],
+                    context,
+                );
+            let statement = crate::decompile::passes::c_pass::helpers::map_stmt_exprs(
+                &statement,
+                &|expression| inline_string_literals(expression, string_map),
+            );
+            let statement = crate::decompile::passes::c_pass::helpers::map_stmt_exprs_total(
+                &statement,
+                &|expression| {
+                    crate::decompile::passes::c_pass::helpers::inline_rodata_constants_preserving_addrof(
+                        expression,
+                        rodata_const_map,
+                    )
+                },
+            );
+            let statement =
+                crate::decompile::passes::c_pass::convert::from_relations::narrow_varargs_in_stmt(
+                    &statement,
+                );
+            (node, statement)
+        })
+        .collect()
+}
 
 impl IRPass for ClightEmitPass {
     fn name(&self) -> &'static str {
@@ -1627,6 +1675,8 @@ impl IRPass for ClightEmitPass {
 
         // Take the typed per-function trees produced by ClightSelectPass.
         let selected_functions = std::mem::take(&mut db.clight_selected_functions);
+        let scalar_lvalue_alternatives =
+            std::mem::take(&mut db.clight_scalar_lvalue_alternatives);
         eprintln!(
             "[clight-emit] selected functions: {}",
             selected_functions.len()
@@ -2066,8 +2116,13 @@ impl IRPass for ClightEmitPass {
         let mut node_to_func_addr: HashMap<Node, u64> = HashMap::new();
 
         for func in &internal_functions {
-            ctx.enter_function(func.address, local_evar_ids.get(&func.address));
-            let mut statements = Vec::new();
+            let statements = convert_selected_function_statements(
+                func,
+                &mut ctx,
+                local_evar_ids.get(&func.address),
+                &string_map,
+                &rodata_const_map,
+            );
             let mut func_edges = Vec::new();
 
             for (reg, pty) in func.param_regs.iter().zip(func.param_types.iter()) {
@@ -2100,31 +2155,6 @@ impl IRPass for ClightEmitPass {
                     TypeQualifiers::none(),
                 );
                 var_types_for_emission.insert(name, ptr_type);
-            }
-
-            {
-                let mut sorted_stmt_nodes: Vec<Node> = func.statements.keys().copied().collect();
-                sorted_stmt_nodes.sort();
-                for node in sorted_stmt_nodes {
-                    let clight_stmt = &func.statements[&node];
-                    let cstmt =
-                        crate::decompile::passes::c_pass::convert::from_relations::convert_stmt(
-                            clight_stmt,
-                            &mut ctx,
-                        );
-                    let cstmt =
-                        crate::decompile::passes::c_pass::helpers::map_stmt_exprs(&cstmt, &|e| {
-                            inline_string_literals(e, &string_map)
-                        });
-                    let cstmt = crate::decompile::passes::c_pass::helpers::map_stmt_exprs_total(
-                        &cstmt,
-                        &|e| {
-                            crate::decompile::passes::c_pass::helpers::inline_rodata_constants_preserving_addrof(e, &rodata_const_map)
-                        },
-                    );
-                    let cstmt = crate::decompile::passes::c_pass::convert::from_relations::narrow_varargs_in_stmt(&cstmt);
-                    statements.push((node, cstmt));
-                }
             }
 
             // func.successors is a HashMap, so iterating it leaks non-deterministic ordering into the edge sets; the pair set is the same, but sort by source for stable diagnostics anyway.
@@ -2206,6 +2236,76 @@ impl IRPass for ClightEmitPass {
 
         let stmt_map: HashMap<Node, CStmt> = all_statements.into_iter().collect();
 
+        // Assemble one TU-wide feature clone only when authenticated feature
+        // selections survived.  Every unaffected function reuses its exact
+        // canonical selected tree and converted statement; all feature nodes
+        // for one function are replaced together, never as a cross-product.
+        let mut feature_by_address: HashMap<Address, Vec<_>> = HashMap::new();
+        for alternative in scalar_lvalue_alternatives {
+            feature_by_address
+                .entry(alternative.function.address)
+                .or_default()
+                .push(alternative);
+        }
+        let mut feature_functions = db.cast_selected_functions.clone();
+        let mut selected_address_counts: HashMap<Address, usize> = HashMap::new();
+        for function in &feature_functions {
+            *selected_address_counts.entry(function.address).or_default() += 1;
+        }
+        let mut feature_stmt_map = stmt_map.clone();
+        let mut feature_object_types = ctx.function_object_types().clone();
+        let mut accepted_feature_addresses = HashSet::new();
+        let mut feature_ctx =
+            crate::decompile::passes::c_pass::convert::from_relations::ConversionContext::new(
+                db.cast_id_to_name.clone(),
+            );
+        for function in &mut feature_functions {
+            let Some(alternatives) = feature_by_address.get(&function.address) else {
+                continue;
+            };
+            if alternatives.len() != 1
+                || selected_address_counts.get(&function.address) != Some(&1)
+                || alternatives[0].function.name != function.name
+                || alternatives[0].function.return_type != function.return_type
+                || alternatives[0].function.param_regs != function.param_regs
+                || alternatives[0].function.param_types != function.param_types
+                || alternatives[0].function.entry_node != function.entry_node
+                || alternatives[0].function.stack_size != function.stack_size
+                || alternatives[0].function.successors != function.successors
+                || alternatives[0].function.used_regs != function.used_regs
+                || alternatives[0].function.struct_fields != function.struct_fields
+                || alternatives[0].function.sseq_groups != function.sseq_groups
+                || alternatives[0].function.var_types != function.var_types
+                || alternatives[0].function.var_type_candidates != function.var_type_candidates
+                || alternatives[0].function.var_decl_idx != function.var_decl_idx
+                || alternatives[0].function.loop_headers != function.loop_headers
+                || alternatives[0].function.switch_heads != function.switch_heads
+                || alternatives[0].function.reg_struct_ids != function.reg_struct_ids
+            {
+                continue;
+            }
+            let alternative = &alternatives[0].function;
+            feature_stmt_map.retain(|node, _| {
+                node_to_func_addr.get(node).copied() != Some(function.address)
+            });
+            for (node, statement) in convert_selected_function_statements(
+                alternative,
+                &mut feature_ctx,
+                local_evar_ids.get(&alternative.address),
+                &string_map,
+                &rodata_const_map,
+            ) {
+                feature_stmt_map.insert(node, statement);
+            }
+            *function = alternative.clone();
+            accepted_feature_addresses.insert(function.address);
+        }
+        for (address, object_types) in feature_ctx.function_object_types() {
+            if accepted_feature_addresses.contains(address) {
+                feature_object_types.insert(*address, object_types.clone());
+            }
+        }
+
         log::info!(
             "Building translation unit from {} statements",
             stmt_map.len()
@@ -2224,6 +2324,20 @@ impl IRPass for ClightEmitPass {
             &node_to_func_addr,
             &field_types,
         );
+        let mut scalar_lvalue_tu = (!accepted_feature_addresses.is_empty()).then(|| {
+            crate::decompile::passes::c_pass::convert::build_translation_unit_from_stmt_map_with_types(
+                db,
+                &feature_functions,
+                &db.cast_globals,
+                &db.cast_id_to_name,
+                &feature_stmt_map,
+                &all_edges,
+                &db.cast_var_types_for_emission,
+                &feature_object_types,
+                &node_to_func_addr,
+                &field_types,
+            )
+        });
         eprintln!(
             "[clight-emit] build_translation_unit (optimized TU): {:?}",
             t.elapsed()
@@ -2272,6 +2386,26 @@ impl IRPass for ClightEmitPass {
                                     &array_globals,
                                     &struct_globals,
                                 );
+                            }
+                        }
+                    }
+                }
+                if let Some(feature_tu) = scalar_lvalue_tu.as_mut() {
+                    for decl in &mut feature_tu.decls {
+                        if let TopLevelDecl::FuncDef(function) = decl {
+                            rewrite_recovered_global_stmt(
+                                &mut function.body,
+                                &array_globals,
+                                &struct_globals,
+                            );
+                            for local in &mut function.local_vars {
+                                if let Some(initializer) = &mut local.init {
+                                    rewrite_recovered_global_init(
+                                        initializer,
+                                        &array_globals,
+                                        &struct_globals,
+                                    );
+                                }
                             }
                         }
                     }
@@ -2449,8 +2583,71 @@ impl IRPass for ClightEmitPass {
         // Rewrite suppressed structs: opaque -> TypedefName, unreferenced -> Void.
         if !suppressed_structs.is_empty() {
             rewrite_opaque_types_in_tu(&mut tu, &suppressed_structs);
+            if let Some(feature_tu) = scalar_lvalue_tu.as_mut() {
+                rewrite_opaque_types_in_tu(feature_tu, &suppressed_structs);
+            }
             for ty in db.cast_var_types_for_emission.values_mut() {
                 *ty = rewrite_ctype(ty, &suppressed_structs);
+            }
+        }
+
+        db.cast_pending_scalar_lvalue_alternatives.clear();
+        if let Some(feature_tu) = scalar_lvalue_tu {
+            let canonical_functions: HashMap<&str, Vec<&FuncDef>> = tu
+                .decls
+                .iter()
+                .filter_map(|declaration| match declaration {
+                    TopLevelDecl::FuncDef(function) => Some((function.name.as_str(), function)),
+                    _ => None,
+                })
+                .fold(HashMap::new(), |mut functions, (name, function)| {
+                    functions.entry(name).or_default().push(function);
+                    functions
+                });
+            let feature_functions_by_name: HashMap<&str, Vec<&FuncDef>> = feature_tu
+                .decls
+                .iter()
+                .filter_map(|declaration| match declaration {
+                    TopLevelDecl::FuncDef(function) => Some((function.name.as_str(), function)),
+                    _ => None,
+                })
+                .fold(HashMap::new(), |mut functions, (name, function)| {
+                    functions.entry(name).or_default().push(function);
+                    functions
+                });
+            for selected in &feature_functions {
+                if !accepted_feature_addresses.contains(&selected.address) {
+                    continue;
+                }
+                let (Some(canonical), Some(alternative)) = (
+                    canonical_functions
+                        .get(selected.name.as_str())
+                        .filter(|functions| functions.len() == 1)
+                        .and_then(|functions| functions.first())
+                        .copied(),
+                    feature_functions_by_name
+                        .get(selected.name.as_str())
+                        .filter(|functions| functions.len() == 1)
+                        .and_then(|functions| functions.first())
+                        .copied(),
+                ) else {
+                    continue;
+                };
+                if canonical == alternative
+                    || canonical.return_type != alternative.return_type
+                    || canonical.params != alternative.params
+                    || canonical.is_variadic != alternative.is_variadic
+                    || canonical.storage_class != alternative.storage_class
+                {
+                    continue;
+                }
+                db.cast_pending_scalar_lvalue_alternatives.push(
+                    crate::decompile::postselect::source_alternatives::PendingScalarLvalueAlternative {
+                        manifold_name: canonical.name.clone(),
+                        manifold_address: selected.address,
+                        function: alternative.clone(),
+                    },
+                );
             }
         }
 
@@ -2470,6 +2667,7 @@ impl IRPass for ClightEmitPass {
             "cast_var_types_for_emission",
             "cast_raw_translation_unit",
             "cast_optimized_translation_unit",
+            "cast_pending_scalar_lvalue_alternatives",
         ]
     }
 
@@ -2484,6 +2682,30 @@ mod provider_identity_tests {
     use crate::decompile::passes::c_pass::convert::from_relations::{
         convert_expr, ConversionContext,
     };
+
+    #[test]
+    fn scalar_lvalue_relations_are_explicit_shared_extra_reads() {
+        for relation in [
+            "scalar_lvalue_candidate",
+            "scalar_lvalue_source_candidate",
+        ] {
+            assert_eq!(
+                CLIGHT_EMIT_EXTRA_READS
+                    .iter()
+                    .filter(|candidate| **candidate == relation)
+                    .count(),
+                1,
+                "{relation} must be one explicit extra read"
+            );
+            assert!(
+                !CLIGHT_EMIT_INPUTS.contains(&relation),
+                "{relation} is provenance, not a swapped canonical input"
+            );
+            assert!(ClightSelectPass.extra_reads().contains(&relation));
+            assert!(ClightEmitPass.extra_reads().contains(&relation));
+        }
+        assert_eq!(ClightSelectPass.extra_reads(), ClightEmitPass.extra_reads());
+    }
 
     #[test]
     fn omitted_provider_overrides_alias_at_direct_evar_call_site() {
