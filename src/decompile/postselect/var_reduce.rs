@@ -1834,6 +1834,32 @@ fn combined_source_alternative_portfolio_fits(
     true
 }
 
+fn combined_stage4_portfolio_fits(
+    prior: &[super::source_alternatives::SourceAlternativeSnapshot],
+    stage4: &[super::source_alternatives::SourceAlternativeSnapshot],
+) -> bool {
+    let Some(total) = prior.len().checked_add(stage4.len()) else {
+        return false;
+    };
+    if total > super::source_alternatives::MAX_TOTAL_SOURCE_ALTERNATIVES {
+        return false;
+    }
+    let mut per_function = HashMap::new();
+    for snapshot in prior.iter().chain(stage4) {
+        let count = per_function
+            .entry(snapshot.declaration_index)
+            .or_insert(0usize);
+        let Some(next) = count.checked_add(1) else {
+            return false;
+        };
+        *count = next;
+        if next > super::source_alternatives::MAX_SOURCE_ALTERNATIVES_PER_FUNCTION_V4 {
+            return false;
+        }
+    }
+    true
+}
+
 pub struct VarReducePass;
 
 impl IRPass for VarReducePass {
@@ -1850,6 +1876,8 @@ impl IRPass for VarReducePass {
         let mut alternatives_overflowed = db.cast_source_alternatives_overflowed;
         let mut feature_alternatives_overflowed =
             db.cast_feature_source_alternatives_overflowed;
+        let mut stage4_alternatives_overflowed =
+            db.cast_stage4_source_alternatives_overflowed;
         let function_addresses = super::source_alternatives::exact_function_addresses(
             &db.cast_selected_functions,
             &db.cast_id_to_name,
@@ -1896,6 +1924,7 @@ impl IRPass for VarReducePass {
         // two useful records. The per-use and hoisted extension profiles remain
         // atomic as a superfamily: each side must contribute a nonempty subset.
         let pending = std::mem::take(&mut db.cast_pending_scalar_lvalue_alternatives);
+        let pending_stage4 = std::mem::take(&mut db.cast_pending_stage4_alternatives);
         if !alternatives_overflowed && !feature_alternatives_overflowed {
             let Some(canonical_tu) = db.cast_optimized_translation_unit.as_ref() else {
                 unreachable!("translation unit checked above")
@@ -2033,9 +2062,90 @@ impl IRPass for VarReducePass {
                 alternatives.extend(feature_snapshots);
             }
         }
+
+        if !alternatives_overflowed
+            && !feature_alternatives_overflowed
+            && !stage4_alternatives_overflowed
+            && !pending_stage4.is_empty()
+        {
+            let Some(canonical_tu) = db.cast_optimized_translation_unit.as_ref() else {
+                unreachable!("translation unit checked above")
+            };
+            let mut groups = std::collections::BTreeMap::new();
+            for alternative in pending_stage4 {
+                groups
+                    .entry((
+                        alternative.manifold_name.clone(),
+                        alternative.manifold_address,
+                        alternative.profile,
+                    ))
+                    .or_insert_with(Vec::new)
+                    .push(alternative);
+            }
+            let mut profile_counts = HashMap::new();
+            for (name, address, _) in groups.keys() {
+                *profile_counts
+                    .entry((name.clone(), *address))
+                    .or_insert(0usize) += 1;
+            }
+            if profile_counts.values().any(|count| {
+                *count
+                    > crate::decompile::passes::clight_select::select::MAX_STAGE4_PROFILES_PER_FUNCTION
+            }) {
+                stage4_alternatives_overflowed = true;
+            } else {
+                let mut stage4_snapshots = Vec::new();
+                for ((manifold_name, manifold_address, profile), mut group) in groups {
+                    if group.len() != 1
+                        || function_addresses.get(&manifold_name) != Some(&manifold_address)
+                    {
+                        continue;
+                    }
+                    let matching: Vec<(usize, &FuncDef)> = canonical_tu
+                        .decls
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, declaration)| match declaration {
+                            TopLevelDecl::FuncDef(function)
+                                if function.name == manifold_name =>
+                            {
+                                Some((index, function))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let [(declaration_index, canonical)] = matching.as_slice() else {
+                        continue;
+                    };
+                    let mut alternative = group.pop().expect("one Stage-4 profile");
+                    let pre = alternative.function.clone();
+                    reduce_one_function(&mut alternative.function);
+                    if let Some(snapshots) =
+                        super::source_alternatives::stage4_feature_snapshots_for_format(
+                            *declaration_index,
+                            manifold_address,
+                            profile,
+                            canonical,
+                            &pre,
+                            &alternative.function,
+                            binary_format,
+                        )
+                    {
+                        stage4_snapshots.extend(snapshots);
+                    }
+                }
+                if combined_stage4_portfolio_fits(&alternatives, &stage4_snapshots) {
+                    alternatives.extend(stage4_snapshots);
+                } else {
+                    // New-family pressure never evicts ordinary or v3 rows.
+                    stage4_alternatives_overflowed = true;
+                }
+            }
+        }
         db.cast_source_alternatives = alternatives;
         db.cast_source_alternatives_overflowed = alternatives_overflowed;
         db.cast_feature_source_alternatives_overflowed = feature_alternatives_overflowed;
+        db.cast_stage4_source_alternatives_overflowed = stage4_alternatives_overflowed;
         log::info!(
             "var_reduce: coalesced {} locals, folded {} single-use temporaries, split {} initializers",
             merged,
@@ -2053,8 +2163,10 @@ impl IRPass for VarReducePass {
         &[
             "cast_optimized_translation_unit",
             "cast_pending_scalar_lvalue_alternatives",
+            "cast_pending_stage4_alternatives",
             "cast_source_alternatives",
             "cast_feature_source_alternatives_overflowed",
+            "cast_stage4_source_alternatives_overflowed",
         ]
     }
 }
@@ -2356,6 +2468,7 @@ mod tests {
             manifold_address: 0x1000 + declaration_index as u64 * 0x10,
             boundary,
             kinds: vec!["local_lifetime"],
+            stage4_profile: None,
             function: function.clone(),
         };
         let ordinary: Vec<_> = (0..4095)

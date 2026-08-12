@@ -404,6 +404,384 @@ impl ScalarMemoryUsePlan {
     }
 }
 
+/// Closed source-shape families whose machine semantics are already fixed by
+/// the selected RTL program.  These identifiers are provider-internal: the
+/// source-alternative wire records only a bounded, content-authenticated
+/// profile derived from one proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Stage4SourceKind {
+    AffineAddress,
+    Zeroing,
+    Add,
+    Sub,
+    Mul,
+    And,
+    Or,
+    Xor,
+}
+
+/// Exact provider boundary at which one Stage-4 source shape was proved.
+/// `FinalRtlDefinition` is the ordinary selected-definition path.  A
+/// destructive x86 register operation may instead be erased after the RTL
+/// optimizer has resolved the destination's copy chain; that second path is
+/// admitted only by the optimizer-published selected-row/dead-node proof and
+/// is reintroduced solely in a private source-alternative view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Stage4RootBoundary {
+    FinalRtlDefinition,
+    EliminatedMutation,
+}
+
+impl Stage4SourceKind {
+    pub fn is_compound(self) -> bool {
+        matches!(
+            self,
+            Self::Add | Self::Sub | Self::Mul | Self::And | Self::Or | Self::Xor
+        )
+    }
+}
+
+/// One exact surviving use of a Stage-4 value.  Repeated occurrences at one
+/// RTL node are deliberately represented as duplicate rows and rejected while
+/// the plan is built; a serialized plan is therefore sorted and unique.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Stage4UseSite {
+    pub node: Node,
+    pub value: RTLReg,
+}
+
+/// One exact value-preserving edge in a Stage-4 final-RTL use forest.  Only a
+/// selected `Omove` may publish this row; arithmetic, casts, loads, calls and
+/// address formation are terminal uses rather than silently replayed aliases.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Stage4Transport {
+    pub node: Node,
+    pub input: RTLReg,
+    pub output: RTLReg,
+}
+
+/// Exact surviving load whose canonical assignment is the placement anchor
+/// for one eliminated two-address mutation.  Stage-4 never rewrites this
+/// load; each later IR boundary must reproduce it byte-for-byte before the
+/// private view may append a compound statement.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Stage4PlacementLoad {
+    pub chunk: MemoryChunk,
+    pub addressing: Addressing,
+    pub args: Args,
+}
+
+/// One exact terminal observation of an eliminated mutation carrier.  V1 is
+/// deliberately closed to a sole return or store and admits no move forest.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Stage4TerminalUse {
+    Return,
+    Store {
+        chunk: MemoryChunk,
+        addressing: Addressing,
+        args: Args,
+    },
+}
+
+/// Bounded final-RTL def/use envelope for a source-shape proof.  Stage-4 does
+/// not replay arbitrary SSA: the authenticated definition must dominate every
+/// listed direct use and no hidden, duplicate, transported, or redefined value
+/// may be omitted from this list.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Stage4UsePlan {
+    pub function: Address,
+    pub definition_node: Node,
+    /// Canonical Clight node at which an eliminated mutation may be prepended.
+    /// Surviving final-RTL definitions place at their own definition node.
+    pub placement_node: Node,
+    pub value: RTLReg,
+    pub placement_load: Option<Stage4PlacementLoad>,
+    pub terminal_use: Option<Stage4TerminalUse>,
+    pub transports: Arc<Vec<Stage4Transport>>,
+    pub sites: Arc<Vec<Stage4UseSite>>,
+}
+
+impl Stage4UsePlan {
+    pub fn is_closed_v1(&self, proof: &Stage4SourceProof) -> bool {
+        if self.function != proof.function
+            || self.definition_node != proof.selected_node
+            || match proof.root_boundary {
+                Stage4RootBoundary::FinalRtlDefinition => {
+                    self.placement_node != self.definition_node
+                }
+                Stage4RootBoundary::EliminatedMutation => {
+                    self.placement_node == self.definition_node
+                }
+            }
+            || self.value != proof.value
+            || self.sites.is_empty()
+            || self.sites.len() > 64
+            || self.transports.len() > 64
+            || self.sites.len().saturating_add(self.transports.len()) > 64
+            || !self.transports.windows(2).all(|pair| pair[0] < pair[1])
+            || !self.sites.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return false;
+        }
+
+        match proof.root_boundary {
+            Stage4RootBoundary::FinalRtlDefinition => {
+                if self.placement_load.is_some() || self.terminal_use.is_some() {
+                    return false;
+                }
+            }
+            Stage4RootBoundary::EliminatedMutation => {
+                if self.placement_load.is_none()
+                    || self.terminal_use.is_none()
+                    || !self.transports.is_empty()
+                    || self.sites.len() != 1
+                {
+                    return false;
+                }
+                let placement = self.placement_load.as_ref().expect("checked placement");
+                let placement_width = match placement.chunk {
+                    MemoryChunk::MInt32 | MemoryChunk::MAny32 => Some(4),
+                    MemoryChunk::MInt64 | MemoryChunk::MAny64 => Some(8),
+                    _ => None,
+                };
+                let terminal_width = match self.terminal_use.as_ref().expect("checked terminal") {
+                    Stage4TerminalUse::Return => Some(proof.width),
+                    Stage4TerminalUse::Store { chunk, args, .. } => {
+                        if args.is_empty() || args.len() > 2 || args.contains(&self.value) {
+                            return false;
+                        }
+                        match chunk {
+                            MemoryChunk::MInt32 | MemoryChunk::MAny32 => Some(4),
+                            MemoryChunk::MInt64 | MemoryChunk::MAny64 => Some(8),
+                            _ => None,
+                        }
+                    }
+                };
+                if placement_width != Some(proof.width)
+                    || terminal_width != Some(proof.width)
+                    || placement.args.is_empty()
+                    || placement.args.len() > 2
+                    || placement.args.contains(&self.value)
+                {
+                    return false;
+                }
+            }
+        }
+
+        let mut output_to_input = std::collections::BTreeMap::new();
+        let mut transport_nodes = std::collections::BTreeSet::new();
+        for transport in self.transports.iter() {
+            if transport.input == transport.output
+                || transport.output == self.value
+                || output_to_input
+                    .insert(transport.output, transport.input)
+                    .is_some()
+                || !transport_nodes.insert(transport.node)
+            {
+                return false;
+            }
+        }
+        let mut site_occurrences = std::collections::BTreeSet::new();
+        if self.sites.iter().any(|site| {
+            transport_nodes.contains(&site.node)
+                || !site_occurrences.insert((site.node, site.value))
+        }) {
+            return false;
+        }
+
+        let mut reachable = std::collections::BTreeSet::from([self.value]);
+        loop {
+            let before = reachable.len();
+            for (output, input) in &output_to_input {
+                if reachable.contains(input) {
+                    reachable.insert(*output);
+                }
+            }
+            if reachable.len() == before {
+                break;
+            }
+            if reachable.len() > 65 {
+                return false;
+            }
+        }
+        if reachable.len() != output_to_input.len().saturating_add(1)
+            || self
+                .sites
+                .iter()
+                .any(|site| !reachable.contains(&site.value))
+        {
+            return false;
+        }
+
+        let consumed_values: std::collections::BTreeSet<_> = self
+            .transports
+            .iter()
+            .map(|transport| transport.input)
+            .chain(self.sites.iter().map(|site| site.value))
+            .collect();
+        reachable
+            .iter()
+            .all(|value| consumed_values.contains(value))
+    }
+}
+
+/// A decoder-, LTL-, selected-RTL-, ownership-, CFG-, and COFF-authenticated
+/// source-shape opportunity.  It carries no source name, score, struct, alias,
+/// or volatility claim.  `operation` is the exact selected RTL operation;
+/// downstream private Clight views must match it rather than synthesizing a
+/// semantically broader expression.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Stage4SourceProof {
+    pub function: Address,
+    pub origin_node: Node,
+    pub selected_node: Node,
+    pub kind: Stage4SourceKind,
+    pub root_boundary: Stage4RootBoundary,
+    pub width: usize,
+    pub operation: Operation,
+    pub args: Arc<Vec<RTLReg>>,
+    /// Exact decoded source immediate for a two-operand register-immediate RMW
+    /// instruction. `operation` remains the selected RTL operation (SUB is
+    /// represented there as add of the negated immediate).
+    pub source_immediate: Option<i64>,
+    pub value: RTLReg,
+    /// Destination of the exact selected pre-optimization row. Surviving
+    /// definitions equal `value`; an eliminated two-address mutation carries
+    /// its distinct fresh root definition, whose exact fixed-point web is
+    /// authenticated back to the surviving `value` carrier.
+    pub selected_result: RTLReg,
+    /// Sorted unique parameter leaves of an affine address DAG.  Non-affine
+    /// forms carry an empty vector and are never allowed to infer pointer type.
+    pub address_param_leaves: Arc<Vec<RTLReg>>,
+}
+
+impl Stage4SourceProof {
+    pub fn is_closed_v1(&self) -> bool {
+        if self.origin_node != self.selected_node
+            || !matches!(self.width, 4 | 8)
+            || self.args.len() > 2
+            || self
+                .address_param_leaves
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return false;
+        }
+        match self.kind {
+            Stage4SourceKind::AffineAddress => {
+                self.root_boundary == Stage4RootBoundary::FinalRtlDefinition
+                    && self.selected_result == self.value
+                    && !self.args.is_empty()
+                    && !self.args.contains(&self.value)
+                    && !self.address_param_leaves.is_empty()
+                    && self.source_immediate.is_none()
+                    && matches!(
+                        self.operation,
+                        Operation::Olea(Addressing::Aindexed(_))
+                            | Operation::Olea(Addressing::Aindexed2(_))
+                            | Operation::Olea(Addressing::Ascaled(1 | 2 | 4 | 8, _))
+                            | Operation::Olea(Addressing::Aindexed2scaled(2 | 4 | 8, _))
+                    )
+            }
+            Stage4SourceKind::Zeroing => {
+                self.root_boundary == Stage4RootBoundary::FinalRtlDefinition
+                    && self.selected_result == self.value
+                    && self.address_param_leaves.is_empty()
+                    && self.args.is_empty()
+                    && self.source_immediate.is_none()
+                    && matches!(
+                        self.operation,
+                        Operation::Ointconst(0) | Operation::Olongconst(0)
+                    )
+            }
+            Stage4SourceKind::Add
+            | Stage4SourceKind::Sub
+            | Stage4SourceKind::Mul
+            | Stage4SourceKind::And
+            | Stage4SourceKind::Or
+            | Stage4SourceKind::Xor => {
+                if self.width == 4
+                    && self.source_immediate.is_some_and(|value| {
+                        i64::from(value as i32) != value
+                    })
+                {
+                    return false;
+                }
+                let expected_operation = match (self.kind, self.width, self.source_immediate) {
+                    (Stage4SourceKind::Add, 4, None) => {
+                        matches!(
+                            self.operation,
+                            Operation::Oadd
+                                | Operation::Olea(Addressing::Aindexed2(0))
+                        )
+                    }
+                    (Stage4SourceKind::Add, 8, None) => {
+                        matches!(
+                            self.operation,
+                            Operation::Oaddl
+                                | Operation::Oleal(Addressing::Aindexed2(0))
+                        )
+                    }
+                    (Stage4SourceKind::Sub, 4, None) => self.operation == Operation::Osub,
+                    (Stage4SourceKind::Sub, 8, None) => self.operation == Operation::Osubl,
+                    (Stage4SourceKind::Mul, 4, None) => self.operation == Operation::Omul,
+                    (Stage4SourceKind::Mul, 8, None) => self.operation == Operation::Omull,
+                    (Stage4SourceKind::And, 4, None) => self.operation == Operation::Oand,
+                    (Stage4SourceKind::And, 8, None) => self.operation == Operation::Oandl,
+                    (Stage4SourceKind::Or, 4, None) => self.operation == Operation::Oor,
+                    (Stage4SourceKind::Or, 8, None) => self.operation == Operation::Oorl,
+                    (Stage4SourceKind::Xor, 4, None) => self.operation == Operation::Oxor,
+                    (Stage4SourceKind::Xor, 8, None) => self.operation == Operation::Oxorl,
+                    (Stage4SourceKind::Add, 4, Some(value)) => {
+                        self.operation == Operation::Oaddimm(value)
+                    }
+                    (Stage4SourceKind::Add, 8, Some(value)) => {
+                        self.operation == Operation::Oaddlimm(value)
+                    }
+                    (Stage4SourceKind::Sub, 4, Some(value)) => value.checked_neg().is_some_and(
+                        |negated| self.operation == Operation::Oaddimm(negated),
+                    ),
+                    (Stage4SourceKind::Sub, 8, Some(value)) => value.checked_neg().is_some_and(
+                        |negated| self.operation == Operation::Oaddlimm(negated),
+                    ),
+                    (Stage4SourceKind::Mul, 4, Some(value)) => {
+                        self.operation == Operation::Omulimm(value)
+                    }
+                    (Stage4SourceKind::Mul, 8, Some(value)) => {
+                        self.operation == Operation::Omullimm(value)
+                    }
+                    (Stage4SourceKind::And, 4, Some(value)) => {
+                        self.operation == Operation::Oandimm(value)
+                    }
+                    (Stage4SourceKind::And, 8, Some(value)) => {
+                        self.operation == Operation::Oandlimm(value)
+                    }
+                    (Stage4SourceKind::Or, 4, Some(value)) => {
+                        self.operation == Operation::Oorimm(value)
+                    }
+                    (Stage4SourceKind::Or, 8, Some(value)) => {
+                        self.operation == Operation::Oorlimm(value)
+                    }
+                    (Stage4SourceKind::Xor, 4, Some(value)) => {
+                        self.operation == Operation::Oxorimm(value)
+                    }
+                    (Stage4SourceKind::Xor, 8, Some(value)) => {
+                        self.operation == Operation::Oxorlimm(value)
+                    }
+                    _ => false,
+                };
+                let expected_arity = if self.source_immediate.is_some() { 1 } else { 2 };
+                self.address_param_leaves.is_empty()
+                    && self.root_boundary == Stage4RootBoundary::EliminatedMutation
+                    && self.selected_result != self.value
+                    && expected_operation
+                    && self.args.len() == expected_arity
+                    && self.args.first() == Some(&self.value)
+            }
+        }
+    }
+}
+
 /// Closed provider-internal spelling carried alongside an authenticated
 /// scalar-memory Clight candidate.  These are selection provenance tags, not
 /// source-alternative wire identifiers: the wire records only the final

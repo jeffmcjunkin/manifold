@@ -442,6 +442,8 @@ ascent_par! {
     relation rtl_succ(Node, Node);
     relation scalar_lvalue_candidate(Node, ScalarMemoryAccessProof);
     relation scalar_memory_use_plan(Node, ScalarMemoryUsePlan);
+    relation stage4_source_candidate(Node, Stage4SourceProof);
+    relation stage4_use_plan(Node, Stage4UsePlan);
     relation scalar_lvalue_source_candidate(
         Node, ScalarLvalueSourceForm, ScalarLvaluePlacement, ClightStmt
     );

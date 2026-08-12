@@ -827,6 +827,265 @@ fn filter_scalar_lvalues_with_final_types(db: &mut DecompileDB) {
     );
 }
 
+/// Final signature/type reconciliation is an ABI boundary.  An eliminated
+/// two-address mutation may cross it only when its load carrier resolves to
+/// one exact integral declaration type and an optional register RHS retains
+/// that exact type.  A sole
+/// direct return additionally has to agree with the finalized function return
+/// register and type; store-only profiles cannot rewrite any ABI value.
+fn stage4_exact_eliminated_carrier_type(
+    proof: &Stage4SourceProof,
+    plan: &Stage4UsePlan,
+    rows: &[XType],
+) -> Option<XType> {
+    let exact = match rows {
+        [only] => *only,
+        [first, second]
+            if proof.width == 8
+                && plan
+                    .placement_load
+                    .as_ref()
+                    .is_some_and(|load| load.chunk == MemoryChunk::MAny64) =>
+        {
+            match (*first, *second) {
+                // Asm's authenticated plain qword MOV may retain Xany64 as a
+                // transport alias alongside one signed or unsigned final C
+                // type.  The concrete type remains authoritative; any other
+                // multiplicity or ambiguity stays fail closed.
+                (XType::Xany64, concrete) | (concrete, XType::Xany64)
+                    if scalar_lvalue_integral_type_width(concrete) == Some(8)
+                        && scalar_lvalue_integral_signedness(concrete).is_some() =>
+                {
+                    concrete
+                }
+                _ => return None,
+            }
+        }
+        [_, _, _]
+            if proof.width == 8
+                && plan
+                    .placement_load
+                    .as_ref()
+                    .is_some_and(|load| load.chunk == MemoryChunk::MAny64)
+                && ((proof
+                    .source_immediate
+                    .is_some_and(|value| i64::from(value as i32) == value)
+                    && matches!(
+                        plan.terminal_use.as_ref(),
+                        Some(Stage4TerminalUse::Store {
+                            chunk: MemoryChunk::MAny64,
+                            ..
+                        })
+                    ))
+                    || (proof.source_immediate.is_none()
+                        && proof.args.len() == 2
+                        && matches!(proof.kind, Stage4SourceKind::And | Stage4SourceKind::Or)
+                        && matches!(plan.terminal_use.as_ref(), Some(Stage4TerminalUse::Return)))) =>
+        {
+            // Immediate arithmetic and Asm's AND/OR width twins may publish
+            // the ordinary 32-bit operation type in addition to the qword
+            // load's MAny64 transport and one concrete 64-bit carrier type.
+            // Admit only that complete unique trio with equal concrete
+            // signedness. The caller still requires either a store-local
+            // carrier or the exact register RHS parameter and return ABI.
+            if rows.windows(2).any(|pair| pair[0] == pair[1])
+                || rows.iter().filter(|xtype| **xtype == XType::Xany64).count() != 1
+            {
+                return None;
+            }
+            let wide: Vec<XType> = rows
+                .iter()
+                .copied()
+                .filter(|xtype| {
+                    *xtype != XType::Xany64
+                        && scalar_lvalue_integral_type_width(*xtype) == Some(8)
+                        && scalar_lvalue_integral_signedness(*xtype).is_some()
+                })
+                .collect();
+            let narrow: Vec<XType> = rows
+                .iter()
+                .copied()
+                .filter(|xtype| {
+                    scalar_lvalue_integral_type_width(*xtype) == Some(4)
+                        && scalar_lvalue_integral_signedness(*xtype).is_some()
+                })
+                .collect();
+            let ([wide], [narrow]) = (wide.as_slice(), narrow.as_slice()) else {
+                return None;
+            };
+            if scalar_lvalue_integral_signedness(*wide)
+                != scalar_lvalue_integral_signedness(*narrow)
+            {
+                return None;
+            }
+            *wide
+        }
+        _ => return None,
+    };
+    (scalar_lvalue_integral_type_width(exact) == Some(proof.width)
+        && scalar_lvalue_integral_signedness(exact).is_some())
+    .then_some(exact)
+}
+
+fn filter_stage4_eliminated_mutations_with_final_types(db: &mut DecompileDB) {
+    let mut source_rows: Vec<(Node, Stage4SourceProof)> = db
+        .rel_iter::<(Node, Stage4SourceProof)>("cminor_stage4_source")
+        .cloned()
+        .collect();
+    source_rows.sort_unstable();
+    if !source_rows
+        .iter()
+        .any(|(_, proof)| proof.root_boundary == Stage4RootBoundary::EliminatedMutation)
+    {
+        return;
+    }
+    let mut plan_rows: Vec<(Node, Stage4UsePlan)> = db
+        .rel_iter::<(Node, Stage4UsePlan)>("cminor_stage4_use_plan")
+        .cloned()
+        .collect();
+    plan_rows.sort_unstable();
+    let mut sources_by_node: BTreeMap<Node, Vec<Stage4SourceProof>> = BTreeMap::new();
+    let mut plans_by_node: BTreeMap<Node, Vec<Stage4UsePlan>> = BTreeMap::new();
+    for (node, proof) in &source_rows {
+        sources_by_node.entry(*node).or_default().push(proof.clone());
+    }
+    for (node, plan) in &plan_rows {
+        plans_by_node.entry(*node).or_default().push(plan.clone());
+    }
+    for rows in sources_by_node.values_mut() {
+        rows.sort_unstable();
+    }
+    for rows in plans_by_node.values_mut() {
+        rows.sort_unstable();
+    }
+
+    let mut types_by_value: BTreeMap<RTLReg, Vec<XType>> = BTreeMap::new();
+    for (value, xtype) in db.rel_iter::<(RTLReg, XType)>("emit_var_type_candidate") {
+        types_by_value.entry(*value).or_default().push(*xtype);
+    }
+    for rows in types_by_value.values_mut() {
+        rows.sort_unstable();
+    }
+    let pointer_values: BTreeSet<RTLReg> = db
+        .rel_iter::<(RTLReg,)>("is_ptr")
+        .map(|(value,)| *value)
+        .collect();
+    let parameter_values: BTreeSet<(Address, RTLReg)> = db
+        .rel_iter::<(Address, RTLReg)>("emit_function_param")
+        .copied()
+        .collect();
+    let mut returns_by_function: BTreeMap<Address, Vec<RTLReg>> = BTreeMap::new();
+    for (function, value) in db.rel_iter::<(Address, RTLReg)>("emit_function_return") {
+        returns_by_function.entry(*function).or_default().push(*value);
+    }
+    for rows in returns_by_function.values_mut() {
+        rows.sort_unstable();
+    }
+    let mut return_types_by_function: BTreeMap<Address, Vec<XType>> = BTreeMap::new();
+    for (function, xtype) in
+        db.rel_iter::<(Address, XType)>("emit_function_return_type_xtype")
+    {
+        return_types_by_function
+            .entry(*function)
+            .or_default()
+            .push(*xtype);
+    }
+    for rows in return_types_by_function.values_mut() {
+        rows.sort_unstable();
+    }
+
+    let mut accepted = BTreeSet::new();
+    for (node, rows) in &sources_by_node {
+        let [proof] = rows.as_slice() else { continue };
+        if proof.root_boundary != Stage4RootBoundary::EliminatedMutation {
+            continue;
+        }
+        let [plan] = plans_by_node.get(node).map(Vec::as_slice).unwrap_or(&[]) else {
+            continue;
+        };
+        let Some(carrier_type) = stage4_exact_eliminated_carrier_type(
+            proof,
+            plan,
+            types_by_value
+                .get(&proof.value)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        ) else {
+            continue;
+        };
+        if !proof.is_closed_v1()
+            || !plan.is_closed_v1(proof)
+            || pointer_values.contains(&proof.value)
+            || parameter_values.contains(&(proof.function, proof.value))
+        {
+            continue;
+        }
+        if let Some(source) = proof.args.get(1) {
+            if pointer_values.contains(source)
+                || !parameter_values.contains(&(proof.function, *source))
+                || types_by_value.get(source).map(Vec::as_slice) != Some(&[carrier_type][..])
+            {
+                continue;
+            }
+        }
+        let return_abi_matches = match plan.terminal_use.as_ref() {
+            Some(Stage4TerminalUse::Return) => {
+                returns_by_function.get(&proof.function).map(Vec::as_slice)
+                    == Some(&[proof.value][..])
+                    && return_types_by_function
+                        .get(&proof.function)
+                        .map(Vec::as_slice)
+                        == Some(&[carrier_type][..])
+            }
+            Some(Stage4TerminalUse::Store { .. }) => {
+                match returns_by_function.get(&proof.function).map(Vec::as_slice) {
+                    None => true,
+                    Some([return_value]) => *return_value != proof.value,
+                    Some(_) => false,
+                }
+            }
+            None => false,
+        };
+        if return_abi_matches {
+            accepted.insert((*node, proof.clone(), plan.clone()));
+        }
+    }
+
+    db.rel_set(
+        "cminor_stage4_source",
+        source_rows
+            .into_iter()
+            .filter(|(node, proof)| {
+                proof.root_boundary == Stage4RootBoundary::FinalRtlDefinition
+                    || accepted
+                        .iter()
+                        .any(|(accepted_node, accepted_proof, _)| {
+                            node == accepted_node && proof == accepted_proof
+                        })
+            })
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "cminor_stage4_use_plan",
+        plan_rows
+            .into_iter()
+            .filter(|(node, plan)| {
+                accepted
+                    .iter()
+                    .any(|(accepted_node, _, accepted_plan)| {
+                        node == accepted_node && plan == accepted_plan
+                    })
+                    || sources_by_node.get(node).is_some_and(|proofs| {
+                        proofs.iter().any(|proof| {
+                            proof.root_boundary == Stage4RootBoundary::FinalRtlDefinition
+                                && plan.is_closed_v1(proof)
+                        })
+                    })
+            })
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+}
+
 ascent_par! {
     #![measure_rule_times]
 
@@ -837,6 +1096,8 @@ ascent_par! {
     relation cminor_stmt(Node, CminorStmt);
     relation cminor_scalar_memory_access(Node, ScalarMemoryAccessProof);
     relation cminor_scalar_memory_use_plan(Node, ScalarMemoryUsePlan);
+    relation cminor_stage4_source(Node, Stage4SourceProof);
+    relation cminor_stage4_use_plan(Node, Stage4UsePlan);
     relation signature_scalar_extension_access(Node, ScalarMemoryAccessProof);
     relation trim_jump_table_impl(Node);
     // RTLOptimize's post-rewrite proof that one exact CR8 condition consumes
@@ -847,6 +1108,8 @@ ascent_par! {
     // node, while Clight may safely retain bounded source alternatives.
     relation scalar_lvalue_candidate(Node, ScalarMemoryAccessProof);
     relation scalar_memory_use_plan(Node, ScalarMemoryUsePlan);
+    relation stage4_source_candidate(Node, Stage4SourceProof);
+    relation stage4_use_plan(Node, Stage4UsePlan);
     #[local] relation scalar_lvalue_param_leaf_missing(Node);
 
     #[local] relation active_cminor_stmt(Node, CminorStmt);
@@ -872,6 +1135,31 @@ ascent_par! {
     scalar_memory_use_plan(node, plan.clone()) <--
         cminor_scalar_memory_use_plan(node, plan),
         scalar_lvalue_candidate(node, proof),
+        if plan.is_closed_v1(proof);
+
+    stage4_source_candidate(node, proof.clone()) <--
+        cminor_stage4_source(node, proof),
+        active_cminor_stmt(node, stmt),
+        if crate::decompile::passes::cminor_pass::stage4_source_proof_matches_cminor(proof, stmt);
+
+    // Signature reconciliation has completed before this pass. Rejoin the
+    // same surviving load and sole terminal statement again; the eliminated
+    // root never acquires a canonical Csharpminor statement.
+    stage4_source_candidate(node, proof.clone()),
+    stage4_use_plan(node, plan.clone()) <--
+        cminor_stage4_source(node, proof),
+        cminor_stage4_use_plan(node, plan),
+        active_cminor_stmt(plan.placement_node, placement),
+        for site in plan.sites.iter(),
+        active_cminor_stmt(site.node, terminal),
+        if crate::decompile::passes::cminor_pass::stage4_eliminated_plan_matches_cminor(
+            proof, plan, placement, terminal
+        );
+
+    stage4_use_plan(node, plan.clone()) <--
+        cminor_stage4_use_plan(node, plan),
+        stage4_source_candidate(node, proof),
+        if proof.root_boundary == Stage4RootBoundary::FinalRtlDefinition,
         if plan.is_closed_v1(proof);
 
     relation instr_in_function(Node, Address);
@@ -1938,6 +2226,7 @@ impl IRPass for CshminorPass {
     fn run(&self, db: &mut DecompileDB) {
         filter_cr8_byte_compares_with_incompatible_types(db);
         filter_scalar_lvalues_with_final_types(db);
+        filter_stage4_eliminated_mutations_with_final_types(db);
         Self::prepare_jump_tables(db);
 
         run_pass!(db, CshminorPassProgram);
@@ -2705,5 +2994,587 @@ mod scalar_lvalue_final_param_tests {
             .filter_map(|(value, xtype)| (*value == VALUE).then_some(*xtype))
             .collect();
         assert_eq!(types, BTreeSet::from([XType::Xintunsigned]));
+    }
+
+    fn stage4_final_type_fixture(
+        carrier_types: &[XType],
+        source_types: &[XType],
+        return_type: XType,
+        placement_chunk: MemoryChunk,
+    ) -> DecompileDB {
+        let proof = Stage4SourceProof {
+            function: FUNCTION,
+            origin_node: NODE,
+            selected_node: NODE,
+            kind: Stage4SourceKind::Add,
+            root_boundary: Stage4RootBoundary::EliminatedMutation,
+            width: 8,
+            operation: Operation::Oaddl,
+            args: Arc::new(vec![VALUE, INDEX]),
+            source_immediate: None,
+            value: VALUE,
+            selected_result: VALUE + 0x100,
+            address_param_leaves: Arc::new(Vec::new()),
+        };
+        let plan = Stage4UsePlan {
+            function: FUNCTION,
+            definition_node: NODE,
+            placement_node: NODE - 3,
+            value: VALUE,
+            placement_load: Some(Stage4PlacementLoad {
+                chunk: placement_chunk,
+                addressing: Addressing::Aindexed(0),
+                args: Arc::new(vec![BASE]),
+            }),
+            terminal_use: Some(Stage4TerminalUse::Return),
+            transports: Arc::new(Vec::new()),
+            sites: Arc::new(vec![Stage4UseSite {
+                node: NODE + 3,
+                value: VALUE,
+            }]),
+        };
+        assert!(proof.is_closed_v1());
+        assert!(plan.is_closed_v1(&proof));
+
+        let mut db = DecompileDB::default();
+        db.rel_push("cminor_stage4_source", (NODE, proof));
+        db.rel_push("cminor_stage4_use_plan", (NODE, plan));
+        for xtype in carrier_types {
+            db.rel_push("emit_var_type_candidate", (VALUE, *xtype));
+        }
+        for xtype in source_types {
+            db.rel_push("emit_var_type_candidate", (INDEX, *xtype));
+        }
+        db.rel_push("emit_function_param", (FUNCTION, INDEX));
+        db.rel_push("emit_function_return", (FUNCTION, VALUE));
+        db.rel_push("emit_function_return_type_xtype", (FUNCTION, return_type));
+        db
+    }
+
+    fn stage4_final_type_case(
+        carrier_types: &[XType],
+        source_types: &[XType],
+        return_type: XType,
+        placement_chunk: MemoryChunk,
+    ) -> DecompileDB {
+        let mut db = stage4_final_type_fixture(
+            carrier_types,
+            source_types,
+            return_type,
+            placement_chunk,
+        );
+        filter_stage4_eliminated_mutations_with_final_types(&mut db);
+        db
+    }
+
+    fn stage4_final_type_candidate_count(db: &DecompileDB) -> usize {
+        db.rel_iter::<(Node, Stage4SourceProof)>("cminor_stage4_source")
+            .filter(|(node, _)| *node == NODE)
+            .count()
+    }
+
+    fn stage4_store_final_type_case(final_returns: &[RTLReg]) -> DecompileDB {
+        let mut db = stage4_final_type_fixture(
+            &[XType::Xany64, XType::Xlong],
+            &[XType::Xlong],
+            XType::Xlong,
+            MemoryChunk::MAny64,
+        );
+        let mut plans: Vec<_> = db
+            .rel_iter::<(Node, Stage4UsePlan)>("cminor_stage4_use_plan")
+            .cloned()
+            .collect();
+        assert_eq!(plans.len(), 1);
+        plans[0].1.terminal_use = Some(Stage4TerminalUse::Store {
+            chunk: MemoryChunk::MAny64,
+            addressing: Addressing::Aindexed(0),
+            args: Arc::new(vec![BASE]),
+        });
+        db.rel_set(
+            "cminor_stage4_use_plan",
+            plans.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "emit_function_return",
+            final_returns
+                .iter()
+                .map(|value| (FUNCTION, *value))
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_push("emit_function_param", (FUNCTION, BASE));
+        filter_stage4_eliminated_mutations_with_final_types(&mut db);
+        db
+    }
+
+    fn stage4_store_immediate_type_fixture(
+        carrier_types: &[XType],
+        source_immediate: Option<i64>,
+        placement_chunk: MemoryChunk,
+        store_chunk: MemoryChunk,
+        final_returns: &[RTLReg],
+    ) -> DecompileDB {
+        let mut db = stage4_final_type_fixture(
+            carrier_types,
+            &[XType::Xlong],
+            XType::Xlong,
+            placement_chunk,
+        );
+        if let Some(immediate) = source_immediate {
+            let mut sources: Vec<_> = db
+                .rel_iter::<(Node, Stage4SourceProof)>("cminor_stage4_source")
+                .cloned()
+                .collect();
+            assert_eq!(sources.len(), 1);
+            sources[0].1.kind = Stage4SourceKind::And;
+            sources[0].1.operation = Operation::Oandlimm(immediate);
+            sources[0].1.args = Arc::new(vec![VALUE]);
+            sources[0].1.source_immediate = Some(immediate);
+            assert!(sources[0].1.is_closed_v1());
+            db.rel_set(
+                "cminor_stage4_source",
+                sources.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+            );
+        }
+        let mut plans: Vec<_> = db
+            .rel_iter::<(Node, Stage4UsePlan)>("cminor_stage4_use_plan")
+            .cloned()
+            .collect();
+        assert_eq!(plans.len(), 1);
+        plans[0].1.terminal_use = Some(Stage4TerminalUse::Store {
+            chunk: store_chunk,
+            addressing: Addressing::Aindexed(0),
+            args: Arc::new(vec![BASE]),
+        });
+        db.rel_set(
+            "cminor_stage4_use_plan",
+            plans.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_set(
+            "emit_function_return",
+            final_returns
+                .iter()
+                .map(|value| (FUNCTION, *value))
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        db.rel_push("emit_function_param", (FUNCTION, BASE));
+        db
+    }
+
+    fn stage4_store_immediate_type_case(
+        carrier_types: &[XType],
+        source_immediate: Option<i64>,
+        placement_chunk: MemoryChunk,
+        store_chunk: MemoryChunk,
+        final_returns: &[RTLReg],
+    ) -> DecompileDB {
+        let mut db = stage4_store_immediate_type_fixture(
+            carrier_types,
+            source_immediate,
+            placement_chunk,
+            store_chunk,
+            final_returns,
+        );
+        filter_stage4_eliminated_mutations_with_final_types(&mut db);
+        db
+    }
+
+    fn stage4_register_return_width_twin_type_case(
+        kind: Stage4SourceKind,
+        operation: Operation,
+        carrier_types: &[XType],
+        source_types: &[XType],
+        return_type: XType,
+        placement_chunk: MemoryChunk,
+    ) -> DecompileDB {
+        let mut db = stage4_final_type_fixture(
+            carrier_types,
+            source_types,
+            return_type,
+            placement_chunk,
+        );
+        let mut sources: Vec<_> = db
+            .rel_iter::<(Node, Stage4SourceProof)>("cminor_stage4_source")
+            .cloned()
+            .collect();
+        assert_eq!(sources.len(), 1);
+        sources[0].1.kind = kind;
+        sources[0].1.operation = operation;
+        assert!(sources[0].1.is_closed_v1());
+        db.rel_set(
+            "cminor_stage4_source",
+            sources.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+        filter_stage4_eliminated_mutations_with_final_types(&mut db);
+        db
+    }
+
+    #[test]
+    fn stage4_eliminated_qword_accepts_only_exact_any64_transport_alias() {
+        for concrete in [XType::Xlong, XType::Xlongunsigned] {
+            assert_eq!(
+                stage4_final_type_candidate_count(&stage4_final_type_case(
+                    &[concrete],
+                    &[concrete],
+                    concrete,
+                    MemoryChunk::MAny64,
+                )),
+                1,
+            );
+            assert_eq!(
+                stage4_final_type_candidate_count(&stage4_final_type_case(
+                    &[XType::Xany64, concrete],
+                    &[concrete],
+                    concrete,
+                    MemoryChunk::MAny64,
+                )),
+                1,
+            );
+        }
+
+        for (carrier_types, source_types, return_type, placement_chunk) in [
+            (
+                &[XType::Xany64][..],
+                &[XType::Xlong][..],
+                XType::Xlong,
+                MemoryChunk::MAny64,
+            ),
+            (
+                &[XType::Xany64, XType::Xlong, XType::Xlongunsigned][..],
+                &[XType::Xlong][..],
+                XType::Xlong,
+                MemoryChunk::MAny64,
+            ),
+            (
+                &[XType::Xany64, XType::Xlong, XType::Xlong][..],
+                &[XType::Xlong][..],
+                XType::Xlong,
+                MemoryChunk::MAny64,
+            ),
+            (
+                &[XType::Xany64, XType::Xint][..],
+                &[XType::Xint][..],
+                XType::Xint,
+                MemoryChunk::MAny64,
+            ),
+            (
+                &[XType::Xany64, XType::Xlong][..],
+                &[XType::Xlong][..],
+                XType::Xlong,
+                MemoryChunk::MInt64,
+            ),
+            (
+                &[XType::Xany64, XType::Xlong][..],
+                &[XType::Xlongunsigned][..],
+                XType::Xlong,
+                MemoryChunk::MAny64,
+            ),
+            (
+                &[XType::Xany64, XType::Xlong][..],
+                &[XType::Xlong][..],
+                XType::Xlongunsigned,
+                MemoryChunk::MAny64,
+            ),
+        ] {
+            assert_eq!(
+                stage4_final_type_candidate_count(&stage4_final_type_case(
+                    carrier_types,
+                    source_types,
+                    return_type,
+                    placement_chunk,
+                )),
+                0,
+                "carrier={carrier_types:?}, source={source_types:?}, return={return_type:?}, chunk={placement_chunk:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn stage4_eliminated_store_excludes_carrier_from_final_return_abi() {
+        assert_eq!(
+            stage4_final_type_candidate_count(&stage4_store_final_type_case(&[BASE])),
+            1,
+            "one unrelated finalized return must not suppress a store profile",
+        );
+        assert_eq!(
+            stage4_final_type_candidate_count(&stage4_store_final_type_case(&[])),
+            1,
+            "a void/no-value return relation is valid for a store profile",
+        );
+        assert_eq!(
+            stage4_final_type_candidate_count(&stage4_store_final_type_case(&[VALUE])),
+            0,
+            "the mutated carrier must not escape through the finalized return ABI",
+        );
+        assert_eq!(
+            stage4_final_type_candidate_count(&stage4_store_final_type_case(&[BASE, INDEX])),
+            0,
+            "ambiguous finalized return values remain fail closed",
+        );
+    }
+
+    #[test]
+    fn stage4_store_immediate_narrow_type_is_only_a_sealed_local_placeholder() {
+        for carrier_types in [
+            &[XType::Xany64, XType::Xlong, XType::Xint][..],
+            &[XType::Xany64, XType::Xlongunsigned, XType::Xintunsigned][..],
+        ] {
+            assert_eq!(
+                stage4_final_type_candidate_count(&stage4_store_immediate_type_case(
+                    carrier_types,
+                    Some(255),
+                    MemoryChunk::MAny64,
+                    MemoryChunk::MAny64,
+                    &[BASE],
+                )),
+                1,
+                "sealed store carrier={carrier_types:?}",
+            );
+        }
+
+        for (carrier_types, immediate, placement_chunk, store_chunk) in [
+            (
+                &[XType::Xany64, XType::Xlong, XType::Xint][..],
+                None,
+                MemoryChunk::MAny64,
+                MemoryChunk::MAny64,
+            ),
+            (
+                &[XType::Xany64, XType::Xlong, XType::Xint][..],
+                Some(i64::from(i32::MAX) + 1),
+                MemoryChunk::MAny64,
+                MemoryChunk::MAny64,
+            ),
+            (
+                &[XType::Xany64, XType::Xlongunsigned, XType::Xint][..],
+                Some(255),
+                MemoryChunk::MAny64,
+                MemoryChunk::MAny64,
+            ),
+            (
+                &[XType::Xany64, XType::Xlong, XType::Xint][..],
+                Some(255),
+                MemoryChunk::MInt64,
+                MemoryChunk::MAny64,
+            ),
+            (
+                &[XType::Xany64, XType::Xlong, XType::Xint][..],
+                Some(255),
+                MemoryChunk::MAny64,
+                MemoryChunk::MInt64,
+            ),
+        ] {
+            assert_eq!(
+                stage4_final_type_candidate_count(&stage4_store_immediate_type_case(
+                    carrier_types,
+                    immediate,
+                    placement_chunk,
+                    store_chunk,
+                    &[BASE],
+                )),
+                0,
+                "carrier={carrier_types:?}, immediate={immediate:?}, placement={placement_chunk:?}, store={store_chunk:?}",
+            );
+        }
+
+        let mut return_terminal = stage4_final_type_fixture(
+            &[XType::Xany64, XType::Xlong, XType::Xint],
+            &[XType::Xlong],
+            XType::Xlong,
+            MemoryChunk::MAny64,
+        );
+        let mut sources: Vec<_> = return_terminal
+            .rel_iter::<(Node, Stage4SourceProof)>("cminor_stage4_source")
+            .cloned()
+            .collect();
+        sources[0].1.kind = Stage4SourceKind::And;
+        sources[0].1.operation = Operation::Oandlimm(255);
+        sources[0].1.args = Arc::new(vec![VALUE]);
+        sources[0].1.source_immediate = Some(255);
+        return_terminal.rel_set(
+            "cminor_stage4_source",
+            sources.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+        filter_stage4_eliminated_mutations_with_final_types(&mut return_terminal);
+        assert_eq!(stage4_final_type_candidate_count(&return_terminal), 0);
+
+        let mut carrier_parameter = stage4_store_immediate_type_fixture(
+            &[XType::Xany64, XType::Xlong, XType::Xint],
+            Some(255),
+            MemoryChunk::MAny64,
+            MemoryChunk::MAny64,
+            &[BASE],
+        );
+        carrier_parameter.rel_push("emit_function_param", (FUNCTION, VALUE));
+        filter_stage4_eliminated_mutations_with_final_types(&mut carrier_parameter);
+        assert_eq!(stage4_final_type_candidate_count(&carrier_parameter), 0);
+
+        let carrier_return = stage4_store_immediate_type_case(
+            &[XType::Xany64, XType::Xlong, XType::Xint],
+            Some(255),
+            MemoryChunk::MAny64,
+            MemoryChunk::MAny64,
+            &[VALUE],
+        );
+        assert_eq!(stage4_final_type_candidate_count(&carrier_return), 0);
+    }
+
+    #[test]
+    fn stage4_register_return_width_twin_requires_exact_rhs_and_return_abi() {
+        for (kind, operation, concrete, narrow) in [
+            (
+                Stage4SourceKind::And,
+                Operation::Oandl,
+                XType::Xlong,
+                XType::Xint,
+            ),
+            (
+                Stage4SourceKind::Or,
+                Operation::Oorl,
+                XType::Xlongunsigned,
+                XType::Xintunsigned,
+            ),
+        ] {
+            assert_eq!(
+                stage4_final_type_candidate_count(
+                    &stage4_register_return_width_twin_type_case(
+                        kind,
+                        operation,
+                        &[XType::Xany64, concrete, narrow],
+                        &[concrete],
+                        concrete,
+                        MemoryChunk::MAny64,
+                    ),
+                ),
+                1,
+                "kind={kind:?}, concrete={concrete:?}",
+            );
+        }
+
+        for (kind, operation, carrier_types, source_types, return_type, chunk) in [
+            (
+                Stage4SourceKind::Add,
+                Operation::Oaddl,
+                &[XType::Xany64, XType::Xlong, XType::Xint][..],
+                &[XType::Xlong][..],
+                XType::Xlong,
+                MemoryChunk::MAny64,
+            ),
+            (
+                Stage4SourceKind::Xor,
+                Operation::Oxorl,
+                &[XType::Xany64, XType::Xlong, XType::Xint][..],
+                &[XType::Xlong][..],
+                XType::Xlong,
+                MemoryChunk::MAny64,
+            ),
+            (
+                Stage4SourceKind::Or,
+                Operation::Oorl,
+                &[XType::Xany64, XType::Xlongunsigned, XType::Xint][..],
+                &[XType::Xlongunsigned][..],
+                XType::Xlongunsigned,
+                MemoryChunk::MAny64,
+            ),
+            (
+                Stage4SourceKind::Or,
+                Operation::Oorl,
+                &[XType::Xany64, XType::Xlong, XType::Xint][..],
+                &[XType::Xlongunsigned][..],
+                XType::Xlong,
+                MemoryChunk::MAny64,
+            ),
+            (
+                Stage4SourceKind::Or,
+                Operation::Oorl,
+                &[XType::Xany64, XType::Xlong, XType::Xint][..],
+                &[XType::Xlong][..],
+                XType::Xlongunsigned,
+                MemoryChunk::MAny64,
+            ),
+            (
+                Stage4SourceKind::Or,
+                Operation::Oorl,
+                &[XType::Xany64, XType::Xlong, XType::Xint][..],
+                &[XType::Xlong][..],
+                XType::Xlong,
+                MemoryChunk::MInt64,
+            ),
+        ] {
+            assert_eq!(
+                stage4_final_type_candidate_count(
+                    &stage4_register_return_width_twin_type_case(
+                        kind,
+                        operation,
+                        carrier_types,
+                        source_types,
+                        return_type,
+                        chunk,
+                    ),
+                ),
+                0,
+                "kind={kind:?}, carrier={carrier_types:?}, source={source_types:?}, return={return_type:?}, chunk={chunk:?}",
+            );
+        }
+
+        let mut missing_rhs_parameter = stage4_final_type_fixture(
+            &[XType::Xany64, XType::Xlong, XType::Xint],
+            &[XType::Xlong],
+            XType::Xlong,
+            MemoryChunk::MAny64,
+        );
+        let mut sources: Vec<_> = missing_rhs_parameter
+            .rel_iter::<(Node, Stage4SourceProof)>("cminor_stage4_source")
+            .cloned()
+            .collect();
+        sources[0].1.kind = Stage4SourceKind::Or;
+        sources[0].1.operation = Operation::Oorl;
+        missing_rhs_parameter.rel_set(
+            "cminor_stage4_source",
+            sources.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+        );
+        missing_rhs_parameter.rel_set(
+            "emit_function_param",
+            ascent::boxcar::Vec::<(Address, RTLReg)>::new(),
+        );
+        filter_stage4_eliminated_mutations_with_final_types(&mut missing_rhs_parameter);
+        assert_eq!(
+            stage4_final_type_candidate_count(&missing_rhs_parameter),
+            0,
+        );
+    }
+
+    #[test]
+    fn stage4_eliminated_late_pointer_and_parameter_conflicts_fail_closed() {
+        let fixture = || {
+            stage4_final_type_fixture(
+                &[XType::Xany64, XType::Xlong],
+                &[XType::Xlong],
+                XType::Xlong,
+                MemoryChunk::MAny64,
+            )
+        };
+
+        let mut carrier_pointer = fixture();
+        carrier_pointer.rel_push("is_ptr", (VALUE,));
+        filter_stage4_eliminated_mutations_with_final_types(&mut carrier_pointer);
+        assert_eq!(stage4_final_type_candidate_count(&carrier_pointer), 0);
+
+        let mut carrier_parameter = fixture();
+        carrier_parameter.rel_push("emit_function_param", (FUNCTION, VALUE));
+        filter_stage4_eliminated_mutations_with_final_types(&mut carrier_parameter);
+        assert_eq!(stage4_final_type_candidate_count(&carrier_parameter), 0);
+
+        let mut rhs_pointer = fixture();
+        rhs_pointer.rel_push("is_ptr", (INDEX,));
+        filter_stage4_eliminated_mutations_with_final_types(&mut rhs_pointer);
+        assert_eq!(stage4_final_type_candidate_count(&rhs_pointer), 0);
+
+        let mut missing_rhs_parameter = fixture();
+        missing_rhs_parameter.rel_set(
+            "emit_function_param",
+            ascent::boxcar::Vec::<(Address, RTLReg)>::new(),
+        );
+        filter_stage4_eliminated_mutations_with_final_types(&mut missing_rhs_parameter);
+        assert_eq!(stage4_final_type_candidate_count(&missing_rhs_parameter), 0);
     }
 }

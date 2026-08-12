@@ -7,6 +7,7 @@ use crate::decompile::passes::clight_select::query::{
     FunctionData, IteInfo, LoopInfo,
 };
 use crate::decompile::passes::csh_pass::ident_from_node;
+use crate::x86::op::{Addressing, Operation};
 use crate::x86::types::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -75,6 +76,31 @@ pub struct ScalarLvalueSelectedAlternative {
     pub authenticated_load_nodes: BTreeSet<Node>,
 }
 
+/// One independently scoreable Stage-4 root.  `root_node` is provider-only
+/// provenance, never a corpus selector: it binds a private source view to the
+/// exact final-RTL definition authenticated for this function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Stage4SourceProfile {
+    pub kind: Stage4SourceKind,
+    pub root_node: Node,
+}
+
+#[derive(Debug, Clone)]
+pub struct Stage4SelectedAlternative {
+    pub profile: Stage4SourceProfile,
+    pub function: SelectedFunction,
+    pub authenticated_nodes: BTreeSet<Node>,
+    /// Exact private-view node whose appended assignment may be rendered as a
+    /// compound source statement. Only eliminated two-address mutations carry
+    /// one; affine/zero profiles never authorize an emitter-side rewrite.
+    pub compound_placement_node: Option<Node>,
+    /// Exact post-structuring statement-map owner of the placement label.
+    /// Structuring may fold a later placement into an entry-owned sequence;
+    /// retaining both coordinates lets emission target that one container
+    /// without scanning unrelated authenticated statements.
+    pub compound_emission_node: Option<Node>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ScalarSourceAlternativeFamily {
     /// Stage-2 compatible raw-byte/typed-scaled address spelling.
@@ -90,10 +116,14 @@ pub enum ScalarSourceAlternativeFamily {
 pub struct ClightSelectionResult {
     pub canonical: Vec<SelectedFunction>,
     pub scalar_lvalue_alternatives: Vec<ScalarLvalueSelectedAlternative>,
+    pub stage4_alternatives: Vec<Stage4SelectedAlternative>,
     /// Permanent fail-closed marker for only the private feature portfolio.
     /// Canonical selection and already-captured ordinary alternatives remain
     /// usable when the feature views exceed their intermediate resource bound.
     pub feature_source_alternatives_overflowed: bool,
+    /// Stage-4 has an independent overflow bit: exceeding a new-family bound
+    /// drops only Stage-4 views and leaves the exact v3 portfolio intact.
+    pub stage4_source_alternatives_overflowed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -556,7 +586,1282 @@ fn scalar_freeze_canonical_view(
     fixed.scalar_lvalue_proofs.clear();
     fixed.scalar_memory_use_plans.clear();
     fixed.scalar_lvalue_source_candidates.clear();
+    fixed.stage4_source_proofs.clear();
+    fixed.stage4_use_plans.clear();
     Some(fixed)
+}
+
+pub(crate) const MAX_STAGE4_PROFILES_PER_FUNCTION: usize = 16;
+pub(crate) const MAX_STAGE4_PROFILES_PER_TU: usize = 1024;
+
+fn stage4_inner_statement(statement: &ClightStmt) -> &ClightStmt {
+    match statement {
+        ClightStmt::Slabel(_, inner) => stage4_inner_statement(inner),
+        statement => statement,
+    }
+}
+
+fn stage4_skip_preserving_labels(statement: &ClightStmt) -> ClightStmt {
+    match statement {
+        ClightStmt::Slabel(label, inner) => ClightStmt::Slabel(
+            *label,
+            Box::new(stage4_skip_preserving_labels(inner)),
+        ),
+        _ => ClightStmt::Sskip,
+    }
+}
+
+fn stage4_freeze_canonical_view(
+    function: &FunctionData,
+    canonical: &SelectedFunction,
+    canonical_state: &ProgramSelectionState,
+) -> Option<FunctionData> {
+    let mut fixed = function.clone();
+    for (node, candidates) in &mut fixed.node_statements {
+        let index = canonical_state
+            .candidate_idx
+            .get(&(function.address, *node))
+            .copied()
+            .flatten()?;
+        *candidates = vec![candidates.get(index)?.clone()];
+    }
+    fixed.var_types = canonical.var_types.clone();
+    fixed.var_type_candidates.clear();
+    fixed.var_decl_idx.clear();
+    for (reg, candidates) in &canonical.var_type_candidates {
+        let index = canonical.var_decl_idx.get(reg).copied().unwrap_or(0);
+        fixed
+            .var_type_candidates
+            .insert(*reg, vec![candidates.get(index)?.clone()]);
+        fixed.var_decl_idx.insert(*reg, 0);
+    }
+    fixed.scalar_lvalue_proofs.clear();
+    fixed.scalar_memory_use_plans.clear();
+    fixed.scalar_lvalue_source_candidates.clear();
+    fixed.stage4_source_proofs.clear();
+    fixed.stage4_use_plans.clear();
+    Some(fixed)
+}
+
+fn stage4_statement_is_wt_clean(
+    function: &FunctionData,
+    canonical: &SelectedFunction,
+    statement: &ClightStmt,
+) -> bool {
+    let no_names = HashMap::new();
+    let environment =
+        crate::decompile::passes::clight_select::wt_audit::AuditEnv::build(
+            function,
+            canonical,
+            &no_names,
+        );
+    crate::decompile::passes::clight_select::ctyping::error_count(
+        &crate::decompile::passes::clight_select::ctyping::wt_check_stmt(
+            statement,
+            &environment,
+        ),
+    ) == 0
+}
+
+type Stage4WtDiagnostic = (u8, u8, String);
+
+fn stage4_wt_error_kind_id(
+    kind: crate::decompile::passes::clight_select::ctyping::WtErrorKind,
+) -> u8 {
+    use crate::decompile::passes::clight_select::ctyping::WtErrorKind;
+    match kind {
+        WtErrorKind::DerefOfScalar => 0,
+        WtErrorKind::MemberOfNonStruct => 1,
+        WtErrorKind::MemberNotFound => 2,
+        WtErrorKind::InvalidBinop => 3,
+        WtErrorKind::InvalidUnop => 4,
+        WtErrorKind::BadCondition => 5,
+        WtErrorKind::BadSwitch => 6,
+        WtErrorKind::BadConditional => 7,
+        WtErrorKind::CondPtrIntMix => 8,
+        WtErrorKind::CallThroughNonFunction => 9,
+        WtErrorKind::ArityTooFew => 10,
+        WtErrorKind::ArityTooMany => 11,
+        WtErrorKind::IncompatibleAssign => 12,
+        WtErrorKind::PtrAsFloat => 13,
+        WtErrorKind::VoidValueUse => 14,
+        WtErrorKind::BadCast => 15,
+        WtErrorKind::AddrofNonLvalue => 16,
+        WtErrorKind::AssignToNonLvalue => 17,
+        WtErrorKind::UnboundTemp => 18,
+        WtErrorKind::ReturnVoidMismatch => 19,
+        WtErrorKind::LiteralAnnotation => 20,
+    }
+}
+
+fn stage4_wt_diagnostics_by_node(
+    function: &FunctionData,
+    selected: &SelectedFunction,
+    name_to_ident: &HashMap<String, Ident>,
+) -> BTreeMap<Node, Vec<Stage4WtDiagnostic>> {
+    use crate::decompile::passes::clight_select::ctyping::{self, Severity};
+
+    let environment =
+        crate::decompile::passes::clight_select::wt_audit::AuditEnv::build(
+            function,
+            selected,
+            name_to_ident,
+        );
+    selected
+        .statements
+        .iter()
+        .map(|(node, statement)| {
+            let mut diagnostics: Vec<_> = ctyping::wt_check_stmt(statement, &environment)
+                .into_iter()
+                .map(|diagnostic| {
+                    (
+                        match diagnostic.severity {
+                            Severity::Error => 0,
+                            Severity::Warning => 1,
+                        },
+                        stage4_wt_error_kind_id(diagnostic.kind),
+                        diagnostic.detail,
+                    )
+                })
+                .collect();
+            diagnostics.sort();
+            (*node, diagnostics)
+        })
+        .collect()
+}
+
+fn stage4_wt_diagnostics_do_not_regress(
+    function: &FunctionData,
+    canonical: &SelectedFunction,
+    feature: &SelectedFunction,
+    name_to_ident: &HashMap<String, Ident>,
+) -> bool {
+    if feature.return_type != canonical.return_type
+        || feature.param_regs != canonical.param_regs
+        || feature.param_types != canonical.param_types
+        || feature.var_types != canonical.var_types
+        || feature.var_type_candidates != canonical.var_type_candidates
+        || feature.var_decl_idx != canonical.var_decl_idx
+    {
+        return false;
+    }
+    let canonical_diagnostics =
+        stage4_wt_diagnostics_by_node(function, canonical, name_to_ident);
+    let feature_diagnostics = stage4_wt_diagnostics_by_node(function, feature, name_to_ident);
+    let nodes: BTreeSet<_> = canonical
+        .statements
+        .keys()
+        .chain(feature.statements.keys())
+        .copied()
+        .collect();
+    nodes.into_iter().all(|node| {
+        let canonical_statement = canonical.statements.get(&node);
+        let feature_statement = feature.statements.get(&node);
+        let canonical_rows = canonical_diagnostics
+            .get(&node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let feature_rows = feature_diagnostics
+            .get(&node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if canonical_statement == feature_statement {
+            // Canonical diagnostics outside the changed private statement are
+            // inherited byte-for-byte and may neither disappear nor drift.
+            return feature_rows == canonical_rows;
+        }
+        if canonical_statement.is_none() || feature_statement.is_none() {
+            return false;
+        }
+        // A proof-bound replacement may repair a canonical diagnostic.  It
+        // may not add a diagnosis, change its identity/detail, or increase
+        // the multiplicity of an inherited diagnosis.
+        let mut remaining = canonical_rows.to_vec();
+        feature_rows.iter().all(|row| {
+            let Some(index) = remaining.iter().position(|candidate| candidate == row) else {
+                return false;
+            };
+            remaining.remove(index);
+            true
+        })
+    })
+}
+
+fn stage4_exact_load_address_expr(
+    expression: &ClightExpr,
+    placement: &Stage4PlacementLoad,
+) -> bool {
+    fn strip_casts(mut expression: &ClightExpr) -> &ClightExpr {
+        while let ClightExpr::Ecast(inner, _) = expression {
+            expression = inner;
+        }
+        expression
+    }
+
+    fn exact_temp(expression: &ClightExpr, value: RTLReg) -> bool {
+        matches!(strip_casts(expression), ClightExpr::Etempvar(identifier, _) if *identifier == value as Ident)
+    }
+
+    fn exact_constant(expression: &ClightExpr, value: i64) -> bool {
+        matches!(
+            strip_casts(expression),
+            ClightExpr::EconstInt(observed, _) if i64::from(*observed) == value
+        ) || matches!(
+            strip_casts(expression),
+            ClightExpr::EconstLong(observed, _) if *observed == value
+        )
+    }
+
+    fn base_index(
+        expression: &ClightExpr,
+        base: RTLReg,
+        index: Option<(RTLReg, i64)>,
+        displacement: i64,
+    ) -> bool {
+        let expression = strip_casts(expression);
+        let core = if displacement == 0 {
+            expression
+        } else {
+            let ClightExpr::Ebinop(ClightBinaryOp::Oadd, left, right, _) = expression else {
+                return false;
+            };
+            if exact_constant(right, displacement) {
+                strip_casts(left)
+            } else if exact_constant(left, displacement) {
+                strip_casts(right)
+            } else {
+                return false;
+            }
+        };
+        let Some((index, scale)) = index else {
+            return exact_temp(core, base);
+        };
+        let ClightExpr::Ebinop(ClightBinaryOp::Oadd, left, right, _) = core else {
+            return false;
+        };
+        let scaled = |candidate: &ClightExpr| {
+            if scale == 1 {
+                exact_temp(candidate, index)
+            } else {
+                matches!(
+                    strip_casts(candidate),
+                    ClightExpr::Ebinop(ClightBinaryOp::Omul, one, other, _)
+                        if (exact_temp(one, index) && exact_constant(other, scale))
+                            || (exact_temp(other, index) && exact_constant(one, scale))
+                )
+            }
+        };
+        (exact_temp(left, base) && scaled(right))
+            || (exact_temp(right, base) && scaled(left))
+    }
+
+    let expression = strip_casts(expression);
+    let address = match expression {
+        ClightExpr::Ederef(address, _) => strip_casts(address),
+        ClightExpr::Efield(base, field, _) => {
+            if i64::try_from(*field).ok()
+                != match &placement.addressing {
+                    Addressing::Aindexed(displacement) => Some(*displacement),
+                    _ => None,
+                }
+            {
+                return false;
+            }
+            let ClightExpr::Ederef(address, _) = strip_casts(base) else {
+                return false;
+            };
+            return placement.args.len() == 1
+                && exact_temp(address, placement.args[0]);
+        }
+        _ => return false,
+    };
+    match (&placement.addressing, placement.args.as_slice()) {
+        (Addressing::Aindexed(displacement), [base]) => {
+            base_index(address, *base, None, *displacement)
+        }
+        (Addressing::Aindexed2(displacement), [base, index]) => {
+            base_index(address, *base, Some((*index, 1)), *displacement)
+        }
+        (Addressing::Aindexed2scaled(scale, displacement), [base, index]) => {
+            base_index(address, *base, Some((*index, *scale)), *displacement)
+        }
+        _ => false,
+    }
+}
+
+fn stage4_unique_affine_candidate(
+    function: &FunctionData,
+    canonical: &SelectedFunction,
+    proof: &Stage4SourceProof,
+    preferred: &ClightStmt,
+) -> Option<ClightStmt> {
+    let candidates = function.node_statements.get(&proof.selected_node)?;
+    let is_matching = |candidate: &ClightStmt| {
+        let ClightStmt::Sset(destination, expression) =
+            stage4_inner_statement(candidate)
+        else {
+            return false;
+        };
+        *destination == proof.value as Ident
+            && stage4_affine_expression_is_closed(expression, proof)
+            && canonical
+                .var_types
+                .get(&proof.value)
+                .map(|declaration| {
+                    crate::decompile::passes::clight_select::wt_audit::type_string_to_clight(
+                        declaration,
+                    )
+                })
+                .as_ref()
+                == Some(&crate::decompile::passes::csh_pass::clight_expr_type(
+                    expression,
+                ))
+            && stage4_statement_is_wt_clean(function, canonical, candidate)
+    };
+    // Preserve the exact canonical node whenever it already satisfies the
+    // proof. Candidate enumeration is needed only to repair a demonstrably
+    // stale width/type choice, so unrelated equivalent spellings cannot turn
+    // an existing Stage-4 profile into an ambiguity.
+    if is_matching(preferred) {
+        return Some(preferred.clone());
+    }
+    let matching: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| is_matching(candidate))
+        .cloned()
+        .collect();
+    let [candidate] = matching.as_slice() else {
+        return None;
+    };
+    Some(candidate.clone())
+}
+
+fn stage4_unique_eliminated_placement_candidate(
+    function: &FunctionData,
+    canonical: &SelectedFunction,
+    proof: &Stage4SourceProof,
+    plan: &Stage4UsePlan,
+    placement_type: &ClightType,
+    preferred: &ClightStmt,
+) -> Option<ClightStmt> {
+    let candidates = function.node_statements.get(&plan.placement_node)?;
+    let placement_load = plan.placement_load.as_ref()?;
+    let is_matching = |candidate: &ClightStmt| {
+        let ClightStmt::Sset(destination, expression) =
+            stage4_inner_statement(candidate)
+        else {
+            return false;
+        };
+        *destination == proof.value as Ident
+            && crate::decompile::passes::csh_pass::clight_expr_type(expression)
+                == *placement_type
+            && scalar_load_lvalue_type(candidate)
+                .and_then(scalar_clight_integral_type)
+                .map(ScalarMemoryUseType::width)
+                == Some(proof.width)
+            && stage4_exact_load_address_expr(expression, placement_load)
+            && stage4_statement_is_wt_clean(function, canonical, candidate)
+    };
+    if is_matching(preferred) {
+        return Some(preferred.clone());
+    }
+    let matching: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| is_matching(candidate))
+        .cloned()
+        .collect();
+    let [candidate] = matching.as_slice() else {
+        return None;
+    };
+    Some(candidate.clone())
+}
+
+fn stage4_integral_decl_width(name: &str) -> Option<usize> {
+    match name {
+        "int_I32" | "int_I32_unsigned" => Some(4),
+        "int_I64" | "int_I64_unsigned" => Some(8),
+        _ => None,
+    }
+}
+
+fn stage4_zero_expression_is_closed(expression: &ClightExpr, width: usize) -> bool {
+    match (width, expression) {
+        (4, ClightExpr::EconstInt(0, ty)) | (8, ClightExpr::EconstLong(0, ty)) => {
+            scalar_clight_integral_type(ty).map(ScalarMemoryUseType::width) == Some(width)
+        }
+        _ => false,
+    }
+}
+
+/// A LEA alternative may duplicate only a pure address expression whose local
+/// leaves are already authenticated by the final-RTL parameter DAG.  Bare
+/// dereferences/fields are loads and are rejected; the same lvalues under an
+/// address-of are pure and may be retained by struct recovery.
+fn stage4_affine_expression_is_closed(
+    expression: &ClightExpr,
+    proof: &Stage4SourceProof,
+) -> bool {
+    fn value(
+        expression: &ClightExpr,
+        allowed: &BTreeSet<Ident>,
+        observed: &mut BTreeSet<Ident>,
+    ) -> bool {
+        match expression {
+            ClightExpr::EconstInt(..) | ClightExpr::EconstLong(..) => true,
+            ClightExpr::Etempvar(identifier, _) if allowed.contains(identifier) => {
+                observed.insert(*identifier);
+                true
+            }
+            ClightExpr::Ecast(inner, _) => value(inner, allowed, observed),
+            ClightExpr::Ebinop(
+                ClightBinaryOp::Oadd | ClightBinaryOp::Osub | ClightBinaryOp::Omul,
+                left,
+                right,
+                _,
+            ) => value(left, allowed, observed) && value(right, allowed, observed),
+            ClightExpr::Eaddrof(lvalue, _) => lvalue_address(lvalue, allowed, observed),
+            ClightExpr::EconstFloat(..)
+            | ClightExpr::EconstSingle(..)
+            | ClightExpr::Evar(..)
+            | ClightExpr::EvarSymbol(..)
+            | ClightExpr::Etempvar(..)
+            | ClightExpr::Ederef(..)
+            | ClightExpr::Eunop(..)
+            | ClightExpr::Ebinop(..)
+            | ClightExpr::Efield(..)
+            | ClightExpr::Esizeof(..)
+            | ClightExpr::Ealignof(..)
+            | ClightExpr::Econdition(..) => false,
+        }
+    }
+
+    fn lvalue_address(
+        expression: &ClightExpr,
+        allowed: &BTreeSet<Ident>,
+        observed: &mut BTreeSet<Ident>,
+    ) -> bool {
+        match expression {
+            ClightExpr::Ederef(address, _) => value(address, allowed, observed),
+            ClightExpr::Efield(base, _, _) => lvalue_address(base, allowed, observed),
+            ClightExpr::Etempvar(identifier, _) if allowed.contains(identifier) => {
+                observed.insert(*identifier);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    if proof.kind != Stage4SourceKind::AffineAddress || !proof.is_closed_v1() {
+        return false;
+    }
+    let allowed: BTreeSet<_> = proof
+        .args
+        .iter()
+        .chain(proof.address_param_leaves.iter())
+        .map(|value| *value as Ident)
+        .collect();
+    let mut observed = BTreeSet::new();
+    let expression_type = crate::decompile::passes::csh_pass::clight_expr_type(expression);
+    let result_width_matches =
+        scalar_clight_integral_type(&expression_type).map(ScalarMemoryUseType::width)
+            == Some(proof.width)
+            || (proof.width == 8
+                && matches!(expression_type, ClightType::Tpointer(_, attributes) if !attributes.attr_volatile));
+    !allowed.is_empty()
+        && result_width_matches
+        && value(expression, &allowed, &mut observed)
+        && !observed.is_empty()
+        && observed.is_subset(&allowed)
+}
+
+fn stage4_rmw_definition(
+    statement: &ClightStmt,
+    proof: &Stage4SourceProof,
+    canonical: &SelectedFunction,
+) -> Option<(ClightStmt, ClightExpr)> {
+    fn rewrite(
+        statement: &mut ClightStmt,
+        proof: &Stage4SourceProof,
+        canonical: &SelectedFunction,
+    ) -> Option<ClightExpr> {
+        if let ClightStmt::Slabel(_, inner) = statement {
+            return rewrite(inner, proof, canonical);
+        }
+        let ClightStmt::Sset(destination, expression) = statement else {
+            return None;
+        };
+        if *destination != proof.value as Ident {
+            return None;
+        }
+        let desired_operation = match proof.kind {
+            Stage4SourceKind::Add => ClightBinaryOp::Oadd,
+            Stage4SourceKind::Sub => ClightBinaryOp::Osub,
+            Stage4SourceKind::Mul => ClightBinaryOp::Omul,
+            Stage4SourceKind::And => ClightBinaryOp::Oand,
+            Stage4SourceKind::Or => ClightBinaryOp::Oor,
+            Stage4SourceKind::Xor => ClightBinaryOp::Oxor,
+            Stage4SourceKind::AffineAddress | Stage4SourceKind::Zeroing => return None,
+        };
+        let selected_operation = match proof.operation {
+            Operation::Oadd
+            | Operation::Oaddl
+            | Operation::Oaddimm(_)
+            | Operation::Oaddlimm(_)
+            | Operation::Olea(Addressing::Aindexed2(0))
+            | Operation::Oleal(Addressing::Aindexed2(0)) => ClightBinaryOp::Oadd,
+            Operation::Osub | Operation::Osubl => ClightBinaryOp::Osub,
+            Operation::Omul
+            | Operation::Omull
+            | Operation::Omulimm(_)
+            | Operation::Omullimm(_) => ClightBinaryOp::Omul,
+            Operation::Oand
+            | Operation::Oandl
+            | Operation::Oandimm(_)
+            | Operation::Oandlimm(_) => ClightBinaryOp::Oand,
+            Operation::Oor
+            | Operation::Oorl
+            | Operation::Oorimm(_)
+            | Operation::Oorlimm(_) => ClightBinaryOp::Oor,
+            Operation::Oxor
+            | Operation::Oxorl
+            | Operation::Oxorimm(_)
+            | Operation::Oxorlimm(_) => ClightBinaryOp::Oxor,
+            _ => return None,
+        };
+        let ClightExpr::Ebinop(operation, left, right, result_type) = expression else {
+            return None;
+        };
+        let ClightExpr::Etempvar(old_identifier, old_type) = left.as_ref() else {
+            return None;
+        };
+        let old_value = proof.args[0];
+        let destination_type = canonical.var_types.get(&proof.value)?;
+        let old_decl_type = canonical.var_types.get(&old_value)?;
+        let exact_width = stage4_integral_decl_width(destination_type)
+            .filter(|width| *width == proof.width)
+            .filter(|_| stage4_integral_decl_width(old_decl_type) == Some(proof.width));
+        let expression_width = scalar_clight_integral_type(result_type)
+            .map(ScalarMemoryUseType::width)
+            .filter(|width| *width == proof.width);
+        let old_width = scalar_clight_integral_type(old_type)
+            .map(ScalarMemoryUseType::width)
+            .filter(|width| *width == proof.width);
+        if *operation != selected_operation
+            || *old_identifier != old_value as Ident
+            // Rebinding the selected result to the old destination is only
+            // conversion-equivalent when their canonical declarations and
+            // the exact Clight scalar types on the defining expression are
+            // identical.  Equal width alone is insufficient: signed and
+            // unsigned compound assignment use different conversions and
+            // overflow rules.
+            || destination_type != old_decl_type
+            || &*result_type != old_type
+            || exact_width.is_none()
+            || expression_width.is_none()
+            || old_width.is_none()
+        {
+            return None;
+        }
+        if let Some(source_immediate) = proof.source_immediate {
+            if proof.args.len() != 1 {
+                return None;
+            }
+            let selected_immediate =
+                crate::decompile::passes::cminor_pass::immediate_from_operation(
+                    &proof.operation,
+                )?;
+            let exact_selected = match (proof.width, right.as_ref()) {
+                (4, ClightExpr::EconstInt(value, ty)) => {
+                    *value == selected_immediate as i32
+                        && scalar_clight_integral_type(ty).map(ScalarMemoryUseType::width)
+                            == Some(4)
+                }
+                (8, ClightExpr::EconstLong(value, ty)) => {
+                    *value == selected_immediate
+                        && scalar_clight_integral_type(ty).map(ScalarMemoryUseType::width)
+                            == Some(8)
+                }
+                _ => false,
+            };
+            if !exact_selected {
+                return None;
+            }
+            *operation = desired_operation;
+            *right = Box::new(if proof.width == 8 {
+                ClightExpr::EconstLong(source_immediate, result_type.clone())
+            } else {
+                ClightExpr::EconstInt(source_immediate as i32, result_type.clone())
+            });
+        } else {
+            if proof.args.len() != 2 || selected_operation != desired_operation {
+                return None;
+            }
+            let ClightExpr::Etempvar(source_identifier, source_type) = right.as_ref() else {
+                return None;
+            };
+            let source_value = proof.args[1];
+            if *source_identifier != source_value as Ident
+                || stage4_integral_decl_width(canonical.var_types.get(&source_value)?)
+                    != Some(proof.width)
+                || scalar_clight_integral_type(source_type).map(ScalarMemoryUseType::width)
+                    != Some(proof.width)
+            {
+                return None;
+            }
+        }
+        *destination = old_value as Ident;
+        Some(ClightExpr::Etempvar(*old_identifier, old_type.clone()))
+    }
+
+    let mut rewritten = statement.clone();
+    let replacement = rewrite(&mut rewritten, proof, canonical)?;
+    Some((rewritten, replacement))
+}
+
+fn stage4_eliminated_mutation_definition(
+    proof: &Stage4SourceProof,
+    canonical: &SelectedFunction,
+) -> Option<ClightStmt> {
+    if proof.root_boundary != Stage4RootBoundary::EliminatedMutation
+        || !proof.kind.is_compound()
+        || proof.args.first() != Some(&proof.value)
+    {
+        return None;
+    }
+    let result_type =
+        crate::decompile::passes::clight_select::wt_audit::type_string_to_clight(
+            canonical.var_types.get(&proof.value)?,
+        );
+    if scalar_clight_integral_type(&result_type).map(ScalarMemoryUseType::width)
+        != Some(proof.width)
+    {
+        return None;
+    }
+    // Seed the exact selected RTL expression.  In particular, x86 SUB-immediate
+    // is represented as Oaddimm(-raw); stage4_rmw_definition authenticates
+    // that form before converting it to the requested `-=` spelling and raw
+    // positive literal.
+    let selected_operation = match proof.operation {
+        Operation::Oadd
+        | Operation::Oaddl
+        | Operation::Oaddimm(_)
+        | Operation::Oaddlimm(_)
+        | Operation::Olea(Addressing::Aindexed2(0))
+        | Operation::Oleal(Addressing::Aindexed2(0)) => ClightBinaryOp::Oadd,
+        Operation::Osub | Operation::Osubl => ClightBinaryOp::Osub,
+        Operation::Omul
+        | Operation::Omull
+        | Operation::Omulimm(_)
+        | Operation::Omullimm(_) => ClightBinaryOp::Omul,
+        Operation::Oand
+        | Operation::Oandl
+        | Operation::Oandimm(_)
+        | Operation::Oandlimm(_) => ClightBinaryOp::Oand,
+        Operation::Oor
+        | Operation::Oorl
+        | Operation::Oorimm(_)
+        | Operation::Oorlimm(_) => ClightBinaryOp::Oor,
+        Operation::Oxor
+        | Operation::Oxorl
+        | Operation::Oxorimm(_)
+        | Operation::Oxorlimm(_) => ClightBinaryOp::Oxor,
+        _ => return None,
+    };
+    let right = if proof.source_immediate.is_some() {
+        let selected = crate::decompile::passes::cminor_pass::immediate_from_operation(
+            &proof.operation,
+        )?;
+        if proof.width == 8 {
+            ClightExpr::EconstLong(selected, result_type.clone())
+        } else {
+            ClightExpr::EconstInt(selected as i32, result_type.clone())
+        }
+    } else {
+        let source = *proof.args.get(1)?;
+        let source_type =
+            crate::decompile::passes::clight_select::wt_audit::type_string_to_clight(
+                canonical.var_types.get(&source)?,
+            );
+        if scalar_clight_integral_type(&source_type).map(ScalarMemoryUseType::width)
+            != Some(proof.width)
+        {
+            return None;
+        }
+        ClightExpr::Etempvar(source as Ident, source_type)
+    };
+    let ordinary = ClightStmt::Sset(
+        proof.value as Ident,
+        ClightExpr::Ebinop(
+            selected_operation,
+            Box::new(ClightExpr::Etempvar(
+                proof.value as Ident,
+                result_type.clone(),
+            )),
+            Box::new(right),
+            result_type,
+        ),
+    );
+    stage4_rmw_definition(&ordinary, proof, canonical).map(|(statement, _)| statement)
+}
+
+fn stage4_append_preserving_labels(
+    statement: &ClightStmt,
+    appended: &ClightStmt,
+) -> ClightStmt {
+    match statement {
+        ClightStmt::Slabel(label, inner) => ClightStmt::Slabel(
+            *label,
+            Box::new(stage4_append_preserving_labels(inner, appended)),
+        ),
+        _ => ClightStmt::Ssequence(vec![statement.clone(), appended.clone()]),
+    }
+}
+
+fn stage4_normalize_eliminated_terminal(
+    statement: &ClightStmt,
+    proof: &Stage4SourceProof,
+    plan: &Stage4UsePlan,
+    placement_type: &ClightType,
+) -> Option<ClightStmt> {
+    fn stale_i32_placeholder(ty: &ClightType) -> bool {
+        matches!(
+            ty,
+            ClightType::Tint(
+                ClightIntSize::I32,
+                ClightSignedness::Signed,
+                attributes,
+            ) if !attributes.attr_volatile
+        )
+    }
+
+    fn rewrite(
+        statement: &ClightStmt,
+        terminal: &Stage4TerminalUse,
+        carrier: Ident,
+        placement_type: &ClightType,
+        allow_m_any64_placeholder: bool,
+    ) -> Option<ClightStmt> {
+        if let ClightStmt::Slabel(label, inner) = statement {
+            return Some(ClightStmt::Slabel(
+                *label,
+                Box::new(rewrite(
+                    inner,
+                    terminal,
+                    carrier,
+                    placement_type,
+                    allow_m_any64_placeholder,
+                )?),
+            ));
+        }
+        match (terminal, statement) {
+            (
+                Stage4TerminalUse::Return,
+                ClightStmt::Sreturn(Some(ClightExpr::Etempvar(identifier, ty))),
+            ) if *identifier == carrier => {
+                if ty == placement_type {
+                    return Some(statement.clone());
+                }
+                if allow_m_any64_placeholder && stale_i32_placeholder(ty) {
+                    return Some(ClightStmt::Sreturn(Some(ClightExpr::Etempvar(
+                        carrier,
+                        placement_type.clone(),
+                    ))));
+                }
+                None
+            }
+            (
+                Stage4TerminalUse::Store { .. },
+                ClightStmt::Sassign(left, ClightExpr::Etempvar(identifier, ty)),
+            ) if *identifier == carrier => {
+                if ty == placement_type {
+                    return Some(statement.clone());
+                }
+                if allow_m_any64_placeholder && stale_i32_placeholder(ty) {
+                    return Some(ClightStmt::Sassign(
+                        left.clone(),
+                        ClightExpr::Etempvar(carrier, placement_type.clone()),
+                    ));
+                }
+                None
+            }
+            (
+                Stage4TerminalUse::Store { .. },
+                ClightStmt::Sassign(left, ClightExpr::Ecast(inner, target_type)),
+            ) if allow_m_any64_placeholder && target_type == placement_type => {
+                let ClightExpr::Etempvar(identifier, observed_type) = inner.as_ref() else {
+                    return None;
+                };
+                if *identifier != carrier || !stale_i32_placeholder(observed_type) {
+                    return None;
+                }
+                Some(ClightStmt::Sassign(
+                    left.clone(),
+                    ClightExpr::Etempvar(carrier, placement_type.clone()),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    let terminal = plan.terminal_use.as_ref()?;
+    let placement_is_m_any64 = matches!(
+        plan.placement_load.as_ref(),
+        Some(Stage4PlacementLoad {
+            chunk: MemoryChunk::MAny64,
+            ..
+        })
+    );
+    let terminal_is_m_any64 = match terminal {
+        Stage4TerminalUse::Return => true,
+        Stage4TerminalUse::Store { chunk, .. } => *chunk == MemoryChunk::MAny64,
+    };
+    let allow_m_any64_placeholder = proof.width == 8
+        && placement_is_m_any64
+        && terminal_is_m_any64
+        && matches!(
+            placement_type,
+            ClightType::Tlong(ClightSignedness::Signed, attributes)
+                if !attributes.attr_volatile
+        );
+    rewrite(
+        statement,
+        terminal,
+        proof.value as Ident,
+        placement_type,
+        allow_m_any64_placeholder,
+    )
+}
+
+/// Inline one authenticated final-RTL source root through its complete move
+/// forest.  This is intentionally one-root-at-a-time: every disjoint profile
+/// is independently scoreable, and no Cartesian product of source choices is
+/// constructed.  All untouched nodes and declarations are frozen to the
+/// canonical solved state.
+fn stage4_inline_feature_view(
+    function: &FunctionData,
+    canonical: &SelectedFunction,
+    canonical_state: &ProgramSelectionState,
+    proof: &Stage4SourceProof,
+    plan: &Stage4UsePlan,
+) -> Option<(FunctionData, BTreeSet<Node>)> {
+    if !proof.is_closed_v1()
+        || !plan.is_closed_v1(proof)
+        || proof.function != function.address
+        || proof.selected_node != plan.definition_node
+    {
+        return None;
+    }
+    let mut fixed = stage4_freeze_canonical_view(function, canonical, canonical_state)?;
+    if proof.root_boundary == Stage4RootBoundary::EliminatedMutation {
+        if canonical.param_regs.contains(&proof.value) {
+            return None;
+        }
+        if let Some(source) = proof.args.get(1) {
+            if canonical
+                .param_regs
+                .iter()
+                .filter(|candidate| *candidate == source)
+                .count()
+                != 1
+                || canonical.var_types.get(source) != canonical.var_types.get(&proof.value)
+            {
+                return None;
+            }
+        }
+        if matches!(plan.terminal_use.as_ref(), Some(Stage4TerminalUse::Return))
+            && scalar_clight_integral_type(&canonical.return_type)
+                .map(ScalarMemoryUseType::width)
+                != Some(proof.width)
+        {
+            return None;
+        }
+        let placement_type =
+            crate::decompile::passes::clight_select::wt_audit::type_string_to_clight(
+                canonical.var_types.get(&proof.value)?,
+            );
+        let preferred = fixed
+            .node_statements
+            .get(&plan.placement_node)?
+            .as_slice();
+        let [preferred] = preferred else {
+            return None;
+        };
+        let placement = stage4_unique_eliminated_placement_candidate(
+            function,
+            canonical,
+            proof,
+            plan,
+            &placement_type,
+            preferred,
+        )?;
+        fixed
+            .node_statements
+            .insert(plan.placement_node, vec![placement.clone()]);
+        let ClightStmt::Sset(destination, placement_expression) =
+            stage4_inner_statement(&placement)
+        else {
+            return None;
+        };
+        if matches!(plan.terminal_use.as_ref(), Some(Stage4TerminalUse::Return))
+            && canonical.return_type != placement_type
+        {
+            return None;
+        }
+        if *destination != proof.value as Ident
+            || crate::decompile::passes::csh_pass::clight_expr_type(placement_expression)
+                != placement_type
+            || scalar_load_lvalue_type(&placement)
+                .and_then(scalar_clight_integral_type)
+                .map(ScalarMemoryUseType::width)
+                != Some(proof.width)
+        {
+            return None;
+        }
+        let mut authenticated_nodes =
+            BTreeSet::from([proof.selected_node, plan.placement_node]);
+        for transport in plan.transports.iter() {
+            let rows = fixed.node_statements.get(&transport.node)?.as_slice();
+            let [statement] = rows else { return None };
+            let ClightStmt::Sset(destination, expression) = stage4_inner_statement(statement)
+            else {
+                return None;
+            };
+            if *destination != transport.output as Ident
+                || !matches!(
+                    expression,
+                    ClightExpr::Etempvar(identifier, _)
+                        if *identifier == transport.input as Ident
+                )
+            {
+                return None;
+            }
+            authenticated_nodes.insert(transport.node);
+        }
+        let mut sites_by_node: BTreeMap<Node, Vec<RTLReg>> = BTreeMap::new();
+        for site in plan.sites.iter() {
+            sites_by_node.entry(site.node).or_default().push(site.value);
+        }
+        for (node, mut values) in sites_by_node {
+            values.sort_unstable();
+            if values.windows(2).any(|pair| pair[0] == pair[1]) {
+                return None;
+            }
+            let canonical_terminal = fixed.node_statements.get(&node)?.as_slice();
+            let [canonical_terminal] = canonical_terminal else {
+                return None;
+            };
+            let normalized_terminal = stage4_normalize_eliminated_terminal(
+                canonical_terminal,
+                proof,
+                plan,
+                &placement_type,
+            )?;
+            fixed
+                .node_statements
+                .insert(node, vec![normalized_terminal]);
+            let rows = fixed.node_statements.get(&node)?.as_slice();
+            let [statement] = rows else { return None };
+            let [site] = plan.sites.as_slice() else {
+                return None;
+            };
+            if site.node != node {
+                return None;
+            }
+            let terminal_role_is_exact = match plan.terminal_use.as_ref()? {
+                Stage4TerminalUse::Return => matches!(
+                    stage4_inner_statement(statement),
+                    ClightStmt::Sreturn(Some(ClightExpr::Etempvar(identifier, ty)))
+                        if *identifier == site.value as Ident
+                            && ty == &placement_type
+                ),
+                terminal @ Stage4TerminalUse::Store { .. } => matches!(
+                    stage4_inner_statement(statement),
+                    ClightStmt::Sassign(_, ClightExpr::Etempvar(identifier, ty))
+                        if *identifier == site.value as Ident
+                            && ty == &placement_type
+                            && stage4_store_lvalue_matches_terminal(statement, terminal)
+                            && stage4_store_lvalue_type(statement)
+                                .and_then(scalar_clight_integral_type)
+                                .map(ScalarMemoryUseType::width) == Some(proof.width)
+                ),
+            };
+            if !terminal_role_is_exact {
+                return None;
+            }
+            for value in values {
+                let value_type =
+                    crate::decompile::passes::clight_select::wt_audit::type_string_to_clight(
+                        canonical.var_types.get(&value)?,
+                    );
+                let replacement = ClightExpr::Etempvar(value as Ident, value_type);
+                let mut observed = statement.clone();
+                let mut occurrences = 0usize;
+                scalar_rewrite_exact_temp_stmt(
+                    &mut observed,
+                    value,
+                    &replacement,
+                    &mut occurrences,
+                );
+                if occurrences != 1 {
+                    return None;
+                }
+            }
+            authenticated_nodes.insert(node);
+        }
+        let mutation = stage4_eliminated_mutation_definition(proof, canonical)?;
+        let combined = stage4_append_preserving_labels(&placement, &mutation);
+        fixed.node_statements.insert(
+            plan.placement_node,
+            vec![combined],
+        );
+        return Some((fixed, authenticated_nodes));
+    }
+    if proof.kind == Stage4SourceKind::AffineAddress {
+        let preferred = fixed
+            .node_statements
+            .get(&proof.selected_node)?
+            .as_slice();
+        let [preferred] = preferred else {
+            return None;
+        };
+        let candidate =
+            stage4_unique_affine_candidate(function, canonical, proof, preferred)?;
+        fixed
+            .node_statements
+            .insert(proof.selected_node, vec![candidate]);
+    }
+    let definition = fixed
+        .node_statements
+        .get(&proof.selected_node)?
+        .as_slice();
+    let [definition] = definition else {
+        return None;
+    };
+    let ClightStmt::Sset(destination, replacement) = stage4_inner_statement(definition) else {
+        return None;
+    };
+    if *destination != proof.value as Ident {
+        return None;
+    }
+    match proof.kind {
+        Stage4SourceKind::AffineAddress
+            if !stage4_affine_expression_is_closed(replacement, proof)
+                || canonical
+                    .var_types
+                    .get(&proof.value)
+                    .map(|declaration| {
+                        crate::decompile::passes::clight_select::wt_audit::type_string_to_clight(
+                            declaration,
+                        )
+                    })
+                    .as_ref()
+                    != Some(&crate::decompile::passes::csh_pass::clight_expr_type(
+                        replacement,
+                    )) =>
+        {
+            return None;
+        }
+        Stage4SourceKind::Zeroing
+            if !stage4_zero_expression_is_closed(replacement, proof.width) =>
+        {
+            return None;
+        }
+        _ => {}
+    }
+    let replacement = replacement.clone();
+    let (definition_replacement, replacement) = if proof.kind.is_compound() {
+        stage4_rmw_definition(definition, proof, canonical)?
+    } else {
+        (stage4_skip_preserving_labels(definition), replacement)
+    };
+    let mut replacement_by_value = BTreeMap::from([(proof.value, replacement.clone())]);
+    let mut authenticated_nodes = BTreeSet::from([proof.selected_node]);
+
+    fixed
+        .node_statements
+        .insert(proof.selected_node, vec![definition_replacement]);
+
+    for transport in plan.transports.iter() {
+        let statement = fixed
+            .node_statements
+            .get(&transport.node)?
+            .as_slice();
+        let [statement] = statement else {
+            return None;
+        };
+        let ClightStmt::Sset(destination, expression) = stage4_inner_statement(statement) else {
+            return None;
+        };
+        if *destination != transport.output as Ident
+            || !matches!(
+                expression,
+                ClightExpr::Etempvar(identifier, _) if *identifier == transport.input as Ident
+            )
+        {
+            return None;
+        }
+        let input_replacement = replacement_by_value.get(&transport.input)?.clone();
+        if replacement_by_value
+            .insert(transport.output, input_replacement)
+            .is_some()
+        {
+            return None;
+        }
+        let skip = stage4_skip_preserving_labels(statement);
+        fixed.node_statements.insert(transport.node, vec![skip]);
+        authenticated_nodes.insert(transport.node);
+    }
+
+    let mut sites_by_node: BTreeMap<Node, Vec<RTLReg>> = BTreeMap::new();
+    for site in plan.sites.iter() {
+        sites_by_node.entry(site.node).or_default().push(site.value);
+    }
+    for (node, mut values) in sites_by_node {
+        values.sort_unstable();
+        if values.windows(2).any(|pair| pair[0] == pair[1]) {
+            return None;
+        }
+        let statement = fixed.node_statements.get(&node)?.as_slice();
+        let [statement] = statement else {
+            return None;
+        };
+        let mut rewritten = statement.clone();
+        for value in values {
+            let mut replacements = 0usize;
+            scalar_rewrite_exact_temp_stmt(
+                &mut rewritten,
+                value,
+                replacement_by_value.get(&value)?,
+                &mut replacements,
+            );
+            if replacements != 1 {
+                return None;
+            }
+        }
+        fixed.node_statements.insert(node, vec![rewritten]);
+        authenticated_nodes.insert(node);
+    }
+    Some((fixed, authenticated_nodes))
+}
+
+fn stage4_label_count(statement: &ClightStmt, target: Ident) -> usize {
+    match statement {
+        ClightStmt::Slabel(label, inner) => {
+            usize::from(*label == target) + stage4_label_count(inner, target)
+        }
+        ClightStmt::Ssequence(statements) => statements
+            .iter()
+            .map(|statement| stage4_label_count(statement, target))
+            .sum(),
+        ClightStmt::Sifthenelse(_, then_statement, else_statement)
+        | ClightStmt::Sloop(then_statement, else_statement) => {
+            stage4_label_count(then_statement, target)
+                + stage4_label_count(else_statement, target)
+        }
+        ClightStmt::Sswitch(_, cases) => cases
+            .iter()
+            .map(|(_, statement)| stage4_label_count(statement, target))
+            .sum(),
+        ClightStmt::Sskip
+        | ClightStmt::Sassign(..)
+        | ClightStmt::Sset(..)
+        | ClightStmt::Scall(..)
+        | ClightStmt::Sbuiltin(..)
+        | ClightStmt::Sbreak
+        | ClightStmt::Scontinue
+        | ClightStmt::Sreturn(..)
+        | ClightStmt::Sgoto(..) => 0,
+    }
+}
+
+pub(crate) fn stage4_compound_emission_owner(
+    function: &SelectedFunction,
+    placement_node: Node,
+) -> Option<Node> {
+    let target = Ident::try_from(placement_node).ok()?;
+    let total: usize = function
+        .statements
+        .values()
+        .map(|statement| stage4_label_count(statement, target))
+        .sum();
+    if total == 0 {
+        return function
+            .statements
+            .contains_key(&placement_node)
+            .then_some(placement_node);
+    }
+    let matching: Vec<_> = function
+        .statements
+        .iter()
+        .filter_map(|(owner, statement)| {
+            (stage4_label_count(statement, target) == 1).then_some(*owner)
+        })
+        .collect();
+    let [owner] = matching.as_slice() else {
+        return None;
+    };
+    (total == 1).then_some(*owner)
+}
+
+fn stage4_feature_views(
+    function: &FunctionData,
+    canonical: &SelectedFunction,
+    canonical_state: &ProgramSelectionState,
+) -> Result<
+    Vec<(
+        Stage4SourceProfile,
+        FunctionData,
+        BTreeSet<Node>,
+        Option<Node>,
+    )>,
+    (),
+> {
+    let mut rows = Vec::new();
+    let mut nodes: Vec<_> = function.stage4_source_proofs.keys().copied().collect();
+    nodes.sort_unstable();
+    for node in nodes {
+        let Some(proofs) = function.stage4_source_proofs.get(&node) else {
+            return Err(());
+        };
+        let Some(plans) = function.stage4_use_plans.get(&node) else {
+            continue;
+        };
+        let [proof] = proofs.as_slice() else {
+            continue;
+        };
+        // Exactly one total plan is required.  A valid row plus any malformed
+        // or cross-root interpretation is ambiguity, not evidence that may be
+        // filtered away before selection.
+        let [plan] = plans.as_slice() else {
+            continue;
+        };
+        if !plan.is_closed_v1(proof) {
+            continue;
+        }
+        let Some((fixed, authenticated_nodes)) = stage4_inline_feature_view(
+            function,
+            canonical,
+            canonical_state,
+            proof,
+            plan,
+        ) else {
+            continue;
+        };
+        rows.push((
+            Stage4SourceProfile {
+                kind: proof.kind,
+                root_node: node,
+            },
+            fixed,
+            authenticated_nodes,
+            proof.kind.is_compound().then_some(plan.placement_node),
+        ));
+        if rows.len() > MAX_STAGE4_PROFILES_PER_FUNCTION {
+            return Err(());
+        }
+    }
+    rows.sort_by_key(|(profile, _, _, _)| *profile);
+    Ok(rows)
 }
 
 /// Stage-2 compatible raw-byte/direct-scaled profile. Each closed root cluster
@@ -955,6 +2260,47 @@ fn scalar_load_lvalue_type(statement: &ClightStmt) -> Option<&ClightType> {
         }
         _ => None,
     }
+}
+
+fn stage4_store_lvalue_type(statement: &ClightStmt) -> Option<&ClightType> {
+    let ClightStmt::Sassign(left, _) = stage4_inner_statement(statement) else {
+        return None;
+    };
+    let mut left = left;
+    while let ClightExpr::Ecast(inner, _) = left {
+        left = inner;
+    }
+    match left {
+        ClightExpr::Ederef(_, access_type) | ClightExpr::Efield(_, _, access_type) => {
+            Some(access_type)
+        }
+        _ => None,
+    }
+}
+
+fn stage4_store_lvalue_matches_terminal(
+    statement: &ClightStmt,
+    terminal: &Stage4TerminalUse,
+) -> bool {
+    let Stage4TerminalUse::Store {
+        chunk,
+        addressing,
+        args,
+    } = terminal
+    else {
+        return false;
+    };
+    let ClightStmt::Sassign(left, _) = stage4_inner_statement(statement) else {
+        return false;
+    };
+    stage4_exact_load_address_expr(
+        left,
+        &Stage4PlacementLoad {
+            chunk: *chunk,
+            addressing: addressing.clone(),
+            args: args.clone(),
+        },
+    )
 }
 
 fn scalar_rewrite_exact_temp_expr(
@@ -1602,6 +2948,8 @@ fn scalar_extension_feature_views(
         fixed.scalar_lvalue_proofs.clear();
         fixed.scalar_memory_use_plans.clear();
         fixed.scalar_lvalue_source_candidates.clear();
+        fixed.stage4_source_proofs.clear();
+        fixed.stage4_use_plans.clear();
     }
     Some((
         (
@@ -1632,6 +2980,7 @@ fn scalar_extension_feature_view(
 mod scalar_lvalue_alternative_tests {
     use super::*;
     use crate::mreg::Mreg;
+    use std::sync::Arc;
 
     fn statement(value: i32) -> ClightStmt {
         ClightStmt::Sset(
@@ -2303,6 +3652,1150 @@ mod scalar_lvalue_alternative_tests {
         assert_eq!(hoisted.1, BTreeSet::from([20]));
     }
 
+    fn stage4_i32_type(signedness: ClightSignedness) -> ClightType {
+        ClightType::Tint(ClightIntSize::I32, signedness, ClightAttr::default())
+    }
+
+    fn stage4_zero_proof(node: Node, value: RTLReg) -> Stage4SourceProof {
+        Stage4SourceProof {
+            function: 0x1000,
+            origin_node: node,
+            selected_node: node,
+            kind: Stage4SourceKind::Zeroing,
+            root_boundary: Stage4RootBoundary::FinalRtlDefinition,
+            width: 4,
+            operation: Operation::Ointconst(0),
+            args: Arc::new(Vec::new()),
+            source_immediate: None,
+            value,
+            selected_result: value,
+            address_param_leaves: Arc::new(Vec::new()),
+        }
+    }
+
+    fn stage4_plan(
+        proof: &Stage4SourceProof,
+        sites: Vec<Stage4UseSite>,
+    ) -> Stage4UsePlan {
+        Stage4UsePlan {
+            function: proof.function,
+            definition_node: proof.selected_node,
+            placement_node: proof.selected_node,
+            value: proof.value,
+            placement_load: None,
+            terminal_use: None,
+            transports: Arc::new(Vec::new()),
+            sites: Arc::new(sites),
+        }
+    }
+
+    fn stage4_canonical_fixture(
+        function: &FunctionData,
+    ) -> (SelectedFunction, ProgramSelectionState) {
+        let state = ProgramSelectionState {
+            candidate_idx: function
+                .node_statements
+                .keys()
+                .map(|node| ((function.address, *node), Some(0)))
+                .collect(),
+            var_decl_idx: function
+                .var_type_candidates
+                .keys()
+                .map(|register| ((function.address, *register), 0))
+                .collect(),
+            var_type_override: HashMap::new(),
+        };
+        let canonical = build_selected_function_from_program_state(
+            function,
+            &state,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        (canonical, state)
+    }
+
+    #[test]
+    fn stage4_disjoint_roots_are_independent_and_invalid_siblings_stay_canonical() {
+        let mut function = function();
+        let ty = stage4_i32_type(ClightSignedness::Signed);
+        for (root, use_node, value, output) in [
+            (0x1010, 0x1014, 30, 31),
+            (0x1020, 0x1024, 40, 41),
+        ] {
+            let proof = stage4_zero_proof(root, value);
+            function.node_statements.insert(
+                root,
+                vec![ClightStmt::Sset(
+                    value as Ident,
+                    ClightExpr::EconstInt(0, ty.clone()),
+                )],
+            );
+            function.node_statements.insert(
+                use_node,
+                vec![ClightStmt::Sset(
+                    output as Ident,
+                    ClightExpr::Etempvar(value as Ident, ty.clone()),
+                )],
+            );
+            function.stage4_source_proofs.insert(root, vec![proof.clone()]);
+            function.stage4_use_plans.insert(
+                root,
+                vec![stage4_plan(
+                    &proof,
+                    vec![Stage4UseSite {
+                        node: use_node,
+                        value,
+                    }],
+                )],
+            );
+            for register in [value, output] {
+                function.var_types.insert(register, "int_I32".into());
+                function
+                    .var_type_candidates
+                    .insert(register, vec!["int_I32".into()]);
+                function.var_decl_idx.insert(register, 0);
+            }
+        }
+        let (canonical, state) = stage4_canonical_fixture(&function);
+        let views = stage4_feature_views(&function, &canonical, &state).unwrap();
+        assert_eq!(views.len(), 2);
+        for (profile, view, nodes, compound_placement_node) in &views {
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(*compound_placement_node, None);
+            assert!(matches!(
+                stage4_inner_statement(&view.node_statements[&profile.root_node][0]),
+                ClightStmt::Sskip
+            ));
+            let other_root = if profile.root_node == 0x1010 { 0x1020 } else { 0x1010 };
+            assert_eq!(
+                view.node_statements[&other_root],
+                function.node_statements[&other_root],
+                "one profile cannot include its disjoint sibling"
+            );
+        }
+
+        let mut one_invalid = function.clone();
+        one_invalid
+            .stage4_source_proofs
+            .get_mut(&0x1010)
+            .unwrap()
+            .push(stage4_zero_proof(0x1010, 30));
+        let views = stage4_feature_views(&one_invalid, &canonical, &state).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].0.root_node, 0x1020);
+
+        let mut competing_plan = function.clone();
+        let mut malformed = competing_plan.stage4_use_plans[&0x1010][0].clone();
+        malformed.function += 1;
+        competing_plan
+            .stage4_use_plans
+            .get_mut(&0x1010)
+            .unwrap()
+            .push(malformed);
+        let views = stage4_feature_views(&competing_plan, &canonical, &state).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].0.root_node, 0x1020);
+    }
+
+    #[test]
+    fn stage4_nested_roots_remain_two_views_without_a_cross_product() {
+        let mut function = function();
+        let ty = stage4_i32_type(ClightSignedness::Signed);
+        let zero = stage4_zero_proof(0x1010, 30);
+        let affine = Stage4SourceProof {
+            function: 0x1000,
+            origin_node: 0x1020,
+            selected_node: 0x1020,
+            kind: Stage4SourceKind::AffineAddress,
+            root_boundary: Stage4RootBoundary::FinalRtlDefinition,
+            width: 4,
+            operation: Operation::Olea(Addressing::Aindexed2(0)),
+            args: Arc::new(vec![30, 40]),
+            source_immediate: None,
+            value: 50,
+            selected_result: 50,
+            address_param_leaves: Arc::new(vec![30, 40]),
+        };
+        function.node_statements.insert(
+            0x1010,
+            vec![ClightStmt::Sset(30, ClightExpr::EconstInt(0, ty.clone()))],
+        );
+        function.node_statements.insert(
+            0x1020,
+            vec![ClightStmt::Sset(
+                50,
+                ClightExpr::Ebinop(
+                    ClightBinaryOp::Oadd,
+                    Box::new(ClightExpr::Etempvar(30, ty.clone())),
+                    Box::new(ClightExpr::Etempvar(40, ty.clone())),
+                    ty.clone(),
+                ),
+            )],
+        );
+        function.node_statements.insert(
+            0x1030,
+            vec![ClightStmt::Sreturn(Some(ClightExpr::Etempvar(
+                50,
+                ty.clone(),
+            )))],
+        );
+        function.stage4_source_proofs.insert(0x1010, vec![zero.clone()]);
+        function
+            .stage4_source_proofs
+            .insert(0x1020, vec![affine.clone()]);
+        function.stage4_use_plans.insert(
+            0x1010,
+            vec![stage4_plan(
+                &zero,
+                vec![Stage4UseSite {
+                    node: 0x1020,
+                    value: 30,
+                }],
+            )],
+        );
+        function.stage4_use_plans.insert(
+            0x1020,
+            vec![stage4_plan(
+                &affine,
+                vec![Stage4UseSite {
+                    node: 0x1030,
+                    value: 50,
+                }],
+            )],
+        );
+        for register in [30, 40, 50] {
+            function.var_types.insert(register, "int_I32".into());
+            function
+                .var_type_candidates
+                .insert(register, vec!["int_I32".into()]);
+            function.var_decl_idx.insert(register, 0);
+        }
+        let (canonical, state) = stage4_canonical_fixture(&function);
+        let views = stage4_feature_views(&function, &canonical, &state).unwrap();
+        assert_eq!(views.len(), 2);
+        assert_eq!(
+            views
+                .iter()
+                .map(|(profile, _, _, _)| (profile.kind, profile.root_node))
+                .collect::<Vec<_>>(),
+            vec![
+                (Stage4SourceKind::AffineAddress, 0x1020),
+                (Stage4SourceKind::Zeroing, 0x1010),
+            ]
+        );
+        assert!(views
+            .iter()
+            .all(|(_, _, nodes, compound_placement_node)| {
+                nodes.len() == 2 && compound_placement_node.is_none()
+            }));
+    }
+
+    #[test]
+    fn stage4_affine_view_preserves_exact_32_or_64_bit_assignment_type() {
+        for (width, declaration, ty, operation) in [
+            (
+                4,
+                "int_I32_unsigned",
+                stage4_i32_type(ClightSignedness::Unsigned),
+                Operation::Olea(Addressing::Aindexed2scaled(4, 12)),
+            ),
+            (
+                8,
+                "int_I64_unsigned",
+                ClightType::Tlong(ClightSignedness::Unsigned, ClightAttr::default()),
+                Operation::Olea(Addressing::Aindexed2scaled(4, 12)),
+            ),
+        ] {
+            let mut function = function();
+            let proof = Stage4SourceProof {
+                function: 0x1000,
+                origin_node: 0x1010,
+                selected_node: 0x1010,
+                kind: Stage4SourceKind::AffineAddress,
+                root_boundary: Stage4RootBoundary::FinalRtlDefinition,
+                width,
+                operation,
+                args: Arc::new(vec![30, 40]),
+                source_immediate: None,
+                value: 50,
+                selected_result: 50,
+                address_param_leaves: Arc::new(vec![30, 40]),
+            };
+            function.node_statements.insert(
+                0x1010,
+                vec![ClightStmt::Sset(
+                    50,
+                    ClightExpr::Ebinop(
+                        ClightBinaryOp::Oadd,
+                        Box::new(ClightExpr::Etempvar(30, ty.clone())),
+                        Box::new(ClightExpr::Ebinop(
+                            ClightBinaryOp::Omul,
+                            Box::new(ClightExpr::Etempvar(40, ty.clone())),
+                            Box::new(if width == 4 {
+                                ClightExpr::EconstInt(4, ty.clone())
+                            } else {
+                                ClightExpr::EconstLong(4, ty.clone())
+                            }),
+                            ty.clone(),
+                        )),
+                        ty.clone(),
+                    ),
+                )],
+            );
+            function.node_statements.insert(
+                0x1020,
+                vec![ClightStmt::Sreturn(Some(ClightExpr::Etempvar(
+                    50,
+                    ty.clone(),
+                )))],
+            );
+            function.stage4_source_proofs.insert(0x1010, vec![proof.clone()]);
+            function.stage4_use_plans.insert(
+                0x1010,
+                vec![stage4_plan(
+                    &proof,
+                    vec![Stage4UseSite {
+                        node: 0x1020,
+                        value: 50,
+                    }],
+                )],
+            );
+            for register in [30, 40, 50] {
+                function.var_types.insert(register, declaration.into());
+                function
+                    .var_type_candidates
+                    .insert(register, vec![declaration.into()]);
+                function.var_decl_idx.insert(register, 0);
+            }
+            let (canonical, state) = stage4_canonical_fixture(&function);
+            assert_eq!(stage4_feature_views(&function, &canonical, &state).unwrap().len(), 1);
+
+            let mut wrong_result_type = function.clone();
+            let [ClightStmt::Sset(_, ClightExpr::Ebinop(_, _, _, result_type))] =
+                wrong_result_type
+                    .node_statements
+                    .get_mut(&0x1010)
+                    .map(Vec::as_mut_slice)
+                    .unwrap()
+            else {
+                unreachable!()
+            };
+            *result_type = if width == 4 {
+                stage4_i32_type(ClightSignedness::Signed)
+            } else {
+                ClightType::Tlong(ClightSignedness::Signed, ClightAttr::default())
+            };
+            let (wrong_canonical, wrong_state) = stage4_canonical_fixture(&wrong_result_type);
+            assert!(stage4_feature_views(&wrong_result_type, &wrong_canonical, &wrong_state)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn stage4_affine_view_selects_the_unique_proof_width_without_changing_canonical() {
+        let mut function = function();
+        let i32_type = stage4_i32_type(ClightSignedness::Signed);
+        let i64_type = ClightType::Tlong(
+            ClightSignedness::Signed,
+            ClightAttr::default(),
+        );
+        let expression = ClightExpr::Ebinop(
+            ClightBinaryOp::Oadd,
+            Box::new(ClightExpr::Etempvar(30, i32_type.clone())),
+            Box::new(ClightExpr::Etempvar(40, i32_type.clone())),
+            i32_type.clone(),
+        );
+        let proof = Stage4SourceProof {
+            function: 0x1000,
+            origin_node: 0x1010,
+            selected_node: 0x1010,
+            kind: Stage4SourceKind::AffineAddress,
+            root_boundary: Stage4RootBoundary::FinalRtlDefinition,
+            width: 8,
+            operation: Operation::Olea(Addressing::Aindexed2(0)),
+            args: Arc::new(vec![30, 40]),
+            source_immediate: None,
+            value: 50,
+            selected_result: 50,
+            address_param_leaves: Arc::new(vec![30, 40]),
+        };
+        function.node_statements.insert(
+            0x1010,
+            vec![
+                ClightStmt::Sset(50, expression.clone()),
+                ClightStmt::Sset(
+                    50,
+                    ClightExpr::Ecast(Box::new(expression), i64_type.clone()),
+                ),
+            ],
+        );
+        function.node_statements.insert(
+            0x1020,
+            vec![ClightStmt::Sreturn(Some(ClightExpr::Etempvar(
+                50,
+                i32_type.clone(),
+            )))],
+        );
+        function.stage4_source_proofs.insert(0x1010, vec![proof.clone()]);
+        function.stage4_use_plans.insert(
+            0x1010,
+            vec![stage4_plan(
+                &proof,
+                vec![Stage4UseSite {
+                    node: 0x1020,
+                    value: 50,
+                }],
+            )],
+        );
+        for register in [30, 40] {
+            function.var_types.insert(register, "int_I32".into());
+            function
+                .var_type_candidates
+                .insert(register, vec!["int_I32".into()]);
+            function.var_decl_idx.insert(register, 0);
+        }
+        function.var_types.insert(50, "int_I64".into());
+        function
+            .var_type_candidates
+            .insert(50, vec!["int_I64".into()]);
+        function.var_decl_idx.insert(50, 0);
+        let (canonical, state) = stage4_canonical_fixture(&function);
+        let canonical_root = canonical.statements[&0x1010].clone();
+        let ClightStmt::Sset(50, expected_replacement) =
+            function.node_statements[&0x1010][1].clone()
+        else {
+            unreachable!()
+        };
+        let views = stage4_feature_views(&function, &canonical, &state).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(canonical.statements[&0x1010], canonical_root);
+        assert_eq!(
+            views[0].1.node_statements[&0x1010],
+            vec![ClightStmt::Sskip],
+            "the private affine definition is inlined rather than emitted twice",
+        );
+        assert_eq!(
+            views[0].1.node_statements[&0x1020],
+            vec![ClightStmt::Sreturn(Some(expected_replacement))],
+            "the unique proof-width expression replaces the exact authenticated use",
+        );
+
+        let duplicate = function.node_statements[&0x1010][1].clone();
+        function
+            .node_statements
+            .get_mut(&0x1010)
+            .unwrap()
+            .push(duplicate);
+        let (canonical, state) = stage4_canonical_fixture(&function);
+        assert!(stage4_feature_views(&function, &canonical, &state)
+            .unwrap()
+            .is_empty());
+    }
+
+    fn stage4_eliminated_rmw_fixture(
+        declaration: &str,
+        signedness: ClightSignedness,
+        kind: Stage4SourceKind,
+        source_immediate: Option<i64>,
+        store_terminal: bool,
+    ) -> FunctionData {
+        const PLACEMENT: Node = 0x1010;
+        const ROOT: Node = 0x1014;
+        const TERMINAL: Node = 0x1018;
+        const CARRIER: RTLReg = 30;
+        const ROOT_RESULT: RTLReg = 31;
+        const SOURCE: RTLReg = 40;
+        const LOAD_BASE: RTLReg = 60;
+        const STORE_BASE: RTLReg = 61;
+
+        let ty = stage4_i32_type(signedness);
+        let pointer_type = ClightType::Tpointer(Arc::new(ty.clone()), ClightAttr::default());
+        let operation = match (kind, source_immediate) {
+            (Stage4SourceKind::Add, None) => Operation::Oadd,
+            (Stage4SourceKind::Sub, None) => Operation::Osub,
+            (Stage4SourceKind::Mul, None) => Operation::Omul,
+            (Stage4SourceKind::And, None) => Operation::Oand,
+            (Stage4SourceKind::Or, None) => Operation::Oor,
+            (Stage4SourceKind::Xor, None) => Operation::Oxor,
+            (Stage4SourceKind::Add, Some(value)) => Operation::Oaddimm(value),
+            (Stage4SourceKind::Sub, Some(value)) => {
+                Operation::Oaddimm(value.checked_neg().expect("bounded test immediate"))
+            }
+            (Stage4SourceKind::Mul, Some(value)) => Operation::Omulimm(value),
+            (Stage4SourceKind::And, Some(value)) => Operation::Oandimm(value),
+            (Stage4SourceKind::Or, Some(value)) => Operation::Oorimm(value),
+            (Stage4SourceKind::Xor, Some(value)) => Operation::Oxorimm(value),
+            (Stage4SourceKind::AffineAddress | Stage4SourceKind::Zeroing, _) => {
+                unreachable!("not an RMW kind")
+            }
+        };
+        let args = if source_immediate.is_some() {
+            vec![CARRIER]
+        } else {
+            vec![CARRIER, SOURCE]
+        };
+        let proof = Stage4SourceProof {
+            function: 0x1000,
+            origin_node: ROOT,
+            selected_node: ROOT,
+            kind,
+            root_boundary: Stage4RootBoundary::EliminatedMutation,
+            width: 4,
+            operation,
+            args: Arc::new(args),
+            source_immediate,
+            value: CARRIER,
+            selected_result: ROOT_RESULT,
+            address_param_leaves: Arc::new(Vec::new()),
+        };
+        let terminal_use = if store_terminal {
+            Stage4TerminalUse::Store {
+                chunk: MemoryChunk::MInt32,
+                addressing: Addressing::Aindexed(0),
+                args: Arc::new(vec![STORE_BASE]),
+            }
+        } else {
+            Stage4TerminalUse::Return
+        };
+        let plan = Stage4UsePlan {
+            function: proof.function,
+            definition_node: ROOT,
+            placement_node: PLACEMENT,
+            value: CARRIER,
+            placement_load: Some(Stage4PlacementLoad {
+                chunk: MemoryChunk::MInt32,
+                addressing: Addressing::Aindexed(0),
+                args: Arc::new(vec![LOAD_BASE]),
+            }),
+            terminal_use: Some(terminal_use),
+            transports: Arc::new(Vec::new()),
+            sites: Arc::new(vec![Stage4UseSite {
+                node: TERMINAL,
+                value: CARRIER,
+            }]),
+        };
+
+        let mut function = function();
+        function.return_type = if store_terminal {
+            ClightType::Tvoid
+        } else {
+            ty.clone()
+        };
+        function.node_statements.insert(
+            PLACEMENT,
+            vec![ClightStmt::Sset(
+                CARRIER as Ident,
+                ClightExpr::Ederef(
+                    Box::new(ClightExpr::Etempvar(
+                        LOAD_BASE as Ident,
+                        pointer_type.clone(),
+                    )),
+                    ty.clone(),
+                ),
+            )],
+        );
+        function.node_statements.insert(
+            TERMINAL,
+            vec![if store_terminal {
+                ClightStmt::Sassign(
+                    ClightExpr::Ederef(
+                        Box::new(ClightExpr::Etempvar(
+                            STORE_BASE as Ident,
+                            pointer_type.clone(),
+                        )),
+                        ty.clone(),
+                    ),
+                    ClightExpr::Etempvar(CARRIER as Ident, ty.clone()),
+                )
+            } else {
+                ClightStmt::Sreturn(Some(ClightExpr::Etempvar(
+                    CARRIER as Ident,
+                    ty.clone(),
+                )))
+            }],
+        );
+        function.stage4_source_proofs.insert(ROOT, vec![proof]);
+        function.stage4_use_plans.insert(ROOT, vec![plan]);
+        function.param_regs.push(LOAD_BASE);
+        function
+            .param_types
+            .push(ParamType::Typed(XType::Xintptr));
+        if store_terminal {
+            function.param_regs.push(STORE_BASE);
+            function
+                .param_types
+                .push(ParamType::Typed(XType::Xintptr));
+        }
+        if source_immediate.is_none() {
+            function.param_regs.push(SOURCE);
+            function.param_types.push(ParamType::Typed(
+                if signedness == ClightSignedness::Signed {
+                    XType::Xint
+                } else {
+                    XType::Xintunsigned
+                },
+            ));
+        }
+        for register in [CARRIER, SOURCE] {
+            function.var_types.insert(register, declaration.into());
+            function
+                .var_type_candidates
+                .insert(register, vec![declaration.into()]);
+            function.var_decl_idx.insert(register, 0);
+        }
+        for register in [LOAD_BASE, STORE_BASE] {
+            function
+                .var_types
+                .insert(register, "ptr_int".into());
+            function
+                .var_type_candidates
+                .insert(register, vec!["ptr_int".into()]);
+            function.var_decl_idx.insert(register, 0);
+        }
+        function
+    }
+
+    #[test]
+    fn stage4_eliminated_rmw_preserves_exact_signedness_and_raw_subtraction() {
+        const PLACEMENT: Node = 0x1010;
+        for (declaration, signedness) in [
+            ("int_I32", ClightSignedness::Signed),
+            ("int_I32_unsigned", ClightSignedness::Unsigned),
+        ] {
+            for (kind, immediate, expected_operation) in [
+                (Stage4SourceKind::Xor, None, ClightBinaryOp::Oxor),
+                (Stage4SourceKind::Sub, Some(7), ClightBinaryOp::Osub),
+            ] {
+                let function = stage4_eliminated_rmw_fixture(
+                    declaration,
+                    signedness,
+                    kind,
+                    immediate,
+                    false,
+                );
+                let (canonical, state) = stage4_canonical_fixture(&function);
+                let canonical_placement = canonical.statements[&PLACEMENT].clone();
+                let views = stage4_feature_views(&function, &canonical, &state).unwrap();
+                assert_eq!(views.len(), 1, "{declaration}/{kind:?}");
+                assert_eq!(views[0].3, Some(PLACEMENT));
+                assert_eq!(canonical.statements[&PLACEMENT], canonical_placement);
+                let [ClightStmt::Ssequence(statements)] =
+                    views[0].1.node_statements[&PLACEMENT].as_slice()
+                else {
+                    panic!("compound mutation must follow the canonical load")
+                };
+                assert_eq!(statements[0], canonical_placement);
+                assert!(matches!(
+                    stage4_inner_statement(&statements[1]),
+                    ClightStmt::Sset(
+                        30,
+                        ClightExpr::Ebinop(operation, left, right, result_type),
+                    ) if *operation == expected_operation
+                        && matches!(left.as_ref(), ClightExpr::Etempvar(30, old_type) if old_type == result_type)
+                        && match immediate {
+                            Some(value) => matches!(right.as_ref(), ClightExpr::EconstInt(actual, immediate_type)
+                                if i64::from(*actual) == value && immediate_type == result_type),
+                            None => matches!(right.as_ref(), ClightExpr::Etempvar(40, source_type)
+                                if source_type == result_type),
+                        }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn stage4_eliminated_placement_uses_the_unique_final_wt_clean_load() {
+        const PLACEMENT: Node = 0x1010;
+        const LOAD_BASE: RTLReg = 60;
+        let mut function = stage4_eliminated_rmw_fixture(
+            "int_I32",
+            ClightSignedness::Signed,
+            Stage4SourceKind::Sub,
+            Some(5),
+            false,
+        );
+        let raw = function.node_statements[&PLACEMENT][0].clone();
+        let int_type = stage4_i32_type(ClightSignedness::Signed);
+        let field = ClightStmt::Sset(
+            30,
+            ClightExpr::Efield(
+                Box::new(ClightExpr::Ederef(
+                    Box::new(ClightExpr::Etempvar(
+                        LOAD_BASE as Ident,
+                        ClightType::Tpointer(
+                            Arc::new(ClightType::Tstruct(3, ClightAttr::default())),
+                            ClightAttr::default(),
+                        ),
+                    )),
+                    ClightType::Tstruct(3, ClightAttr::default()),
+                )),
+                0,
+                int_type,
+            ),
+        );
+        function
+            .node_statements
+            .insert(PLACEMENT, vec![field.clone(), raw.clone()]);
+        function
+            .var_types
+            .insert(LOAD_BASE, "ptr_struct_3".into());
+        function
+            .var_type_candidates
+            .insert(LOAD_BASE, vec!["ptr_struct_3".into()]);
+        let (canonical, state) = stage4_canonical_fixture(&function);
+        assert_eq!(canonical.statements[&PLACEMENT], field);
+        let no_names = HashMap::new();
+        let canonical_environment =
+            crate::decompile::passes::clight_select::wt_audit::AuditEnv::build(
+                &function,
+                &canonical,
+                &no_names,
+            );
+        let canonical_errors =
+            crate::decompile::passes::clight_select::ctyping::wt_check_stmt(
+                &canonical.statements[&PLACEMENT],
+                &canonical_environment,
+            );
+        assert_eq!(
+            canonical_errors
+                .iter()
+                .map(|error| (error.kind, error.severity))
+                .collect::<Vec<_>>(),
+            vec![(
+                crate::decompile::passes::clight_select::ctyping::WtErrorKind::MemberOfNonStruct,
+                crate::decompile::passes::clight_select::ctyping::Severity::Error,
+            )],
+        );
+        assert_eq!(
+            crate::decompile::passes::clight_select::wt_audit::selected_error_count(
+                &function,
+                &canonical,
+                &no_names,
+            ),
+            1,
+        );
+        let views = stage4_feature_views(&function, &canonical, &state).unwrap();
+        assert_eq!(views.len(), 1);
+        let [ClightStmt::Ssequence(statements)] =
+            views[0].1.node_statements[&PLACEMENT].as_slice()
+        else {
+            panic!("the exact load must precede the private mutation")
+        };
+        assert_eq!(statements[0], raw);
+        let (feature, _) = stage4_canonical_fixture(&views[0].1);
+        let feature_environment =
+            crate::decompile::passes::clight_select::wt_audit::AuditEnv::build(
+                &views[0].1,
+                &feature,
+                &no_names,
+            );
+        assert!(
+            crate::decompile::passes::clight_select::ctyping::wt_check_stmt(
+                &feature.statements[&PLACEMENT],
+                &feature_environment,
+            )
+            .is_empty(),
+        );
+        assert_eq!(
+            crate::decompile::passes::clight_select::wt_audit::selected_error_count(
+                &views[0].1,
+                &feature,
+                &no_names,
+            ),
+            0,
+        );
+        assert!(stage4_wt_diagnostics_do_not_regress(
+            &function,
+            &canonical,
+            &feature,
+            &no_names,
+        ));
+
+        // An unrelated canonical diagnostic is inherited exactly.  Repairing
+        // it at a changed statement is permitted, but adding a new diagnostic
+        // or changing its exact identity/detail is not.
+        const INHERITED: Node = 0x1040;
+        let mut inherited_canonical = canonical.clone();
+        inherited_canonical
+            .statements
+            .insert(INHERITED, field.clone());
+        let mut inherited_feature = feature.clone();
+        inherited_feature.statements.insert(INHERITED, field.clone());
+        assert!(stage4_wt_diagnostics_do_not_regress(
+            &function,
+            &inherited_canonical,
+            &inherited_feature,
+            &no_names,
+        ));
+
+        inherited_feature
+            .statements
+            .insert(INHERITED, ClightStmt::Sskip);
+        assert!(stage4_wt_diagnostics_do_not_regress(
+            &function,
+            &inherited_canonical,
+            &inherited_feature,
+            &no_names,
+        ));
+
+        let mut changed_diagnostic = inherited_canonical.clone();
+        let mut different_field = field.clone();
+        let ClightStmt::Sset(_, ClightExpr::Efield(_, field_id, _)) =
+            &mut different_field
+        else {
+            unreachable!()
+        };
+        *field_id = 4;
+        changed_diagnostic
+            .statements
+            .insert(INHERITED, different_field);
+        assert!(!stage4_wt_diagnostics_do_not_regress(
+            &function,
+            &inherited_canonical,
+            &changed_diagnostic,
+            &no_names,
+        ));
+
+        let mut new_diagnostic = feature.clone();
+        new_diagnostic.statements.insert(INHERITED, field.clone());
+        assert!(!stage4_wt_diagnostics_do_not_regress(
+            &function,
+            &feature,
+            &new_diagnostic,
+            &no_names,
+        ));
+
+        function
+            .node_statements
+            .get_mut(&PLACEMENT)
+            .unwrap()
+            .push(raw);
+        let (canonical, state) = stage4_canonical_fixture(&function);
+        assert!(stage4_feature_views(&function, &canonical, &state)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn stage4_m_any64_terminal_placeholder_normalization_is_exact() {
+        let long_type = ClightType::Tlong(
+            ClightSignedness::Signed,
+            ClightAttr::default(),
+        );
+        let stale_type = stage4_i32_type(ClightSignedness::Signed);
+        let mut proof = Stage4SourceProof {
+            function: 0x1000,
+            origin_node: 0x1014,
+            selected_node: 0x1014,
+            kind: Stage4SourceKind::And,
+            root_boundary: Stage4RootBoundary::EliminatedMutation,
+            width: 8,
+            operation: Operation::Oandlimm(255),
+            args: Arc::new(vec![30]),
+            source_immediate: Some(255),
+            value: 30,
+            selected_result: 31,
+            address_param_leaves: Arc::new(Vec::new()),
+        };
+        let mut plan = Stage4UsePlan {
+            function: proof.function,
+            definition_node: proof.selected_node,
+            placement_node: 0x1010,
+            value: proof.value,
+            placement_load: Some(Stage4PlacementLoad {
+                chunk: MemoryChunk::MAny64,
+                addressing: Addressing::Aindexed(0),
+                args: Arc::new(vec![60]),
+            }),
+            terminal_use: Some(Stage4TerminalUse::Return),
+            transports: Arc::new(Vec::new()),
+            sites: Arc::new(vec![Stage4UseSite {
+                node: 0x1018,
+                value: proof.value,
+            }]),
+        };
+        let returned = ClightStmt::Slabel(
+            0x1018,
+            Box::new(ClightStmt::Sreturn(Some(ClightExpr::Etempvar(
+                30,
+                stale_type.clone(),
+            )))),
+        );
+        let normalized_return = stage4_normalize_eliminated_terminal(
+            &returned,
+            &proof,
+            &plan,
+            &long_type,
+        )
+        .unwrap();
+        assert!(matches!(
+            stage4_inner_statement(&normalized_return),
+            ClightStmt::Sreturn(Some(ClightExpr::Etempvar(30, ty))) if ty == &long_type
+        ));
+
+        plan.terminal_use = Some(Stage4TerminalUse::Store {
+            chunk: MemoryChunk::MAny64,
+            addressing: Addressing::Aindexed(0),
+            args: Arc::new(vec![61]),
+        });
+        let store_left = ClightExpr::Ederef(
+            Box::new(ClightExpr::Etempvar(
+                61,
+                ClightType::Tpointer(Arc::new(long_type.clone()), ClightAttr::default()),
+            )),
+            long_type.clone(),
+        );
+        let stored = ClightStmt::Sassign(
+            store_left,
+            ClightExpr::Ecast(
+                Box::new(ClightExpr::Etempvar(30, stale_type.clone())),
+                long_type.clone(),
+            ),
+        );
+        assert!(matches!(
+            stage4_normalize_eliminated_terminal(&stored, &proof, &plan, &long_type),
+            Some(ClightStmt::Sassign(_, ClightExpr::Etempvar(30, ref ty))) if ty == &long_type
+        ));
+
+        let mut wrong_chunk = plan.clone();
+        wrong_chunk.placement_load.as_mut().unwrap().chunk = MemoryChunk::MInt64;
+        assert!(stage4_normalize_eliminated_terminal(
+            &stored,
+            &proof,
+            &wrong_chunk,
+            &long_type,
+        )
+        .is_none());
+        let wrong_signedness = ClightStmt::Sreturn(Some(ClightExpr::Etempvar(
+            30,
+            stage4_i32_type(ClightSignedness::Unsigned),
+        )));
+        plan.terminal_use = Some(Stage4TerminalUse::Return);
+        assert!(stage4_normalize_eliminated_terminal(
+            &wrong_signedness,
+            &proof,
+            &plan,
+            &long_type,
+        )
+        .is_none());
+        proof.width = 4;
+        assert!(stage4_normalize_eliminated_terminal(
+            &returned,
+            &proof,
+            &plan,
+            &long_type,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn stage4_compound_emission_owner_is_the_unique_structured_label_owner() {
+        const ENTRY: Node = 0x1000;
+        const PLACEMENT: Node = 0x1010;
+        let mut function = function();
+        let (mut selected, _) = stage4_canonical_fixture(&function);
+        selected.statements = HashMap::from([(
+            ENTRY,
+            ClightStmt::Ssequence(vec![ClightStmt::Slabel(
+                PLACEMENT as Ident,
+                Box::new(ClightStmt::Sset(
+                    30,
+                    ClightExpr::EconstInt(
+                        0,
+                        stage4_i32_type(ClightSignedness::Signed),
+                    ),
+                )),
+            )]),
+        )]);
+        assert_eq!(
+            stage4_compound_emission_owner(&selected, PLACEMENT),
+            Some(ENTRY),
+        );
+
+        selected.statements.insert(
+            0x1020,
+            ClightStmt::Slabel(PLACEMENT as Ident, Box::new(ClightStmt::Sskip)),
+        );
+        assert_eq!(stage4_compound_emission_owner(&selected, PLACEMENT), None);
+        selected.statements.clear();
+        selected.statements.insert(PLACEMENT, ClightStmt::Sskip);
+        assert_eq!(
+            stage4_compound_emission_owner(&selected, PLACEMENT),
+            Some(PLACEMENT),
+        );
+        selected.statements.clear();
+        assert_eq!(stage4_compound_emission_owner(&selected, PLACEMENT), None);
+    }
+
+    #[test]
+    fn stage4_eliminated_rmw_revalidates_local_parameter_types_and_exact_roles() {
+        const PLACEMENT: Node = 0x1010;
+        const ROOT: Node = 0x1014;
+        const TERMINAL: Node = 0x1018;
+        let function = stage4_eliminated_rmw_fixture(
+            "int_I32",
+            ClightSignedness::Signed,
+            Stage4SourceKind::Add,
+            None,
+            false,
+        );
+
+        let rejects = |candidate: &FunctionData| {
+            let (canonical, state) = stage4_canonical_fixture(candidate);
+            stage4_feature_views(candidate, &canonical, &state)
+                .unwrap()
+                .is_empty()
+        };
+
+        let mut carrier_parameter = function.clone();
+        carrier_parameter.param_regs.push(30);
+        assert!(rejects(&carrier_parameter));
+
+        let mut source_signedness = function.clone();
+        source_signedness
+            .var_types
+            .insert(40, "int_I32_unsigned".into());
+        source_signedness
+            .var_type_candidates
+            .insert(40, vec!["int_I32_unsigned".into()]);
+        assert!(rejects(&source_signedness));
+
+        let mut source_not_parameter = function.clone();
+        source_not_parameter.param_regs.retain(|value| *value != 40);
+        assert!(rejects(&source_not_parameter));
+
+        let mut return_width = function.clone();
+        return_width.return_type =
+            ClightType::Tlong(ClightSignedness::Signed, ClightAttr::default());
+        assert!(rejects(&return_width));
+
+        let mut return_signedness = function.clone();
+        return_signedness.return_type = stage4_i32_type(ClightSignedness::Unsigned);
+        assert!(rejects(&return_signedness));
+
+        let mut wrong_terminal_role = function.clone();
+        wrong_terminal_role.node_statements.insert(
+            TERMINAL,
+            vec![ClightStmt::Sset(
+                70,
+                ClightExpr::Etempvar(30, stage4_i32_type(ClightSignedness::Signed)),
+            )],
+        );
+        assert!(rejects(&wrong_terminal_role));
+
+        let mut wrong_placement = function.clone();
+        wrong_placement.stage4_use_plans.get_mut(&ROOT).unwrap()[0].placement_node = TERMINAL;
+        assert!(rejects(&wrong_placement));
+
+        let mut no_load_role = function.clone();
+        no_load_role.node_statements.insert(
+            PLACEMENT,
+            vec![ClightStmt::Sset(
+                30,
+                ClightExpr::Etempvar(40, stage4_i32_type(ClightSignedness::Signed)),
+            )],
+        );
+        assert!(rejects(&no_load_role));
+    }
+
+    #[test]
+    fn stage4_eliminated_store_requires_the_carrier_as_exact_rhs() {
+        const TERMINAL: Node = 0x1018;
+        let function = stage4_eliminated_rmw_fixture(
+            "int_I32_unsigned",
+            ClightSignedness::Unsigned,
+            Stage4SourceKind::And,
+            Some(255),
+            true,
+        );
+        let (canonical, state) = stage4_canonical_fixture(&function);
+        let views = stage4_feature_views(&function, &canonical, &state).unwrap();
+        assert_eq!(views.len(), 1);
+
+        let mut carrier_only_in_lvalue = function.clone();
+        let ty = stage4_i32_type(ClightSignedness::Unsigned);
+        carrier_only_in_lvalue.node_statements.insert(
+            TERMINAL,
+            vec![ClightStmt::Sassign(
+                ClightExpr::Ederef(
+                    Box::new(ClightExpr::Etempvar(
+                        30,
+                        ClightType::Tpointer(Arc::new(ty.clone()), ClightAttr::default()),
+                    )),
+                    ty.clone(),
+                ),
+                ClightExpr::EconstInt(0, ty),
+            )],
+        );
+        let (canonical, state) = stage4_canonical_fixture(&carrier_only_in_lvalue);
+        assert!(stage4_feature_views(&carrier_only_in_lvalue, &canonical, &state)
+            .unwrap()
+            .is_empty());
+
+        let mut wrong_rhs_signedness = function.clone();
+        let [ClightStmt::Sassign(_, ClightExpr::Etempvar(_, rhs_type))] =
+            wrong_rhs_signedness
+                .node_statements
+                .get_mut(&TERMINAL)
+                .map(Vec::as_mut_slice)
+                .unwrap()
+        else {
+            unreachable!()
+        };
+        *rhs_type = stage4_i32_type(ClightSignedness::Signed);
+        let (canonical, state) = stage4_canonical_fixture(&wrong_rhs_signedness);
+        assert!(stage4_feature_views(&wrong_rhs_signedness, &canonical, &state)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn stage4_profile_cap_fails_closed_without_touching_canonical() {
+        let mut function = function();
+        let ty = stage4_i32_type(ClightSignedness::Signed);
+        for index in 0..=MAX_STAGE4_PROFILES_PER_FUNCTION {
+            let root = 0x1100 + index as u64 * 8;
+            let use_node = root + 4;
+            let value = 100 + index as u64;
+            let proof = stage4_zero_proof(root, value);
+            function.node_statements.insert(
+                root,
+                vec![ClightStmt::Sset(
+                    value as Ident,
+                    ClightExpr::EconstInt(0, ty.clone()),
+                )],
+            );
+            function.node_statements.insert(
+                use_node,
+                vec![ClightStmt::Sreturn(Some(ClightExpr::Etempvar(
+                    value as Ident,
+                    ty.clone(),
+                )))],
+            );
+            function.stage4_source_proofs.insert(root, vec![proof.clone()]);
+            function.stage4_use_plans.insert(
+                root,
+                vec![stage4_plan(
+                    &proof,
+                    vec![Stage4UseSite {
+                        node: use_node,
+                        value,
+                    }],
+                )],
+            );
+            function.var_types.insert(value, "int_I32".into());
+            function
+                .var_type_candidates
+                .insert(value, vec!["int_I32".into()]);
+            function.var_decl_idx.insert(value, 0);
+        }
+        let (canonical, state) = stage4_canonical_fixture(&function);
+        let fingerprint = format!("{:?}|{:?}", canonical.statements, canonical.var_types);
+        assert!(stage4_feature_views(&function, &canonical, &state).is_err());
+        assert_eq!(fingerprint, format!("{:?}|{:?}", canonical.statements, canonical.var_types));
+    }
+
     fn canonical_isolation_db(extension: Option<ScalarMemoryExtension>) -> DecompileDB {
         const FUNCTION: Address = 0x1000;
         const NODE: Node = 0x1010;
@@ -2701,6 +5194,94 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<ClightSelectionResult, St
         scalar_lvalue_alternatives.extend(function_alternatives);
     }
 
+    // Stage-4 is cumulative but independently bounded.  Each authenticated
+    // machine root is solved in isolation over a canonical-frozen function;
+    // no profile includes another Stage-4 root, so the portfolio grows
+    // linearly rather than as a Cartesian product.  Any resource overflow
+    // clears only these new views and preserves the exact v3 alternatives.
+    let mut stage4_alternatives = Vec::new();
+    let mut stage4_source_alternatives_overflowed = false;
+    for (func, canonical) in functions.iter().zip(selected.iter()) {
+        let views = match stage4_feature_views(func, canonical, &best_state) {
+            Ok(views) => views,
+            Err(()) => {
+                stage4_alternatives.clear();
+                stage4_source_alternatives_overflowed = true;
+                break;
+            }
+        };
+        if stage4_alternatives.len().saturating_add(views.len())
+            > MAX_STAGE4_PROFILES_PER_TU
+        {
+            stage4_alternatives.clear();
+            stage4_source_alternatives_overflowed = true;
+            break;
+        }
+        for (profile, fixed, authenticated_nodes, compound_placement_node) in views {
+            let Some(feature_state) =
+                crate::decompile::passes::clight_select::solve::solve_fixed_feature_selection(
+                    &fixed,
+                    &name_to_ident,
+                )
+            else {
+                continue;
+            };
+            let mut alternative = build_selected_function_from_program_state(
+                &fixed,
+                &feature_state,
+                &loop_info_all,
+                &ite_info_all,
+            );
+            alternative.var_types = canonical.var_types.clone();
+            alternative.var_type_candidates = canonical.var_type_candidates.clone();
+            alternative.var_decl_idx = canonical.var_decl_idx.clone();
+            if authenticated_nodes.is_empty()
+                || match (profile.kind.is_compound(), compound_placement_node) {
+                    (true, Some(node)) => !authenticated_nodes.contains(&node),
+                    (false, None) => false,
+                    _ => true,
+                }
+                || alternative.return_type != canonical.return_type
+                || alternative.param_regs != canonical.param_regs
+                || alternative.param_types != canonical.param_types
+                || alternative.var_types != canonical.var_types
+                || alternative.var_type_candidates != canonical.var_type_candidates
+                || alternative.var_decl_idx != canonical.var_decl_idx
+                || alternative.statements == canonical.statements
+                || !stage4_wt_diagnostics_do_not_regress(
+                    func,
+                    canonical,
+                    &alternative,
+                    &name_to_ident,
+                )
+            {
+                continue;
+            }
+            let compound_emission_node = match compound_placement_node {
+                Some(placement_node) if profile.kind.is_compound() => {
+                    let Some(owner) =
+                        stage4_compound_emission_owner(&alternative, placement_node)
+                    else {
+                        continue;
+                    };
+                    Some(owner)
+                }
+                None if !profile.kind.is_compound() => None,
+                _ => continue,
+            };
+            stage4_alternatives.push(Stage4SelectedAlternative {
+                profile,
+                function: alternative,
+                authenticated_nodes,
+                compound_placement_node,
+                compound_emission_node,
+            });
+        }
+    }
+    stage4_alternatives.sort_by_key(|alternative| {
+        (alternative.function.address, alternative.profile)
+    });
+
     // Read-only wt audit (CTYPING_PLAN.md P2): frontend-typing diagnoses over the selected statements/decls, stderr only.
     if std::env::var("MANIFOLD_WT_AUDIT_OFF").is_err() {
         crate::decompile::passes::clight_select::wt_audit::wt_audit(
@@ -2785,7 +5366,9 @@ pub fn select_clight_stmts(db: &DecompileDB) -> Result<ClightSelectionResult, St
     Ok(ClightSelectionResult {
         canonical: selected,
         scalar_lvalue_alternatives,
+        stage4_alternatives,
         feature_source_alternatives_overflowed,
+        stage4_source_alternatives_overflowed,
     })
 }
 

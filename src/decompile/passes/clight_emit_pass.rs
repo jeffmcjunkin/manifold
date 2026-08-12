@@ -4,7 +4,8 @@ use crate::decompile::passes::c_pass::helpers::{
     inline_string_literals, is_terminal_cstmt, param_name_for_reg, xtype_string_to_ctype,
 };
 use crate::decompile::passes::c_pass::types::{
-    CExpr, CStmt, CType, FuncDef, StructField, TopLevelDecl, TypeQualifiers,
+    AssignOp, BinaryOp, CBlockItem, CExpr, CStmt, CType, FuncDef, StructField,
+    TopLevelDecl, TypeQualifiers,
 };
 use crate::decompile::passes::pass::IRPass;
 use crate::x86::types::*;
@@ -90,6 +91,229 @@ fn known_opaque_struct_params() -> HashMap<&'static str, Vec<(usize, &'static st
         m.entry(func).or_default().push((0, "DIR"));
     }
     m
+}
+
+/// Convert the one exact node-bound `old = old op rhs` private Stage-4
+/// statement into its compound spelling.  The left side and both operands must
+/// be plain distinct locals, so compound assignment cannot change evaluation
+/// count, pointer arithmetic, aliasing, or volatile behavior.  A wrapper may
+/// contain labels/blocks, but exactly one closed assignment must be present.
+fn stage4_compound_source_stmt(
+    statement: &CStmt,
+    kind: Stage4SourceKind,
+) -> Option<CStmt> {
+    let (assign_op, binary_op) = match kind {
+        Stage4SourceKind::Add => (AssignOp::AddAssign, BinaryOp::Add),
+        Stage4SourceKind::Sub => (AssignOp::SubAssign, BinaryOp::Sub),
+        Stage4SourceKind::Mul => (AssignOp::MulAssign, BinaryOp::Mul),
+        Stage4SourceKind::And => (AssignOp::AndAssign, BinaryOp::BitAnd),
+        Stage4SourceKind::Or => (AssignOp::OrAssign, BinaryOp::BitOr),
+        Stage4SourceKind::Xor => (AssignOp::XorAssign, BinaryOp::BitXor),
+        Stage4SourceKind::AffineAddress | Stage4SourceKind::Zeroing => return None,
+    };
+
+    fn rewrite_expr(
+        expression: &mut CExpr,
+        assign_op: AssignOp,
+        binary_op: BinaryOp,
+    ) -> usize {
+        let CExpr::Assign(AssignOp::Assign, left, right) = expression else {
+            return 0;
+        };
+        let CExpr::Binary(operation, binary_left, binary_right) = right.as_ref() else {
+            return 0;
+        };
+        let (CExpr::Var(left_name), CExpr::Var(binary_left_name)) =
+            (left.as_ref(), binary_left.as_ref())
+        else {
+            return 0;
+        };
+        let rhs_is_closed = match binary_right.as_ref() {
+            CExpr::Var(right_name) => left_name != right_name,
+            // Authenticated register-immediate RMW profiles reach this layer
+            // as one literal.  No cast, call, sizeof, unary expression, or
+            // other source form is admitted here.
+            CExpr::IntLit(_) => true,
+            _ => false,
+        };
+        if *operation != binary_op || left_name != binary_left_name || !rhs_is_closed {
+            return 0;
+        }
+        let new_right = binary_right.clone();
+        *expression = CExpr::Assign(assign_op, left.clone(), new_right);
+        1
+    }
+
+    fn rewrite_stmt(
+        statement: &mut CStmt,
+        assign_op: AssignOp,
+        binary_op: BinaryOp,
+    ) -> usize {
+        match statement {
+            CStmt::Expr(expression) => rewrite_expr(expression, assign_op, binary_op),
+            CStmt::Labeled(_, inner) => rewrite_stmt(inner, assign_op, binary_op),
+            CStmt::Block(items) => items
+                .iter_mut()
+                .map(|item| match item {
+                    CBlockItem::Stmt(statement) => {
+                        rewrite_stmt(statement, assign_op, binary_op)
+                    }
+                    CBlockItem::Decl(_) => 0,
+                })
+                .sum(),
+            CStmt::Sequence(statements) => statements
+                .iter_mut()
+                .map(|statement| rewrite_stmt(statement, assign_op, binary_op))
+                .sum(),
+            CStmt::Empty
+            | CStmt::If(..)
+            | CStmt::Switch(..)
+            | CStmt::While(..)
+            | CStmt::DoWhile(..)
+            | CStmt::For(..)
+            | CStmt::Goto(..)
+            | CStmt::Continue
+            | CStmt::Break
+            | CStmt::Return(..)
+            | CStmt::Decl(..) => 0,
+        }
+    }
+
+    let mut rewritten = statement.clone();
+    (rewrite_stmt(&mut rewritten, assign_op, binary_op) == 1).then_some(rewritten)
+}
+
+fn stage4_compound_source_stmt_at_placement(
+    statement: &CStmt,
+    kind: Stage4SourceKind,
+    placement_label: &str,
+    allow_unlabeled_owner: bool,
+) -> Option<CStmt> {
+    fn label_count(statement: &CStmt, target: &str) -> usize {
+        match statement {
+            CStmt::Labeled(
+                crate::decompile::passes::c_pass::types::Label::Named(label),
+                inner,
+            ) => usize::from(label == target) + label_count(inner, target),
+            CStmt::Labeled(_, inner)
+            | CStmt::While(_, inner)
+            | CStmt::DoWhile(inner, _)
+            | CStmt::For(_, _, _, inner)
+            | CStmt::Switch(_, inner) => label_count(inner, target),
+            CStmt::If(_, then_statement, else_statement) => {
+                label_count(then_statement, target)
+                    + else_statement
+                        .as_ref()
+                        .map_or(0, |statement| label_count(statement, target))
+            }
+            CStmt::Block(items) => items
+                .iter()
+                .map(|item| match item {
+                    CBlockItem::Stmt(statement) => label_count(statement, target),
+                    CBlockItem::Decl(_) => 0,
+                })
+                .sum(),
+            CStmt::Sequence(statements) => statements
+                .iter()
+                .map(|statement| label_count(statement, target))
+                .sum(),
+            CStmt::Empty
+            | CStmt::Expr(..)
+            | CStmt::Goto(..)
+            | CStmt::Continue
+            | CStmt::Break
+            | CStmt::Return(..)
+            | CStmt::Decl(..) => 0,
+        }
+    }
+
+    fn rewrite(
+        statement: &mut CStmt,
+        kind: Stage4SourceKind,
+        target: &str,
+        labels: &mut usize,
+        rewrites: &mut usize,
+    ) -> bool {
+        match statement {
+            CStmt::Labeled(
+                crate::decompile::passes::c_pass::types::Label::Named(label),
+                inner,
+            ) if label == target => {
+                *labels += 1;
+                let Some(rewritten) = stage4_compound_source_stmt(inner, kind) else {
+                    return false;
+                };
+                *inner = Box::new(rewritten);
+                *rewrites += 1;
+                true
+            }
+            CStmt::Labeled(_, inner)
+            | CStmt::While(_, inner)
+            | CStmt::DoWhile(inner, _)
+            | CStmt::For(_, _, _, inner)
+            | CStmt::Switch(_, inner) => {
+                rewrite(inner, kind, target, labels, rewrites)
+            }
+            CStmt::If(_, then_statement, else_statement) => {
+                if !rewrite(then_statement, kind, target, labels, rewrites) {
+                    return false;
+                }
+                if let Some(statement) = else_statement.as_mut() {
+                    if !rewrite(statement, kind, target, labels, rewrites) {
+                        return false;
+                    }
+                }
+                true
+            }
+            CStmt::Block(items) => {
+                for item in items {
+                    if let CBlockItem::Stmt(statement) = item {
+                        if !rewrite(statement, kind, target, labels, rewrites) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            CStmt::Sequence(statements) => {
+                for statement in statements {
+                    if !rewrite(statement, kind, target, labels, rewrites) {
+                        return false;
+                    }
+                }
+                true
+            }
+            CStmt::Empty
+            | CStmt::Expr(..)
+            | CStmt::Goto(..)
+            | CStmt::Continue
+            | CStmt::Break
+            | CStmt::Return(..)
+            | CStmt::Decl(..) => true,
+        }
+    }
+
+    let exact_label_count = label_count(statement, placement_label);
+    if exact_label_count > 1 || (exact_label_count == 0 && !allow_unlabeled_owner) {
+        return None;
+    }
+    let mut rewritten = statement.clone();
+    let mut labels = 0usize;
+    let mut rewrites = 0usize;
+    if !rewrite(
+        &mut rewritten,
+        kind,
+        placement_label,
+        &mut labels,
+        &mut rewrites,
+    ) {
+        return None;
+    }
+    match (labels, rewrites, allow_unlabeled_owner) {
+        (1, 1, _) => Some(rewritten),
+        (0, 0, true) => stage4_compound_source_stmt(statement, kind),
+        _ => None,
+    }
 }
 
 /// Scan a CExpr to find struct names that appear in calls to known opaque-pointer functions.
@@ -1495,6 +1719,8 @@ const CLIGHT_EMIT_EXTRA_READS: &[&str] = &[
     "reg_rtl",
     "scalar_lvalue_candidate",
     "scalar_lvalue_source_candidate",
+    "stage4_source_candidate",
+    "stage4_use_plan",
     "resolved_extern_signature",
     "rtl_reg_used_in_func",
     "struct_id_to_canonical",
@@ -1595,13 +1821,17 @@ impl IRPass for ClightSelectPass {
                 );
                 db.clight_selected_functions = result.canonical;
                 db.clight_scalar_lvalue_alternatives = result.scalar_lvalue_alternatives;
+                db.clight_stage4_alternatives = result.stage4_alternatives;
                 db.cast_feature_source_alternatives_overflowed |=
                     result.feature_source_alternatives_overflowed;
+                db.cast_stage4_source_alternatives_overflowed |=
+                    result.stage4_source_alternatives_overflowed;
             }
             Err(e) => {
                 log::warn!("ClightSelectPass: failed to select statements: {}", e);
                 db.clight_selected_functions = Vec::new();
                 db.clight_scalar_lvalue_alternatives = Vec::new();
+                db.clight_stage4_alternatives = Vec::new();
             }
         }
     }
@@ -1614,7 +1844,9 @@ impl IRPass for ClightSelectPass {
         &[
             "clight_selected_functions",
             "clight_scalar_lvalue_alternatives",
+            "clight_stage4_alternatives",
             "cast_feature_source_alternatives_overflowed",
+            "cast_stage4_source_alternatives_overflowed",
         ]
     }
 
@@ -1755,6 +1987,7 @@ impl IRPass for ClightEmitPass {
         let selected_functions = std::mem::take(&mut db.clight_selected_functions);
         let scalar_lvalue_alternatives =
             std::mem::take(&mut db.clight_scalar_lvalue_alternatives);
+        let stage4_alternatives = std::mem::take(&mut db.clight_stage4_alternatives);
         eprintln!(
             "[clight-emit] selected functions: {}",
             selected_functions.len()
@@ -2471,6 +2704,115 @@ impl IRPass for ClightEmitPass {
             }
         }
 
+        // Stage-4 profiles are deliberately not grouped into one family TU:
+        // each root is one independent candidate over an otherwise canonical
+        // program.  This prevents a Cartesian product and lets downstream
+        // scoring attribute every source change to one authenticated machine
+        // definition.
+        let mut stage4_by_profile: BTreeMap<
+            (
+                Address,
+                crate::decompile::passes::clight_select::select::Stage4SourceProfile,
+            ),
+            Vec<_>,
+        > = BTreeMap::new();
+        for alternative in &stage4_alternatives {
+            stage4_by_profile
+                .entry((alternative.function.address, alternative.profile))
+                .or_default()
+                .push(alternative);
+        }
+        let mut stage4_feature_inputs = Vec::new();
+        for ((address, profile), alternatives) in stage4_by_profile {
+            let [selected] = alternatives.as_slice() else {
+                continue;
+            };
+            let Some(canonical) = canonical_by_address.get(&address).copied() else {
+                continue;
+            };
+            let alternative = &selected.function;
+            let compound_placement_is_closed = match (
+                profile.kind.is_compound(),
+                selected.compound_placement_node,
+                selected.compound_emission_node,
+            ) {
+                (true, Some(placement_node), Some(emission_node)) => {
+                    selected.authenticated_nodes.contains(&placement_node)
+                        && crate::decompile::passes::clight_select::select::stage4_compound_emission_owner(
+                            alternative,
+                            placement_node,
+                        ) == Some(emission_node)
+                }
+                (false, None, None) => true,
+                _ => false,
+            };
+            if selected.authenticated_nodes.is_empty()
+                || !compound_placement_is_closed
+                || alternative.name != canonical.name
+                || alternative.return_type != canonical.return_type
+                || alternative.param_regs != canonical.param_regs
+                || alternative.param_types != canonical.param_types
+                || alternative.entry_node != canonical.entry_node
+                || alternative.stack_size != canonical.stack_size
+                || alternative.successors != canonical.successors
+                || alternative.used_regs != canonical.used_regs
+                || alternative.struct_fields != canonical.struct_fields
+                || alternative.sseq_groups != canonical.sseq_groups
+                || alternative.loop_headers != canonical.loop_headers
+                || alternative.switch_heads != canonical.switch_heads
+                || alternative.reg_struct_ids != canonical.reg_struct_ids
+                || !scalar_feature_changed_type_regs(canonical, alternative).is_empty()
+            {
+                continue;
+            }
+
+            let mut feature_ctx =
+                crate::decompile::passes::c_pass::convert::from_relations::ConversionContext::new(
+                    db.cast_id_to_name.clone(),
+                );
+            let mut feature_statements = HashMap::new();
+            for (node, statement) in convert_selected_function_statements(
+                alternative,
+                &mut feature_ctx,
+                local_evar_ids.get(&address),
+                &string_map,
+                &rodata_const_map,
+            ) {
+                feature_statements.insert(node, statement);
+            }
+            if profile.kind.is_compound() {
+                let (Some(placement_node), Some(emission_node)) = (
+                    selected.compound_placement_node,
+                    selected.compound_emission_node,
+                ) else {
+                    continue;
+                };
+                let Some(statement) = feature_statements.get(&emission_node) else {
+                    continue;
+                };
+                let placement_label = feature_ctx.label_name(
+                    crate::decompile::passes::csh_pass::ident_from_node(placement_node),
+                );
+                let Some(compound) = stage4_compound_source_stmt_at_placement(
+                    statement,
+                    profile.kind,
+                    &placement_label,
+                    emission_node == placement_node,
+                ) else {
+                    continue;
+                };
+                feature_statements.insert(emission_node, compound);
+            }
+            let feature_object_types = feature_ctx.function_object_types().get(&address).cloned();
+            stage4_feature_inputs.push((
+                profile,
+                alternative.clone(),
+                feature_statements,
+                feature_object_types,
+                address,
+            ));
+        }
+
         log::info!(
             "Building translation unit from {} statements",
             stmt_map.len()
@@ -2520,6 +2862,11 @@ impl IRPass for ClightEmitPass {
                 },
             )
             .collect();
+        // Stage-4 keeps only one selected function plus its node-local statement
+        // delta per profile. Full translation units are constructed and dropped
+        // sequentially below, bounding peak memory independently of the number
+        // of authenticated roots.
+        let mut stage4_feature_functions = Vec::new();
         eprintln!(
             "[clight-emit] build_translation_unit (optimized TU): {:?}",
             t.elapsed()
@@ -2592,6 +2939,86 @@ impl IRPass for ClightEmitPass {
                         }
                     }
                 }
+            }
+
+            for (profile, alternative, feature_statements, object_types, address) in
+                stage4_feature_inputs.drain(..)
+            {
+                let mut feature_functions = db.cast_selected_functions.clone();
+                let matching_indices: Vec<_> = feature_functions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, function)| {
+                        (function.address == address).then_some(index)
+                    })
+                    .collect();
+                let [function_index] = matching_indices.as_slice() else {
+                    continue;
+                };
+                let selected_name = alternative.name.clone();
+                feature_functions[*function_index] = alternative;
+
+                if feature_statements.keys().any(|node| {
+                    node_to_func_addr.get(node).copied() != Some(address)
+                }) {
+                    continue;
+                }
+                let mut feature_stmt_map = stmt_map.clone();
+                feature_stmt_map
+                    .retain(|node, _| node_to_func_addr.get(node).copied() != Some(address));
+                feature_stmt_map.extend(feature_statements);
+                let mut feature_object_types = ctx.function_object_types().clone();
+                if let Some(object_types) = object_types {
+                    feature_object_types.insert(address, object_types);
+                }
+                let feature_tu = crate::decompile::passes::c_pass::convert::build_translation_unit_from_stmt_map_with_types(
+                    db,
+                    &feature_functions,
+                    &db.cast_globals,
+                    &db.cast_id_to_name,
+                    &feature_stmt_map,
+                    &all_edges,
+                    &db.cast_var_types_for_emission,
+                    &feature_object_types,
+                    &node_to_func_addr,
+                    &field_types,
+                );
+                let feature_defs: Vec<_> = feature_tu
+                    .decls
+                    .into_iter()
+                    .filter_map(|declaration| match declaration {
+                        TopLevelDecl::FuncDef(function) => Some(function),
+                        _ => None,
+                    })
+                    .collect();
+                // The selected function's provider name is unique in every
+                // accepted TU. Re-resolve by the selected metadata rather than
+                // retaining a whole translation unit for later passes.
+                let matching: Vec<_> = feature_defs
+                    .into_iter()
+                    .filter(|function| function.name == selected_name)
+                    .collect();
+                let [function] = matching.as_slice() else {
+                    continue;
+                };
+                let mut function = function.clone();
+                if !array_globals.is_empty() || !struct_globals.is_empty() {
+                    rewrite_recovered_global_stmt(
+                        &mut function.body,
+                        &array_globals,
+                        &struct_globals,
+                    );
+                    for local in &mut function.local_vars {
+                        if let Some(initializer) = &mut local.init {
+                            rewrite_recovered_global_init(
+                                initializer,
+                                &array_globals,
+                                &struct_globals,
+                            );
+                        }
+                    }
+                }
+                stage4_feature_functions.push((profile, address, function));
             }
         }
 
@@ -2768,6 +3195,16 @@ impl IRPass for ClightEmitPass {
             for (_, _, _, feature_tu) in &mut scalar_feature_tus {
                 rewrite_opaque_types_in_tu(feature_tu, &suppressed_structs);
             }
+            for (_, _, function) in &mut stage4_feature_functions {
+                function.return_type = rewrite_ctype(&function.return_type, &suppressed_structs);
+                for parameter in &mut function.params {
+                    parameter.ty = rewrite_ctype(&parameter.ty, &suppressed_structs);
+                }
+                for local in &mut function.local_vars {
+                    local.ty = rewrite_ctype(&local.ty, &suppressed_structs);
+                }
+                rewrite_ctype_in_stmt(&mut function.body, &suppressed_structs);
+            }
             for ty in db.cast_var_types_for_emission.values_mut() {
                 *ty = rewrite_ctype(ty, &suppressed_structs);
             }
@@ -2836,6 +3273,53 @@ impl IRPass for ClightEmitPass {
             }
         }
 
+        db.cast_pending_stage4_alternatives.clear();
+        let canonical_functions: HashMap<&str, Vec<&FuncDef>> = tu
+            .decls
+            .iter()
+            .filter_map(|declaration| match declaration {
+                TopLevelDecl::FuncDef(function) => Some((function.name.as_str(), function)),
+                _ => None,
+            })
+            .fold(HashMap::new(), |mut functions, (name, function)| {
+                functions.entry(name).or_default().push(function);
+                functions
+            });
+        for (profile, accepted_address, alternative) in stage4_feature_functions {
+            let Some(selected) = db
+                .cast_selected_functions
+                .iter()
+                .find(|function| function.address == accepted_address)
+            else {
+                continue;
+            };
+            let Some(canonical) = canonical_functions
+                .get(selected.name.as_str())
+                .filter(|functions| functions.len() == 1)
+                .and_then(|functions| functions.first())
+                .copied()
+            else {
+                continue;
+            };
+            if canonical == &alternative
+                || canonical.name != alternative.name
+                || canonical.return_type != alternative.return_type
+                || canonical.params != alternative.params
+                || canonical.is_variadic != alternative.is_variadic
+                || canonical.storage_class != alternative.storage_class
+            {
+                continue;
+            }
+            db.cast_pending_stage4_alternatives.push(
+                crate::decompile::postselect::source_alternatives::PendingStage4Alternative {
+                    manifold_name: canonical.name.clone(),
+                    manifold_address: accepted_address,
+                    profile,
+                    function: alternative,
+                },
+            );
+        }
+
         db.cast_optimized_translation_unit = Some(tu);
     }
 
@@ -2853,6 +3337,7 @@ impl IRPass for ClightEmitPass {
             "cast_raw_translation_unit",
             "cast_optimized_translation_unit",
             "cast_pending_scalar_lvalue_alternatives",
+            "cast_pending_stage4_alternatives",
         ]
     }
 
@@ -2961,6 +3446,8 @@ mod provider_identity_tests {
         for relation in [
             "scalar_lvalue_candidate",
             "scalar_lvalue_source_candidate",
+            "stage4_source_candidate",
+            "stage4_use_plan",
         ] {
             assert_eq!(
                 CLIGHT_EMIT_EXTRA_READS
@@ -2978,6 +3465,191 @@ mod provider_identity_tests {
             assert!(ClightEmitPass.extra_reads().contains(&relation));
         }
         assert_eq!(ClightSelectPass.extra_reads(), ClightEmitPass.extra_reads());
+    }
+
+    fn ordinary_assignment(operation: BinaryOp) -> CStmt {
+        CStmt::Expr(CExpr::Assign(
+            AssignOp::Assign,
+            Box::new(CExpr::Var("lhs".into())),
+            Box::new(CExpr::Binary(
+                operation,
+                Box::new(CExpr::Var("lhs".into())),
+                Box::new(CExpr::Var("rhs".into())),
+            )),
+        ))
+    }
+
+    fn immediate_assignment(operation: BinaryOp, value: i64) -> CStmt {
+        CStmt::Expr(CExpr::Assign(
+            AssignOp::Assign,
+            Box::new(CExpr::Var("lhs".into())),
+            Box::new(CExpr::Binary(
+                operation,
+                Box::new(CExpr::Var("lhs".into())),
+                Box::new(CExpr::int(value)),
+            )),
+        ))
+    }
+
+    #[test]
+    fn stage4_compound_source_spelling_is_exact_and_node_local() {
+        for (kind, binary, assign) in [
+            (Stage4SourceKind::Add, BinaryOp::Add, AssignOp::AddAssign),
+            (Stage4SourceKind::Sub, BinaryOp::Sub, AssignOp::SubAssign),
+            (Stage4SourceKind::Mul, BinaryOp::Mul, AssignOp::MulAssign),
+            (Stage4SourceKind::And, BinaryOp::BitAnd, AssignOp::AndAssign),
+            (Stage4SourceKind::Or, BinaryOp::BitOr, AssignOp::OrAssign),
+            (Stage4SourceKind::Xor, BinaryOp::BitXor, AssignOp::XorAssign),
+        ] {
+            let rewritten = stage4_compound_source_stmt(&ordinary_assignment(binary), kind)
+                .expect("one exact scalar assignment");
+            assert_eq!(
+                rewritten,
+                CStmt::Expr(CExpr::Assign(
+                    assign,
+                    Box::new(CExpr::Var("lhs".into())),
+                    Box::new(CExpr::Var("rhs".into())),
+                ))
+            );
+            let immediate = stage4_compound_source_stmt(
+                &immediate_assignment(binary, -7),
+                kind,
+            )
+            .expect("one exact immediate assignment");
+            assert_eq!(
+                immediate,
+                CStmt::Expr(CExpr::Assign(
+                    assign,
+                    Box::new(CExpr::Var("lhs".into())),
+                    Box::new(CExpr::int(-7)),
+                ))
+            );
+        }
+
+        let mut wrong_lhs = ordinary_assignment(BinaryOp::Add);
+        let CStmt::Expr(CExpr::Assign(_, _, right)) = &mut wrong_lhs else {
+            unreachable!()
+        };
+        let CExpr::Binary(_, left, _) = right.as_mut() else {
+            unreachable!()
+        };
+        *left = Box::new(CExpr::Var("other".into()));
+        assert!(stage4_compound_source_stmt(&wrong_lhs, Stage4SourceKind::Add).is_none());
+
+        let duplicate = CStmt::Sequence(vec![
+            ordinary_assignment(BinaryOp::Add),
+            ordinary_assignment(BinaryOp::Add),
+        ]);
+        assert!(stage4_compound_source_stmt(&duplicate, Stage4SourceKind::Add).is_none());
+        assert!(stage4_compound_source_stmt(
+            &ordinary_assignment(BinaryOp::Sub),
+            Stage4SourceKind::Add,
+        )
+        .is_none());
+
+        let side_effecting_lvalue = CStmt::Expr(CExpr::Assign(
+            AssignOp::Assign,
+            Box::new(CExpr::Unary(
+                crate::decompile::passes::c_pass::types::UnaryOp::Deref,
+                Box::new(CExpr::Var("p".into())),
+            )),
+            Box::new(CExpr::Binary(
+                BinaryOp::Add,
+                Box::new(CExpr::Unary(
+                    crate::decompile::passes::c_pass::types::UnaryOp::Deref,
+                    Box::new(CExpr::Var("p".into())),
+                )),
+                Box::new(CExpr::Var("rhs".into())),
+            )),
+        ));
+        assert!(stage4_compound_source_stmt(
+            &side_effecting_lvalue,
+            Stage4SourceKind::Add,
+        )
+        .is_none());
+
+        for forbidden_rhs in [
+            CExpr::Cast(CType::int(), Box::new(CExpr::int(7))),
+            CExpr::Call(Box::new(CExpr::Var("f".into())), Vec::new()),
+            CExpr::SizeofType(CType::int()),
+            CExpr::Unary(
+                crate::decompile::passes::c_pass::types::UnaryOp::Neg,
+                Box::new(CExpr::int(7)),
+            ),
+        ] {
+            let statement = CStmt::Expr(CExpr::Assign(
+                AssignOp::Assign,
+                Box::new(CExpr::Var("lhs".into())),
+                Box::new(CExpr::Binary(
+                    BinaryOp::Add,
+                    Box::new(CExpr::Var("lhs".into())),
+                    Box::new(forbidden_rhs),
+                )),
+            ));
+            assert!(stage4_compound_source_stmt(&statement, Stage4SourceKind::Add).is_none());
+        }
+    }
+
+    #[test]
+    fn stage4_compound_source_spelling_is_closed_to_the_exact_placement_label() {
+        use crate::decompile::passes::c_pass::types::Label;
+        let target = CStmt::Labeled(
+            Label::Named("L4112".into()),
+            Box::new(ordinary_assignment(BinaryOp::Mul)),
+        );
+        let decoy = ordinary_assignment(BinaryOp::Mul);
+        let owner = CStmt::Sequence(vec![decoy.clone(), target]);
+        let rewritten = stage4_compound_source_stmt_at_placement(
+            &owner,
+            Stage4SourceKind::Mul,
+            "L4112",
+            false,
+        )
+        .expect("only the exact labeled placement is rewritten");
+        let CStmt::Sequence(statements) = rewritten else {
+            unreachable!()
+        };
+        assert_eq!(statements[0], decoy);
+        assert!(matches!(
+            &statements[1],
+            CStmt::Labeled(
+                Label::Named(label),
+                inner,
+            ) if label == "L4112"
+                && matches!(inner.as_ref(), CStmt::Expr(CExpr::Assign(AssignOp::MulAssign, _, _)))
+        ));
+
+        let duplicate_label = CStmt::Sequence(vec![
+            CStmt::Labeled(
+                Label::Named("L4112".into()),
+                Box::new(ordinary_assignment(BinaryOp::Mul)),
+            ),
+            CStmt::Labeled(
+                Label::Named("L4112".into()),
+                Box::new(ordinary_assignment(BinaryOp::Mul)),
+            ),
+        ]);
+        assert!(stage4_compound_source_stmt_at_placement(
+            &duplicate_label,
+            Stage4SourceKind::Mul,
+            "L4112",
+            false,
+        )
+        .is_none());
+        assert!(stage4_compound_source_stmt_at_placement(
+            &ordinary_assignment(BinaryOp::Mul),
+            Stage4SourceKind::Mul,
+            "L4112",
+            false,
+        )
+        .is_none());
+        assert!(stage4_compound_source_stmt_at_placement(
+            &ordinary_assignment(BinaryOp::Mul),
+            Stage4SourceKind::Mul,
+            "L4112",
+            true,
+        )
+        .is_some());
     }
 
     #[test]

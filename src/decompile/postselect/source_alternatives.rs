@@ -8,7 +8,7 @@
 //! function for downstream best-candidate evaluation.
 
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::abi::BinaryFormat;
 use crate::decompile::elevator::DecompileDB;
@@ -16,13 +16,17 @@ use crate::decompile::passes::c_pass::types::{
     CBlockItem, CExpr, CStmt, FuncDef, TopLevelDecl, TranslationUnit,
 };
 use crate::decompile::passes::clight_select::select::{
-    ScalarSourceAlternativeFamily, SelectedFunction,
+    ScalarSourceAlternativeFamily, SelectedFunction, Stage4SourceProfile,
 };
 
 pub const SOURCE_ALTERNATIVES_SCHEMA: &str = "manifold-source-alternatives-v3";
+pub const SOURCE_ALTERNATIVES_SCHEMA_V4: &str = "manifold-source-alternatives-v4";
 /// Two ordinary rows plus at most two typed, two field, and four extension
 /// rows. No unused wire capacity is advertised.
 pub const MAX_SOURCE_ALTERNATIVES_PER_FUNCTION: usize = 10;
+/// V4 adds at most two content-distinct forms for each of sixteen independent
+/// Stage-4 roots while retaining all ten historical v3 rows.
+pub const MAX_SOURCE_ALTERNATIVES_PER_FUNCTION_V4: usize = 42;
 pub const MAX_TOTAL_SOURCE_ALTERNATIVES: usize = 4096;
 pub const MAX_SOURCE_ALTERNATIVE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_SOURCE_ALTERNATIVE_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
@@ -122,6 +126,12 @@ pub enum SourceAlternativeBoundary {
     ScalarExtensionPerUsePostVarReduce,
     ScalarExtensionHoistedPreVarReduce,
     ScalarExtensionHoistedPostVarReduce,
+    Stage4AffinePreVarReduce,
+    Stage4AffinePostVarReduce,
+    Stage4ZeroPreVarReduce,
+    Stage4ZeroPostVarReduce,
+    Stage4RmwPreVarReduce,
+    Stage4RmwPostVarReduce,
 }
 
 impl SourceAlternativeBoundary {
@@ -145,6 +155,12 @@ impl SourceAlternativeBoundary {
             Self::ScalarExtensionHoistedPostVarReduce => {
                 "scalar_extension_hoisted_post_var_reduce"
             }
+            Self::Stage4AffinePreVarReduce => "stage4_affine_pre_var_reduce",
+            Self::Stage4AffinePostVarReduce => "stage4_affine_post_var_reduce",
+            Self::Stage4ZeroPreVarReduce => "stage4_zero_pre_var_reduce",
+            Self::Stage4ZeroPostVarReduce => "stage4_zero_post_var_reduce",
+            Self::Stage4RmwPreVarReduce => "stage4_rmw_pre_var_reduce",
+            Self::Stage4RmwPostVarReduce => "stage4_rmw_post_var_reduce",
         }
     }
 }
@@ -159,6 +175,9 @@ pub struct SourceAlternativeSnapshot {
     pub manifold_address: u64,
     pub boundary: SourceAlternativeBoundary,
     pub kinds: Vec<&'static str>,
+    /// Present only for v4 Stage-4 rows.  The root is provider provenance; a
+    /// deterministic per-function ordinal is derived during rendering.
+    pub stage4_profile: Option<Stage4SourceProfile>,
     pub function: FuncDef,
 }
 
@@ -171,6 +190,17 @@ pub struct PendingScalarLvalueAlternative {
     pub manifold_name: String,
     pub manifold_address: u64,
     pub family: ScalarSourceAlternativeFamily,
+    pub function: FuncDef,
+}
+
+/// One private Stage-4 root assembled through the canonical Clight-to-C path.
+/// Profiles are independent: no pending function contains two Stage-4 roots,
+/// and VarReduce records this profile's bounded pre/post subsequence only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingStage4Alternative {
+    pub manifold_name: String,
+    pub manifold_address: u64,
+    pub profile: Stage4SourceProfile,
     pub function: FuncDef,
 }
 
@@ -498,7 +528,13 @@ pub fn snapshot_if_changed(
         | SourceAlternativeBoundary::ScalarExtensionPerUsePreVarReduce
         | SourceAlternativeBoundary::ScalarExtensionPerUsePostVarReduce
         | SourceAlternativeBoundary::ScalarExtensionHoistedPreVarReduce
-        | SourceAlternativeBoundary::ScalarExtensionHoistedPostVarReduce => return None,
+        | SourceAlternativeBoundary::ScalarExtensionHoistedPostVarReduce
+        | SourceAlternativeBoundary::Stage4AffinePreVarReduce
+        | SourceAlternativeBoundary::Stage4AffinePostVarReduce
+        | SourceAlternativeBoundary::Stage4ZeroPreVarReduce
+        | SourceAlternativeBoundary::Stage4ZeroPostVarReduce
+        | SourceAlternativeBoundary::Stage4RmwPreVarReduce
+        | SourceAlternativeBoundary::Stage4RmwPostVarReduce => return None,
     };
     match boundary {
         SourceAlternativeBoundary::PreForLoop => {
@@ -526,7 +562,13 @@ pub fn snapshot_if_changed(
         | SourceAlternativeBoundary::ScalarExtensionPerUsePreVarReduce
         | SourceAlternativeBoundary::ScalarExtensionPerUsePostVarReduce
         | SourceAlternativeBoundary::ScalarExtensionHoistedPreVarReduce
-        | SourceAlternativeBoundary::ScalarExtensionHoistedPostVarReduce => unreachable!(),
+        | SourceAlternativeBoundary::ScalarExtensionHoistedPostVarReduce
+        | SourceAlternativeBoundary::Stage4AffinePreVarReduce
+        | SourceAlternativeBoundary::Stage4AffinePostVarReduce
+        | SourceAlternativeBoundary::Stage4ZeroPreVarReduce
+        | SourceAlternativeBoundary::Stage4ZeroPostVarReduce
+        | SourceAlternativeBoundary::Stage4RmwPreVarReduce
+        | SourceAlternativeBoundary::Stage4RmwPostVarReduce => unreachable!(),
     }
     kinds.sort_unstable();
     kinds.dedup();
@@ -536,6 +578,7 @@ pub fn snapshot_if_changed(
         manifold_address,
         boundary,
         kinds,
+        stage4_profile: None,
         function: before.clone(),
     })
 }
@@ -647,6 +690,88 @@ pub fn scalar_feature_snapshots_for_format(
             manifold_address,
             boundary,
             kinds,
+            stage4_profile: None,
+            function: function.clone(),
+        });
+    }
+    (!snapshots.is_empty()).then_some(snapshots)
+}
+
+fn stage4_boundary_data(
+    kind: crate::x86::types::Stage4SourceKind,
+) -> [(SourceAlternativeBoundary, Vec<&'static str>); 2] {
+    use crate::x86::types::Stage4SourceKind;
+    match kind {
+        Stage4SourceKind::AffineAddress => [
+            (
+                SourceAlternativeBoundary::Stage4AffinePreVarReduce,
+                vec!["address_expression", "local_lifetime"],
+            ),
+            (
+                SourceAlternativeBoundary::Stage4AffinePostVarReduce,
+                vec!["address_expression"],
+            ),
+        ],
+        Stage4SourceKind::Zeroing => [
+            (
+                SourceAlternativeBoundary::Stage4ZeroPreVarReduce,
+                vec!["local_lifetime", "zeroing"],
+            ),
+            (
+                SourceAlternativeBoundary::Stage4ZeroPostVarReduce,
+                vec!["zeroing"],
+            ),
+        ],
+        Stage4SourceKind::Add
+        | Stage4SourceKind::Sub
+        | Stage4SourceKind::Mul
+        | Stage4SourceKind::And
+        | Stage4SourceKind::Or
+        | Stage4SourceKind::Xor => [
+            (
+                SourceAlternativeBoundary::Stage4RmwPreVarReduce,
+                vec!["compound_assignment", "local_lifetime"],
+            ),
+            (
+                SourceAlternativeBoundary::Stage4RmwPostVarReduce,
+                vec!["compound_assignment"],
+            ),
+        ],
+    }
+}
+
+pub fn stage4_feature_snapshots_for_format(
+    declaration_index: usize,
+    manifold_address: u64,
+    profile: Stage4SourceProfile,
+    canonical: &FuncDef,
+    pre_var_reduce: &FuncDef,
+    post_var_reduce: &FuncDef,
+    format: BinaryFormat,
+) -> Option<Vec<SourceAlternativeSnapshot>> {
+    if !same_signature(canonical, pre_var_reduce)
+        || !same_signature(canonical, post_var_reduce)
+    {
+        return None;
+    }
+    let canonical_source = one_function_source(canonical, format);
+    let mut seen_sources = HashSet::new();
+    let mut snapshots = Vec::new();
+    for ((boundary, kinds), function) in stage4_boundary_data(profile.kind)
+        .into_iter()
+        .zip([pre_var_reduce, post_var_reduce])
+    {
+        let source = one_function_source(function, format);
+        if source == canonical_source || !seen_sources.insert(source) {
+            continue;
+        }
+        snapshots.push(SourceAlternativeSnapshot {
+            declaration_index,
+            manifold_name: canonical.name.clone(),
+            manifold_address,
+            boundary,
+            kinds,
+            stage4_profile: Some(profile),
             function: function.clone(),
         });
     }
@@ -680,6 +805,7 @@ pub fn scalar_lvalue_snapshot_pair(
             manifold_address,
             boundary: pre_boundary,
             kinds: pre_kinds,
+            stage4_profile: None,
             function: pre_var_reduce.clone(),
         },
         SourceAlternativeSnapshot {
@@ -688,6 +814,7 @@ pub fn scalar_lvalue_snapshot_pair(
             manifold_address,
             boundary: post_boundary,
             kinds: post_kinds,
+            stage4_profile: None,
             function: post_var_reduce.clone(),
         },
     ])
@@ -714,6 +841,10 @@ struct SourceAlternativeRecord {
     manifold_address: String,
     boundary: &'static str,
     kinds: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_ordinal: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_root_node: Option<String>,
     canonical_source_sha256: String,
     alternative_source_sha256: String,
     canonical_source: String,
@@ -768,8 +899,49 @@ fn feature_boundary_family(
         SourceAlternativeBoundary::ScalarExtensionHoistedPostVarReduce => {
             Some((ScalarSourceAlternativeFamily::ExtensionHoisted, false))
         }
-        SourceAlternativeBoundary::PreForLoop | SourceAlternativeBoundary::PreVarReduce => None,
+        SourceAlternativeBoundary::PreForLoop
+        | SourceAlternativeBoundary::PreVarReduce
+        | SourceAlternativeBoundary::Stage4AffinePreVarReduce
+        | SourceAlternativeBoundary::Stage4AffinePostVarReduce
+        | SourceAlternativeBoundary::Stage4ZeroPreVarReduce
+        | SourceAlternativeBoundary::Stage4ZeroPostVarReduce
+        | SourceAlternativeBoundary::Stage4RmwPreVarReduce
+        | SourceAlternativeBoundary::Stage4RmwPostVarReduce => None,
     }
+}
+
+fn stage4_boundary_data_for_snapshot(
+    snapshot: &SourceAlternativeSnapshot,
+) -> Option<(bool, Vec<&'static str>)> {
+    let profile = snapshot.stage4_profile?;
+    stage4_boundary_data(profile.kind)
+        .into_iter()
+        .find(|(boundary, _)| *boundary == snapshot.boundary)
+        .map(|(boundary, kinds)| {
+            let pre = matches!(
+                boundary,
+                SourceAlternativeBoundary::Stage4AffinePreVarReduce
+                    | SourceAlternativeBoundary::Stage4ZeroPreVarReduce
+                    | SourceAlternativeBoundary::Stage4RmwPreVarReduce
+            );
+            (pre, kinds)
+        })
+}
+
+fn is_stage4_boundary(boundary: SourceAlternativeBoundary) -> bool {
+    matches!(
+        boundary,
+        SourceAlternativeBoundary::Stage4AffinePreVarReduce
+            | SourceAlternativeBoundary::Stage4AffinePostVarReduce
+            | SourceAlternativeBoundary::Stage4ZeroPreVarReduce
+            | SourceAlternativeBoundary::Stage4ZeroPostVarReduce
+            | SourceAlternativeBoundary::Stage4RmwPreVarReduce
+            | SourceAlternativeBoundary::Stage4RmwPostVarReduce
+    )
+}
+
+fn is_feature_boundary(boundary: SourceAlternativeBoundary) -> bool {
+    feature_boundary_family(boundary).is_some() || is_stage4_boundary(boundary)
 }
 
 fn append_digest_field(material: &mut Vec<u8>, field: &[u8]) {
@@ -781,11 +953,12 @@ fn append_digest_field(material: &mut Vec<u8>, field: &[u8]) {
 /// length-prefix framing.  The source text itself is separately authenticated by
 /// each record's digest and by the provider artifact bundle.
 fn ordered_set_sha256(
+    schema: &str,
     canonical_translation_unit_sha256: &str,
     records: &[SourceAlternativeRecord],
 ) -> String {
     let mut material = Vec::new();
-    append_digest_field(&mut material, SOURCE_ALTERNATIVES_SCHEMA.as_bytes());
+    append_digest_field(&mut material, schema.as_bytes());
     append_digest_field(&mut material, canonical_translation_unit_sha256.as_bytes());
     material.extend_from_slice(&(records.len() as u64).to_be_bytes());
     for record in records {
@@ -797,6 +970,19 @@ fn ordered_set_sha256(
         material.extend_from_slice(&(record.kinds.len() as u64).to_be_bytes());
         for kind in &record.kinds {
             append_digest_field(&mut material, kind.as_bytes());
+        }
+        if schema == SOURCE_ALTERNATIVES_SCHEMA_V4 {
+            material.extend_from_slice(
+                &record
+                    .profile_ordinal
+                    .map(|ordinal| ordinal as u64)
+                    .unwrap_or(u64::MAX)
+                    .to_be_bytes(),
+            );
+            append_digest_field(
+                &mut material,
+                record.profile_root_node.as_deref().unwrap_or("").as_bytes(),
+            );
         }
         append_digest_field(&mut material, record.canonical_source_sha256.as_bytes());
         append_digest_field(&mut material, record.alternative_source_sha256.as_bytes());
@@ -875,6 +1061,19 @@ fn render_manifest_with_limits_inner(
     if capture_overflowed || exclusions.suppress_all {
         return Ok(None);
     }
+    let has_stage4 = snapshots
+        .iter()
+        .any(|snapshot| is_stage4_boundary(snapshot.boundary));
+    let schema = if has_stage4 {
+        SOURCE_ALTERNATIVES_SCHEMA_V4
+    } else {
+        SOURCE_ALTERNATIVES_SCHEMA
+    };
+    let max_per_function = if has_stage4 {
+        MAX_SOURCE_ALTERNATIVES_PER_FUNCTION_V4
+    } else {
+        MAX_SOURCE_ALTERNATIVES_PER_FUNCTION
+    };
     let reproduced_source =
         crate::decompile::passes::c_pass::print_translation_unit_for_format(final_tu, format);
     if reproduced_source != canonical_translation_unit_source {
@@ -884,16 +1083,36 @@ fn render_manifest_with_limits_inner(
         )));
     }
     let fallback_to_ordinary = || {
+        if has_stage4 {
+            let prior: Vec<_> = snapshots
+                .iter()
+                .filter(|snapshot| !is_stage4_boundary(snapshot.boundary))
+                .cloned()
+                .collect();
+            return render_manifest_with_limits_inner(
+                final_tu,
+                &prior,
+                capture_overflowed,
+                exclusions,
+                exact_function_identities,
+                canonical_translation_unit_source,
+                format,
+                max_total,
+                max_source_bytes,
+                max_manifest_bytes,
+                allow_feature_fallback,
+            );
+        }
         if !allow_feature_fallback
             || !snapshots
                 .iter()
-                .any(|snapshot| feature_boundary_family(snapshot.boundary).is_some())
+                .any(|snapshot| is_feature_boundary(snapshot.boundary))
         {
             return Ok(None);
         }
         let ordinary: Vec<_> = snapshots
             .iter()
-            .filter(|snapshot| feature_boundary_family(snapshot.boundary).is_none())
+            .filter(|snapshot| !is_feature_boundary(snapshot.boundary))
             .cloned()
             .collect();
         render_manifest_with_limits_inner(
@@ -972,7 +1191,7 @@ fn render_manifest_with_limits_inner(
     let mut ordinary_key_counts = HashMap::new();
     for snapshot in snapshots
         .iter()
-        .filter(|snapshot| feature_boundary_family(snapshot.boundary).is_none())
+        .filter(|snapshot| !is_feature_boundary(snapshot.boundary))
     {
         *ordinary_key_counts
             .entry((snapshot.declaration_index, snapshot.boundary))
@@ -981,7 +1200,7 @@ fn render_manifest_with_limits_inner(
     let mut admitted_sources: HashMap<usize, HashSet<String>> = HashMap::new();
     for snapshot in snapshots
         .iter()
-        .filter(|snapshot| feature_boundary_family(snapshot.boundary).is_none())
+        .filter(|snapshot| !is_feature_boundary(snapshot.boundary))
     {
         if ordinary_key_counts
             .get(&(snapshot.declaration_index, snapshot.boundary))
@@ -1096,12 +1315,101 @@ fn render_manifest_with_limits_inner(
             }
         }
     }
+
+    let mut stage4_groups: HashMap<
+        (usize, Stage4SourceProfile),
+        Vec<&SourceAlternativeSnapshot>,
+    > = HashMap::new();
+    for snapshot in snapshots
+        .iter()
+        .filter(|snapshot| is_stage4_boundary(snapshot.boundary))
+    {
+        let Some(profile) = snapshot.stage4_profile else {
+            continue;
+        };
+        stage4_groups
+            .entry((snapshot.declaration_index, profile))
+            .or_default()
+            .push(snapshot);
+    }
+    let mut profiles_by_declaration: BTreeMap<usize, BTreeSet<Stage4SourceProfile>> =
+        BTreeMap::new();
+    for &(declaration_index, profile) in stage4_groups.keys() {
+        profiles_by_declaration
+            .entry(declaration_index)
+            .or_default()
+            .insert(profile);
+    }
+    if profiles_by_declaration
+        .values()
+        .any(|profiles| profiles.len() > crate::decompile::passes::clight_select::select::MAX_STAGE4_PROFILES_PER_FUNCTION)
+        || stage4_groups.len()
+            > crate::decompile::passes::clight_select::select::MAX_STAGE4_PROFILES_PER_TU
+    {
+        return fallback_to_ordinary();
+    }
+    let mut valid_stage4_groups = HashSet::new();
+    let mut sorted_stage4_keys: Vec<_> = stage4_groups.keys().copied().collect();
+    sorted_stage4_keys.sort_unstable();
+    for key @ (declaration_index, profile) in sorted_stage4_keys {
+        let group = &stage4_groups[&key];
+        if group.is_empty() || group.len() > 2 {
+            continue;
+        }
+        let mut boundaries = HashSet::new();
+        let mut sources = HashSet::new();
+        let valid = group.iter().all(|snapshot| {
+            snapshot.stage4_profile == Some(profile)
+                && stage4_boundary_data_for_snapshot(snapshot)
+                    .is_some_and(|(_, kinds)| kinds == snapshot.kinds)
+                && boundaries.insert(snapshot.boundary)
+                && snapshot_source_if_valid(snapshot)
+                    .is_some_and(|source| sources.insert(source))
+        });
+        if !valid {
+            continue;
+        }
+        let used = admitted_sources.entry(declaration_index).or_default();
+        if sources.is_disjoint(used) {
+            used.extend(sources);
+            valid_stage4_groups.insert(key);
+        }
+    }
+    if has_stage4 && valid_stage4_groups.is_empty() {
+        return fallback_to_ordinary();
+    }
+    // Derive contiguous wire ordinals only from admitted profiles. Invalid or
+    // content-colliding siblings remain canonical and cannot perturb the
+    // identity of an otherwise valid profile.
+    let mut admitted_profiles_by_declaration: BTreeMap<usize, BTreeSet<Stage4SourceProfile>> =
+        BTreeMap::new();
+    for &(declaration_index, profile) in &valid_stage4_groups {
+        admitted_profiles_by_declaration
+            .entry(declaration_index)
+            .or_default()
+            .insert(profile);
+    }
+    let profile_ordinals: HashMap<(usize, Stage4SourceProfile), usize> =
+        admitted_profiles_by_declaration
+            .iter()
+            .flat_map(|(declaration_index, profiles)| {
+                profiles.iter().enumerate().map(move |(ordinal, profile)| {
+                    ((*declaration_index, *profile), ordinal)
+                })
+            })
+            .collect();
     let mut ordered: Vec<(usize, &SourceAlternativeSnapshot)> = snapshots
         .iter()
         .filter(|snapshot| {
-            feature_boundary_family(snapshot.boundary).map_or(true, |(family, _)| {
+            if let Some((family, _)) = feature_boundary_family(snapshot.boundary) {
                 valid_feature_groups.contains(&(snapshot.declaration_index, family))
-            })
+            } else if is_stage4_boundary(snapshot.boundary) {
+                snapshot.stage4_profile.is_some_and(|profile| {
+                    valid_stage4_groups.contains(&(snapshot.declaration_index, profile))
+                })
+            } else {
+                true
+            }
         })
         .filter(|snapshot| {
             !exclusions.excludes(&snapshot.manifold_name, snapshot.manifold_address)
@@ -1113,11 +1421,31 @@ fn render_manifest_with_limits_inner(
                 .map(|function_ordinal| (function_ordinal, snapshot))
         })
         .collect();
-    ordered.sort_by_key(|(function_ordinal, snapshot)| (*function_ordinal, snapshot.boundary));
+    ordered.sort_by_key(|(function_ordinal, snapshot)| {
+        let stage4 = is_stage4_boundary(snapshot.boundary);
+        let profile_ordinal = snapshot
+            .stage4_profile
+            .and_then(|profile| {
+                profile_ordinals
+                    .get(&(snapshot.declaration_index, profile))
+                    .copied()
+            })
+            .unwrap_or(usize::MAX);
+        (
+            *function_ordinal,
+            stage4,
+            profile_ordinal,
+            snapshot.boundary,
+        )
+    });
     let mut snapshot_key_counts = std::collections::HashMap::new();
     for (_, snapshot) in &ordered {
         *snapshot_key_counts
-            .entry((snapshot.declaration_index, snapshot.boundary))
+            .entry((
+                snapshot.declaration_index,
+                snapshot.boundary,
+                snapshot.stage4_profile,
+            ))
             .or_insert(0usize) += 1;
     }
 
@@ -1130,14 +1458,18 @@ fn render_manifest_with_limits_inner(
             last_ordinal = Some(*function_ordinal);
             count_for_function = 0;
         }
-        if count_for_function >= MAX_SOURCE_ALTERNATIVES_PER_FUNCTION {
+        if count_for_function >= max_per_function {
             return fallback_to_ordinary();
         }
         if alternatives.len() >= max_total {
             return fallback_to_ordinary();
         }
         if snapshot_key_counts
-            .get(&(snapshot.declaration_index, snapshot.boundary))
+            .get(&(
+                snapshot.declaration_index,
+                snapshot.boundary,
+                snapshot.stage4_profile,
+            ))
             .copied()
             != Some(1)
         {
@@ -1182,17 +1514,36 @@ fn render_manifest_with_limits_inner(
             crate::decompile::disassembly::coff::sha256_hex(canonical_source.as_bytes());
         let alternative_source_sha256 =
             crate::decompile::disassembly::coff::sha256_hex(alternative_source.as_bytes());
-        alternatives.push(SourceAlternativeRecord {
-            id: format!(
+        let profile_ordinal = snapshot.stage4_profile.and_then(|profile| {
+            profile_ordinals
+                .get(&(snapshot.declaration_index, profile))
+                .copied()
+        });
+        let id = if let Some(profile_ordinal) = profile_ordinal {
+            format!(
+                "function-{:06}:{}:profile-{:04}",
+                function_ordinal,
+                snapshot.boundary.wire_name(),
+                profile_ordinal,
+            )
+        } else {
+            format!(
                 "function-{:06}:{}",
                 function_ordinal,
                 snapshot.boundary.wire_name(),
-            ),
+            )
+        };
+        alternatives.push(SourceAlternativeRecord {
+            id,
             function_ordinal: *function_ordinal,
             manifold_name: snapshot.manifold_name.clone(),
             manifold_address: format!("0x{:x}", snapshot.manifold_address),
             boundary: snapshot.boundary.wire_name(),
             kinds: snapshot.kinds.clone(),
+            profile_ordinal,
+            profile_root_node: snapshot
+                .stage4_profile
+                .map(|profile| format!("0x{:x}", profile.root_node)),
             canonical_source_sha256,
             alternative_source_sha256,
             canonical_source,
@@ -1207,10 +1558,11 @@ fn render_manifest_with_limits_inner(
     if alternatives.is_empty() {
         return Ok(None);
     }
-    let ordered_set_sha256 = ordered_set_sha256(&canonical_translation_unit_sha256, &alternatives);
+    let ordered_set_sha256 =
+        ordered_set_sha256(schema, &canonical_translation_unit_sha256, &alternatives);
     let rendered = serde_json::to_string_pretty(&SourceAlternativeManifest {
-        schema: SOURCE_ALTERNATIVES_SCHEMA,
-        max_per_function: MAX_SOURCE_ALTERNATIVES_PER_FUNCTION,
+        schema,
+        max_per_function,
         max_total: MAX_TOTAL_SOURCE_ALTERNATIVES,
         max_source_bytes: MAX_SOURCE_ALTERNATIVE_BYTES,
         max_manifest_bytes: MAX_SOURCE_ALTERNATIVE_MANIFEST_BYTES,
@@ -1231,6 +1583,7 @@ mod tests {
     use crate::decompile::passes::c_pass::types::{
         BinaryOp, CType, FuncParam, SourceLoc, StorageClass,
     };
+    use crate::decompile::passes::clight_select::select::MAX_STAGE4_PROFILES_PER_FUNCTION;
 
     fn function(name: &str, body: CStmt) -> FuncDef {
         FuncDef {
@@ -1377,6 +1730,245 @@ mod tests {
             BinaryFormat::Coff,
         )
         .is_none());
+    }
+
+    fn stage4_profile(kind: crate::x86::types::Stage4SourceKind, root_node: u64) -> Stage4SourceProfile {
+        Stage4SourceProfile { kind, root_node }
+    }
+
+    #[test]
+    fn v4_stage4_profiles_collapse_to_one_closed_pre_post_subsequence() {
+        use crate::x86::types::Stage4SourceKind;
+
+        let canonical = function("f", CStmt::Return(Some(CExpr::int(0))));
+        let pre = function("f", CStmt::Return(Some(CExpr::int(1))));
+        let post = function("f", CStmt::Return(Some(CExpr::int(2))));
+        let profile = stage4_profile(Stage4SourceKind::AffineAddress, 0x1010);
+        let both = stage4_feature_snapshots_for_format(
+            0,
+            0x1000,
+            profile,
+            &canonical,
+            &pre,
+            &post,
+            BinaryFormat::Coff,
+        )
+        .expect("two content-distinct affine forms");
+        assert_eq!(both.len(), 2);
+        assert!(both.iter().all(|snapshot| snapshot.stage4_profile == Some(profile)));
+        assert_eq!(both[0].boundary, SourceAlternativeBoundary::Stage4AffinePreVarReduce);
+        assert_eq!(both[0].kinds, vec!["address_expression", "local_lifetime"]);
+        assert_eq!(both[1].boundary, SourceAlternativeBoundary::Stage4AffinePostVarReduce);
+        assert_eq!(both[1].kinds, vec!["address_expression"]);
+
+        let one = stage4_feature_snapshots_for_format(
+            0,
+            0x1000,
+            profile,
+            &canonical,
+            &pre,
+            &pre,
+            BinaryFormat::Coff,
+        )
+        .expect("the first duplicate source survives");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].boundary, SourceAlternativeBoundary::Stage4AffinePreVarReduce);
+
+        let mut wrong_signature = post.clone();
+        wrong_signature.return_type = CType::long();
+        assert!(stage4_feature_snapshots_for_format(
+            0,
+            0x1000,
+            profile,
+            &canonical,
+            &pre,
+            &wrong_signature,
+            BinaryFormat::Coff,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn v4_is_cumulative_and_stage4_failure_preserves_exact_v3_manifest() {
+        use crate::x86::types::Stage4SourceKind;
+
+        let canonical_function = function("f", CStmt::Return(Some(CExpr::int(100))));
+        let ordinary_function = function("f", CStmt::Return(Some(CExpr::int(90))));
+        let ordinary = snapshot_if_changed(
+            0,
+            0x1000,
+            SourceAlternativeBoundary::PreForLoop,
+            &ordinary_function,
+            &canonical_function,
+        )
+        .expect("ordinary snapshot");
+        let mut final_tu = TranslationUnit::new();
+        final_tu.add_function(canonical_function.clone());
+        let canonical = crate::decompile::passes::c_pass::print_translation_unit_for_format(
+            &final_tu,
+            BinaryFormat::Coff,
+        );
+        let identities = [("f".to_string(), 0x1000)];
+        let render = |snapshots: &[SourceAlternativeSnapshot]| {
+            render_manifest(
+                &final_tu,
+                snapshots,
+                false,
+                &SourceAlternativeExclusions::default(),
+                &identities,
+                &canonical,
+                BinaryFormat::Coff,
+            )
+            .expect("render cumulative fixture")
+        };
+        let v3 = render(std::slice::from_ref(&ordinary))
+            .expect("ordinary v3 manifest");
+        let v3_json: serde_json::Value = serde_json::from_str(&v3).unwrap();
+        assert_eq!(v3_json["schema"], SOURCE_ALTERNATIVES_SCHEMA);
+        assert!(v3_json["alternatives"][0].get("profile_ordinal").is_none());
+
+        let profile = stage4_profile(Stage4SourceKind::Zeroing, 0x1010);
+        let mut cumulative = vec![ordinary.clone()];
+        cumulative.extend(
+            stage4_feature_snapshots_for_format(
+                0,
+                0x1000,
+                profile,
+                &canonical_function,
+                &function("f", CStmt::Return(Some(CExpr::int(1)))),
+                &function("f", CStmt::Return(Some(CExpr::int(2)))),
+                BinaryFormat::Coff,
+            )
+            .expect("zeroing profile"),
+        );
+        let v4 = render(&cumulative).expect("cumulative v4 manifest");
+        let v4_json: serde_json::Value = serde_json::from_str(&v4).unwrap();
+        assert_eq!(v4_json["schema"], SOURCE_ALTERNATIVES_SCHEMA_V4);
+        assert_eq!(
+            v4_json["max_per_function"],
+            MAX_SOURCE_ALTERNATIVES_PER_FUNCTION_V4
+        );
+        assert_eq!(v4_json["alternatives"][0], v3_json["alternatives"][0]);
+        assert_eq!(
+            v4_json["alternatives"][1]["id"],
+            "function-000000:stage4_zero_pre_var_reduce:profile-0000"
+        );
+        assert_eq!(v4_json["alternatives"][1]["profile_root_node"], "0x1010");
+
+        // An exact source collision drops only the affected Stage-4 group and
+        // recursively renders the historical bytes; it cannot evict ordinary.
+        let mut collision = vec![ordinary.clone()];
+        collision.extend(
+            stage4_feature_snapshots_for_format(
+                0,
+                0x1000,
+                profile,
+                &canonical_function,
+                &ordinary_function,
+                &canonical_function,
+                BinaryFormat::Coff,
+            )
+            .expect("colliding stage4 row"),
+        );
+        assert_eq!(render(&collision).expect("v3 fallback"), v3);
+
+        let mut missing_profile = cumulative.clone();
+        for snapshot in &mut missing_profile {
+            if is_stage4_boundary(snapshot.boundary) {
+                snapshot.stage4_profile = None;
+            }
+        }
+        assert_eq!(render(&missing_profile).expect("missing profile fallback"), v3);
+    }
+
+    #[test]
+    fn v4_profiles_are_independent_contiguous_and_bounded_without_eviction() {
+        use crate::x86::types::Stage4SourceKind;
+
+        let canonical_function = function("f", CStmt::Return(Some(CExpr::int(100))));
+        let ordinary = snapshot_if_changed(
+            0,
+            0x1000,
+            SourceAlternativeBoundary::PreForLoop,
+            &function("f", CStmt::Return(Some(CExpr::int(90)))),
+            &canonical_function,
+        )
+        .unwrap();
+        let mut final_tu = TranslationUnit::new();
+        final_tu.add_function(canonical_function.clone());
+        let canonical = crate::decompile::passes::c_pass::print_translation_unit_for_format(
+            &final_tu,
+            BinaryFormat::Coff,
+        );
+        let identities = [("f".to_string(), 0x1000)];
+        let render = |snapshots: &[SourceAlternativeSnapshot]| {
+            render_manifest(
+                &final_tu,
+                snapshots,
+                false,
+                &SourceAlternativeExclusions::default(),
+                &identities,
+                &canonical,
+                BinaryFormat::Coff,
+            )
+            .expect("render bounded profile fixture")
+        };
+        let v3 = render(std::slice::from_ref(&ordinary)).unwrap();
+
+        let colliding_profile = stage4_profile(Stage4SourceKind::AffineAddress, 0x1010);
+        let valid_profile = stage4_profile(Stage4SourceKind::Zeroing, 0x1020);
+        let mut rows = vec![ordinary.clone()];
+        rows.extend(
+            stage4_feature_snapshots_for_format(
+                0,
+                0x1000,
+                colliding_profile,
+                &canonical_function,
+                &function("f", CStmt::Return(Some(CExpr::int(90)))),
+                &canonical_function,
+                BinaryFormat::Coff,
+            )
+            .unwrap(),
+        );
+        rows.extend(
+            stage4_feature_snapshots_for_format(
+                0,
+                0x1000,
+                valid_profile,
+                &canonical_function,
+                &function("f", CStmt::Return(Some(CExpr::int(1)))),
+                &canonical_function,
+                BinaryFormat::Coff,
+            )
+            .unwrap(),
+        );
+        let rendered = render(&rows).expect("valid sibling remains");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let alternatives = parsed["alternatives"].as_array().unwrap();
+        assert_eq!(alternatives.len(), 2);
+        assert_eq!(alternatives[1]["profile_ordinal"], 0);
+        assert_eq!(alternatives[1]["profile_root_node"], "0x1020");
+
+        let mut overflow = vec![ordinary];
+        for index in 0..=MAX_STAGE4_PROFILES_PER_FUNCTION {
+            let profile = stage4_profile(Stage4SourceKind::AffineAddress, 0x2000 + index as u64);
+            overflow.extend(
+                stage4_feature_snapshots_for_format(
+                    0,
+                    0x1000,
+                    profile,
+                    &canonical_function,
+                    &function(
+                        "f",
+                        CStmt::Return(Some(CExpr::int(1000 + index as i64))),
+                    ),
+                    &canonical_function,
+                    BinaryFormat::Coff,
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(render(&overflow).expect("profile overflow preserves v3"), v3);
     }
 
     #[test]
@@ -1565,6 +2157,7 @@ mod tests {
                 manifold_address: 0x2000,
                 boundary: SourceAlternativeBoundary::PreForLoop,
                 kinds: vec!["control_layout"],
+                stage4_profile: None,
                 function: stale,
             },
         ];
@@ -2517,6 +3110,7 @@ mod tests {
             manifold_address: 0x1000,
             boundary: SourceAlternativeBoundary::PreForLoop,
             kinds: vec!["control_layout"],
+            stage4_profile: None,
             function: wrong_signature,
         };
         let rendered = render_manifest(

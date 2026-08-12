@@ -862,8 +862,12 @@ impl IRPass for ForLoopPass {
             for alternative in &mut db.cast_pending_scalar_lvalue_alternatives {
                 recover_forloop_function(&mut alternative.function);
             }
+            for alternative in &mut db.cast_pending_stage4_alternatives {
+                recover_forloop_function(&mut alternative.function);
+            }
         } else {
             db.cast_pending_scalar_lvalue_alternatives.clear();
+            db.cast_pending_stage4_alternatives.clear();
         }
         db.cast_source_alternatives = alternatives;
         db.cast_source_alternatives_overflowed = alternatives_overflowed;
@@ -881,6 +885,7 @@ impl IRPass for ForLoopPass {
         &[
             "cast_optimized_translation_unit",
             "cast_pending_scalar_lvalue_alternatives",
+            "cast_pending_stage4_alternatives",
             "cast_source_alternatives",
         ]
     }

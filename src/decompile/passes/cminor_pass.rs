@@ -84,6 +84,101 @@ pub(crate) fn scalar_memory_proof_matches_cminor(
     }
 }
 
+/// Revalidate the exact selected Stage-4 operation at the first typed IR
+/// boundary.  The proof does not authorize a source alternative if ordinary
+/// Cminor lowering has changed its destination, operands, operation, or
+/// constant width.
+pub(crate) fn stage4_source_proof_matches_cminor(
+    proof: &Stage4SourceProof,
+    stmt: &CminorStmt,
+) -> bool {
+    if !proof.is_closed_v1()
+        || proof.root_boundary != Stage4RootBoundary::FinalRtlDefinition
+    {
+        return false;
+    }
+    let CminorStmt::Sassign(destination, expression) = stmt else {
+        return false;
+    };
+    if *destination != proof.value {
+        return false;
+    }
+    match proof.kind {
+        Stage4SourceKind::AffineAddress => matches!(
+            expression,
+            CminorExpr::Eop(operation, args)
+                if operation == &proof.operation && args == &proof.args
+        ),
+        Stage4SourceKind::Zeroing => matches!(
+            (&proof.operation, expression),
+            (Operation::Ointconst(0), CminorExpr::Econst(Constant::Ointconst(0)))
+                | (Operation::Olongconst(0), CminorExpr::Econst(Constant::Olongconst(0)))
+        ),
+        Stage4SourceKind::Add
+        | Stage4SourceKind::Sub
+        | Stage4SourceKind::Mul
+        | Stage4SourceKind::And
+        | Stage4SourceKind::Or
+        | Stage4SourceKind::Xor => false,
+    }
+}
+
+/// Rejoin an eliminated two-address mutation to the exact surviving load and
+/// sole terminal observation carried by its closed plan.  The mutation itself
+/// deliberately has no canonical Cminor statement; both surrounding
+/// statements must nevertheless remain byte-for-byte equivalent to final RTL
+/// before its provenance may cross this boundary.
+pub(crate) fn stage4_eliminated_plan_matches_cminor(
+    proof: &Stage4SourceProof,
+    plan: &Stage4UsePlan,
+    placement: &CminorStmt,
+    terminal: &CminorStmt,
+) -> bool {
+    if proof.root_boundary != Stage4RootBoundary::EliminatedMutation
+        || !proof.is_closed_v1()
+        || !plan.is_closed_v1(proof)
+    {
+        return false;
+    }
+    let (Some(load), Some(terminal_use), [site]) = (
+        plan.placement_load.as_ref(),
+        plan.terminal_use.as_ref(),
+        plan.sites.as_slice(),
+    ) else {
+        return false;
+    };
+    let placement_matches = matches!(
+        placement,
+        CminorStmt::Sassign(
+            destination,
+            CminorExpr::Eload(chunk, addressing, args),
+        ) if *destination == plan.value
+            && *chunk == load.chunk
+            && addressing == &load.addressing
+            && args == &load.args
+    );
+    let terminal_matches = match (terminal_use, terminal) {
+        (Stage4TerminalUse::Return, CminorStmt::Sreturn(value)) => {
+            *value == site.value
+        }
+        (
+            Stage4TerminalUse::Store {
+                chunk,
+                addressing,
+                args,
+            },
+            CminorStmt::Sstore(actual_chunk, actual_addressing, actual_args, value),
+        ) => {
+            *value == site.value
+                && actual_chunk == chunk
+                && actual_addressing == addressing
+                && actual_args == args
+        }
+        _ => false,
+    };
+    placement_matches && terminal_matches
+}
+
 ascent_par! {
     #![measure_rule_times]
 
@@ -99,11 +194,15 @@ ascent_par! {
     relation stack_var(Address, Address, i64, RTLReg);
     relation authenticated_scalar_memory_access(Node, ScalarMemoryAccessProof);
     relation authenticated_scalar_memory_use_plan(Node, ScalarMemoryUsePlan);
+    relation authenticated_stage4_source(Node, Stage4SourceProof);
+    relation authenticated_stage4_use_plan(Node, Stage4UsePlan);
 
     relation cminor_stmt(Node, CminorStmt);
     relation cminor_fallthrough(Node, Node);
     relation cminor_scalar_memory_access(Node, ScalarMemoryAccessProof);
     relation cminor_scalar_memory_use_plan(Node, ScalarMemoryUsePlan);
+    relation cminor_stage4_source(Node, Stage4SourceProof);
+    relation cminor_stage4_use_plan(Node, Stage4UsePlan);
 
     cminor_scalar_memory_access(node, proof.clone()) <--
         authenticated_scalar_memory_access(node, proof),
@@ -113,6 +212,31 @@ ascent_par! {
     cminor_scalar_memory_use_plan(node, plan.clone()) <--
         authenticated_scalar_memory_use_plan(node, plan),
         authenticated_scalar_memory_access(node, proof),
+        if plan.is_closed_v1(proof);
+
+    cminor_stage4_source(node, proof.clone()) <--
+        authenticated_stage4_source(node, proof),
+        cminor_stmt(node, stmt),
+        if crate::decompile::passes::cminor_pass::stage4_source_proof_matches_cminor(proof, stmt);
+
+    // An eliminated mutation has no canonical statement of its own.  Rejoin
+    // its exact surviving load and sole return/store instead of carrying a
+    // free-floating marker across the typed boundary.
+    cminor_stage4_source(node, proof.clone()),
+    cminor_stage4_use_plan(node, plan.clone()) <--
+        authenticated_stage4_source(node, proof),
+        authenticated_stage4_use_plan(node, plan),
+        cminor_stmt(plan.placement_node, placement),
+        for site in plan.sites.iter(),
+        cminor_stmt(site.node, terminal),
+        if crate::decompile::passes::cminor_pass::stage4_eliminated_plan_matches_cminor(
+            proof, plan, placement, terminal
+        );
+
+    cminor_stage4_use_plan(node, plan.clone()) <--
+        authenticated_stage4_use_plan(node, plan),
+        authenticated_stage4_source(node, proof),
+        if proof.root_boundary == Stage4RootBoundary::FinalRtlDefinition,
         if plan.is_closed_v1(proof);
 
     // Track nodes where Olea(Ainstack) was resolved to a stack address constant via stack_var.

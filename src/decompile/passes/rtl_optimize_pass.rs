@@ -545,7 +545,7 @@ mod scalar_lvalue_memory_access_tests {
     }
 
     fn proofs(mut db: DecompileDB) -> Vec<ScalarMemoryAccessProof> {
-        materialize_authenticated_scalar_memory_accesses(&mut db);
+        let _ = materialize_authenticated_scalar_memory_accesses(&mut db);
         db.rel_iter::<(Node, ScalarMemoryAccessProof)>("authenticated_scalar_memory_access")
             .map(|(_, proof)| proof.clone())
             .collect()
@@ -955,6 +955,359 @@ mod scalar_lvalue_memory_access_tests {
                 "transport alias escaped: {mnemonic}/{width}/{register}/{chunk:?}"
             );
         }
+    }
+
+    #[test]
+    fn plain_store_fixed_point_aliases_are_exact_and_stage4_private() {
+        const ALIAS_ONE: RTLReg = 0x8000_0000_0000_0070;
+        const ALIAS_TWO: RTLReg = 0x8000_0000_0000_0080;
+        const EXTRA_ALIAS: RTLReg = 0x8000_0000_0000_0090;
+
+        fn fixture() -> DecompileDB {
+            let mut db = scalar_fixture(
+                "MOV",
+                8,
+                "RAX",
+                MemoryChunk::MAny64,
+                ScalarMemoryDirection::Write,
+                Mutation::None,
+            );
+            for source in [ALIAS_ONE, ALIAS_TWO] {
+                db.rel_push(
+                    "rtl_inst_candidate",
+                    (
+                        NODE,
+                        RTLInst::Istore(
+                            MemoryChunk::MAny64,
+                            Addressing::Aindexed(12),
+                            Arc::new(vec![BASE]),
+                            source,
+                        ),
+                    ),
+                );
+            }
+            for source in [VALUE, ALIAS_ONE, ALIAS_TWO] {
+                db.rel_push("reg_xtl", (NODE, Mreg::AX, source));
+                db.rel_push("xtl_canonical", (source, source));
+                if source != VALUE {
+                    db.rel_push("xtl_canonical", (source, VALUE));
+                }
+            }
+            db.rel_push("reaching_use_rtl", (NODE, Mreg::AX, VALUE));
+            db
+        }
+
+        fn remove_candidate(db: &mut DecompileDB, removed_source: RTLReg) {
+            let rows = db
+                .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+                .filter(|(node, row)| {
+                    *node != NODE
+                        || !matches!(row, RTLInst::Istore(_, _, _, source) if *source == removed_source)
+                })
+                .cloned()
+                .collect::<ascent::boxcar::Vec<_>>();
+            db.rel_set("rtl_inst_candidate", rows);
+        }
+
+        fn private_proofs(mut db: DecompileDB) -> Vec<(Node, ScalarMemoryAccessProof)> {
+            let private = materialize_authenticated_scalar_memory_accesses(&mut db);
+            assert!(
+                db.rel_iter::<(Node, ScalarMemoryAccessProof)>("authenticated_scalar_memory_access")
+                    .next()
+                    .is_none(),
+                "fixed-point store aliases must stay Stage-4 private",
+            );
+            private
+        }
+
+        let rows = private_proofs(fixture());
+        let [(node, proof)] = rows.as_slice() else {
+            panic!("expected one private fixed-point store: {rows:#?}");
+        };
+        assert_eq!(*node, NODE);
+        assert_eq!(proof.direction, ScalarMemoryDirection::Write);
+        assert_eq!(proof.value, VALUE);
+
+        let mut missing = fixture();
+        remove_candidate(&mut missing, ALIAS_TWO);
+        assert!(private_proofs(missing).is_empty());
+
+        let mut extra = fixture();
+        extra.rel_push(
+            "rtl_inst_candidate",
+            (
+                NODE,
+                RTLInst::Istore(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed(12),
+                    Arc::new(vec![BASE]),
+                    EXTRA_ALIAS,
+                ),
+            ),
+        );
+        extra.rel_push("xtl_canonical", (EXTRA_ALIAS, VALUE));
+        assert!(private_proofs(extra).is_empty());
+
+        let mut duplicate = fixture();
+        duplicate.rel_push(
+            "rtl_inst_candidate",
+            (
+                NODE,
+                RTLInst::Istore(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed(12),
+                    Arc::new(vec![BASE]),
+                    ALIAS_ONE,
+                ),
+            ),
+        );
+        assert!(private_proofs(duplicate).is_empty());
+
+        let mut wrong_canonical = fixture();
+        let canonical_rows = wrong_canonical
+            .rel_iter::<(RTLReg, RTLReg)>("xtl_canonical")
+            .filter(|(source, canonical)| !(*source == ALIAS_TWO && *canonical == VALUE))
+            .copied()
+            .collect::<ascent::boxcar::Vec<_>>();
+        wrong_canonical.rel_set("xtl_canonical", canonical_rows);
+        assert!(private_proofs(wrong_canonical).is_empty());
+
+        let mut ambiguous_reaching = fixture();
+        ambiguous_reaching.rel_push("reaching_use_rtl", (NODE, Mreg::AX, ALIAS_ONE));
+        assert!(private_proofs(ambiguous_reaching).is_empty());
+
+        let mut wrong_reaching = fixture();
+        wrong_reaching.rel_set(
+            "reaching_use_rtl",
+            vec![(NODE, Mreg::AX, ALIAS_ONE)]
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        assert!(private_proofs(wrong_reaching).is_empty());
+
+        let mut wrong_chunk = fixture();
+        remove_candidate(&mut wrong_chunk, ALIAS_TWO);
+        wrong_chunk.rel_push(
+            "rtl_inst_candidate",
+            (
+                NODE,
+                RTLInst::Istore(
+                    MemoryChunk::MInt64,
+                    Addressing::Aindexed(12),
+                    Arc::new(vec![BASE]),
+                    ALIAS_TWO,
+                ),
+            ),
+        );
+        assert!(private_proofs(wrong_chunk).is_empty());
+
+        let mut wrong_address = fixture();
+        remove_candidate(&mut wrong_address, ALIAS_TWO);
+        wrong_address.rel_push(
+            "rtl_inst_candidate",
+            (
+                NODE,
+                RTLInst::Istore(
+                    MemoryChunk::MAny64,
+                    Addressing::Aindexed(16),
+                    Arc::new(vec![BASE]),
+                    ALIAS_TWO,
+                ),
+            ),
+        );
+        assert!(private_proofs(wrong_address).is_empty());
+
+        let mut missing_identity = fixture();
+        let xtl_rows = missing_identity
+            .rel_iter::<(Node, Mreg, RTLReg)>("reg_xtl")
+            .filter(|(_, _, value)| *value != ALIAS_TWO)
+            .copied()
+            .collect::<ascent::boxcar::Vec<_>>();
+        missing_identity.rel_set("reg_xtl", xtl_rows);
+        assert!(private_proofs(missing_identity).is_empty());
+    }
+
+    #[test]
+    fn plain_read_fixed_point_base_alias_is_exact_and_stage4_private() {
+        const HISTORICAL_BASE: RTLReg = 0x8000_0000_0000_0070;
+        const EXTRA_BASE: RTLReg = 0x8000_0000_0000_0080;
+
+        fn fixture() -> DecompileDB {
+            let mut db = scalar_fixture(
+                "MOV",
+                4,
+                "EAX",
+                MemoryChunk::MInt32,
+                ScalarMemoryDirection::Read,
+                Mutation::None,
+            );
+            db.rel_push(
+                "rtl_inst_candidate",
+                (
+                    NODE,
+                    RTLInst::Iload(
+                        MemoryChunk::MInt32,
+                        Addressing::Aindexed(12),
+                        Arc::new(vec![HISTORICAL_BASE]),
+                        VALUE,
+                    ),
+                ),
+            );
+            for base in [BASE, HISTORICAL_BASE] {
+                db.rel_push("reg_xtl", (NODE, Mreg::CX, base));
+                db.rel_push("xtl_canonical", (base, base));
+            }
+            db.rel_push("xtl_canonical", (HISTORICAL_BASE, BASE));
+            db.rel_push("reaching_use_rtl", (NODE, Mreg::CX, BASE));
+            db
+        }
+
+        fn run(
+            mut db: DecompileDB,
+        ) -> (
+            Vec<ScalarMemoryAccessProof>,
+            Vec<(Node, ScalarMemoryAccessProof)>,
+        ) {
+            let private = materialize_authenticated_scalar_memory_accesses(&mut db);
+            let public = db
+                .rel_iter::<(Node, ScalarMemoryAccessProof)>(
+                    "authenticated_scalar_memory_access",
+                )
+                .map(|(_, proof)| proof.clone())
+                .collect();
+            (public, private)
+        }
+
+        fn remove_historical_candidate(db: &mut DecompileDB) {
+            let rows = db
+                .rel_iter::<(Node, RTLInst)>("rtl_inst_candidate")
+                .filter(|(node, row)| {
+                    *node != NODE
+                        || !matches!(
+                            row,
+                            RTLInst::Iload(_, _, args, _)
+                                if args.as_slice() == [HISTORICAL_BASE]
+                        )
+                })
+                .cloned()
+                .collect::<ascent::boxcar::Vec<_>>();
+            db.rel_set("rtl_inst_candidate", rows);
+        }
+
+        let (public, private) = run(fixture());
+        assert!(public.is_empty(), "fixed-point alias must stay Stage-4 private");
+        let [(node, proof)] = private.as_slice() else {
+            panic!("expected one private fixed-point placement: {private:#?}");
+        };
+        assert_eq!(*node, NODE);
+        assert_eq!(proof.base_value, Some(BASE));
+        assert_eq!(proof.value, VALUE);
+        assert_eq!(proof.direction, ScalarMemoryDirection::Read);
+
+        let mut missing_candidate = fixture();
+        remove_historical_candidate(&mut missing_candidate);
+        let (public, private) = run(missing_candidate);
+        assert!(private.is_empty());
+        assert_eq!(public.len(), 1, "the remaining exact singleton is ordinary");
+
+        let mut extra_candidate = fixture();
+        extra_candidate.rel_push(
+            "rtl_inst_candidate",
+            (
+                NODE,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed(12),
+                    Arc::new(vec![EXTRA_BASE]),
+                    VALUE,
+                ),
+            ),
+        );
+        extra_candidate.rel_push("xtl_canonical", (EXTRA_BASE, BASE));
+        assert!(run(extra_candidate).1.is_empty());
+
+        let mut duplicate_candidate = fixture();
+        duplicate_candidate.rel_push(
+            "rtl_inst_candidate",
+            (
+                NODE,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed(12),
+                    Arc::new(vec![HISTORICAL_BASE]),
+                    VALUE,
+                ),
+            ),
+        );
+        assert!(run(duplicate_candidate).1.is_empty());
+
+        let mut wrong_canonical = fixture();
+        let canonical_rows = wrong_canonical
+            .rel_iter::<(RTLReg, RTLReg)>("xtl_canonical")
+            .filter(|(source, canonical)| {
+                !(*source == HISTORICAL_BASE && *canonical == BASE)
+            })
+            .copied()
+            .collect::<ascent::boxcar::Vec<_>>();
+        wrong_canonical.rel_set("xtl_canonical", canonical_rows);
+        assert!(run(wrong_canonical).1.is_empty());
+
+        let mut ambiguous_reaching = fixture();
+        ambiguous_reaching.rel_push(
+            "reaching_use_rtl",
+            (NODE, Mreg::CX, HISTORICAL_BASE),
+        );
+        assert!(run(ambiguous_reaching).1.is_empty());
+
+        let mut wrong_reaching = fixture();
+        wrong_reaching.rel_set(
+            "reaching_use_rtl",
+            vec![(NODE, Mreg::CX, HISTORICAL_BASE)]
+                .into_iter()
+                .collect::<ascent::boxcar::Vec<_>>(),
+        );
+        assert!(run(wrong_reaching).1.is_empty());
+
+        let mut wrong_chunk = fixture();
+        remove_historical_candidate(&mut wrong_chunk);
+        wrong_chunk.rel_push(
+            "rtl_inst_candidate",
+            (
+                NODE,
+                RTLInst::Iload(
+                    MemoryChunk::MAny32,
+                    Addressing::Aindexed(12),
+                    Arc::new(vec![HISTORICAL_BASE]),
+                    VALUE,
+                ),
+            ),
+        );
+        assert!(run(wrong_chunk).1.is_empty());
+
+        let mut wrong_address = fixture();
+        remove_historical_candidate(&mut wrong_address);
+        wrong_address.rel_push(
+            "rtl_inst_candidate",
+            (
+                NODE,
+                RTLInst::Iload(
+                    MemoryChunk::MInt32,
+                    Addressing::Aindexed(16),
+                    Arc::new(vec![HISTORICAL_BASE]),
+                    VALUE,
+                ),
+            ),
+        );
+        assert!(run(wrong_address).1.is_empty());
+
+        let mut missing_identity = fixture();
+        let xtl_rows = missing_identity
+            .rel_iter::<(Node, Mreg, RTLReg)>("reg_xtl")
+            .filter(|(_, _, value)| *value != HISTORICAL_BASE)
+            .copied()
+            .collect::<ascent::boxcar::Vec<_>>();
+        missing_identity.rel_set("reg_xtl", xtl_rows);
+        assert!(run(missing_identity).1.is_empty());
     }
 
     #[test]
@@ -2334,6 +2687,10 @@ mod scalar_lvalue_memory_access_tests {
     }
 }
 
+#[cfg(test)]
+#[path = "rtl_optimize_stage4_tests.rs"]
+mod stage4_source_shape_tests;
+
 fn low_byte_register(full: &str) -> Option<(&'static str, usize)> {
     match full {
         "RAX" => Some(("AL", 2)),
@@ -3601,6 +3958,116 @@ fn scalar_rtl_rows_match(
     )
 }
 
+/// Final RTL may select the surviving source of a plain two-address store
+/// after the Dual fixed point has retained the store-local identity and the
+/// eliminated producer's historical identities.  Admit that transport-only
+/// multiplicity only when the complete fixed-point web proves every distinct
+/// candidate is the same final carrier.  This is deliberately separate from
+/// byte/word signedness companions: chunks, addressing, arguments, and the
+/// final store source must remain exact. A successful match is carried only
+/// in the private Stage-4 access vector and is never published to the legacy
+/// scalar-lvalue pipeline.
+fn scalar_plain_write_fixed_point_rows_match(
+    rows: &[RTLInst],
+    chunk: MemoryChunk,
+    width: usize,
+    addressing: &Addressing,
+    args: &[RTLReg],
+    value: RTLReg,
+    store_xtl_rows: &[RTLReg],
+    reaching_rows: &[RTLReg],
+    canonical_values: &BTreeMap<RTLReg, RTLReg>,
+) -> bool {
+    const MAX_FIXED_POINT_STORE_IDENTITIES: usize = 4;
+
+    if !matches!(width, 4 | 8)
+        || rows.len() < 2
+        || rows.len() > MAX_FIXED_POINT_STORE_IDENTITIES
+        || rows.len() != store_xtl_rows.len()
+        || reaching_rows != [value]
+        || store_xtl_rows.windows(2).any(|pair| pair[0] == pair[1])
+    {
+        return false;
+    }
+    let mut candidate_sources = Vec::with_capacity(rows.len());
+    for row in rows {
+        let RTLInst::Istore(row_chunk, row_addressing, row_args, source) = row else {
+            return false;
+        };
+        if *row_chunk != chunk || row_addressing != addressing || row_args.as_slice() != args {
+            return false;
+        }
+        candidate_sources.push(*source);
+    }
+    candidate_sources.sort_unstable();
+    candidate_sources.as_slice() == store_xtl_rows
+        && candidate_sources.windows(2).all(|pair| pair[0] != pair[1])
+        && candidate_sources
+            .iter()
+            .filter(|source| **source == value)
+            .count()
+            == 1
+        && candidate_sources
+            .iter()
+            .all(|source| canonical_values.get(source) == Some(&value))
+}
+
+/// A later plain load through the same architectural base register may retain
+/// both the final parameter identity and one historical fixed-point identity
+/// in `rtl_inst_candidate`, even though final RTL and reaching-use select the
+/// parameter exactly.  This narrow matcher is Stage-4 placement provenance
+/// only: it is never published as a general scalar-lvalue candidate.  Admit a
+/// base-only load when the complete bounded candidate/base-identity sets are
+/// equal and every historical base canonicalizes to the exact final base.
+fn scalar_plain_read_fixed_point_base_rows_match(
+    rows: &[RTLInst],
+    chunk: MemoryChunk,
+    width: usize,
+    addressing: &Addressing,
+    args: &[RTLReg],
+    value: RTLReg,
+    base_xtl_rows: &[RTLReg],
+    reaching_rows: &[RTLReg],
+    canonical_values: &BTreeMap<RTLReg, RTLReg>,
+) -> bool {
+    const MAX_FIXED_POINT_BASE_IDENTITIES: usize = 4;
+
+    let [final_base] = args else { return false };
+    if !matches!(width, 4 | 8)
+        || rows.len() < 2
+        || rows.len() > MAX_FIXED_POINT_BASE_IDENTITIES
+        || rows.len() != base_xtl_rows.len()
+        || reaching_rows != [*final_base]
+        || base_xtl_rows.windows(2).any(|pair| pair[0] == pair[1])
+    {
+        return false;
+    }
+    let mut candidate_bases = Vec::with_capacity(rows.len());
+    for row in rows {
+        let RTLInst::Iload(row_chunk, row_addressing, row_args, destination) = row else {
+            return false;
+        };
+        let [base] = row_args.as_slice() else {
+            return false;
+        };
+        if *row_chunk != chunk || row_addressing != addressing || *destination != value {
+            return false;
+        }
+        candidate_bases.push(*base);
+    }
+    candidate_bases.sort_unstable();
+    candidate_bases.as_slice() == base_xtl_rows
+        && candidate_bases.windows(2).all(|pair| pair[0] != pair[1])
+        && candidate_bases
+            .iter()
+            .filter(|base| **base == *final_base)
+            .count()
+            == 1
+        && candidate_bases
+            .iter()
+            .all(|base| canonical_values.get(base) == Some(final_base))
+}
+
 fn decoded_scalar_addressing(
     base_name: &str,
     index_name: &str,
@@ -4175,7 +4642,9 @@ impl ScalarCoffIndex {
 /// selected and rewritten the surviving memory effects.  Every rejected or
 /// ambiguous input produces no row; the ordinary decompilation path is never
 /// removed or rewritten here.
-fn materialize_authenticated_scalar_memory_accesses(db: &mut DecompileDB) {
+fn materialize_authenticated_scalar_memory_accesses(
+    db: &mut DecompileDB,
+) -> Vec<(Node, ScalarMemoryAccessProof)> {
     let Some(coff_map) = db.coff_address_map.as_ref() else {
         db.rel_set(
             "authenticated_scalar_memory_access",
@@ -4185,7 +4654,7 @@ fn materialize_authenticated_scalar_memory_accesses(db: &mut DecompileDB) {
             "authenticated_scalar_memory_use_plan",
             ascent::boxcar::Vec::<(Node, ScalarMemoryUsePlan)>::new(),
         );
-        return;
+        return Vec::new();
     };
     if coff_map.schema != "manifold.coff-address-map.v1"
         || coff_map.loader_id != "amd64-coff-image-v1"
@@ -4199,7 +4668,7 @@ fn materialize_authenticated_scalar_memory_accesses(db: &mut DecompileDB) {
             "authenticated_scalar_memory_use_plan",
             ascent::boxcar::Vec::<(Node, ScalarMemoryUsePlan)>::new(),
         );
-        return;
+        return Vec::new();
     }
     let coff_index = ScalarCoffIndex::new(coff_map);
     if !coff_index.relocations_well_formed {
@@ -4211,7 +4680,7 @@ fn materialize_authenticated_scalar_memory_accesses(db: &mut DecompileDB) {
             "authenticated_scalar_memory_use_plan",
             ascent::boxcar::Vec::<(Node, ScalarMemoryUsePlan)>::new(),
         );
-        return;
+        return Vec::new();
     }
 
     let mut owners: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
@@ -4317,6 +4786,36 @@ fn materialize_authenticated_scalar_memory_accesses(db: &mut DecompileDB) {
             .or_default()
             .insert(*register);
     }
+    let mut reg_xtl_rows: BTreeMap<(Node, Mreg), Vec<RTLReg>> = BTreeMap::new();
+    for (node, register, value) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_xtl") {
+        reg_xtl_rows
+            .entry((*node, *register))
+            .or_default()
+            .push(*value);
+    }
+    for rows in reg_xtl_rows.values_mut() {
+        rows.sort_unstable();
+    }
+    // `xtl_canonical` is a Dual-lattice projection and deliberately retains
+    // reflexive/historical rows.  Its final representative is the minimum per
+    // identity, matching the optimizer's fixed-point semantics.
+    let mut canonical_values: BTreeMap<RTLReg, RTLReg> = BTreeMap::new();
+    for (value, canonical) in db.rel_iter::<(RTLReg, RTLReg)>("xtl_canonical") {
+        canonical_values
+            .entry(*value)
+            .and_modify(|current| *current = (*current).min(*canonical))
+            .or_insert(*canonical);
+    }
+    let mut reaching_values: BTreeMap<(Node, Mreg), Vec<RTLReg>> = BTreeMap::new();
+    for (node, register, value) in db.rel_iter::<(Node, Mreg, RTLReg)>("reaching_use_rtl") {
+        reaching_values
+            .entry((*node, *register))
+            .or_default()
+            .push(*value);
+    }
+    for rows in reaching_values.values_mut() {
+        rows.sort_unstable();
+    }
     let mut ltl: BTreeMap<Node, Vec<LTLInst>> = BTreeMap::new();
     for (node, inst) in db.rel_iter::<(Node, LTLInst)>("ltl_inst") {
         ltl.entry(*node).or_default().push(inst.clone());
@@ -4400,6 +4899,7 @@ fn materialize_authenticated_scalar_memory_accesses(db: &mut DecompileDB) {
     };
 
     let mut proofs = Vec::new();
+    let mut stage4_private_accesses = Vec::new();
     let mut use_plans = Vec::new();
     let mut address_closure_cache = ScalarAddressClosureCache::new();
     for (selected_node, final_rows) in &final_rtl {
@@ -4538,6 +5038,10 @@ fn materialize_authenticated_scalar_memory_accesses(db: &mut DecompileDB) {
         let Some(value_width) = x86_scalar_register_width(register_name) else {
             continue;
         };
+        let expected_value_mreg = Mreg::x86(register_name);
+        if expected_value_mreg.is_unknown() {
+            continue;
+        }
         let Some((segment, base_name, index_name, scale, displacement, width)) =
             indirects.get(&memory_operand).and_then(|rows| {
                 (rows.len() == 1)
@@ -4568,10 +5072,13 @@ fn materialize_authenticated_scalar_memory_accesses(db: &mut DecompileDB) {
         // v1 does not replay copy propagation inside an address. The final
         // row must occur exactly once among the input candidates; only
         // AsmPass's sole same-width signedness companion may coexist with it.
+        // A plain 32/64-bit write additionally admits the complete, bounded
+        // fixed-point source-identity set when every identity canonically
+        // equals the exact selected store carrier.
         let Some(input_rows) = input_rtl.get(selected_node) else {
             continue;
         };
-        if !scalar_rtl_rows_match(
+        let ordinary_input_match = scalar_rtl_rows_match(
             input_rows,
             direction,
             final_chunk,
@@ -4580,9 +5087,28 @@ fn materialize_authenticated_scalar_memory_accesses(db: &mut DecompileDB) {
             final_addressing,
             final_args,
             value,
-        ) {
-            continue;
-        }
+        );
+        let fixed_point_write_match = direction == ScalarMemoryDirection::Write
+            && decoded_extension == ScalarMemoryExtension::Plain
+            && !companion_required
+            && !synthetic
+            && scalar_plain_write_fixed_point_rows_match(
+                input_rows,
+                final_chunk,
+                width,
+                final_addressing,
+                final_args,
+                value,
+                reg_xtl_rows
+                    .get(&(*selected_node, expected_value_mreg))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                reaching_values
+                    .get(&(*selected_node, expected_value_mreg))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                &canonical_values,
+            );
         // LTL and the proof must retain the exact selected transport chunk;
         // the contract above authorizes raw-semantic equivalence, not a global
         // chunk normalization.
@@ -4614,7 +5140,31 @@ fn materialize_authenticated_scalar_memory_accesses(db: &mut DecompileDB) {
         else {
             continue;
         };
-        let expected_value_mreg = Mreg::x86(register_name);
+        let fixed_point_read_match = direction == ScalarMemoryDirection::Read
+            && decoded_extension == ScalarMemoryExtension::Plain
+            && !companion_required
+            && !synthetic
+            && expected_mregs.len() == 1
+            && scalar_plain_read_fixed_point_base_rows_match(
+                input_rows,
+                final_chunk,
+                width,
+                final_addressing,
+                final_args,
+                value,
+                reg_xtl_rows
+                    .get(&(*selected_node, expected_mregs[0]))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                reaching_values
+                    .get(&(*selected_node, expected_mregs[0]))
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                &canonical_values,
+            );
+        if !ordinary_input_match && !fixed_point_write_match && !fixed_point_read_match {
+            continue;
+        }
         let mut expected_register_uses: BTreeSet<Mreg> = expected_mregs.iter().copied().collect();
         let expected_register_defs = match direction {
             ScalarMemoryDirection::Read => BTreeSet::from([expected_value_mreg]),
@@ -4883,6 +5433,15 @@ fn materialize_authenticated_scalar_memory_accesses(db: &mut DecompileDB) {
                 && scale == width as i64,
         };
         if proof.is_closed_v1() {
+            // Fixed-point alias exceptions exist solely to authenticate a
+            // Stage-4 eliminated-mutation placement or terminal. Publishing
+            // either exception through the legacy scalar relation would grow
+            // the frozen v3 typed-lvalue/field portfolio merely by enabling
+            // Stage-4 support.
+            if fixed_point_read_match || fixed_point_write_match {
+                stage4_private_accesses.push((proof.selected_node, proof));
+                continue;
+            }
             let use_plan = (proof.direction == ScalarMemoryDirection::Read).then(|| {
                 scalar_memory_use_plan(
                     &proof,
@@ -4933,6 +5492,1798 @@ fn materialize_authenticated_scalar_memory_accesses(db: &mut DecompileDB) {
         use_plans
             .into_iter()
             .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    stage4_private_accesses.sort_unstable();
+    stage4_private_accesses.dedup();
+    stage4_private_accesses
+}
+
+fn clear_authenticated_stage4_sources(db: &mut DecompileDB) {
+    db.rel_set(
+        "authenticated_stage4_source",
+        ascent::boxcar::Vec::<(Node, Stage4SourceProof)>::new(),
+    );
+    db.rel_set(
+        "authenticated_stage4_use_plan",
+        ascent::boxcar::Vec::<(Node, Stage4UsePlan)>::new(),
+    );
+}
+
+fn stage4_exact_register(
+    operand: Symbol,
+    registers: &BTreeMap<Symbol, BTreeSet<&'static str>>,
+    indirects: &BTreeMap<Symbol, BTreeSet<ScalarIndirectOperand>>,
+    immediates: &BTreeSet<Symbol>,
+) -> Option<&'static str> {
+    if indirects.contains_key(&operand) || immediates.contains(&operand) {
+        return None;
+    }
+    let rows = registers.get(&operand)?;
+    (rows.len() == 1)
+        .then(|| rows.iter().next().copied())
+        .flatten()
+}
+
+fn stage4_exact_mreg_binding(
+    rtl_mregs: &BTreeMap<(Node, RTLReg), BTreeSet<Mreg>>,
+    node: Node,
+    value: RTLReg,
+    expected: Mreg,
+) -> bool {
+    rtl_mregs.get(&(node, value)) == Some(&BTreeSet::from([expected]))
+}
+
+fn stage4_selected_with_optional_companion<T: PartialEq>(
+    rows: &[T],
+    selected: &T,
+    companion: Option<&T>,
+) -> bool {
+    match rows {
+        [only] => only == selected,
+        [first, second] => companion.is_some_and(|companion| {
+            selected != companion
+                && ((first == selected && second == companion)
+                    || (second == selected && first == companion))
+        }),
+        _ => false,
+    }
+}
+
+fn stage4_rmw_input_candidates_match(
+    rows: &[RTLInst],
+    authenticated_operations: &[Operation],
+    args: &Args,
+    carrier: RTLReg,
+    selected_result: RTLReg,
+) -> bool {
+    if carrier == selected_result
+        || authenticated_operations.is_empty()
+        || authenticated_operations.len() > 2
+        || authenticated_operations
+            .iter()
+            .enumerate()
+            .any(|(index, operation)| authenticated_operations[..index].contains(operation))
+    {
+        return false;
+    }
+    let results = [carrier, selected_result];
+    let expected_len = authenticated_operations.len() * results.len();
+    rows.len() == expected_len
+        && authenticated_operations.iter().all(|expected_operation| {
+            results.into_iter().all(|expected_result| {
+                rows.iter()
+                    .filter(|row| {
+                        matches!(
+                            row,
+                            RTLInst::Iop(row_operation, row_args, row_result)
+                                if row_operation == expected_operation
+                                    && row_args == args
+                                    && *row_result == expected_result
+                        )
+                    })
+                    .count()
+                    == 1
+            })
+        })
+}
+
+fn stage4_addition_operations(width: usize) -> Option<(Operation, Operation)> {
+    match width {
+        4 => Some((
+            Operation::Oadd,
+            Operation::Olea(Addressing::Aindexed2(0)),
+        )),
+        8 => Some((
+            Operation::Oaddl,
+            Operation::Oleal(Addressing::Aindexed2(0)),
+        )),
+        _ => None,
+    }
+}
+
+fn stage4_and_or_width_companion(operation: &Operation) -> Option<Operation> {
+    match operation {
+        Operation::Oand => Some(Operation::Oandl),
+        Operation::Oandl => Some(Operation::Oand),
+        Operation::Oor => Some(Operation::Oorl),
+        Operation::Oorl => Some(Operation::Oor),
+        Operation::Oandimm(value) => Some(Operation::Oandlimm(*value)),
+        Operation::Oandlimm(value) => Some(Operation::Oandimm(*value)),
+        Operation::Oorimm(value) => Some(Operation::Oorlimm(*value)),
+        Operation::Oorlimm(value) => Some(Operation::Oorimm(*value)),
+        _ => None,
+    }
+}
+
+fn stage4_rmw_kind_and_operation(
+    mnemonic: &str,
+    width: usize,
+    immediate: Option<i64>,
+) -> Option<(Stage4SourceKind, Operation)> {
+    Some(match (mnemonic, width, immediate) {
+        ("ADD", 4, None) => (Stage4SourceKind::Add, Operation::Oadd),
+        ("ADD", 8, None) => (Stage4SourceKind::Add, Operation::Oaddl),
+        ("SUB", 4, None) => (Stage4SourceKind::Sub, Operation::Osub),
+        ("SUB", 8, None) => (Stage4SourceKind::Sub, Operation::Osubl),
+        ("IMUL", 4, None) => (Stage4SourceKind::Mul, Operation::Omul),
+        ("IMUL", 8, None) => (Stage4SourceKind::Mul, Operation::Omull),
+        ("AND", 4, None) => (Stage4SourceKind::And, Operation::Oand),
+        ("AND", 8, None) => (Stage4SourceKind::And, Operation::Oandl),
+        ("OR", 4, None) => (Stage4SourceKind::Or, Operation::Oor),
+        ("OR", 8, None) => (Stage4SourceKind::Or, Operation::Oorl),
+        ("XOR", 4, None) => (Stage4SourceKind::Xor, Operation::Oxor),
+        ("XOR", 8, None) => (Stage4SourceKind::Xor, Operation::Oxorl),
+        ("ADD", 4, Some(value)) => (Stage4SourceKind::Add, Operation::Oaddimm(value)),
+        ("ADD", 8, Some(value)) => (Stage4SourceKind::Add, Operation::Oaddlimm(value)),
+        ("SUB", 4, Some(value)) => {
+            (Stage4SourceKind::Sub, Operation::Oaddimm(value.checked_neg()?))
+        }
+        ("SUB", 8, Some(value)) => {
+            (Stage4SourceKind::Sub, Operation::Oaddlimm(value.checked_neg()?))
+        }
+        ("IMUL", 4, Some(value)) => (Stage4SourceKind::Mul, Operation::Omulimm(value)),
+        ("IMUL", 8, Some(value)) => (Stage4SourceKind::Mul, Operation::Omullimm(value)),
+        ("AND", 4, Some(value)) => (Stage4SourceKind::And, Operation::Oandimm(value)),
+        ("AND", 8, Some(value)) => (Stage4SourceKind::And, Operation::Oandlimm(value)),
+        ("OR", 4, Some(value)) => (Stage4SourceKind::Or, Operation::Oorimm(value)),
+        ("OR", 8, Some(value)) => (Stage4SourceKind::Or, Operation::Oorlimm(value)),
+        ("XOR", 4, Some(value)) => (Stage4SourceKind::Xor, Operation::Oxorimm(value)),
+        ("XOR", 8, Some(value)) => (Stage4SourceKind::Xor, Operation::Oxorlimm(value)),
+        _ => return None,
+    })
+}
+
+/// Prove that an eliminated arithmetic root's flags cannot be observed before
+/// one exact terminal value use.  The ordinary flags relation covers only a
+/// subset of Jcc producers and does not retain every CMOV/SETcc-style use, so
+/// this private proof walks the exact selected pre-opt CFG itself.  V1 accepts
+/// only a unique linear corridor containing flag-preserving moves/address
+/// formation, or ending at one instruction that definitely overwrites the
+/// arithmetic flags.  Any unknown instruction, prefix, branch, merge, cycle,
+/// consumer, or work-limit event is fail closed.
+fn stage4_exact_imul_flags_clobber(
+    node: Node,
+    instruction: &Cr8RawInstruction,
+    registers: &BTreeMap<Symbol, BTreeSet<&'static str>>,
+    immediate_rows: &BTreeMap<Symbol, BTreeSet<(i64, usize)>>,
+    indirects: &BTreeMap<Symbol, BTreeSet<ScalarIndirectOperand>>,
+    decoded_defs: &BTreeMap<Node, BTreeSet<Mreg>>,
+    decoded_uses: &BTreeMap<Node, BTreeSet<Mreg>>,
+) -> bool {
+    if instruction.1 != "" || instruction.2 != "IMUL" {
+        return false;
+    }
+    let Some(count @ (2 | 3)) = exact_raw_operand_count(instruction) else {
+        return false;
+    };
+    let operands = [instruction.3, instruction.4, instruction.5, instruction.6];
+    let mut raw_registers = BTreeSet::new();
+    let mut register_width = None;
+    for operand in &operands[..count] {
+        if indirects.contains_key(operand) {
+            return false;
+        }
+        let register = registers.get(operand).and_then(|rows| {
+            (rows.len() == 1).then(|| rows.iter().next().copied()).flatten()
+        });
+        let immediate = immediate_rows
+            .get(operand)
+            .is_some_and(|rows| rows.len() == 1);
+        if register.is_some() == immediate {
+            return false;
+        }
+        if let Some(name) = register {
+            let Some(width @ (4 | 8)) = x86_scalar_register_width(name) else {
+                return false;
+            };
+            if register_width.replace(width).is_some_and(|old| old != width) {
+                return false;
+            }
+            let mreg = Mreg::x86(name);
+            if mreg.is_unknown() || !raw_registers.insert(mreg) {
+                // Repeated source==destination is the closed compound form and
+                // is represented once in the architectural effect set.
+                if !raw_registers.contains(&mreg) {
+                    return false;
+                }
+            }
+        }
+    }
+    // The loader keeps its AT&T-like normalized order: two-operand IMUL is
+    // [source, destination], and the immediate form is
+    // [source, destination, immediate].  Do not reuse Intel display order at
+    // this raw/refined authentication boundary.
+    if registers
+        .get(&operands[0])
+        .is_none_or(|rows| rows.len() != 1)
+        || registers
+            .get(&operands[1])
+            .is_none_or(|rows| rows.len() != 1)
+        || (count == 3
+            && (immediate_rows
+                .get(&operands[2])
+                .is_none_or(|rows| {
+                    rows.len() != 1 || rows.iter().any(|(_, encoded_width)| *encoded_width != 0)
+                })
+                || registers.contains_key(&operands[2])))
+    {
+        return false;
+    }
+    let Some(destination_name) = registers.get(&operands[1]).and_then(|rows| {
+        (rows.len() == 1).then(|| rows.iter().next().copied()).flatten()
+    }) else {
+        return false;
+    };
+    let destination = Mreg::x86(destination_name);
+    !destination.is_unknown()
+        && raw_registers.contains(&destination)
+        && decoded_defs.get(&node) == Some(&BTreeSet::from([destination]))
+        && decoded_uses.get(&node) == Some(&raw_registers)
+}
+
+fn stage4_flags_are_dead_before_terminal(
+    root: Node,
+    terminal: Node,
+    terminal_use: &Stage4TerminalUse,
+    function: Address,
+    coff_map: &crate::decompile::disassembly::coff::CoffAddressMap,
+    coff_index: &ScalarCoffIndex,
+    owners: &BTreeMap<Node, BTreeSet<Address>>,
+    instructions: &BTreeMap<Node, Vec<Cr8RawInstruction>>,
+    raw_instructions: &BTreeMap<Node, Vec<Cr8RawInstruction>>,
+    registers: &BTreeMap<Symbol, BTreeSet<&'static str>>,
+    immediate_rows: &BTreeMap<Symbol, BTreeSet<(i64, usize)>>,
+    indirects: &BTreeMap<Symbol, BTreeSet<ScalarIndirectOperand>>,
+    decoded_defs: &BTreeMap<Node, BTreeSet<Mreg>>,
+    decoded_uses: &BTreeMap<Node, BTreeSet<Mreg>>,
+    succs: &BTreeMap<Node, Vec<Node>>,
+    preds: &BTreeMap<Node, Vec<Node>>,
+) -> bool {
+    let mut current = root;
+    let mut seen = BTreeSet::from([root]);
+    let mut passed_store_terminal = false;
+    for _ in 0..SCALAR_ADDRESS_CFG_NODE_LIMIT {
+        let [next] = succs.get(&current).map(Vec::as_slice).unwrap_or(&[]) else {
+            return false;
+        };
+        if preds.get(next).map(Vec::as_slice) != Some(&[current][..])
+            || !seen.insert(*next)
+        {
+            return false;
+        }
+        let [instruction] = instructions.get(next).map(Vec::as_slice).unwrap_or(&[]) else {
+            return false;
+        };
+        let [raw] = raw_instructions.get(next).map(Vec::as_slice).unwrap_or(&[]) else {
+            return false;
+        };
+        if instruction != raw
+            || instruction.1 != ""
+            || stage4_instruction_function(coff_map, coff_index, owners, *next, instruction)
+                != Some(function)
+        {
+            return false;
+        }
+        if *next == terminal {
+            match terminal_use {
+                Stage4TerminalUse::Return => {
+                    return instruction.2 == "RET"
+                        && exact_raw_operand_count(instruction) == Some(0);
+                }
+                Stage4TerminalUse::Store { .. } => {
+                    if instruction.2 != "MOV" || exact_raw_operand_count(instruction) != Some(2) {
+                        return false;
+                    }
+                    passed_store_terminal = true;
+                    current = *next;
+                    continue;
+                }
+            }
+        }
+        if !passed_store_terminal {
+            // V1 requires the authenticated return/store to be the root's
+            // immediate selected successor.  No unmodelled instruction may be
+            // skipped on the way to that terminal value use.
+            return false;
+        }
+        let mnemonic = instruction.2;
+        if mnemonic == "RET" {
+            return exact_raw_operand_count(instruction) == Some(0);
+        }
+        let definitely_clobbers = matches!(
+            mnemonic,
+            "ADD" | "SUB" | "CMP" | "TEST" | "AND" | "OR" | "XOR" | "NEG"
+        ) || stage4_exact_imul_flags_clobber(
+            *next,
+            instruction,
+            registers,
+            immediate_rows,
+            indirects,
+            decoded_defs,
+            decoded_uses,
+        );
+        if definitely_clobbers {
+            return true;
+        }
+        let preserves_without_observing = matches!(
+            mnemonic,
+            "MOV" | "MOVSX" | "MOVZX" | "MOVSXD" | "LEA" | "NOP"
+        );
+        if !preserves_without_observing {
+            return false;
+        }
+        current = *next;
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage4_instruction_function(
+    coff_map: &crate::decompile::disassembly::coff::CoffAddressMap,
+    coff_index: &ScalarCoffIndex,
+    owners: &BTreeMap<Node, BTreeSet<Address>>,
+    node: Node,
+    instruction: &Cr8RawInstruction,
+) -> Option<Address> {
+    let function = owners
+        .get(&node)
+        .filter(|rows| rows.len() == 1)?
+        .iter()
+        .next()
+        .copied()?;
+    let instruction_end = node.checked_add(instruction.0 as u64)?;
+    let mapped_function_index = coff_index
+        .functions
+        .unique_overlap_payload(node, instruction_end)?;
+    let mapped_function = &coff_map.functions[mapped_function_index];
+    if mapped_function.mapped_entry != function || instruction_end > mapped_function.mapped_end {
+        return None;
+    }
+    let section_index = coff_index.valid_function_section[mapped_function_index]?;
+    let section = &coff_map.sections[section_index];
+    let instruction_delta = node.checked_sub(mapped_function.mapped_entry)?;
+    let original_instruction_start = mapped_function
+        .section_offset
+        .checked_add(instruction_delta)?;
+    let original_instruction_end = original_instruction_start.checked_add(instruction.0 as u64)?;
+    if coff_index
+        .mapped_relocations
+        .has_overlap(node, instruction_end)
+        || coff_index
+            .original_relocations
+            .get(&mapped_function.section_index)
+            .is_some_and(|rows| {
+                rows.has_overlap(original_instruction_start, original_instruction_end)
+            })
+        || coff_index
+            .relocation_section_names
+            .get(&mapped_function.section_index)
+            .is_some_and(|names| names.iter().any(|name| name != &section.name))
+    {
+        return None;
+    }
+    Some(function)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage4_use_plan(
+    proof: &Stage4SourceProof,
+    placement_node: Node,
+    entry: Node,
+    function_nodes: &BTreeSet<Node>,
+    definitions: &BTreeMap<RTLReg, BTreeSet<Node>>,
+    uses: &BTreeMap<RTLReg, Vec<Node>>,
+    final_rtl: &BTreeMap<Node, Vec<RTLInst>>,
+    succs: &HashMap<Node, Vec<Node>>,
+) -> Option<Stage4UsePlan> {
+    let expected_definition = match proof.root_boundary {
+        Stage4RootBoundary::FinalRtlDefinition => proof.selected_node,
+        Stage4RootBoundary::EliminatedMutation => placement_node,
+    };
+    if definitions.get(&proof.value) != Some(&BTreeSet::from([expected_definition])) {
+        return None;
+    }
+    let mut pending = VecDeque::from([(proof.value, expected_definition)]);
+    let mut queued = BTreeSet::from([proof.value]);
+    let mut visited = BTreeSet::new();
+    let mut use_count = 0usize;
+    let mut transports = Vec::new();
+    let mut sites = Vec::new();
+
+    while let Some((value, definition)) = pending.pop_front() {
+        if !visited.insert(value)
+            || visited.len() > 65
+            || definitions.get(&value) != Some(&BTreeSet::from([definition]))
+        {
+            return None;
+        }
+        let use_nodes = uses.get(&value)?;
+        if use_nodes.is_empty()
+            || use_nodes.len() > 64
+            || use_nodes.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return None;
+        }
+        use_count = use_count.checked_add(use_nodes.len())?;
+        if use_count > 64 {
+            return None;
+        }
+        for &node in use_nodes {
+            if node == definition || !function_nodes.contains(&node) {
+                return None;
+            }
+            let definition_reaches_use = graph_reaches_through_owned_region(
+                succs,
+                function_nodes,
+                definition,
+                node,
+                None,
+            ) == Some(true);
+            let no_definition_bypass = definition == entry
+                || graph_reaches_through_owned_region(
+                    succs,
+                    function_nodes,
+                    entry,
+                    node,
+                    Some(definition),
+                ) == Some(false);
+            if !definition_reaches_use || !no_definition_bypass {
+                return None;
+            }
+            let [instruction] = final_rtl.get(&node)?.as_slice() else {
+                return None;
+            };
+            if let RTLInst::Iop(Operation::Omove, args, output) = instruction {
+                if args.as_slice() != [value]
+                    || *output == value
+                    || !queued.insert(*output)
+                    || definitions.get(output) != Some(&BTreeSet::from([node]))
+                {
+                    return None;
+                }
+                transports.push(Stage4Transport {
+                    node,
+                    input: value,
+                    output: *output,
+                });
+                pending.push_back((*output, node));
+            } else {
+                if inst_def_use(instruction)
+                    .1
+                    .into_iter()
+                    .filter(|candidate| *candidate == value)
+                    .count()
+                    != 1
+                {
+                    return None;
+                }
+                sites.push(Stage4UseSite { node, value });
+            }
+        }
+    }
+    transports.sort();
+    sites.sort();
+    let (placement_load, terminal_use) = match proof.root_boundary {
+        Stage4RootBoundary::FinalRtlDefinition => (None, None),
+        Stage4RootBoundary::EliminatedMutation => {
+            if !transports.is_empty() || sites.len() != 1 {
+                return None;
+            }
+            let [RTLInst::Iload(chunk, addressing, args, value)] =
+                final_rtl.get(&placement_node)?.as_slice()
+            else {
+                return None;
+            };
+            if *value != proof.value {
+                return None;
+            }
+            let terminal = match final_rtl.get(&sites[0].node)?.as_slice() {
+                [RTLInst::Ireturn(value)] if *value == sites[0].value => {
+                    Stage4TerminalUse::Return
+                }
+                [RTLInst::Istore(chunk, addressing, args, value)]
+                    if *value == sites[0].value
+                        && match chunk {
+                            MemoryChunk::MInt32 | MemoryChunk::MAny32 => proof.width == 4,
+                            MemoryChunk::MInt64 | MemoryChunk::MAny64 => proof.width == 8,
+                            _ => false,
+                        } =>
+                {
+                    Stage4TerminalUse::Store {
+                        chunk: *chunk,
+                        addressing: addressing.clone(),
+                        args: args.clone(),
+                    }
+                }
+                _ => return None,
+            };
+            (
+                Some(Stage4PlacementLoad {
+                    chunk: *chunk,
+                    addressing: addressing.clone(),
+                    args: args.clone(),
+                }),
+                Some(terminal),
+            )
+        }
+    };
+    let plan = Stage4UsePlan {
+        function: proof.function,
+        definition_node: proof.selected_node,
+        placement_node,
+        value: proof.value,
+        placement_load,
+        terminal_use,
+        transports: Arc::new(transports),
+        sites: Arc::new(sites),
+    };
+    plan.is_closed_v1(proof).then_some(plan)
+}
+
+/// Authenticate source-shape alternatives from immutable x86-64 COFF bytes
+/// through decoder effects, LTL, and the uniquely selected final RTL row.
+/// This relation is provenance only: it never changes the canonical RTL or
+/// candidate pool.  Later private Clight views must revalidate the same proof
+/// and complete use forest before assembling a bounded alternative.
+#[cfg(test)]
+fn materialize_authenticated_stage4_sources(db: &mut DecompileDB) {
+    materialize_authenticated_stage4_sources_with_private_accesses(db, &[]);
+}
+
+fn materialize_authenticated_stage4_sources_with_private_accesses(
+    db: &mut DecompileDB,
+    private_accesses: &[(Node, ScalarMemoryAccessProof)],
+) {
+    let Some(coff_map) = db.coff_address_map.as_ref() else {
+        clear_authenticated_stage4_sources(db);
+        return;
+    };
+    if coff_map.schema != "manifold.coff-address-map.v1"
+        || coff_map.loader_id != "amd64-coff-image-v1"
+        || coff_map.architecture != "x86_64-pc-windows-msvc"
+    {
+        clear_authenticated_stage4_sources(db);
+        return;
+    }
+    let coff_index = ScalarCoffIndex::new(coff_map);
+    if !coff_index.relocations_well_formed {
+        clear_authenticated_stage4_sources(db);
+        return;
+    }
+
+    let mut owners: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for (node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        owners.entry(*node).or_default().insert(*function);
+    }
+    let mut instructions: BTreeMap<Node, Vec<Cr8RawInstruction>> = BTreeMap::new();
+    for row in db.rel_iter::<(
+        Node,
+        usize,
+        &'static str,
+        &'static str,
+        Symbol,
+        Symbol,
+        Symbol,
+        Symbol,
+        usize,
+        usize,
+    )>("instruction") {
+        instructions.entry(row.0).or_default().push((
+            row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
+        ));
+    }
+    let mut raw_instructions: BTreeMap<Node, Vec<Cr8RawInstruction>> = BTreeMap::new();
+    for row in db.rel_iter::<(
+        Node,
+        usize,
+        &'static str,
+        &'static str,
+        Symbol,
+        Symbol,
+        Symbol,
+        Symbol,
+        usize,
+        usize,
+    )>("unrefinedinstruction") {
+        raw_instructions.entry(row.0).or_default().push((
+            row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
+        ));
+    }
+    let mut indirects: BTreeMap<Symbol, BTreeSet<ScalarIndirectOperand>> = BTreeMap::new();
+    for row in db.rel_iter::<(
+        Symbol,
+        &'static str,
+        &'static str,
+        &'static str,
+        i64,
+        i64,
+        usize,
+    )>("op_indirect") {
+        indirects
+            .entry(row.0)
+            .or_default()
+            .insert((row.1, row.2, row.3, row.4, row.5, row.6));
+    }
+    let mut registers: BTreeMap<Symbol, BTreeSet<&'static str>> = BTreeMap::new();
+    for (operand, register) in db.rel_iter::<(Symbol, &'static str)>("op_register") {
+        registers.entry(*operand).or_default().insert(*register);
+    }
+    let mut immediate_rows: BTreeMap<Symbol, BTreeSet<(i64, usize)>> = BTreeMap::new();
+    for (operand, value, width) in db.rel_iter::<(Symbol, i64, usize)>("op_immediate") {
+        immediate_rows
+            .entry(*operand)
+            .or_default()
+            .insert((*value, *width));
+    }
+    let immediates: BTreeSet<Symbol> = immediate_rows.keys().copied().collect();
+    let mut reads: BTreeMap<Node, BTreeSet<Symbol>> = BTreeMap::new();
+    for (node, operand) in db.rel_iter::<(Node, Symbol)>("decoded_memory_read_operand") {
+        reads.entry(*node).or_default().insert(*operand);
+    }
+    let mut writes: BTreeMap<Node, BTreeSet<Symbol>> = BTreeMap::new();
+    for (node, operand) in db.rel_iter::<(Node, Symbol)>("decoded_memory_write_operand") {
+        writes.entry(*node).or_default().insert(*operand);
+    }
+    let mut decoded_defs: BTreeMap<Node, BTreeSet<Mreg>> = BTreeMap::new();
+    for (node, register) in db.rel_iter::<(Node, Mreg)>("decoded_reg_def") {
+        decoded_defs.entry(*node).or_default().insert(*register);
+    }
+    let mut decoded_uses: BTreeMap<Node, BTreeSet<Mreg>> = BTreeMap::new();
+    for (node, register) in db.rel_iter::<(Node, Mreg)>("decoded_reg_use") {
+        decoded_uses.entry(*node).or_default().insert(*register);
+    }
+    let mut address_sizes: BTreeMap<Node, BTreeSet<u8>> = BTreeMap::new();
+    for (node, size) in db.rel_iter::<(Node, u8)>("instruction_address_size") {
+        address_sizes.entry(*node).or_default().insert(*size);
+    }
+    let mut rtl_mregs: BTreeMap<(Node, RTLReg), BTreeSet<Mreg>> = BTreeMap::new();
+    for (node, register, value) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_rtl") {
+        rtl_mregs
+            .entry((*node, *value))
+            .or_default()
+            .insert(*register);
+    }
+    // Retain row multiplicity for every cross-pass architectural-identity
+    // relation.  An exact row plus a duplicate or competing interpretation is
+    // ambiguity and must not be normalized away before the eliminated-RMW
+    // proof consumes it.
+    let mut reg_defs_reaching_use: BTreeMap<(Node, Mreg), Vec<Node>> = BTreeMap::new();
+    let mut reg_uses_reached_from_def: BTreeMap<(Node, Mreg), Vec<Node>> = BTreeMap::new();
+    for (definition, register, use_node) in
+        db.rel_iter::<(Node, Mreg, Node)>("reg_def_used")
+    {
+        reg_defs_reaching_use
+            .entry((*use_node, *register))
+            .or_default()
+            .push(*definition);
+        reg_uses_reached_from_def
+            .entry((*definition, *register))
+            .or_default()
+            .push(*use_node);
+    }
+    for rows in reg_defs_reaching_use.values_mut() {
+        rows.sort_unstable();
+    }
+    for rows in reg_uses_reached_from_def.values_mut() {
+        rows.sort_unstable();
+    }
+    let mut reg_xtl_rows: BTreeMap<(Node, Mreg), Vec<RTLReg>> = BTreeMap::new();
+    for (node, register, value) in db.rel_iter::<(Node, Mreg, RTLReg)>("reg_xtl") {
+        reg_xtl_rows
+            .entry((*node, *register))
+            .or_default()
+            .push(*value);
+    }
+    for rows in reg_xtl_rows.values_mut() {
+        rows.sort_unstable();
+    }
+    let mut definitions_at_node: BTreeMap<Node, Vec<RTLReg>> = BTreeMap::new();
+    for (node, value) in db.rel_iter::<(Node, RTLReg)>("is_def") {
+        definitions_at_node.entry(*node).or_default().push(*value);
+    }
+    for rows in definitions_at_node.values_mut() {
+        rows.sort_unstable();
+    }
+    // `xtl_canonical` is the projection of a Dual lattice and may retain
+    // historical representatives.  Its semantic value is the minimum final
+    // representative per id, not singleton row cardinality.
+    let mut canonical_values: BTreeMap<RTLReg, RTLReg> = BTreeMap::new();
+    for (value, canonical) in db.rel_iter::<(RTLReg, RTLReg)>("xtl_canonical") {
+        canonical_values
+            .entry(*value)
+            .and_modify(|current| *current = (*current).min(*canonical))
+            .or_insert(*canonical);
+    }
+    let mut reaching_values: BTreeMap<(Node, Mreg), Vec<RTLReg>> = BTreeMap::new();
+    for (node, register, value) in
+        db.rel_iter::<(Node, Mreg, RTLReg)>("reaching_use_rtl")
+    {
+        reaching_values
+            .entry((*node, *register))
+            .or_default()
+            .push(*value);
+    }
+    for rows in reaching_values.values_mut() {
+        rows.sort_unstable();
+    }
+    let mut scalar_accesses: BTreeMap<Node, Vec<ScalarMemoryAccessProof>> = BTreeMap::new();
+    for (node, proof) in db
+        .rel_iter::<(Node, ScalarMemoryAccessProof)>("authenticated_scalar_memory_access")
+    {
+        scalar_accesses.entry(*node).or_default().push(proof.clone());
+    }
+    for (node, proof) in private_accesses {
+        scalar_accesses.entry(*node).or_default().push(proof.clone());
+    }
+    for rows in scalar_accesses.values_mut() {
+        rows.sort_unstable();
+    }
+    let mut ltl: BTreeMap<Node, Vec<LTLInst>> = BTreeMap::new();
+    for (node, instruction) in db.rel_iter::<(Node, LTLInst)>("ltl_inst") {
+        ltl.entry(*node).or_default().push(instruction.clone());
+    }
+    let mut final_rtl: BTreeMap<Node, Vec<RTLInst>> = BTreeMap::new();
+    for (node, instruction) in db.rel_iter::<(Node, RTLInst)>("rtl_inst") {
+        final_rtl.entry(*node).or_default().push(instruction.clone());
+    }
+    let mut input_rtl: BTreeMap<Node, Vec<RTLInst>> = BTreeMap::new();
+    for (node, instruction) in db.rel_iter::<(Node, RTLInst)>("rtl_inst_candidate") {
+        input_rtl.entry(*node).or_default().push(instruction.clone());
+    }
+    let mut preopt_selected: BTreeMap<Node, Vec<RTLInst>> = BTreeMap::new();
+    for (node, instruction) in
+        db.rel_iter::<(Node, RTLInst)>("stage4_preopt_selected_rtl")
+    {
+        preopt_selected
+            .entry(*node)
+            .or_default()
+            .push(instruction.clone());
+    }
+    let optimizer_copy_substitutions: BTreeSet<(RTLReg, RTLReg)> = db
+        .rel_iter::<(RTLReg, RTLReg)>("stage4_optimizer_copy_substitution")
+        .copied()
+        .collect();
+    let optimizer_eliminated_nodes: BTreeSet<Node> = db
+        .rel_iter::<(Node,)>("stage4_optimizer_eliminated_node")
+        .map(|(node,)| *node)
+        .collect();
+    let mut preopt_definitions: BTreeMap<RTLReg, BTreeSet<Node>> = BTreeMap::new();
+    let mut preopt_uses: BTreeMap<RTLReg, BTreeSet<Node>> = BTreeMap::new();
+    for (node, rows) in &preopt_selected {
+        for instruction in rows {
+            let (definition, instruction_uses) = inst_def_use(instruction);
+            if let Some(value) = definition {
+                preopt_definitions.entry(value).or_default().insert(*node);
+            }
+            for value in instruction_uses {
+                preopt_uses.entry(value).or_default().insert(*node);
+            }
+        }
+    }
+    let mut definitions: BTreeMap<RTLReg, BTreeSet<Node>> = BTreeMap::new();
+    let mut uses: BTreeMap<RTLReg, Vec<Node>> = BTreeMap::new();
+    for (node, rows) in &final_rtl {
+        for instruction in rows {
+            let (definition, instruction_uses) = inst_def_use(instruction);
+            if let Some(value) = definition {
+                definitions.entry(value).or_default().insert(*node);
+            }
+            for value in instruction_uses {
+                uses.entry(value).or_default().push(*node);
+            }
+        }
+    }
+    for (node, _temp, _chunk, _addressing, args) in
+        db.rel_iter::<(Node, RTLReg, MemoryChunk, Addressing, Arc<Vec<RTLReg>>)>(
+            "call_through_memory_load",
+        )
+    {
+        for value in args.iter() {
+            uses.entry(*value).or_default().push(*node);
+        }
+    }
+    for rows in uses.values_mut() {
+        rows.sort_unstable();
+    }
+    let mut function_nodes: BTreeMap<Address, BTreeSet<Node>> = BTreeMap::new();
+    for (node, functions) in &owners {
+        if functions.len() == 1 {
+            function_nodes
+                .entry(*functions.iter().next().expect("one owner"))
+                .or_default()
+                .insert(*node);
+        }
+    }
+    let mut succs: HashMap<Node, Vec<Node>> = HashMap::new();
+    for (source, target) in db.rel_iter::<(Node, Node)>("rtl_succ") {
+        succs.entry(*source).or_default().push(*target);
+    }
+    for targets in succs.values_mut() {
+        targets.sort_unstable();
+        targets.dedup();
+    }
+    let mut final_succs_exact: BTreeMap<Node, Vec<Node>> = BTreeMap::new();
+    let mut final_preds_exact: BTreeMap<Node, Vec<Node>> = BTreeMap::new();
+    for (source, target) in db.rel_iter::<(Node, Node)>("rtl_succ") {
+        final_succs_exact.entry(*source).or_default().push(*target);
+        final_preds_exact.entry(*target).or_default().push(*source);
+    }
+    for targets in final_succs_exact.values_mut() {
+        targets.sort_unstable();
+    }
+    for sources in final_preds_exact.values_mut() {
+        sources.sort_unstable();
+    }
+    let mut preopt_succs: HashMap<Node, Vec<Node>> = HashMap::new();
+    let mut preopt_succs_exact: BTreeMap<Node, Vec<Node>> = BTreeMap::new();
+    let mut preopt_preds_exact: BTreeMap<Node, Vec<Node>> = BTreeMap::new();
+    for (source, target) in db.rel_iter::<(Node, Node)>("stage4_preopt_selected_succ") {
+        preopt_succs.entry(*source).or_default().push(*target);
+        preopt_succs_exact.entry(*source).or_default().push(*target);
+        preopt_preds_exact.entry(*target).or_default().push(*source);
+    }
+    for targets in preopt_succs.values_mut() {
+        targets.sort_unstable();
+        targets.dedup();
+    }
+    for targets in preopt_succs_exact.values_mut() {
+        targets.sort_unstable();
+    }
+    for sources in preopt_preds_exact.values_mut() {
+        sources.sort_unstable();
+    }
+    let params: BTreeSet<(Address, RTLReg)> = db
+        .rel_iter::<(Address, RTLReg)>("emit_function_param_candidate")
+        .copied()
+        .collect();
+    let inline_temps: BTreeSet<RTLReg> =
+        db.rel_iter::<RTLReg>("emit_inline_temp").copied().collect();
+    let mut entries: BTreeMap<Address, BTreeSet<Node>> = BTreeMap::new();
+    for (function, _, entry) in db.rel_iter::<(Address, Symbol, Node)>("emit_function") {
+        entries.entry(*function).or_default().insert(*entry);
+    }
+    let stage4_flag_producers: BTreeSet<Node> = db
+        .rel_iter::<(Node, Node, &'static str)>("flags_and_jump_pair")
+        .map(|(producer, _, _)| *producer)
+        .collect();
+
+    let mut proofs = Vec::new();
+    let mut plans = Vec::new();
+    let mut address_closure_cache = ScalarAddressClosureCache::new();
+    for (&node, rows) in &final_rtl {
+        let [final_instruction] = rows.as_slice() else {
+            continue;
+        };
+        let [instruction] = instructions.get(&node).map(Vec::as_slice).unwrap_or(&[]) else {
+            continue;
+        };
+        let [raw_instruction] = raw_instructions
+            .get(&node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        else {
+            continue;
+        };
+        if raw_instruction != instruction
+            || instruction.1 != ""
+            || exact_raw_operand_count(instruction) != Some(2)
+            || address_sizes.get(&node) != Some(&BTreeSet::from([8]))
+            || !writes.get(&node).is_none_or(BTreeSet::is_empty)
+        {
+            continue;
+        }
+        let Some(function) =
+            stage4_instruction_function(coff_map, &coff_index, &owners, node, instruction)
+        else {
+            continue;
+        };
+        let Some(owned_nodes) = function_nodes.get(&function) else {
+            continue;
+        };
+        let Some(entry) = entries.get(&function).and_then(|rows| {
+            (rows.len() == 1)
+                .then(|| rows.iter().next().copied())
+                .flatten()
+        }) else {
+            continue;
+        };
+
+        let proof = match (instruction.2, final_instruction) {
+            ("LEA", RTLInst::Iop(Operation::Olea(addressing), args, value)) => {
+                let source_operand = instruction.3;
+                let destination_operand = instruction.4;
+                // Capstone marks LEA's address operand readable even though
+                // the instruction has no architectural memory read.  Bind
+                // that exact decoder-owned pseudo-read instead of treating
+                // LEA like a load or accepting an unaccounted effect row.
+                if reads.get(&node) != Some(&BTreeSet::from([source_operand]))
+                    || registers.contains_key(&source_operand)
+                    || immediates.contains(&source_operand)
+                    || indirects.contains_key(&destination_operand)
+                    || immediates.contains(&destination_operand)
+                {
+                    continue;
+                }
+                let Some(destination_name) = stage4_exact_register(
+                    destination_operand,
+                    &registers,
+                    &indirects,
+                    &immediates,
+                ) else {
+                    continue;
+                };
+                let Some((segment, base_name, index_name, scale, displacement, operand_width)) =
+                    indirects.get(&source_operand).and_then(|rows| {
+                        (rows.len() == 1)
+                            .then(|| rows.iter().next().copied())
+                            .flatten()
+                    })
+                else {
+                    continue;
+                };
+                let Some(destination_width @ (4 | 8)) =
+                    x86_scalar_register_width(destination_name)
+                else {
+                    continue;
+                };
+                if segment != "NONE" || operand_width != destination_width {
+                    continue;
+                }
+                let destination = Mreg::x86(destination_name);
+                if destination.is_unknown() {
+                    continue;
+                }
+                let base = if matches!(base_name, "" | "NONE") {
+                    None
+                } else {
+                    let register = Mreg::x86(base_name);
+                    if register.is_unknown()
+                        || matches!(register, Mreg::SP | Mreg::BP)
+                        || x86_scalar_register_width(base_name) != Some(8)
+                    {
+                        continue;
+                    }
+                    Some(register)
+                };
+                let index = if matches!(index_name, "" | "NONE") {
+                    None
+                } else {
+                    let register = Mreg::x86(index_name);
+                    if register.is_unknown()
+                        || matches!(register, Mreg::SP | Mreg::BP)
+                        || x86_scalar_register_width(index_name) != Some(8)
+                    {
+                        continue;
+                    }
+                    Some(register)
+                };
+                let (expected_addressing, expected_mregs) = match (base, index, scale) {
+                    (Some(base), None, 1) => {
+                        (Addressing::Aindexed(displacement), vec![base])
+                    }
+                    (Some(base), Some(index), 1) => {
+                        (Addressing::Aindexed2(displacement), vec![base, index])
+                    }
+                    (Some(base), Some(index), 2 | 4 | 8) => (
+                        Addressing::Aindexed2scaled(scale, displacement),
+                        vec![base, index],
+                    ),
+                    (None, Some(index), 1 | 2 | 4 | 8) => {
+                        (Addressing::Ascaled(scale, displacement), vec![index])
+                    }
+                    _ => continue,
+                };
+                if *addressing != expected_addressing || args.len() != expected_mregs.len() {
+                    continue;
+                }
+                let expected_defs = BTreeSet::from([destination]);
+                let expected_uses: BTreeSet<_> = expected_mregs.iter().copied().collect();
+                if decoded_defs.get(&node) != Some(&expected_defs)
+                    || decoded_uses.get(&node) != Some(&expected_uses)
+                {
+                    continue;
+                }
+                let expected_ltl = LTLInst::Lop(
+                    Operation::Olea(expected_addressing.clone()),
+                    Arc::new(expected_mregs.clone()),
+                    destination,
+                );
+                if !stage4_selected_with_optional_companion(
+                    ltl.get(&node).map(Vec::as_slice).unwrap_or(&[]),
+                    &expected_ltl,
+                    None,
+                )
+                    || !stage4_selected_with_optional_companion(
+                        input_rtl.get(&node).map(Vec::as_slice).unwrap_or(&[]),
+                        final_instruction,
+                        None,
+                    )
+                    || !stage4_exact_mreg_binding(&rtl_mregs, node, *value, destination)
+                    || args.iter().zip(&expected_mregs).any(|(argument, register)| {
+                        !stage4_exact_mreg_binding(&rtl_mregs, node, *argument, *register)
+                    })
+                {
+                    continue;
+                }
+                let Some(address_param_leaves) = scalar_address_param_leaves(
+                    function,
+                    node,
+                    args,
+                    entry,
+                    owned_nodes,
+                    &definitions,
+                    &final_rtl,
+                    &uses,
+                    &succs,
+                    &params,
+                    &inline_temps,
+                    None,
+                    &mut address_closure_cache,
+                ) else {
+                    continue;
+                };
+                Stage4SourceProof {
+                    function,
+                    origin_node: node,
+                    selected_node: node,
+                    kind: Stage4SourceKind::AffineAddress,
+                    root_boundary: Stage4RootBoundary::FinalRtlDefinition,
+                    width: destination_width,
+                    operation: Operation::Olea(expected_addressing),
+                    args: args.clone(),
+                    source_immediate: None,
+                    value: *value,
+                    selected_result: *value,
+                    address_param_leaves,
+                }
+            }
+            ("XOR" | "SUB", RTLInst::Iop(operation, args, value))
+                if args.is_empty()
+                    && matches!(operation, Operation::Ointconst(0) | Operation::Olongconst(0)) =>
+            {
+                if !reads.get(&node).is_none_or(BTreeSet::is_empty) {
+                    continue;
+                }
+                let Some(source_name) = stage4_exact_register(
+                    instruction.3,
+                    &registers,
+                    &indirects,
+                    &immediates,
+                ) else {
+                    continue;
+                };
+                let Some(destination_name) = stage4_exact_register(
+                    instruction.4,
+                    &registers,
+                    &indirects,
+                    &immediates,
+                ) else {
+                    continue;
+                };
+                let width = match (
+                    x86_scalar_register_width(source_name),
+                    x86_scalar_register_width(destination_name),
+                ) {
+                    (Some(width @ (4 | 8)), Some(other)) if width == other => width,
+                    _ => continue,
+                };
+                let register = Mreg::x86(source_name);
+                let expected_uses = if instruction.2 == "XOR" {
+                    BTreeSet::new()
+                } else {
+                    BTreeSet::from([register])
+                };
+                if register.is_unknown()
+                    || Mreg::x86(destination_name) != register
+                    || *operation
+                        != if width == 8 {
+                            Operation::Olongconst(0)
+                        } else {
+                            Operation::Ointconst(0)
+                        }
+                    || decoded_defs.get(&node) != Some(&BTreeSet::from([register]))
+                    || decoded_uses.get(&node).cloned().unwrap_or_default() != expected_uses
+                {
+                    continue;
+                }
+                // The loader and LTL retain the exact destructive self-op.
+                // `self_zero_rewrite` changes only the selected final RTL row
+                // to a constant, so no constant LTL/input companion exists.
+                let raw_operation = match (instruction.2, width) {
+                    ("XOR", 4) => Operation::Oxor,
+                    ("XOR", 8) => Operation::Oxorl,
+                    ("SUB", 4) => Operation::Osub,
+                    ("SUB", 8) => Operation::Osubl,
+                    _ => continue,
+                };
+                let selected_ltl = LTLInst::Lop(
+                    raw_operation.clone(),
+                    Arc::new(vec![register, register]),
+                    register,
+                );
+                let selected_input = RTLInst::Iop(
+                    raw_operation,
+                    Arc::new(vec![*value, *value]),
+                    *value,
+                );
+                if !stage4_selected_with_optional_companion(
+                    ltl.get(&node).map(Vec::as_slice).unwrap_or(&[]),
+                    &selected_ltl,
+                    None,
+                ) || !stage4_selected_with_optional_companion(
+                    input_rtl.get(&node).map(Vec::as_slice).unwrap_or(&[]),
+                    &selected_input,
+                    None,
+                ) || !stage4_exact_mreg_binding(&rtl_mregs, node, *value, register)
+                {
+                    continue;
+                }
+                Stage4SourceProof {
+                    function,
+                    origin_node: node,
+                    selected_node: node,
+                    kind: Stage4SourceKind::Zeroing,
+                    root_boundary: Stage4RootBoundary::FinalRtlDefinition,
+                    width,
+                    operation: operation.clone(),
+                    args: Arc::new(Vec::new()),
+                    source_immediate: None,
+                    value: *value,
+                    selected_result: *value,
+                    address_param_leaves: Arc::new(Vec::new()),
+                }
+            }
+            _ => continue,
+        };
+        if !proof.is_closed_v1() {
+            continue;
+        }
+        let Some(plan) = stage4_use_plan(
+            &proof,
+            proof.selected_node,
+            entry,
+            owned_nodes,
+            &definitions,
+            &uses,
+            &final_rtl,
+            &succs,
+        ) else {
+            continue;
+        };
+        proofs.push((node, proof));
+        plans.push((node, plan));
+    }
+
+    // A common two-address x86 RMW reaches RTL as `v = v op rhs`.  The
+    // current SSA optimization eliminates that self-definition and thereby
+    // loses the architectural register mutation from canonical source.
+    // Recover only the narrow case where the exact
+    // deterministic pre-opt winner was eliminated, `v` itself was never copy
+    // substituted, and one surviving final definition of `v` ends exactly at
+    // the raw RMW instruction.  The private source view may then append the
+    // mutation to that definition; canonical RTL and source stay untouched.
+    for (&node, selected_rows) in &preopt_selected {
+        if final_rtl.contains_key(&node) || !optimizer_eliminated_nodes.contains(&node) {
+            continue;
+        }
+        let [RTLInst::Iop(selected_operation, selected_args, selected_result)] =
+            selected_rows.as_slice()
+        else {
+            continue;
+        };
+        let [root_definition] = definitions_at_node
+            .get(&node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        else {
+            continue;
+        };
+        if selected_result != root_definition {
+            continue;
+        }
+        let [instruction] = instructions.get(&node).map(Vec::as_slice).unwrap_or(&[]) else {
+            continue;
+        };
+        let [raw_instruction] = raw_instructions
+            .get(&node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        else {
+            continue;
+        };
+        if raw_instruction != instruction
+            || instruction.1 != ""
+            || address_sizes.get(&node) != Some(&BTreeSet::from([8]))
+            || !reads.get(&node).is_none_or(BTreeSet::is_empty)
+            || !writes.get(&node).is_none_or(BTreeSet::is_empty)
+            || !matches!(instruction.2, "ADD" | "SUB" | "IMUL" | "AND" | "OR" | "XOR")
+            || stage4_flag_producers.contains(&node)
+        {
+            continue;
+        }
+        let Some(function) =
+            stage4_instruction_function(coff_map, &coff_index, &owners, node, instruction)
+        else {
+            continue;
+        };
+        let Some(owned_nodes) = function_nodes.get(&function) else {
+            continue;
+        };
+        let Some(entry) = entries.get(&function).and_then(|rows| {
+            (rows.len() == 1)
+                .then(|| rows.iter().next().copied())
+                .flatten()
+        }) else {
+            continue;
+        };
+
+        let operand_count = exact_raw_operand_count(instruction);
+        let first_immediate = immediate_rows.get(&instruction.3).and_then(|rows| {
+            (rows.len() == 1)
+                .then(|| rows.iter().next().copied())
+                .flatten()
+        });
+        let (source_operand, destination_operand, source_immediate) =
+            match (instruction.2, operand_count, first_immediate) {
+                ("IMUL", Some(3), None) => {
+                    let Some((value, encoded_width)) = immediate_rows
+                        .get(&instruction.5)
+                        .and_then(|rows| {
+                            (rows.len() == 1)
+                                .then(|| rows.iter().next().copied())
+                                .flatten()
+                        })
+                    else {
+                        continue;
+                    };
+                    let source = stage4_exact_register(
+                        instruction.3,
+                        &registers,
+                        &indirects,
+                        &immediates,
+                    );
+                    let destination = stage4_exact_register(
+                        instruction.4,
+                        &registers,
+                        &indirects,
+                        &immediates,
+                    );
+                    if source.is_none() || source != destination {
+                        continue;
+                    }
+                    if encoded_width != 0 {
+                        continue;
+                    }
+                    if registers.contains_key(&instruction.5)
+                        || indirects.contains_key(&instruction.5)
+                    {
+                        continue;
+                    }
+                    (None, instruction.4, Some((value, encoded_width)))
+                }
+                (_, Some(2), Some((value, encoded_width))) if instruction.2 != "IMUL" => {
+                    if encoded_width != 0
+                        || registers.contains_key(&instruction.3)
+                        || indirects.contains_key(&instruction.3)
+                    {
+                        continue;
+                    }
+                    (None, instruction.4, Some((value, encoded_width)))
+                }
+                (_, Some(2), None) => (Some(instruction.3), instruction.4, None),
+                _ => continue,
+            };
+        let Some(destination_name) = stage4_exact_register(
+            destination_operand,
+            &registers,
+            &indirects,
+            &immediates,
+        ) else {
+            continue;
+        };
+        let Some(width @ (4 | 8)) = x86_scalar_register_width(destination_name) else {
+            continue;
+        };
+        let destination = Mreg::x86(destination_name);
+        if destination.is_unknown() {
+            continue;
+        }
+        let source = if let Some(source_operand) = source_operand {
+            let Some(source_name) = stage4_exact_register(
+                source_operand,
+                &registers,
+                &indirects,
+                &immediates,
+            ) else {
+                continue;
+            };
+            if x86_scalar_register_width(source_name) != Some(width) {
+                continue;
+            }
+            let source = Mreg::x86(source_name);
+            if source.is_unknown() || source == destination {
+                continue;
+            }
+            Some(source)
+        } else {
+            None
+        };
+        let source_immediate = source_immediate.map(|(value, _)| value);
+        if width == 4
+            && source_immediate.is_some_and(|value| i64::from(value as i32) != value)
+        {
+            continue;
+        }
+        let Some((kind, expected_operation)) =
+            stage4_rmw_kind_and_operation(instruction.2, width, source_immediate)
+        else {
+            continue;
+        };
+        let companion_operation = if instruction.2 == "ADD" && source_immediate.is_none() {
+            stage4_addition_operations(width).map(|(_, companion)| companion)
+        } else if matches!(kind, Stage4SourceKind::And | Stage4SourceKind::Or) {
+            stage4_and_or_width_companion(&expected_operation)
+        } else {
+            None
+        };
+        let selected_operation_is_exact = if kind == Stage4SourceKind::Add {
+            selected_operation == &expected_operation
+                || companion_operation.as_ref() == Some(selected_operation)
+        } else {
+            // Unlike ADD's sealed Oadd/Olea divergence, the other source
+            // families do not represent a companion winner.  A width-twin
+            // may coexist in LTL/input evidence, but the deterministic winner
+            // must remain the exact raw-width operation serialized in proof.
+            selected_operation == &expected_operation
+        };
+        if !selected_operation_is_exact {
+            continue;
+        }
+        let expected_mregs: Vec<Mreg> = std::iter::once(destination)
+            .chain(source)
+            .collect();
+        let expected_defs = BTreeSet::from([destination]);
+        let expected_uses: BTreeSet<Mreg> = expected_mregs.iter().copied().collect();
+        if decoded_defs.get(&node) != Some(&expected_defs)
+            || decoded_uses.get(&node) != Some(&expected_uses)
+        {
+            continue;
+        }
+        let expected_ltl = LTLInst::Lop(
+            expected_operation.clone(),
+            Arc::new(expected_mregs.clone()),
+            destination,
+        );
+        let companion_ltl = companion_operation.as_ref().map(|operation| {
+            LTLInst::Lop(
+                operation.clone(),
+                Arc::new(expected_mregs.clone()),
+                destination,
+            )
+        });
+        let ltl_rows = ltl.get(&node).map(Vec::as_slice).unwrap_or(&[]);
+        if !stage4_selected_with_optional_companion(
+            ltl_rows,
+            &expected_ltl,
+            companion_ltl.as_ref(),
+        ) {
+            continue;
+        }
+        let Some(authenticated_operations) = ltl_rows
+            .iter()
+            .map(|row| match row {
+                LTLInst::Lop(operation, _, _) => Some(operation.clone()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let expected_args: Arc<Vec<RTLReg>> = selected_args.clone();
+        let Some(&carrier) = expected_args.first() else {
+            continue;
+        };
+        let source_reaching_value_is_exact = match (source, expected_args.get(1).copied()) {
+            (Some(register), Some(value)) => reaching_values
+                .get(&(node, register))
+                .map(Vec::as_slice)
+                == Some(&[value][..]),
+            (None, None) => true,
+            _ => false,
+        };
+        let source_value = expected_args.get(1).copied();
+        if *selected_result == carrier
+            || expected_args.len() != if source_immediate.is_some() { 1 } else { 2 }
+            || !stage4_exact_mreg_binding(&rtl_mregs, node, carrier, destination)
+            || source.zip(expected_args.get(1).copied()).is_some_and(|(register, value)| {
+                !stage4_exact_mreg_binding(&rtl_mregs, node, value, register)
+            })
+            || (source.is_some() != (expected_args.len() == 2))
+            || !source_reaching_value_is_exact
+            || source_value
+                .is_some_and(|value| !params.contains(&(function, value)))
+            || optimizer_copy_substitutions
+                .iter()
+                .any(|(destination, source)| {
+                    *destination == carrier
+                        || *source == carrier
+                        || *destination == *selected_result
+                        || *source == *selected_result
+                        || source_value
+                            .is_some_and(|value| *destination == value || *source == value)
+                })
+        {
+            continue;
+        }
+        // The Dual fixed point deliberately retains both the surviving
+        // carrier and the fresh root definition as candidate destinations.
+        // The deterministic pre-opt winner uses the latter; it is sealed to
+        // the carrier by the exact is_def/reg_xtl/canonical web below.  Admit
+        // only the complete operation x destination cross-product so a
+        // missing, duplicate, or third transport alias remains ambiguous.
+        if !stage4_rmw_input_candidates_match(
+            input_rtl.get(&node).map(Vec::as_slice).unwrap_or(&[]),
+            &authenticated_operations,
+            &expected_args,
+            carrier,
+            *selected_result,
+        ) {
+            continue;
+        }
+
+        let Some(placement_node) = definitions.get(&carrier).and_then(|rows| {
+            (rows.len() == 1)
+                .then(|| rows.iter().next().copied())
+                .flatten()
+        }) else {
+            continue;
+        };
+        let [RTLInst::Iload(placement_chunk, _, _, placement_value)] = final_rtl
+            .get(&placement_node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        else {
+            continue;
+        };
+        if *placement_value != carrier
+            || match placement_chunk {
+                MemoryChunk::MInt32 | MemoryChunk::MAny32 => width != 4,
+                MemoryChunk::MInt64 | MemoryChunk::MAny64 => width != 8,
+                _ => true,
+            }
+        {
+            continue;
+        }
+        let [placement_access] = scalar_accesses
+            .get(&placement_node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        else {
+            continue;
+        };
+        if !placement_access.is_closed_v1()
+            || placement_access.function != function
+            || placement_access.origin_node != placement_node
+            || placement_access.selected_node != placement_node
+            || placement_access.direction != ScalarMemoryDirection::Read
+            || placement_access.extension != ScalarMemoryExtension::Plain
+            || placement_access.synthetic_stack_origin
+            || placement_access.width != width
+            || placement_access.value_width != width
+            || placement_access.chunk != *placement_chunk
+            || placement_access.value != carrier
+        {
+            continue;
+        }
+        let [placement_instruction] = instructions
+            .get(&placement_node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        else {
+            continue;
+        };
+        let [placement_raw] = raw_instructions
+            .get(&placement_node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        else {
+            continue;
+        };
+        if placement_instruction != placement_raw
+            || placement_node.checked_add(placement_instruction.0 as u64) != Some(node)
+            || stage4_instruction_function(
+                coff_map,
+                &coff_index,
+                &owners,
+                placement_node,
+                placement_instruction,
+            ) != Some(function)
+        {
+            continue;
+        }
+        let [placement_definition] = definitions_at_node
+            .get(&placement_node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        else {
+            continue;
+        };
+        if placement_definition == root_definition {
+            continue;
+        }
+        let root_xtl_rows = reg_xtl_rows
+            .get(&(node, destination))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        // A real two-address Lop carries two exact architectural identities at
+        // its destination: the fresh definition minted for this root and the
+        // prior placement-load definition propagated into the destination's
+        // read position.  Both must collapse to the same final carrier below;
+        // any missing, substituted, or additional historical row is
+        // ambiguity.  Synthetic fixtures used to model only the fresh root
+        // definition, which made this singleton check reject every real RMW.
+        let mut expected_root_xtl_rows = vec![*placement_definition, *root_definition];
+        expected_root_xtl_rows.sort_unstable();
+        if reg_defs_reaching_use
+            .get(&(node, destination))
+            .map(Vec::as_slice)
+            != Some(&[placement_node][..])
+            || reg_uses_reached_from_def
+                .get(&(placement_node, destination))
+                .map(Vec::as_slice)
+                != Some(&[node][..])
+            || reg_xtl_rows
+                .get(&(placement_node, destination))
+                .map(Vec::as_slice)
+                != Some(&[*placement_definition][..])
+            || canonical_values.get(placement_definition) != Some(&carrier)
+            || root_xtl_rows != expected_root_xtl_rows.as_slice()
+            || canonical_values.get(root_definition) != Some(&carrier)
+            || reaching_values
+                .get(&(node, destination))
+                .map(Vec::as_slice)
+                != Some(&[carrier][..])
+        {
+            continue;
+        }
+        let Some(&anchor) = preopt_succs
+            .get(&node)
+            .filter(|rows| rows.len() == 1)
+            .and_then(|rows| rows.first())
+        else {
+            continue;
+        };
+        if preopt_succs_exact
+            .get(&placement_node)
+            .map(Vec::as_slice)
+            != Some(&[node][..])
+            || preopt_preds_exact.get(&node).map(Vec::as_slice)
+                != Some(&[placement_node][..])
+            || preopt_succs_exact.get(&node).map(Vec::as_slice) != Some(&[anchor][..])
+            || preopt_preds_exact.get(&anchor).map(Vec::as_slice) != Some(&[node][..])
+            || node.checked_add(instruction.0 as u64) != Some(anchor)
+            || final_succs_exact
+                .get(&placement_node)
+                .map(Vec::as_slice)
+                != Some(&[anchor][..])
+            || final_preds_exact.get(&anchor).map(Vec::as_slice)
+                != Some(&[placement_node][..])
+            || !final_rtl.contains_key(&anchor)
+            || graph_reaches_through_owned_region(
+                &preopt_succs,
+                owned_nodes,
+                entry,
+                node,
+                None,
+            ) != Some(true)
+            || graph_reaches_through_owned_region(
+                &preopt_succs,
+                owned_nodes,
+                entry,
+                anchor,
+                Some(node),
+            ) != Some(false)
+        {
+            continue;
+        }
+        let expected_carrier_preopt_defs = BTreeSet::from([placement_node]);
+        let expected_result_preopt_defs = BTreeSet::from([node]);
+        let expected_carrier_preopt_uses = uses
+            .get(&carrier)
+            .into_iter()
+            .flatten()
+            .copied()
+            .chain(std::iter::once(node))
+            .collect::<BTreeSet<_>>();
+        if preopt_definitions.get(&carrier) != Some(&expected_carrier_preopt_defs)
+            || preopt_definitions.get(selected_result) != Some(&expected_result_preopt_defs)
+            || preopt_uses.get(&carrier) != Some(&expected_carrier_preopt_uses)
+            || preopt_uses.contains_key(selected_result)
+            || definitions.contains_key(selected_result)
+            || uses.contains_key(selected_result)
+        {
+            continue;
+        }
+
+        let operation = if kind == Stage4SourceKind::Add {
+            selected_operation.clone()
+        } else {
+            expected_operation
+        };
+        let proof = Stage4SourceProof {
+            function,
+            origin_node: node,
+            selected_node: node,
+            kind,
+            root_boundary: Stage4RootBoundary::EliminatedMutation,
+            width,
+            operation,
+            args: expected_args,
+            source_immediate,
+            value: carrier,
+            selected_result: *selected_result,
+            address_param_leaves: Arc::new(Vec::new()),
+        };
+        if !proof.is_closed_v1() {
+            continue;
+        }
+        let Some(plan) = stage4_use_plan(
+            &proof,
+            placement_node,
+            entry,
+            owned_nodes,
+            &definitions,
+            &uses,
+            &final_rtl,
+            &succs,
+        ) else {
+            continue;
+        };
+        let [terminal_site] = plan.sites.as_slice() else {
+            continue;
+        };
+        let Some(terminal_use) = plan.terminal_use.as_ref() else {
+            continue;
+        };
+        let terminal_is_sealed = match terminal_use {
+            Stage4TerminalUse::Return => {
+                let [terminal_instruction] = instructions
+                    .get(&terminal_site.node)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                else {
+                    continue;
+                };
+                let [terminal_raw] = raw_instructions
+                    .get(&terminal_site.node)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                else {
+                    continue;
+                };
+                terminal_instruction == terminal_raw
+                    && terminal_instruction.1 == ""
+                    && terminal_instruction.2 == "RET"
+                    && exact_raw_operand_count(terminal_instruction) == Some(0)
+                    && stage4_instruction_function(
+                        coff_map,
+                        &coff_index,
+                        &owners,
+                        terminal_site.node,
+                        terminal_instruction,
+                    ) == Some(function)
+            }
+            Stage4TerminalUse::Store { chunk, .. } => {
+                let [access] = scalar_accesses
+                    .get(&terminal_site.node)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                else {
+                    continue;
+                };
+                access.is_closed_v1()
+                    && access.function == function
+                    && access.origin_node == terminal_site.node
+                    && access.selected_node == terminal_site.node
+                    && access.direction == ScalarMemoryDirection::Write
+                    && access.extension == ScalarMemoryExtension::Plain
+                    && !access.synthetic_stack_origin
+                    && access.width == width
+                    && access.value_width == width
+                    && access.chunk == *chunk
+                    && access.value == carrier
+            }
+        };
+        if !plan.transports.is_empty()
+            || anchor != terminal_site.node
+            || !terminal_is_sealed
+            || reg_uses_reached_from_def
+                .get(&(node, destination))
+                .map(Vec::as_slice)
+                != Some(&[terminal_site.node][..])
+            || reg_defs_reaching_use
+                .get(&(terminal_site.node, destination))
+                .map(Vec::as_slice)
+                != Some(&[node][..])
+            || !stage4_flags_are_dead_before_terminal(
+                node,
+                terminal_site.node,
+                terminal_use,
+                function,
+                coff_map,
+                &coff_index,
+                &owners,
+                &instructions,
+                &raw_instructions,
+                &registers,
+                &immediate_rows,
+                &indirects,
+                &decoded_defs,
+                &decoded_uses,
+                &preopt_succs_exact,
+                &preopt_preds_exact,
+            )
+        {
+            continue;
+        }
+        let all_plan_nodes = plan
+            .transports
+            .iter()
+            .map(|transport| transport.node)
+            .chain(plan.sites.iter().map(|site| site.node));
+        if all_plan_nodes.into_iter().any(|use_node| {
+            graph_reaches_through_owned_region(
+                &preopt_succs,
+                owned_nodes,
+                node,
+                use_node,
+                None,
+            ) != Some(true)
+                || graph_reaches_through_owned_region(
+                    &preopt_succs,
+                    owned_nodes,
+                    entry,
+                    use_node,
+                    Some(node),
+                ) != Some(false)
+        }) {
+            continue;
+        }
+        proofs.push((node, proof));
+        plans.push((node, plan));
+    }
+
+    proofs.sort();
+    proofs.dedup();
+    plans.sort();
+    plans.dedup();
+    db.rel_set(
+        "authenticated_stage4_source",
+        proofs.into_iter().collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "authenticated_stage4_use_plan",
+        plans.into_iter().collect::<ascent::boxcar::Vec<_>>(),
     );
 }
 
@@ -5615,8 +7966,46 @@ struct AscentV2Snapshot {
 fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
     let mut ctx = PassContext::load(db);
     if ctx.functions.is_empty() {
+        db.rel_set(
+            "stage4_preopt_selected_rtl",
+            ascent::boxcar::Vec::<(Node, RTLInst)>::new(),
+        );
+        db.rel_set(
+            "stage4_optimizer_copy_substitution",
+            ascent::boxcar::Vec::<(RTLReg, RTLReg)>::new(),
+        );
+        db.rel_set(
+            "stage4_optimizer_eliminated_node",
+            ascent::boxcar::Vec::<(Node,)>::new(),
+        );
+        db.rel_set(
+            "stage4_preopt_selected_succ",
+            ascent::boxcar::Vec::<(Node, Node)>::new(),
+        );
         return None;
     }
+
+    // Preserve the exact deterministic winner selected by PassContext before
+    // any copy propagation or DSE.  This is provider-internal provenance for
+    // Stage-4 alternatives only; canonical optimization and write-back remain
+    // unchanged.  Candidate rows which lost the PassContext competition can
+    // never become source alternatives merely because they match raw bytes.
+    let mut stage4_preopt_selected = Vec::new();
+    let mut stage4_preopt_succ = Vec::new();
+    for function in ctx.functions.values() {
+        stage4_preopt_selected.extend(
+            function
+                .inst
+                .iter()
+                .map(|(&node, instruction)| (node, instruction.clone())),
+        );
+        for (&source, targets) in &function.succs {
+            stage4_preopt_succ.extend(targets.iter().map(|&target| (source, target)));
+        }
+    }
+    stage4_preopt_selected
+        .sort_by_cached_key(|(node, instruction)| (*node, format!("{instruction:?}")));
+    stage4_preopt_succ.sort_unstable();
 
     let var_types = std::mem::take(&mut ctx.var_types);
 
@@ -5688,6 +8077,7 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         .functions
         .par_iter_mut()
         .map(|(&func_addr, func)| {
+            let preopt_inst = func.inst.clone();
             let mut func_var_types = per_func_var_types
                 .lock()
                 .unwrap()
@@ -5726,6 +8116,7 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
             let mut iter1_copy_subst: HashMap<RTLReg, RTLReg> = HashMap::new();
             let mut iter1_dead_store_nodes: HashSet<Node> = HashSet::new();
             let mut iter1_dead_call_nodes: HashSet<Node> = HashSet::new();
+            let mut all_copy_substitutions = BTreeSet::new();
             let mut first_iter = true;
             loop {
                 let du = DefUseInfo::build(func);
@@ -5739,6 +8130,7 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
                 };
 
                 let (c, copy_subst) = copy_propagation(func, &du, &liveness);
+                all_copy_substitutions.extend(copy_subst.iter().map(|(&dst, &src)| (dst, src)));
                 if first_iter {
                     iter1_copy_subst = copy_subst.clone();
                 }
@@ -5784,6 +8176,19 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
             let du = DefUseInfo::build(func);
             let liveness = LivenessInfo::build(func, &du);
             let inlines = find_inline_temps(func, &du, &liveness);
+            let eliminated_nodes: BTreeSet<Node> = preopt_inst
+                .iter()
+                .filter_map(|(&node, instruction)| {
+                    (!matches!(instruction, RTLInst::Inop)
+                        && func
+                            .inst
+                            .get(&node)
+                            .is_none_or(|final_instruction| {
+                                matches!(final_instruction, RTLInst::Inop)
+                            }))
+                    .then_some(node)
+                })
+                .collect();
 
             // The function became void if static-eq folding pruned the defining node of its recorded return value, leaving the return reg with no surviving def (and not a parameter); scoped to folded functions so normal returns are untouched.
             let became_void = folded_static_branch
@@ -5808,6 +8213,8 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
                 iter1_copy_subst,
                 iter1_dead_store_nodes,
                 iter1_dead_call_nodes,
+                all_copy_substitutions,
+                eliminated_nodes,
                 became_void,
             )
         })
@@ -5821,8 +8228,23 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
     let mut imp_dead_store_all: HashSet<Node> = HashSet::new();
     let mut imp_dead_call_all: HashSet<Node> = HashSet::new();
     let mut newly_void: HashSet<Address> = HashSet::new();
+    let mut stage4_copy_substitutions = BTreeSet::new();
+    let mut stage4_eliminated_nodes = BTreeSet::new();
 
-    for (func_stats, inlines, func_vt, fa, isz, icp, idst, idcl, became_void) in results {
+    for (
+        func_stats,
+        inlines,
+        func_vt,
+        fa,
+        isz,
+        icp,
+        idst,
+        idcl,
+        copy_substitutions,
+        eliminated_nodes,
+        became_void,
+    ) in results
+    {
         stats.accumulate(func_stats);
         ctx.inline_temps.extend(inlines);
         merged_var_types.extend(func_vt);
@@ -5832,6 +8254,8 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
         }
         imp_dead_store_all.extend(idst);
         imp_dead_call_all.extend(idcl);
+        stage4_copy_substitutions.extend(copy_substitutions);
+        stage4_eliminated_nodes.extend(eliminated_nodes);
         if became_void {
             newly_void.insert(fa);
         }
@@ -5946,6 +8370,31 @@ fn optimize_rtl_candidates(db: &mut DecompileDB) -> Option<RtlOptStats> {
 
     ctx.var_types = merged_var_types;
     ctx.write_back(db);
+    db.rel_set(
+        "stage4_preopt_selected_rtl",
+        stage4_preopt_selected
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "stage4_optimizer_copy_substitution",
+        stage4_copy_substitutions
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "stage4_optimizer_eliminated_node",
+        stage4_eliminated_nodes
+            .into_iter()
+            .map(|node| (node,))
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
+    db.rel_set(
+        "stage4_preopt_selected_succ",
+        stage4_preopt_succ
+            .into_iter()
+            .collect::<ascent::boxcar::Vec<_>>(),
+    );
 
     if !newly_void.is_empty() {
         mark_functions_void(db, &newly_void);
@@ -6217,7 +8666,11 @@ impl IRPass for RTLOptimizePass {
             }
         }
         materialize_cr8_byte_compares(db);
-        materialize_authenticated_scalar_memory_accesses(db);
+        let stage4_private_accesses = materialize_authenticated_scalar_memory_accesses(db);
+        materialize_authenticated_stage4_sources_with_private_accesses(
+            db,
+            &stage4_private_accesses,
+        );
     }
 
     fn inputs(&self) -> &'static [&'static str] {
@@ -6237,6 +8690,11 @@ impl IRPass for RTLOptimizePass {
             "call_float_args_collected",
             "func_has_variadic_xmm_prologue",
             "msvc_gs_cookie_guard_call",
+            "reg_def_used",
+            "reg_xtl",
+            "is_def",
+            "xtl_canonical",
+            "reaching_use_rtl",
         ]
     }
 
@@ -6253,6 +8711,12 @@ impl IRPass for RTLOptimizePass {
             "cr8_byte_compare",
             "authenticated_scalar_memory_access",
             "authenticated_scalar_memory_use_plan",
+            "authenticated_stage4_source",
+            "authenticated_stage4_use_plan",
+            "stage4_preopt_selected_rtl",
+            "stage4_optimizer_copy_substitution",
+            "stage4_optimizer_eliminated_node",
+            "stage4_preopt_selected_succ",
             // Static-eq branch folding can retype a function void; these signal that to the signature reconciliation pass.
             "emit_function_void_candidate",
             "emit_function_has_return_candidate",
@@ -6277,6 +8741,7 @@ impl IRPass for RTLOptimizePass {
             // local byte width after final RTL register rewriting.
             "next",
             "code_in_block",
+            "flags_and_jump_pair",
             "ltl_inst",
             "op_register",
             "op_immediate",
@@ -6289,6 +8754,11 @@ impl IRPass for RTLOptimizePass {
             "decoded_reg_use",
             "instruction_address_size",
             "reg_rtl",
+            "reg_def_used",
+            "reg_xtl",
+            "is_def",
+            "xtl_canonical",
+            "reaching_use_rtl",
         ]
     }
 }

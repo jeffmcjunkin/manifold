@@ -25,6 +25,20 @@ pub(crate) fn insert_preferred_symbol_name(
 
 const SYNTHETIC_NODE_BITS: Node = (1u64 << 62) | (1u64 << 63);
 
+fn stage4_integral_clight_width(ty: &ClightType) -> Option<usize> {
+    match ty {
+        ClightType::Tint(ClightIntSize::I8, _, attributes) if !attributes.attr_volatile => Some(1),
+        ClightType::Tint(ClightIntSize::I16, _, attributes) if !attributes.attr_volatile => {
+            Some(2)
+        }
+        ClightType::Tint(ClightIntSize::I32, _, attributes) if !attributes.attr_volatile => {
+            Some(4)
+        }
+        ClightType::Tlong(_, attributes) if !attributes.attr_volatile => Some(8),
+        _ => None,
+    }
+}
+
 pub(crate) fn containing_function_owner(node: Node, claimants: &[Address]) -> Option<Address> {
     let real = node & !SYNTHETIC_NODE_BITS;
     claimants
@@ -168,6 +182,13 @@ pub struct FunctionData {
     pub scalar_lvalue_source_candidates:
         HashMap<Node, Vec<(ScalarLvalueSourceForm, ScalarLvaluePlacement, ClightStmt)>>,
 
+    /// Stage-4 provenance remains outside `node_statements`, just like the
+    /// scalar-lvalue portfolio.  Private views consume one independently
+    /// authenticated root at a time; merely enabling the sidecar cannot add a
+    /// candidate to the canonical solve.
+    pub stage4_source_proofs: HashMap<Node, Vec<Stage4SourceProof>>,
+    pub stage4_use_plans: HashMap<Node, Vec<Stage4UsePlan>>,
+
     pub successors: HashMap<Node, Vec<Node>>,
 
     pub used_regs: HashSet<RTLReg>,
@@ -273,6 +294,8 @@ impl FunctionData {
             scalar_lvalue_proofs: HashMap::new(),
             scalar_memory_use_plans: HashMap::new(),
             scalar_lvalue_source_candidates: HashMap::new(),
+            stage4_source_proofs: HashMap::new(),
+            stage4_use_plans: HashMap::new(),
             successors: HashMap::new(),
             used_regs: HashSet::new(),
             struct_fields: HashMap::new(),
@@ -680,6 +703,13 @@ pub fn extract_functions(
             node_owner.insert(*node, owner);
         }
     }
+    let mut instruction_owners: BTreeMap<Node, BTreeSet<Address>> = BTreeMap::new();
+    for (node, function) in db.rel_iter::<(Node, Address)>("instr_in_function") {
+        instruction_owners
+            .entry(*node)
+            .or_default()
+            .insert(*function);
+    }
 
     for (addr, node, stmt) in db.rel_iter::<(Address, Node, ClightStmt)>("emit_clight_stmt") {
         let is_goto_target = goto_targets.contains(node);
@@ -769,6 +799,113 @@ pub fn extract_functions(
             plans.push(plan.clone());
             plans.sort_unstable();
         }
+    }
+
+    let mut stage4_return_types: BTreeMap<Address, Vec<ClightType>> = BTreeMap::new();
+    for (function, return_type) in
+        db.rel_iter::<(Address, ClightType)>("emit_function_return_type")
+    {
+        stage4_return_types
+            .entry(*function)
+            .or_default()
+            .push(return_type.clone());
+    }
+    for rows in stage4_return_types.values_mut() {
+        rows.sort_by_cached_key(|return_type| format!("{return_type:?}"));
+    }
+
+    // Stage-4 rows are admitted only as exact proof/plan pairs under the same
+    // canonical ownership used for ordinary statement extraction.  Duplicate
+    // or cross-function rows remain visible as ambiguity and therefore never
+    // become a private profile.
+    for (node, proof) in db.rel_iter::<(Node, Stage4SourceProof)>("stage4_source_candidate") {
+        if *node != proof.selected_node || !proof.is_closed_v1() {
+            continue;
+        }
+        let owner = match proof.root_boundary {
+            Stage4RootBoundary::FinalRtlDefinition => node_owner.get(node).copied(),
+            Stage4RootBoundary::EliminatedMutation => instruction_owners
+                .get(node)
+                .filter(|owners| owners.len() == 1)
+                .and_then(|owners| owners.iter().next().copied()),
+        };
+        let Some(owner) = owner else { continue };
+        if owner != proof.function {
+            continue;
+        }
+        if let Some(function) = func_map.get_mut(&proof.function) {
+            let proofs = function.stage4_source_proofs.entry(*node).or_default();
+            proofs.push(proof.clone());
+            proofs.sort_unstable();
+        }
+    }
+    for (node, plan) in db.rel_iter::<(Node, Stage4UsePlan)>("stage4_use_plan") {
+        let Some(function) = func_map.get_mut(&plan.function) else {
+            continue;
+        };
+        let Some(proofs) = function.stage4_source_proofs.get(node) else {
+            continue;
+        };
+        let matching: Vec<_> = proofs
+            .iter()
+            .filter(|proof| plan.is_closed_v1(proof))
+            .collect();
+        let [proof] = matching.as_slice() else { continue };
+        if proof.args.get(1).is_some_and(|source| {
+            function
+                .param_regs
+                .iter()
+                .filter(|candidate| *candidate == source)
+                .count()
+                != 1
+        }) {
+            continue;
+        }
+        let return_width_closed = match plan.terminal_use.as_ref() {
+            Some(Stage4TerminalUse::Return) => {
+                let [return_type] = stage4_return_types
+                    .get(&plan.function)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                else {
+                    continue;
+                };
+                stage4_integral_clight_width(return_type) == Some(proof.width)
+            }
+            Some(Stage4TerminalUse::Store { .. }) | None => true,
+        };
+        if !return_width_closed {
+            continue;
+        }
+        let exact_instruction_owner = |candidate: Node| {
+            instruction_owners
+                .get(&candidate)
+                .filter(|owners| owners.len() == 1)
+                .and_then(|owners| owners.iter().next().copied())
+                == Some(plan.function)
+        };
+        let ownership_closed = match proof.root_boundary {
+            Stage4RootBoundary::FinalRtlDefinition => {
+                node_owner.get(node).copied() == Some(plan.function)
+            }
+            Stage4RootBoundary::EliminatedMutation => {
+                exact_instruction_owner(*node)
+                    && exact_instruction_owner(plan.placement_node)
+                    && node_owner.get(&plan.placement_node).copied() == Some(plan.function)
+                    && plan.transports.iter().all(|transport| {
+                        node_owner.get(&transport.node).copied() == Some(plan.function)
+                    })
+                    && plan.sites.iter().all(|site| {
+                        node_owner.get(&site.node).copied() == Some(plan.function)
+                    })
+            }
+        };
+        if *node != plan.definition_node || !ownership_closed {
+            continue;
+        }
+        let plans = function.stage4_use_plans.entry(*node).or_default();
+        plans.push(plan.clone());
+        plans.sort_unstable();
     }
 
     // A feature statement may be attached only to the unique exact
