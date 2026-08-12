@@ -18,8 +18,73 @@ use std::sync::Arc;
 pub const CLIGHT_EXPORT_SCHEMA_ID: &str = "manifold-clight-v4";
 pub const PARTIAL_SUPPRESSION_CERTIFICATE_ID: &str = "atomic-unsupported-address-suppression-v1";
 
+const CRT_FUNCTIONS: &[&str] = &[
+    "_start",
+    "_init",
+    "_fini",
+    "__libc_csu_init",
+    "__libc_csu_fini",
+    "__libc_start_main",
+    "deregister_tm_clones",
+    "register_tm_clones",
+    "__do_global_dtors_aux",
+    "frame_dummy",
+    "__x86.get_pc_thunk.bx",
+];
+
+fn final_clight_function_is_emitted(
+    db: &DecompileDB,
+    external_functions: &std::collections::HashSet<Address>,
+    address: Address,
+    name: &str,
+) -> bool {
+    !external_functions.contains(&address)
+        && !name.starts_with('.')
+        && !name.starts_with("__")
+        && !CRT_FUNCTIONS.contains(&name)
+        && !name.starts_with("FUN_")
+        && !db.should_skip_function(name)
+}
+
+fn final_clight_emitted_functions<'a>(
+    db: &DecompileDB,
+    selected_functions: &'a [SelectedFunction],
+) -> Vec<&'a SelectedFunction> {
+    let external_functions: std::collections::HashSet<Address> = db
+        .rel_iter::<(Address,)>("is_external_function")
+        .map(|(address,)| *address)
+        .collect();
+    selected_functions
+        .iter()
+        .filter(|function| {
+            final_clight_function_is_emitted(
+                db,
+                &external_functions,
+                function.address,
+                function.name.as_str(),
+            )
+        })
+        .collect()
+}
+
+/// Return the exact name/address identities that the final Clight JSON
+/// emission policy would serialize. Source-alternative sidecars use this same
+/// authority so they can never name a definition omitted from Clight.
+pub fn final_clight_emitted_function_identities(
+    db: &DecompileDB,
+    selected_functions: &[SelectedFunction],
+) -> Vec<(String, Address)> {
+    final_clight_emitted_functions(db, selected_functions)
+        .into_iter()
+        .map(|function| (function.name.clone(), function.address))
+        .collect()
+}
+
 /// Export the selected Clight IR from the decompile DB to a JSON file.
-pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), String> {
+pub fn export_clight_json(
+    db: &DecompileDB,
+    output_path: &str,
+) -> Result<Vec<(String, Address)>, String> {
     // Diagnostics
     let csharp_count = db
         .rel_iter::<(Node, CsharpminorStmt)>("csharp_stmt")
@@ -96,38 +161,13 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         id_to_name.insert(*address as usize, name.clone());
     }
 
-    let external_funcs: std::collections::HashSet<u64> = db
-        .rel_iter::<(Address,)>("is_external_function")
-        .map(|(a,)| *a)
-        .collect();
-
-    const CRT_FUNCTIONS: &[&str] = &[
-        "_start",
-        "_init",
-        "_fini",
-        "__libc_csu_init",
-        "__libc_csu_fini",
-        "__libc_start_main",
-        "deregister_tm_clones",
-        "register_tm_clones",
-        "__do_global_dtors_aux",
-        "frame_dummy",
-        "__x86.get_pc_thunk.bx",
-    ];
-
     // Partial metadata describes definitions in this exact JSON document, not
     // merely functions which survived statement selection. Apply the final
     // emission filter before classifying any diagnostic.
-    let internal_functions: Vec<&SelectedFunction> = selected_functions
+    let internal_functions = final_clight_emitted_functions(db, &selected_functions);
+    let emitted_function_identities = internal_functions
         .iter()
-        .filter(|func| {
-            !external_funcs.contains(&func.address)
-                && !func.name.starts_with('.')
-                && !func.name.starts_with("__")
-                && !CRT_FUNCTIONS.contains(&func.name.as_str())
-                && !func.name.starts_with("FUN_")
-                && !db.should_skip_function(func.name.as_str())
-        })
+        .map(|function| (function.name.clone(), function.address))
         .collect();
     let emitted_addresses: std::collections::HashSet<Address> = internal_functions
         .iter()
@@ -448,7 +488,7 @@ pub fn export_clight_json(db: &DecompileDB, output_path: &str) -> Result<(), Str
         .flush()
         .map_err(|e| format!("Failed to write {}: {}", output_path, e))?;
 
-    Ok(())
+    Ok(emitted_function_identities)
 }
 
 fn write_compact_json<W: Write>(writer: W, program: &Value) -> serde_json::Result<()> {
@@ -1297,5 +1337,32 @@ mod tests {
             round_trip["manifold_clight_schema"],
             CLIGHT_EXPORT_SCHEMA_ID
         );
+    }
+
+    #[test]
+    fn final_clight_emission_policy_is_shared_and_fail_closed() {
+        let mut db = DecompileDB::default();
+        db.skip_function_names.insert("configured_skip");
+        let external_functions = std::collections::HashSet::from([0x2000]);
+
+        assert!(final_clight_function_is_emitted(
+            &db,
+            &external_functions,
+            0x1000,
+            "coff_fn_kept",
+        ));
+        for (address, name) in [
+            (0x2000, "coff_fn_external"),
+            (0x3000, ".local"),
+            (0x4000, "__hidden"),
+            (0x5000, "FUN_10005000"),
+            (0x6000, "frame_dummy"),
+            (0x7000, "configured_skip"),
+        ] {
+            assert!(
+                !final_clight_function_is_emitted(&db, &external_functions, address, name,),
+                "unexpectedly emitted {name}",
+            );
+        }
     }
 }

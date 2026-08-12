@@ -2214,6 +2214,54 @@ mod tests {
     }
 
     #[test]
+    fn manifest_omits_non_clight_identity_and_retains_adjacent_valid_row() {
+        let kept = function("coff_fn_kept", CStmt::Return(Some(CExpr::int(2))));
+        let omitted = function("FUN_10002000", CStmt::Return(Some(CExpr::int(4))));
+        let mut final_tu = TranslationUnit::new();
+        final_tu.add_function(kept.clone());
+        final_tu.add_function(omitted.clone());
+        let snapshots = [
+            snapshot_if_changed(
+                0,
+                0x1000,
+                SourceAlternativeBoundary::PreVarReduce,
+                &function("coff_fn_kept", CStmt::Return(Some(CExpr::int(1)))),
+                &kept,
+            )
+            .unwrap(),
+            snapshot_if_changed(
+                1,
+                0x2000,
+                SourceAlternativeBoundary::PreVarReduce,
+                &function("FUN_10002000", CStmt::Return(Some(CExpr::int(3)))),
+                &omitted,
+            )
+            .unwrap(),
+        ];
+        let canonical = crate::decompile::passes::c_pass::print_translation_unit_for_format(
+            &final_tu,
+            BinaryFormat::Coff,
+        );
+        let rendered = render_manifest(
+            &final_tu,
+            &snapshots,
+            false,
+            &SourceAlternativeExclusions::default(),
+            &[("coff_fn_kept".to_string(), 0x1000)],
+            &canonical,
+            BinaryFormat::Coff,
+        )
+        .unwrap()
+        .expect("the adjacent emitted identity remains eligible");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let records = parsed["alternatives"].as_array().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["manifold_name"], "coff_fn_kept");
+        assert_eq!(records[0]["manifold_address"], "0x1000");
+        assert_eq!(records[0]["id"], "function-000000:pre_var_reduce");
+    }
+
+    #[test]
     fn manifest_emits_the_exact_ten_record_cumulative_v3_portfolio() {
         // Regression shape from
         // wbemcomn.dll|admin/wmi/wbem/winmgmt/wbemcomn/smallarr|

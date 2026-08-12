@@ -223,13 +223,18 @@ fn main() {
     }
 
     let mut clight_export_succeeded = true;
+    let mut exported_clight_function_identities = None;
     if dump_clight_json {
         let canonical = crate::decompile::passes::clight_select::derive_canonical_path(
             out_file_path.to_str().unwrap_or("output.light.c"),
         );
-        let json_path = crate::decompile::passes::clight_select::derive_with_suffix(&canonical, ".clight.json");
+        let json_path =
+            crate::decompile::passes::clight_select::derive_with_suffix(&canonical, ".clight.json");
         match crate::debug::clight_export::export_clight_json(&prog, &json_path) {
-            Ok(()) => println!("Clight IR exported to: {}", json_path),
+            Ok(identities) => {
+                exported_clight_function_identities = Some(identities);
+                println!("Clight IR exported to: {}", json_path);
+            }
             Err(e) => {
                 clight_export_succeeded = false;
                 eprintln!("Failed to export Clight JSON: {}", e);
@@ -291,13 +296,12 @@ fn main() {
         .cast_optimized_translation_unit
         .as_ref()
         .expect("ClightEmitPass must produce cast_optimized_translation_unit");
-    let exact_function_identities: Vec<_> =
-        crate::decompile::postselect::source_alternatives::exact_function_addresses(
+    let exact_function_identities = exported_clight_function_identities.unwrap_or_else(|| {
+        crate::debug::clight_export::final_clight_emitted_function_identities(
+            &prog,
             &prog.cast_selected_functions,
-            &prog.cast_id_to_name,
         )
-        .into_iter()
-        .collect();
+    });
     let source_alternative_exclusions = if !clight_export_succeeded {
         crate::decompile::postselect::source_alternatives::SourceAlternativeExclusions::suppress_all()
     } else if prog.cast_source_alternatives_overflowed
